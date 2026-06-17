@@ -1,0 +1,17 @@
+# PlatformIO build output & downloaded libraries (generated, large)
+.pio/
+**/.pio/
+
+# PlatformIO IDE / VSCode
+.vscode/
+.pioenvs/
+.piolibdeps/
+
+# Redundant binary archive (the Test Code/ folder is already tracked unzipped)
+Test Code.zip
+
+# OS / editor junk
+Thumbs.db
+desktop.ini
+*.swp
+*~

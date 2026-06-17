@@ -1,0 +1,103 @@
+// --------- ANALOG SENSOR PINS ----------
+#define COL_A_S1 A0
+#define COL_A_S2 A1
+#define COL_B_S1 A2
+#define COL_B_S2 A3
+#define COL_C_S1 A4
+#define COL_C_S2 A5
+#define PHOTO_PIN A6
+
+const int SOIL_DRY = 800;   // dry soil ADC value
+const int SOIL_WET = 300;   // fully wet ADC value
+const int Lightness = 1020;   // dry soil ADC value
+const int Darkness = 249;   // fully wet ADC value
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(9600);
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  readSoilSensorsDebug();
+  delay(1500);
+
+}
+
+int adcToMoisturePercent(int adc) {
+  adc = constrain(adc, SOIL_WET, SOIL_DRY);
+  return map(adc, SOIL_DRY, SOIL_WET, 0, 100);
+}
+
+void readSoilSensorsDebug() {
+  int a1_adc = analogRead(COL_A_S1);
+  int a2_adc = analogRead(COL_A_S2);
+  int b1_adc = analogRead(COL_B_S1);
+  int b2_adc = analogRead(COL_B_S2);
+  int c1_adc = analogRead(COL_C_S1);
+  int c2_adc = analogRead(COL_C_S2);
+  int photoVal = analogRead(PHOTO_PIN);
+
+
+  int a1_pct = adcToMoisturePercent(a1_adc);
+  int a2_pct = adcToMoisturePercent(a2_adc);
+  int b1_pct = adcToMoisturePercent(b1_adc);
+  int b2_pct = adcToMoisturePercent(b2_adc);
+  int c1_pct = adcToMoisturePercent(c1_adc);
+  int c2_pct = adcToMoisturePercent(c2_adc);
+  int photo_pct = map(photoVal, Lightness, Darkness, 100, 0);
+
+  int avgA = (a1_pct + a2_pct) / 2;
+  int avgB = (b1_pct + b2_pct) / 2;
+  int avgC = (c1_pct + c2_pct) / 2;
+
+  Serial.println("---- Soil Moisture Debug (% ) ----");
+
+  Serial.print("Column A - Sensor 1: ");
+  Serial.print(a1_pct);
+  Serial.println(" %");
+
+  Serial.print("Column A - Sensor 2: ");
+  Serial.print(a2_pct);
+  Serial.println(" %");
+
+  Serial.print("Column A - AVERAGE: ");
+  Serial.print(avgA);
+  Serial.println(" %");
+
+  Serial.println();
+
+  Serial.print("Column B - Sensor 1: ");
+  Serial.print(b1_pct);
+  Serial.println(" %");
+
+  Serial.print("Column B - Sensor 2: ");
+  Serial.print(b2_pct);
+  Serial.println(" %");
+
+  Serial.print("Column B - AVERAGE: ");
+  Serial.print(avgB);
+  Serial.println(" %");
+
+  Serial.println();
+
+  Serial.print("Column C - Sensor 1: ");
+  Serial.print(c1_pct);
+  Serial.println(" %");
+
+  Serial.print("Column C - Sensor 2: ");
+  Serial.print(c2_pct);
+  Serial.println(" %");
+
+  Serial.print("Column C - AVERAGE: ");
+  Serial.print(avgC);
+  Serial.println(" %");
+
+  Serial.println();
+
+  Serial.print("PhotoResistor: ");
+  Serial.print(photo_pct);
+  Serial.println(" %");
+
+
+}

@@ -1,0 +1,117 @@
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+#define RE 8
+#define DE 7
+#define BUTTON_PIN 2   // INT0
+
+// RS485 moved away from D2/D3
+SoftwareSerial mod(10, 11); // RO -> D10, DI -> D11
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Sensor queries: 1, 2, 3
+const byte queries[3][8] = {
+  {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08},
+  {0x02, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x3B},
+  {0x03, 0x03, 0x00, 0x00, 0x00, 0x07, 0x05, 0xEA}
+};
+
+byte response[19];
+
+volatile bool buttonPressed = false;
+int currentSensor = 3;
+
+// ===== INTERRUPT HANDLER =====
+void handleButton() {
+  buttonPressed = true;
+}
+
+void setup() {
+  Serial.begin(9600);
+  mod.begin(4800);
+
+  pinMode(RE, OUTPUT);
+  pinMode(DE, OUTPUT);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButton, FALLING);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(2, 1);
+  lcd.print("Soil Sensors");
+  lcd.setCursor(2, 2);
+  lcd.print("Starting...");
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+
+  // Handle button event
+  if (buttonPressed) {
+    buttonPressed = false;
+    currentSensor--;
+    if (currentSensor < 1) currentSensor = 3;
+    lcd.clear();
+  }
+
+  readSoilData(currentSensor);
+  delay(2000);
+}
+
+void readSoilData(int sensorNum) {
+  const byte* query = queries[sensorNum - 1];
+
+  digitalWrite(DE, HIGH);
+  digitalWrite(RE, HIGH);
+  delay(10);
+
+  mod.write(query, 8);
+
+  digitalWrite(DE, LOW);
+  digitalWrite(RE, LOW);
+
+  delay(800);
+
+  if (mod.available() >= 19) {
+    mod.readBytes(response, 19);
+
+    float moisture     = ((response[3] << 8) | response[4]) / 10.0;
+    float temperature  = ((response[5] << 8) | response[6]) / 10.0;
+    uint16_t ec        = (response[7] << 8) | response[8];
+    float ph           = ((response[9] << 8) | response[10]) / 10.0;
+    uint16_t nitrogen  = (response[11] << 8) | response[12];
+    uint16_t phosphorus= (response[13] << 8) | response[14];
+    uint16_t potassium = (response[15] << 8) | response[16];
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("Soil Sensor ");
+    lcd.print(sensorNum);
+
+    lcd.setCursor(0, 1);
+    lcd.print("M:");
+    lcd.print(moisture, 1);
+    lcd.print("%  T:");
+    lcd.print(temperature, 1);
+    lcd.print("C");
+
+    lcd.setCursor(0, 2);
+    lcd.print("EC:");
+    lcd.print(ec);
+    lcd.print(" pH:");
+    lcd.print(ph, 1);
+
+    lcd.setCursor(0, 3);
+    lcd.print("N:");
+    lcd.print(nitrogen);
+    lcd.print(" P:");
+    lcd.print(phosphorus);
+    lcd.print(" K:");
+    lcd.print(potassium);
+  }
+}
