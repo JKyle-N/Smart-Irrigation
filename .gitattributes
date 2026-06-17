@@ -1,0 +1,36 @@
+# Normalize line endings across platforms.
+# Store text as LF in the repo AND check out LF everywhere (consistent for the
+# PlatformIO / Arduino toolchains and avoids CRLF/LF churn on Windows).
+* text=auto eol=lf
+
+# Explicit text types (defensive; same LF policy)
+*.ino        text eol=lf
+*.cpp        text eol=lf
+*.cc         text eol=lf
+*.h          text eol=lf
+*.hpp        text eol=lf
+*.c          text eol=lf
+*.S          text eol=lf
+*.ino.cpp    text eol=lf
+*.ini        text eol=lf
+*.md         text eol=lf
+*.txt        text eol=lf
+*.json       text eol=lf
+*.properties text eol=lf
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.csv        text eol=lf
+*.gitignore  text eol=lf
+*.gitattributes text eol=lf
+
+# Binary files — never touch line endings
+*.zip  binary
+*.bin  binary
+*.hex  binary
+*.elf  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.pdf  binary
+*.ico  binary
