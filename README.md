@@ -135,3 +135,9 @@ All three controllers compile cleanly (PlatformIO `esp32dev` / `nanoatmega328`).
 ESP32 #2 work-order execution path is implemented to spec and can be fully end-to-end
 tested once the ESP32 #2 hardware is assembled. This is active thesis work — values marked
 for commissioning are not yet final.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE) — © 2026 John Kyle Nacor.
