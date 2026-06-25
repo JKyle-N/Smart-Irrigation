@@ -228,7 +228,16 @@ bool     testCapped    = false;       // 10 s hard cap reached -> stay OFF until
 unsigned long testRelayOnMs = 0;      // when the current relay went ON (for the cap)
 unsigned long testLastHoldMs = 0;     // last TEST,HOLD received (for the release timeout)
 const unsigned long TEST_HOLD_TIMEOUT_MS = 400;     // no HOLD within this -> release (fail-safe)
-const unsigned long TEST_HARD_CAP_MS     = 10000;   // max continuous ON (spec sec.18.10.8.3)
+const unsigned long TEST_HARD_CAP_MS     = 10000;   // max continuous ON, single relay (sec.18.10.8.3)
+const unsigned long TEST_COMBO_CAP_MS    = 30000;   // longer cap for valve+pump PRIMING combos
+
+/* ---- Testing valve+pump priming combos (TEST,HOLD idx > 15) --------------- *
+ * idx 16 = Fill (Reservoir -> Mixing), 17/18/19 = Push (Mixing -> Column A/B/C). Each lists the
+ * PCF8575 OUT_* bits energized together (inverter first, then valve(s), then the pump).            */
+const uint8_t COMBO_FILL[]   = { OUT_INVERTER, OUT_RES_VALVE, OUT_TRANSFER };
+const uint8_t COMBO_PUSH_A[] = { OUT_INVERTER, OUT_MIX_VALVE, OUT_COL_A, OUT_BOOSTER };
+const uint8_t COMBO_PUSH_B[] = { OUT_INVERTER, OUT_MIX_VALVE, OUT_COL_B, OUT_BOOSTER };
+const uint8_t COMBO_PUSH_C[] = { OUT_INVERTER, OUT_MIX_VALVE, OUT_COL_C, OUT_BOOSTER };
 
 /* ---- Calibration: raw stream + Prime (companion spec §A) ----------------- */
 String   calId = "";                  // active CAL sensor id ("" = none)
@@ -333,6 +342,8 @@ float readPH();
 float readEC();
 void heartbeat();
 void testSafety();
+void testComboOn(int idx);
+void testOff();
 void calStreamTick();
 int  flowPinForId(const String &id);
 bool applySetCal(const String &id, const String *tok, int n, int i);
@@ -431,6 +442,26 @@ void stopAll()           { pcfWrite(0xFFFF); }                    // all OFF inc
  * actuation; de-energize on fault / completion / idle.                                */
 void cutoffEnergize()    { pcfOn(OUT_MASTER_CUTOFF); }
 void cutoffDeenergize()  { pcfOff(OUT_MASTER_CUTOFF); }
+
+// Energize all PCF bits of a Testing priming combo (idx 16=Fill, 17/18/19=Push>Col A/B/C).
+void testComboOn(int idx) {
+  const uint8_t *bits; uint8_t cnt;
+  switch (idx) {
+    case 16: bits = COMBO_FILL;   cnt = sizeof(COMBO_FILL);   break;
+    case 17: bits = COMBO_PUSH_A; cnt = sizeof(COMBO_PUSH_A); break;
+    case 18: bits = COMBO_PUSH_B; cnt = sizeof(COMBO_PUSH_B); break;
+    case 19: bits = COMBO_PUSH_C; cnt = sizeof(COMBO_PUSH_C); break;
+    default: return;
+  }
+  for (uint8_t i = 0; i < cnt; i++) pcfOn(bits[i]);
+}
+// Turn off whatever Testing item is held (single relay OR a whole combo) and return to the
+// resting bank-powered state.
+void testOff() {
+  if (testHeldBit > 15)      stopAll();              // combo: drop every bit
+  else if (testHeldBit >= 0) pcfOff(testHeldBit);    // single relay
+  cutoffEnergize();
+}
 
 /* ---- Mixing-tank volume persistence (NVS) -------------------------------- *
  * Persist mixTankL so a reboot/brown-out/power-down can never make ESP2 assume an
@@ -614,17 +645,19 @@ void dispatch(const String &payload) {
       reply("DONE,TEST"); return;
     }
     if (sub == "RELEASE") {                                // explicit button-up
-      if (testHeldBit >= 0) pcfOff(testHeldBit);
-      cutoffEnergize();                                    // resting test state: bank stays powered
+      testOff();                                           // single relay OR combo -> off, bank stays powered
       testHeldBit = -1; testCapped = false; return;
     }
-    if (sub == "HOLD") {                                   // dead-man keep-alive for <bit>
+    if (sub == "HOLD") {                                   // dead-man keep-alive for <bit/combo>
       if (!testMode || n < 3) return;
       int bit = tok[2].toInt();
-      if (bit < 0 || bit > 15) { reply("INVALID,TEST_BIT"); return; }
+      if (bit < 0 || bit > 19) { reply("INVALID,TEST_BIT"); return; }   // 0..15 relays, 16..19 combos
       if (bit != testHeldBit) {                            // new selection -> one-at-a-time switch
         stopAll();
-        if (bit == OUT_MASTER_CUTOFF) {
+        if (bit > 15) {                                    // valve+pump priming combo
+          cutoffEnergize();
+          testComboOn(bit);
+        } else if (bit == OUT_MASTER_CUTOFF) {
           // REVERSED in test mode: the bank is kept powered by default, so holding the master
           // cutoff entry DE-energizes it (lets the operator verify the cutoff drops the bank).
           cutoffDeenergize();
@@ -997,17 +1030,16 @@ void heartbeat() {
 void testSafety() {
   if (!testMode || testHeldBit < 0) return;
   unsigned long now = millis();
-  // 10 s HARD CAP: force OFF regardless of ESP1, stay capped until the operator
-  // releases (HOLD stream stops -> the timeout below clears testHeldBit).
-  if (!testCapped && now - testRelayOnMs >= TEST_HARD_CAP_MS) {
-    pcfOff(testHeldBit); cutoffEnergize(); testCapped = true;   // back to resting (bank powered)
+  // HARD CAP: force OFF regardless of ESP1. Combos get the longer priming cap; single relays 10 s.
+  unsigned long cap = (testHeldBit > 15) ? TEST_COMBO_CAP_MS : TEST_HARD_CAP_MS;
+  if (!testCapped && now - testRelayOnMs >= cap) {
+    testOff(); testCapped = true;                  // back to resting (bank powered)
     reply("DONE,TEST_CAP");
   }
   // Dead-man: no HOLD within the timeout (button released, ESP1 hung, or link lost)
-  // -> relay OFF and clear selection (fail-safe). Restore the resting bank-powered state.
+  // -> turn off and clear selection (fail-safe). Restore the resting bank-powered state.
   if (now - testLastHoldMs > TEST_HOLD_TIMEOUT_MS) {
-    if (!testCapped) pcfOff(testHeldBit);
-    cutoffEnergize();
+    if (!testCapped) testOff();
     testHeldBit = -1; testCapped = false;
   }
 }

@@ -564,6 +564,10 @@ const char *TEST_NAMES[16] = {
 };
 int  testSel   = 0;          // selected component row
 int  testOnBit = -1;         // which bit is currently ON (-1 = none)
+// Testing rows: 16 single relays (0..15) + Fill combo (16) + one Push>Col combo per column (17+c).
+// These extra indices double as the TEST,HOLD value; ESP2 treats idx>15 as a valve+pump priming combo.
+const int TEST_FILL_ROW = 16;
+const int TEST_ROWS = 16 + 1 + NUM_COLUMNS;        // = 20
 
 /* ---- Calibration UI (companion spec §A) ---------------------------------- */
 enum CalKind { CK_SOIL, CK_PH, CK_EC, CK_ACS, CK_LEVEL_RES, CK_LEVEL_MIX, CK_FLOW, CK_OFFSET, CK_NPK };
@@ -3082,6 +3086,17 @@ void sendEsp2(const String &body) {
 // Derive the 3-state column mode (0=AUTO,1=IRRIGATION_ONLY,2=OFF) for the editor.
 static int colMode3(int c) { return !COLUMN_ENABLED[c] ? 2 : (col[c].mode == MODE_AUTO ? 0 : 1); }
 
+// Testing row helpers: rows 0..15 are single relays, 16 = Fill combo, 17+c = Push>Col c combo.
+static bool testRowVisible(int r) {
+  if (r <= TEST_FILL_ROW) return true;                       // single relays + Fill always shown
+  return COLUMN_ENABLED[r - (TEST_FILL_ROW + 1)];            // Push>Col c hidden if the column is off
+}
+static String testRowName(int r) {
+  if (r < 16) return TEST_NAMES[r];
+  if (r == TEST_FILL_ROW) return "Fill Res>Mix";
+  return String("Push>Col ") + COL_TAG[r - (TEST_FILL_ROW + 1)];
+}
+
 // Load the per-column schedule fields into the working copy for editCol.
 static void seedSchedule() {
   editTmp[0] = colSchedMode[editCol];                          // AUTO / MANUAL
@@ -3225,8 +3240,8 @@ void settingsButton(int i) {
 
   if (uiMode == UI_TEST) {
     // Dead-man: ENTER is NOT an edge action here (held = ON, handled by testHoldTick).
-    if (i == 0) testSel = (testSel + 16 - 1) % 16;             // UP   select component
-    else if (i == 1) testSel = (testSel + 1) % 16;            // DOWN select component
+    if (i == 0)      { do { testSel = (testSel + TEST_ROWS - 1) % TEST_ROWS; } while (!testRowVisible(testSel)); }  // UP
+    else if (i == 1) { do { testSel = (testSel + 1) % TEST_ROWS; } while (!testRowVisible(testSel)); }              // DOWN
     else if (i == 3) {                                         // BACK exit Testing
       sendEsp2("TEST,EXIT"); testOnBit = -1; testArmPending = false;
       esp2SetPower(false);                                     // power ESP2 back off (idle model)
@@ -3358,7 +3373,7 @@ void testHoldTick() {
   if (held) {
     if (!wasHeld) {                                            // press edge
       wasHeld = true; lastSendMs = 0; testOnBit = testSel;
-      logEvent("ESP1", "ACT", String("TEST|START|") + TEST_NAMES[testSel]);
+      logEvent("ESP1", "ACT", String("TEST|START|") + testRowName(testSel));
     }
     if (millis() - lastSendMs >= 150) {                        // keep-alive stream (< ESP2 timeout)
       lastSendMs = millis();
@@ -3539,12 +3554,14 @@ void lcdRenderSettings() {
                     : (testArmTries >= TEST_ARM_NOACK_HINT) ? "TEST NO ACK-chk link"
                     :                        "TESTING: ARMING...  ";
     lcd.setCursor(0, 0); lcd.print(hdr);
-    int top = testSel - 1; if (top < 0) top = 0; if (top > 16 - 2) top = 16 - 2;
+    int top = testSel - 1; if (top < 0) top = 0; if (top > TEST_ROWS - 2) top = TEST_ROWS - 2;
     for (int r = 0; r < 2; r++) {
       int idx = top + r;
       lcd.setCursor(0, r + 1);
-      snprintf(l, 21, "%c%-9s %s", idx == testSel ? '>' : ' ', TEST_NAMES[idx],
-               idx == testOnBit ? "[ON] " : "[ - ]");
+      if (idx < TEST_ROWS && testRowVisible(idx))
+        snprintf(l, 21, "%c%-11s %s", idx == testSel ? '>' : ' ', testRowName(idx).c_str(),
+                 idx == testOnBit ? "[ON]" : "[ -]");
+      else snprintf(l, 21, "                    ");
       lcd.print(l);
     }
     lcd.setCursor(0, 3); lcd.print("HOLD ENT=on BACK=ext");

@@ -308,7 +308,7 @@ RESET_REQ is used both for fault recovery (after 5 consecutive garbage packets, 
 | RESET_SELF        | Soft reset ESP32 #2 |
 | STATUS_REQ        | Request status      |
 | TEST,ENTER        | Enter manual TEST mode (Settings>Testing, sec.18.10.8): ESP32 #2 forces SAFE (all OFF) and arms the dead-man. Idle-only (BUSY during a sequence). |
-| TEST,HOLD,\<bit\> | Dead-man keep-alive: ESP32 #1 streams this (~every 150 ms) while the operator holds ENTER. ESP32 #2 keeps ONE relay ON (PCF8575 OUT_* index 0..15) only while these arrive; switching bit turns the previous OFF (one-at-a-time). |
+| TEST,HOLD,\<idx\> | Dead-man keep-alive: ESP32 #1 streams this (~every 150 ms) while the operator holds ENTER. `idx` 0..15 = a single PCF8575 OUT_* relay (one-at-a-time). `idx` 16..19 = a **valve+pump priming combo** run together (16 = Fill: inverter+reservoir valve+transfer pump; 17/18/19 = Push>Col A/B/C: inverter+mix valve+column valve+booster pump) with a longer ~30 s cap. Switching the selection turns the previous one OFF. |
 | TEST,RELEASE      | Operator released ENTER — turn the held relay OFF immediately. |
 | TEST,EXIT         | Leave TEST mode, all outputs OFF. |
 | CAL_START,\<SENSOR_ID\> / CAL_STOP | Begin/end the fast raw calibration stream for an ESP2 sensor (pH/EC/ACS712/FLOW_*) — companion spec §A.3 |
