@@ -86,9 +86,7 @@ This multi-layer approach ensures:
 
 ---
 
-##  5.4. Microcontroller Responsibility Boundaries
-
-## 5.5. 5.X. 🔷 Microcontroller Responsibility Boundaries
+## 5.4. 🔷 Microcontroller Responsibility Boundaries
 
 The system uses strict role separation to reduce firmware complexity, avoid duplicated logic, and improve debugging reliability.
 
@@ -109,10 +107,10 @@ The system uses strict role separation to reduce firmware complexity, avoid dupl
 | Flow interrupt counting          | ✘            | ✘        | ✔            |
 | Actuator-level safety validation | ✘            | ✘        | ✔            |
 | Watchdog recovery                | ✘            | ✔        | ✔            |
-| Nano reset authority             | ✘            | ✔        | Execute only |
-| Hardware reset execution         | ✘            | ✘        | ✔            |
+| Nano reset authority (software RESET_REQ over UART) | ✘ | ✔ | ✘ |
+| Master actuator-power cutoff (P17, sec.19.4.8)      | ✘ | ✘ | ✔ |
 
-### 5.5.1. Design Philosophy
+### 5.4.1. Design Philosophy
 
 * ESP32 #1 is the supervisory controller and single decision-making authority.
 * ESP32 #2 operates strictly as an actuator execution subsystem.
@@ -278,11 +276,14 @@ DONE
 
 | Command | Purpose          |
 |---------|------------------|
-| ENV     | Environment data |
-| SOIL    | Soil moisture    |
-| TANK    | Tank levels      |
-| NPK     | Nutrient values  |
+| ENV     | Environment data (RAW; ESP1 applies offsets — companion spec §A) |
+| SOIL    | Soil moisture (RAW averaged ADC; ESP1 maps to %) |
+| TANK    | Tank levels (RAW ultrasonic distances cm + flow; ESP1 maps) |
+| NPK     | Nutrient values (RAW Modbus registers; ESP1 applies scale + offset) |
 | STATUS  | Nano health      |
+| CAL     | One raw sample for the active calibration sensor (companion spec §A.3) |
+
+Note (companion spec §A): the Nano streams RAW signals; ESP32 #1 owns and applies all calibration constants. The CAL packet (`CAL,<SENSOR_ID>,<RAW>`) carries the fast calibration stream.
 
 ### 9.7.1.1. ESP32 #1 to Nano Commands
 
@@ -292,6 +293,7 @@ DONE
 | DAY       | Switch Nano to day-idle interval                         |
 | NIGHT     | Switch Nano to night-idle interval                       |
 | RESET_REQ | Request Nano software self-reset (via short-timeout WDT) |
+| CAL_START,\<SENSOR_ID\> / CAL_STOP,\<SENSOR_ID\> | Begin / end the fast raw calibration stream for one Nano sensor (companion spec §A.3) |
 
 RESET_REQ is used both for fault recovery (after 5 consecutive garbage packets, Section 18.9.5) and for the once-per-day fresh-start reset.
 
@@ -299,16 +301,21 @@ RESET_REQ is used both for fault recovery (after 5 consecutive garbage packets, 
 
 | Command           | Purpose             |
 |-------------------|---------------------|
-| START_IRRIGATION  | Begin irrigation    |
-| START_FERTIGATION | Begin fertigation   |
+| SEQ_IRRIGATION_\<X\>  | Begin irrigation of column X (A/B/C); carries FLUSH,\<pct\> |
+| SEQ_FERTIGATION_\<X\> | Begin fertigation of column X; carries FLUSH/DOSE/EC/PH/MIX work-order params |
 | STOP_ALL          | Emergency stop      |
-| RESET_NANO        | Trigger Nano hardware reset (last resort) |
+| RESUME,\<NORMAL\|IRRIGATE\|RELEASE\> | User-gated fault recovery (sec.19.4.8.2). NORMAL resumes the paused sequence; IRRIGATE finishes as irrigation only (top up plain water, no dosing); RELEASE dumps the current mixing-tank contents to the assigned column as-is. |
 | RESET_SELF        | Soft reset ESP32 #2 |
 | STATUS_REQ        | Request status      |
 | TEST,ENTER        | Enter manual TEST mode (Settings>Testing, sec.18.10.8): ESP32 #2 forces SAFE (all OFF) and arms the dead-man. Idle-only (BUSY during a sequence). |
 | TEST,HOLD,\<bit\> | Dead-man keep-alive: ESP32 #1 streams this (~every 150 ms) while the operator holds ENTER. ESP32 #2 keeps ONE relay ON (PCF8575 OUT_* index 0..15) only while these arrive; switching bit turns the previous OFF (one-at-a-time). |
 | TEST,RELEASE      | Operator released ENTER — turn the held relay OFF immediately. |
 | TEST,EXIT         | Leave TEST mode, all outputs OFF. |
+| CAL_START,\<SENSOR_ID\> / CAL_STOP | Begin/end the fast raw calibration stream for an ESP2 sensor (pH/EC/ACS712/FLOW_*) — companion spec §A.3 |
+| SET_CAL,\<SENSOR_ID\>,\<VALUE\>[,\<VALUE2\>] | Push a runtime calibration constant; ESP2 replies `ACK,SET_CAL,<id>` (block-until-ACK, §A.5.1) |
+| PRIME_START,\<LINE_ID\>[,\<COL\>] / PRIME_STOP | Open a line's valve(s) + run its paired pump to purge air, dead-man + generous cap (§A.4.2) |
+
+Work orders additionally carry job-critical calibration (`KMAIN/KNUT/ECCAL/PHCAL`) so a reset just before a job can never run on stale K-factors / EC-pH cal (companion spec §A.5.1 #3).
 
 ESP32 #2 is the SOLE safety authority in TEST mode (sec.18.10.8.3): it turns the relay OFF if HOLD stops arriving within a short timeout (button released, ESP32 #1 hang, or link loss) and enforces a HARD 10-second cap on continuous ON regardless of ESP32 #1.
 
@@ -317,13 +324,16 @@ ESP32 #2 is the SOLE safety authority in TEST mode (sec.18.10.8.3): it turns the
 | Response  | Meaning                  |
 |-----------|--------------------------|
 | DONE      | Command completed        |
-| BUSY      | Operation active         |
-| ERROR     | Execution failure (ESP32 #1 treats as Critical: stop + power-cut) |
+| BUSY      | Operation active (BUSY,ACTIVE / BUSY,TEST / BUSY,HELD = a held fault must be resolved via RESUME first, sec.19.4.8.2) |
+| ERROR     | Execution failure. ESP32 #1 holds the work order on the master cutoff (ESP32 #2 stays alive, P17 dropped) and awaits a user-gated RESUME (sec.19.4.8) |
 | DEGRADED  | A single channel disabled (nutrient no-flow / mixer no-load) but the sequence CONTINUES; ESP32 #1 classifies Major (alert + log, no shutdown, work order stays active). Used instead of ERROR for recoverable per-channel faults (sec.23.2.2.1, .4) |
-| FLOW_FAIL | Flow validation failed   |
-| PWR_FAIL  | PZEM power validation failed (pump ON but no current / overcurrent / voltage out of range) |
+| FLOW_FAIL | Flow validation failed. ESP32 #2 drops P17 and HOLDS with the mixing-tank volume retained; recovery is user-gated (sec.19.4.8) |
+| PWR_FAIL  | PZEM power validation failed (pump ON but no current / overcurrent / voltage out of range). Triggers the same fault HOLD as FLOW_FAIL |
 | EC_FAIL   | EC outside safe window during dosing (local protective stop) |
 | PH_FAIL   | pH outside safe window during dosing (local protective stop) |
+| SENSOR_FAIL,EC / SENSOR_FAIL,PH | EC/pH probe railed (disconnected/shorted) during dosing — HARDWARE sensor fault, distinct from EC_FAIL/PH_FAIL (out-of-window). ESP32 #1 = Major (alert + log); batch still delivered (no drain). |
+| PCF_FAIL,I2C | PCF8575 relay driver not ACKing (actuator bus fault), debounced over several reads. ESP32 #1 = Major (alert + log, no shutdown); other safeties still apply. Re-asserted ~10 s while faulted. |
+| PCF_OK    | PCF8575 recovered (informational; clears the PCF fault) |
 | SAFE_STOP | Emergency stop triggered |
 
 ## 9.8. 🔷 Command Granularity & Execution Model
@@ -454,7 +464,7 @@ Examples:
 
 <START>,SOIL,A,41,B,53,C,48,<END>
 
-<START>,START_IRRIGATION,A,<END>
+<START>,SEQ_IRRIGATION_A,<END>
 
 <START>,FLOW_FAIL,MAIN,<END>
 
@@ -571,7 +581,7 @@ Packet field notes:
 
 <START>,STOP_ALL,<END>
 
-<START>,RESET_NANO,<END>
+<START>,RESUME,NORMAL,<END>
 
 ---
 
@@ -1057,8 +1067,8 @@ ESP32 #1 monitors heartbeat freshness.
 If heartbeat timeout occurs:
 
 * communication recovery may begin
-* Nano software recovery may be attempted
-* hardware reset may be triggered if required
+* Nano software recovery may be attempted (RESET_REQ)
+* (the Nano's own internal watchdog handles a true lockup; there is no external hardware reset)
 
 ---
 
@@ -1902,14 +1912,16 @@ The SIM800L GSM module is connected to ESP32 #1 (hardware UART2, GPIO27 TX / GPI
 
 SIM800L sends an SMS for ALL fault tiers (Critical 🔴, Major 🟠, Minor 🟡, per Section 23).
 
-Special-case alert: when ESP32 #1 issues a Nano reset after 5 consecutive garbage packets (Section 18.9.5), an alert is sent identifying which reset layer was used (software RESET_REQ or hardware reset).
+Special-case alert: when ESP32 #1 issues a Nano RESET_REQ software reset after 5 consecutive garbage packets (Section 18.9.5), an alert is sent. If RESET_REQ does not restore valid data, a Major alert is sent and ESP32 #1 continues on last-valid data (there is no hardware-reset layer).
 
 Compact format examples:
 
-ALERT,CRIT,PUMP_FAIL,TRANSFER
+ALERT,CRIT,FLOW_FAIL,MAIN,FERTIGATION,COL_B,reply STOP/RELEASE/IRRIGATE/NORMAL
 ALERT,MAJ,NPK_FAULT,COL_B
 ALERT,MIN,ULTRASONIC,MIX
 ALERT,WARN,NANO_RESET,SOFT,GARBAGE5
+
+A hard ESP32 #2 fault (FLOW_FAIL / PWR_FAIL / SAFE_STOP) carries the current operation (IRRIGATION/FERTIGATION) and column, and offers the user-gated recovery menu (Section 19.4.8.2): the system holds (ESP32 #2 stays alive with the mixing-tank volume retained) until the user replies STOP / RELEASE / IRRIGATE / NORMAL.
 
 Note: Minor-tier alerts (e.g. ultrasonic ripple) may be frequent. Rate-limiting of Minor alerts can be added later if SMS volume becomes excessive; by current design all three tiers are sent.
 
@@ -2006,7 +2018,18 @@ Mode is set PER COLUMN. There is no manual fertigation command (fertigation is a
 | MODE,COL_A,AUTO           | Column decides irrigate/fertigate by nutrient gap |
 | MODE,COL_A,IRRIGATION_ONLY| Disable fertigation for this column (water only)  |
 | STOP,ALL                  | Emergency stop                                    |
+| STOP                      | (while a fault is HELD, sec.19.4.8.2) acknowledge & keep holding — deliver nothing, wait |
+| RELEASE                   | (held) dump the mixing-tank contents to the assigned column as-is (no top-up, no dosing) |
+| IRRIGATE                  | (held) finish as irrigation only — top up plain water to budget, deliver, skip dosing |
+| NORMAL                    | (held) resume the paused sequence from where it stopped (fill remainder, no re-dose) |
 | STATUS                    | Live status + daily report (both)                 |
+| SUMMARY[,\<day\>]         | Day-averages digest; day = (none/TODAY)\|YESTERDAY\|YYYYMMDD\|NODATE (Section 29.5) |
+| FULL SUMMARY[,\<day\>]    | Hourly record + deduped errors + events + peaks (Section 29.5)        |
+| NET                       | WiFi / ThingSpeak link status (Section 29.4)      |
+| WIFI,\<ssid\>,\<pass\>    | Set WiFi credentials — owner-only, NVS (Section 29.4) |
+| TSKEY,\<1\|2\|3\>,\<key\> | Set a ThingSpeak channel write key — owner-only (Section 29.4) |
+
+(SUMMARY/FULL SUMMARY/NET/WIFI/TSKEY were added after the original catalog — full behavior in Section 29.4–29.5.)
 
 ---
 
@@ -2675,7 +2698,8 @@ Recovery priority order:
 
 1. Nano internal watchdog (self-recovery from lockup) — highest
 2. ESP32 #1 software reset request via UART (RESET_REQ) — after 5 consecutive garbage packets
-3. ESP32 #1 hardware reset via ESP32 #2 → PCF8575 → Nano RESET pin — last resort
+
+(There is no third hardware-reset layer: PCF8575 P17 is now the master actuator-power cutoff, Section 19.4.8. If RESET_REQ fails, ESP32 #1 logs/alerts and continues on last-valid data.)
 
 RESET_REQ mechanism: on receiving RESET_REQ over UART, the Nano enables its watchdog with a very short timeout and enters an infinite loop, causing the watchdog to perform a true hardware-level reset and restart the sketch from setup().
 
@@ -2847,7 +2871,7 @@ I2C Devices with adress:
   - System recovery (power cycling ESP#2)
 - Relay is active HIGH (via transistor driver)
 
-- Because ESP32 #2 and the PCF8575 are power-dependent on GPIO4 relay control, disabling ESP32 #2 also disables the Arduino Nano external hardware reset pathway until ESP32 #2 is restored.
+- Because ESP32 #2 and the PCF8575 are power-dependent on GPIO4 relay control, cutting GPIO4 de-energizes the PCF8575 — including P17, the master actuator-power cutoff (Section 19.4.8). So cutting GPIO4 forces all actuators OFF as a hardware backstop. (The Nano hardware-reset pathway no longer exists; P17 was repurposed from Nano RESET to the master cutoff.)
 
 ---
 
@@ -2946,97 +2970,21 @@ Note: "UART timeout persists" is NO LONGER a Nano-reset trigger. If the Nano goe
 #### 18.9.5.0.2. Recovery Escalation Order
 
 1. Nano internal watchdog — self-recovery from lockup (highest priority, automatic)
-2. ESP32 #1 software reset request (RESET_REQ over UART) — second priority, triggered after 5 consecutive garbage packets. Used because the Nano cannot detect its own garbage output.
-3. ESP32 #1 hardware reset (RESET_NANO → ESP32 #2 → PCF8575 P17 → Nano RESET) — last resort, only if software reset fails to restore valid data.
+2. ESP32 #1 software reset request (RESET_REQ over UART) — triggered after 5 consecutive garbage packets. Used because the Nano cannot detect its own garbage output.
+
+There is NO third (hardware-reset) layer. The former PCF8575 P17 → Nano RESET path was REMOVED when P17 was repurposed to the master actuator-power cutoff (Section 19.4.8). If RESET_REQ fails to restore valid data, ESP32 #1 logs/alerts (Major) and continues on the most recent valid data; there is no further automatic Nano reset (deliberate 2-layer ladder).
 
 #### 18.9.5.0.3. Daily Fresh-Start Reset
 
-Independent of fault handling, ESP32 #1 sends RESET_REQ to the Nano once per day to ensure a clean daily restart (proactive hygiene, not fault-driven). This uses the software-reset path (Layer 2 mechanism) and is EXEMPT from the once-per-day hardware-reset limit.
+Independent of fault handling, ESP32 #1 sends RESET_REQ to the Nano once per day to ensure a clean daily restart (proactive hygiene, not fault-driven). This uses the software-reset path (Layer 2 mechanism).
 
 ---
 
-#### 18.9.5.1. External Nano Hardware Reset
+#### 18.9.5.1. External Nano Hardware Reset — REMOVED
 
-To improve long-term system reliability, the Arduino Nano reset pin may be controlled externally through ESP32-based recovery logic. This is the LAST-RESORT recovery layer, used only after the Nano's own watchdog and the RESET_REQ software path have failed.
+The former external Nano hardware-reset path (ESP32 #1 → ESP32 #2 → PCF8575 P17 → transistor → Nano RESET pin) has been REMOVED. PCF8575 P17 is now the **master actuator-power cutoff** (Section 19.4.8), and the Nano RESET pin is no longer driven by the system. The `RESET_NANO` command is retired.
 
-Implementation concept:
-
-ESP32 #1
-↓ UART Command
-ESP32 #2
-↓ PCF8575 Output
-Transistor Driver
-↓
-Arduino Nano RESET pin
-
-Behavior:
-
-* ESP32 #1 evaluates incoming Nano data validity (garbage counter, Section 18.9.5.0.1)
-* If 5 consecutive garbage packets occur:
-  → ESP32 #1 first issues a RESET_REQ software reset (second priority)
-* If software reset fails to restore valid data:
-  → ESP32 #1 escalates to hardware reset (last resort)
-* ESP32 #2 briefly pulls Nano RESET pin LOW
-* Arduino Nano restarts and resumes sensor acquisition
-
-Protection Logic:
-
-* Reset attempts are limited to prevent continuous reset loops
-* Maximum one automatic fault-driven hardware reset per day
-* The daily fresh-start software reset (Section 18.9.5.0.3) is separate and does NOT count against this limit
-* Software-based recovery (RESET_REQ) is always attempted before hardware reset
-
-Purpose:
-
-* Recover from a Nano that is alive but stuck producing invalid data
-* Improve autonomous operation
-* Maintain monitoring reliability during long-term deployment
-
-
----
-
-##### 18.9.5.1.1. Design Philosophy
-
-The system prioritizes:
-- Autonomous recovery
-- Minimal manual intervention
-- Reliable long-term operation
-
----
-
-#### 18.9.5.2. Reset Dependency Chain
-
-The Arduino Nano hardware reset path depends on ESP32 #2 operational availability.
-
-Reset sequence:
-
-ESP32 #1
-↓ GPIO4 ACTIVE
-Power enabled to ESP32 #2
-↓
-ESP32 #2 initializes
-↓
-PCF8575 initialized
-↓
-ESP32 #1 sends RESET_NANO command
-↓
-ESP32 #2 activates PCF8575 P17
-↓
-Transistor pulls Arduino Nano RESET LOW
-
-Important Notes:
-
-* ESP32 #1 does not directly control the Arduino Nano RESET pin
-* Nano hardware reset depends on:
-
-  * ESP32 #2 operational state
-  * PCF8575 availability
-  * I2C communication integrity
-* ESP32 #2 watchdog recovery and external power-cycling mechanisms help maintain reset-path reliability
-
-##### 18.9.5.2.1. Design Philosophy:
-
-This distributed reset structure maintains centralized supervisory control while delegating hardware execution tasks to the actuator controller subsystem.
+Consequence: the Nano recovery ladder is now TWO layers — its internal watchdog (lockups) and the RESET_REQ software reset over UART (garbage output). A Nano that is alive but persistently producing garbage AND does not respond to RESET_REQ can no longer be hardware-reset automatically; ESP32 #1 logs/alerts (Major) and continues on last-valid data. This reduction was accepted deliberately when P17 was repurposed.
 
 
 ---
@@ -3212,6 +3160,10 @@ WARNING (documented operator responsibility): bypassing hardware-protection stop
 
 All manual actuations in testing mode are logged to SD (relay/device, ON/OFF, duration), as ACT events (Section 25.2.1), so bench tests are recorded.
 
+---
+
+# 19. 🟠 ESP32 #2 — Actuator Controller
+
 ## 19.1. 🔹 Role
 
 Executes commands, controls pumps/valves, performs safety monitoring.
@@ -3351,7 +3303,47 @@ Stop at Target Volume
 | P14    | Nutrient D Pump   |
 | P15    | pH Up Pump        |
 | P16    | pH Down Pump      |
-| P17    | Nano RESET Control |
+| P17    | **Master Actuator-Power Cutoff** (gates power to the P0–P16 relay bank; see Section 19.4.8) |
+
+Note: P17 is no longer the Nano hardware-reset line. It is now a master cutoff that controls power to ALL control relays (P0–P16). Consequently the Nano no longer has a hardware-reset path — its recovery is limited to its internal watchdog and the RESET_REQ software reset (Section 18.9.5, recovery ladder reduced to 2 layers).
+
+### 19.4.8. 🔹 P17 Master Actuator-Power Cutoff & Fault Hold
+
+P17 drives a master relay that supplies power to the entire P0–P16 control-relay bank. When P17 is de-energized, ALL actuators (pumps, valves, mixer) lose power regardless of their individual PCF output states. This is a single, reliable hardware cutoff for fault conditions.
+
+**Wiring requirement (FAIL-SAFE):** the relay bank and loads MUST be wired so that loss of P17 power = all actuators OFF (loads on normally-open contacts). No load may sit on a normally-closed contact, or it would energize when P17 drops.
+
+ESP32 #2 energizes P17 at the start of any actuation (work order, preventive exercise, testing entry) and de-energizes it on completion, on a fault, and at idle.
+
+#### 19.4.8.1. Fault Hold (ESP32 #2 stays alive, tank-aware)
+
+On a hard fault that warrants stopping actuation (FLOW_FAIL, PWR_FAIL, SAFE_STOP), ESP32 #2 on its own authority:
+
+1. Sets all P0–P16 outputs to SAFE/OFF and **de-energizes P17** (bank hardware-dead).
+2. **PAUSES** the sequence, keeping the work order, the current step, and the metered **mixing-tank volume**.
+3. Reports the fault to ESP32 #1 (fault code + location).
+4. **STAYS ALIVE and HOLDS** — ESP32 #2 does NOT power itself off, and ESP32 #1 keeps it powered (does NOT cut GPIO4). Powering it down would forget the water already in the mixing tank and overfill on resume.
+
+The mixing-tank volume is metered from ESP32 #2's OWN flow sensors (reservoir→mix fill, mix→column deliver) and **persisted to NVS**, so even an unexpected reboot/brown-out cannot make ESP32 #2 assume an empty tank and overfill. The Nano ultrasonic mixing-tank reading is display-only and is NOT trusted for control. The mixing tank's only outlet is the booster pump → a column (no drain line), so held water is ultimately delivered to a column.
+
+#### 19.4.8.2. User-Gated Recovery (GSM / LCD)
+
+ESP32 #1 alerts the user over GSM with the fault, the operation (irrigation/fertigation), and the column, then waits for one of four replies (also selectable on the LCD fault screen):
+
+* **STOP** — acknowledge & keep holding (delivers nothing; waits for a later RELEASE/IRRIGATE/NORMAL).
+* **RELEASE** — re-energize P17 and dump the current mixing-tank contents to the assigned column as-is (no top-up, no dosing), emptying the tank.
+* **ONLY IRRIGATE** — re-energize P17, top up plain reservoir water to the column's irrigation budget (minus what is already in the tank), deliver, skip remaining dosing.
+* **NORMALLY** — re-energize P17 and resume the paused sequence from where it stopped (fill only the remaining liters, no re-dose), then deliver and flush.
+
+There is no automatic resume after a fault; the user must decide. While held, ESP32 #2 refuses new sequence/exercise/test commands with `BUSY,HELD`.
+
+#### 19.4.8.3. Hardware Backstop Retained (GPIO4)
+
+ESP32 #1's GPIO4 relay (ESP32 #2 power) is retained as a backstop for a FROZEN ESP32 #2 and for the manual MODE+BACK emergency stop: cutting GPIO4 de-energizes the PCF8575 (which drives P17), so the actuator bank goes hardware-dead even if ESP32 #2's firmware has failed.
+
+#### 19.4.8.4. Testing Mode Interaction
+
+Because P17 gates all actuator power, testing mode (Section 18.10.8) energizes P17 on entry (so manual relay control works) and de-energizes it on exit. P17 stays energized as the resting state throughout testing so each relay under test actually receives power; the master-cutoff entry in the test list is therefore REVERSED — holding it de-energizes the bank (to verify the cutoff), and releasing restores power.
 
 ---
 
@@ -3727,7 +3719,7 @@ Logged event categories:
 * Every ESP32 #1 → Nano command: ACTIVE/DAY/NIGHT mode changes, RESET_REQ (fault and daily)
 * Every global state change (Section 10.11)
 * All faults (Critical / Major / Minor) and their classification
-* All recovery actions: Nano watchdog events (as inferred), software RESET_REQ, hardware Nano reset, ESP32 #2 power-cycle, ESP32 #1 self-reset
+* All recovery actions: Nano watchdog events (as inferred), software RESET_REQ, ESP32 #2 soft reset (RESET_SELF) / power-cycle, fault hold + RESUME (sec.19.4.8), ESP32 #1 self-reset
 * Dosing events (per nutrient: start, target, measured volume)
 * Actuator start/stop (irrigation, fertigation, transfer, mixing)
 * GSM messages sent and received
@@ -3760,7 +3752,7 @@ The detail column content is defined per event_type below. Secondary delimiter i
 | RESP       | ESP1           | RETRY|COMMAND|attempt_n   or   TIMEOUT|COMMAND             | RETRY|SEQ_IRRIGATION_A|2                 |
 | STATE      | ESP1           | FROM->TO  (state names per Section 10.11.2)                | IDLE_STATE->ACTIVE_STATE                |
 | FAULT      | ESP1           | TIER|CODE|location  (TIER = CRIT/MAJ/MIN)                  | MAJ|NPK_FAULT|COL_B                      |
-| RESET      | ESP1           | TARGET|METHOD|reason  (METHOD = WDT/RESET_REQ/HW; reason = GARBAGE5/DAILY/TIMEOUT) | NANO|RESET_REQ|GARBAGE5 |
+| RESET      | ESP1           | TARGET|METHOD|reason  (METHOD = WDT/RESET_REQ; reason = GARBAGE5/DAILY/TIMEOUT) | NANO|RESET_REQ|GARBAGE5 |
 | DOSE       | ESP2           | NUTRIENT|target_mL|measured_mL|COL                         | NUT_A|50.0|49.2|COL_A                    |
 | ACT        | ESP1/ESP2      | DEVICE|STATE|COL  (STATE = START/STOP)                     | IRRIGATION|START|COL_A                   |
 | GSM        | GSM            | DIR|payload  (DIR = TX/RX)                                 | TX|ALERT|MAJ|NPK_FAULT|COL_B             |
@@ -3794,7 +3786,7 @@ Note: daily files keep individual files manageable and align with the daily-summ
 * Debugging (primary purpose — full event visibility)
 * Daily summary generation (via GSM, Section 12.1.3)
 * Performance analysis
-* Thesis data collection (the Arduino/sensor data is graphed manually on paper from these logs; graphing is not implemented in firmware)
+* Thesis data collection. Sensor data can be graphed two ways now: (a) automatically via the WiFi → ThingSpeak telemetry uplink (live per-field charts, Section 29.4), and (b) from the SD CSV logs / SMS digests for offline or paper graphing.
 
 ---
 
@@ -3823,6 +3815,143 @@ When starting a new chat:
 
 Please read this project reference file first.
 This is my irrigation thesis system.
+
+---
+
+# 29. 🆕 Firmware Feature Additions (Implemented)
+
+These features were implemented after the original specification. They are part of the
+build and supersede any earlier text that conflicts with them. Most live on ESP32 #1 (the
+master); §29.7 (hardware-fault reporting) and §29.8 (Testing arming + wiring test) involve
+ESP32 #2. The Nano is unchanged except where stated.
+
+## 29.1. Emergency-Off + operator recovery
+
+* **Trigger:** pressing **MODE + BACK at the same time** initiates an Emergency Off —
+  STOP_ALL is sent to ESP32 #2, ESP32 #2 power is cut, and the global state becomes
+  `EMERGENCY_STOP`. It fires even while the screen is locked (safety override).
+* **Recovery is deliberate:** the LCD shows a selectable prompt — `> Return to normal` /
+  `Stay stopped`. UP/DOWN choose, ENTER confirms. "Return to normal" re-enters
+  `STARTUP_SYNC` (re-powers and re-validates ESP32 #2 and devices). There is no automatic
+  exit from Emergency Off.
+
+## 29.2. LCD Lock (anti-tamper)
+
+* A **"Lock Screen"** item in the Settings menu locks the LCD. **Manual only — the system
+  never auto-locks.** The lock state persists in NVS across reboots.
+* While locked, all buttons are ignored **except**: **UP + DOWN together = unlock** (the
+  lock screen shows this hint), and the MODE + BACK Emergency-Off combo (safety).
+* **The lock does not affect operation.** Automation, irrigation/fertigation, logging, and
+  telemetry continue normally while locked — only the UI is gated.
+
+## 29.3. ESP32 #1 self-recovery (device-loss daily reset)
+
+* Watches the core devices that answered **at boot**: RTC (0x68), LCD (0x27),
+  INA226 (0x40), and the microSD card.
+* If one **drops out at runtime** (the suspected "RTC/all devices stop responding" I2C
+  wedge), ESP32 #1 reboots itself — **at most once per calendar day**.
+* **Boot-loop-safe:** only a present→absent transition triggers a reset; a device absent
+  from boot simply runs degraded. The daily limit uses an RTC-RAM day stamp that survives
+  the software reset and self-limits even when the RTC itself is dead.
+
+## 29.4. WiFi → ThingSpeak telemetry (live graphs)
+
+* ESP32 #1 connects to a nearby WiFi network and uploads telemetry to **ThingSpeak**,
+  which renders a live graph per field — viewable from anywhere over the internet. This
+  is the "long-range monitoring / graphs" path. **SMS is retained** for alerts, commands,
+  and on-demand reports; WiFi carries telemetry only (alerts still work if WiFi is down).
+* **Non-blocking by design:** all WiFi/HTTP runs in a FreeRTOS task pinned to **core 0**,
+  so blocking network calls never disturb the core-1 control loop or the 8 s task watchdog.
+  Telemetry crosses cores via a spinlock-guarded snapshot; credentials via a mutex.
+* **Channels (8 fields each; one write key per channel):**
+
+  | Channel | Name    | Fields |
+  | ------- | ------- | ------ |
+  | 1       | Columns | per-enabled-column moisture + N, P, K |
+  | 2       | System  | temp, humidity, lux, reservoir %, mixing %, battery V, battery W, flow |
+  | 3       | Chem    | per-enabled-column EC + pH |
+
+* **Setup is by SMS** (owner-only; the sender's last 9 digits must match the configured
+  number), persisted to NVS:
+  * `WIFI,<ssid>,<password>` — password is the remainder after the 2nd comma (may contain
+    commas/spaces; SSID may not).
+  * `TSKEY,<1|2|3>,<writeApiKey>` — set a channel's write key.
+  * `NET` — reply with WiFi up/down, RSSI, IP, and last-upload status.
+* Upload cadence ≈ 20 s during ACTIVE, 60 s when idle. Transport is plain HTTP
+  (unencrypted) for simplicity; HTTPS is a possible future upgrade.
+* Build note: ESP32 #1 uses the `huge_app` partition to fit WiFi + HTTPClient + SD + libs.
+
+## 29.5. SMS reports — day-selectable SUMMARY and new FULL SUMMARY
+
+Extends Section 12 (GSM reports). **STATUS is unchanged** (always the current day).
+
+* **`SUMMARY[,<day>]`** — the day's **averages**, formatted for the thesis paper:
+  per-column NPK + moisture averages, power averages (avg V/W) + energy Wh, water and
+  nutrient totals, and fault/reset/run/dose counts.
+* **`FULL SUMMARY[,<day>]`** — an uncapped **hourly** record: per-column N/P/K + moisture +
+  battery V/W for each hour that has data, plus a **deduplicated error list** (each error
+  code once, with its first timestamp), run/dose events with volumes, and a daily
+  peaks/totals line (max temp, min battery V, peak W, totals, counts). Segments are streamed
+  paced to the SMS queue so none are dropped, each tagged `(i/N)`; a busy day can be many
+  messages (tunable cap, default unlimited).
+* **`<day>` selector** (both reports): omitted / `TODAY`, `YESTERDAY`, explicit `YYYYMMDD`,
+  or `NODATE`.
+* **NODATE / RTC-dead data:** when the RTC has stopped, logs are written to `/NODATE.CSV`
+  with `0000-00-00 00:00:00` timestamps. Both reports resolve there automatically when the
+  RTC is dead, and `,NODATE` selects that file explicitly (its rows bucket into hour 00).
+  Both reports reuse the existing bounded, non-blocking incremental SD parser.
+
+## 29.6. Review-fix behaviors (now part of the build)
+
+* **Nano interval pacing:** ESP32 #1 now actively drives the Nano's `ACTIVE` / `DAY` /
+  `NIGHT` transmission interval (single owner, sent only on change) — `ACTIVE` during runs,
+  otherwise `DAY`/`NIGHT` by the RTC clock. Previously the Nano was left at the fast
+  interval indefinitely.
+* **Reservoir-low alert is one-shot:** raised once per low episode and cleared on recovery
+  (was previously re-raised every loop, flooding SMS/log).
+* **ESP32 #2 timer cleanup:** `STOP_ALL` and `TEST` cancel any in-flight preventive-exercise
+  or Nano-reset pulse timers, so no stray late `DONE` is emitted; the inverter is dropped
+  during DC nutrient dosing.
+* **Water in the log:** irrigation/fertigation STOP log rows now include `|W=<liters>` so
+  per-day water totals can be recovered from the CSV by the reports.
+
+## 29.7. ESP2 hardware-fault reporting (PCF8575 / EC / pH)
+
+ESP32 #2 now actively detects and reports hardware faults to ESP32 #1 (response codes in
+Section 9.7.3). Both are classified **Major** on ESP32 #1 (alert + log, no shutdown).
+
+* **PCF8575 relay bus (`PCF_FAIL,I2C` / `PCF_OK`):** every relay write checks the I2C result,
+  and a periodic active probe (~2 s) feeds a consecutive-failure counter so a single glitch
+  can't false-trip. After a few failures ESP32 #2 sends `PCF_FAIL,I2C`, re-asserted ~10 s while
+  the bus stays dead (so a missed UART line still gets through), and `PCF_OK` on recovery.
+  It does NOT force a stop (keep-running policy); the PZEM no-current and flow-timeout safeties
+  still apply during a run.
+* **EC / pH probe (`SENSOR_FAIL,EC` / `SENSOR_FAIL,PH`):** at the dosing EC/pH step the raw ADC
+  is range-checked; a railed reading (probe disconnected/shorted) reports a SENSOR_FAIL — a
+  HARDWARE fault, distinct from `EC_FAIL`/`PH_FAIL` which mean the value is merely outside the
+  safe window. EC and pH are checked independently. The mixed batch still delivers (no drain).
+* Editable thresholds on ESP32 #2: PCF probe cadence / fail-limit / re-assert interval, and the
+  EC/pH rail ADC bounds (`[MEASURE]` at commissioning).
+
+## 29.8. Testing-mode arming hardening + standalone PCF8575 wiring test
+
+Extends the manual TEST mode (Section 18.10.8).
+
+* **Robust arming:** opening Settings>Testing powers ESP32 #2 via the GPIO4 relay, **primes**
+  it (~2 s boot settle), then **re-sends `TEST,ENTER` every ~1 s until ESP32 #2 confirms with
+  `ACK,TEST,ENTER`**. This replaces the old reliance on the single boot-time `READY`, which is
+  easily lost on a cold relay power-up — leaving ESP32 #2 out of test mode so every `TEST,HOLD`
+  was silently dropped and no relay actuated.
+* **Honest LCD feedback** (header): `ESP2 DOWN` (no heartbeat) / `ARMING...` (alive, awaiting
+  confirmation) / `(dead-man)` (confirmed in test mode, relays controllable) /
+  `NO ACK-chk link` (ESP32 #2 heartbeats but never ACKs after several tries → suspect the
+  ESP32 #1 → ESP32 #2 TX link, GPIO25→GPIO16). `TEST,HOLD` keeps streaming so control engages
+  the instant ESP32 #2 is armed.
+* **Standalone wiring test:** `Test Code/ESP2_PCF8575_SEQ/` (PlatformIO, ESP32 #2 only) walks
+  the PCF8575 outputs ON one at a time P0→P15 with a 1 s gap, active-LOW, naming each channel on
+  the serial monitor, and probes the PCF at boot. It isolates relay/PCF wiring from the
+  ESP32 #1↔#2 link: if relays click here but Testing still fails, the fault is the link, not the
+  hardware.
 
 
 ---

@@ -37,6 +37,8 @@
 #include <INA226.h>
 #include <SoftwareSerial.h>      // EspSoftwareSerial (plerup) -- Nano link
 #include <esp_task_wdt.h>
+#include <WiFi.h>                // built-in ESP32 WiFi (telemetry uplink, Part A)
+#include <HTTPClient.h>          // ThingSpeak HTTP upload
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -113,6 +115,44 @@ const unsigned long MIXING_DURATION_MS = 30000UL;  // homogenize time           
 const float EC_MIN = 0.0f,  EC_MAX = 3.0f;    // [TBD]
 const float PH_MIN = 5.0f,  PH_MAX = 7.0f;    // [TBD]
 
+/* =============================================================================
+ *  CALIBRATION CONSTANTS  (companion spec §A) -- own NVS namespace "calib"
+ * -----------------------------------------------------------------------------
+ *  Subsystems stream RAW; ESP32 #1 applies these. Nano-owned consts are applied here when
+ *  interpreting packets; ESP2-owned consts (flow K, EC/pH, ACS712 zero) are the authoritative
+ *  copy ESP1 pushes to ESP2 (SET_CAL + startup sync + work order, §A.5.1). Defaults = bench.   */
+// Nano-applied:
+int   calSoilAir[NUM_COLUMNS]   = { 800, 800, 800 };   // raw ADC dry (per column avg) [MEASURE]
+int   calSoilWater[NUM_COLUMNS] = { 300, 300, 300 };   // raw ADC saturated            [MEASURE]
+float calResEmptyCm = 53.0f, calResFullCm = 3.0f;      // ultrasonic geometry (moved from Nano)
+float calMixEmptyCm = 50.0f, calMixFullCm = 4.0f;
+float calFlowResScale = 1.0f;                          // reservoir flow correction factor
+float calNpkScale[7] = { 10, 10, 1, 10, 1, 1, 1 };     // raw register -> engineering (moved from Nano)
+float calNpkOff[NUM_COLUMNS][3] = { {0,0,0}, {0,0,0}, {0,0,0} };  // N/P/K offset trim (default 0, §A.4.3)
+float calTempOff = 0, calHumOff = 0, calLuxOff = 0;    // env/light offset trims
+// ESP2-owned (ESP1 holds authoritative copy, pushes to ESP2):
+float calKResMix = 450, calKMixIrr = 450, calKNut[3] = { 450, 450, 450 };
+float calKNutD = 450, calKPhUp = 450, calKPhDn = 450;
+float calPhM = 0.0036621f, calPhB = 0, calEcM = 0.0009766f, calEcB = 0;
+float calAcs712Zero = 1.65f;
+// Runtime: live raw stream + SET_CAL ack capture (block-until-ACK).
+String lastSetCalAck = "";              // arg of the last ACK,SET_CAL,<id>
+String calRxId = "";                    // sensor id of the last CAL sample received
+float  calRxRaw = 0; bool calRxValid = false; unsigned long calRxMs = 0;
+
+// Map a raw soil ADC to 0..100 % using the per-column endpoints (dry=high ADC, wet=low ADC).
+static int soilPct(int col, int raw) {
+  long p = map(raw, calSoilAir[col], calSoilWater[col], 0, 100);
+  if (p < 0) p = 0; if (p > 100) p = 100;
+  return (int)p;
+}
+// Map a raw ultrasonic distance (cm) to 0..100 % using empty/full geometry.
+static float levelPct(float distCm, float emptyCm, float fullCm) {
+  float pct = (emptyCm - distCm) * 100.0f / (emptyCm - fullCm);
+  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+  return pct;
+}
+
 /* ---- Tank levels (%) (spec sec.14.4) ------------------------------------- */
 const float RES_LOW_PCT      = 15.0f;   // reservoir too low -> block ops  [TBD]
 const float MIX_TARGET_PCT   = 70.0f;   // mixing tank fill target          [TBD]
@@ -138,13 +178,16 @@ const unsigned long BTN_DEBOUNCE_MS       = 40;      // per-button debounce wind
 const unsigned long LOG_FLUSH_INTERVAL_MS = 5000;    // batched SD flush
 const uint16_t      LOG_FLUSH_LINES       = 20;
 const uint8_t       GARBAGE_LIMIT         = 5;       // consecutive (spec sec.18.9.5)
-const uint8_t       MAX_NANO_HW_RESET_PER_DAY = 1;   // spec sec.18.9.5.1
+// (Nano hardware-reset layer removed -- P17 is now the master cutoff; ladder is 2 layers, sec.18.9.5.1)
 
 /* ---- ESP2 power model: OFF during idle (power-saving, spec sec.18.8) ------ *
  * ESP2 is unpowered in IDLE_STATE. It is powered ON only for: startup validation,
  * a scheduled run (warm-up -> READY -> work order -> OFF), Testing, recovery, and
  * the last-resort HW Nano reset (sec.18.9.5.2). Warm-up bounds the boot wait.    */
 const unsigned long ESP2_WARMUP_TIMEOUT_MS = 8000;   // ESP2 cold-boot -> READY budget
+// Recovery ladder: try a cheap soft reset (RESET_SELF) before the relay power-cycle. This is the
+// RESET_SELF -> READY budget; if ESP2 stays dark past it we escalate to esp2PowerCycle() (sec.18.9).
+const unsigned long ESP2_SOFT_RESET_TIMEOUT_MS = 10000;  // ESP2 cold-boot 8s + margin for frame/stopAll
 
 /* ---- Preventive pump exercise (spec sec.14.9.1 / 19.4.2) ----------------- *
  * MOVED to ESP1: with ESP2 OFF during idle it loses millis() each power-down and
@@ -164,9 +207,14 @@ const unsigned long PWR_LOG_INTERVAL_MS = 60000;     // log a PWR snapshot ~1/mi
  * NOTE: SUMMARY is NOT in the spec inbound catalog (sec.12.2 lists only STATUS);
  * added by explicit request. It parses today's YYYYMMDD.CSV incrementally so the
  * read never blocks the loop/WDT. Tunables below cap the SMS volume.             */
-const uint8_t       SUMMARY_MAX_SMS     = 3;    // cap reply length (>=1)
+const uint8_t       SUMMARY_MAX_SMS     = 4;    // SHORT SUMMARY: cap reply length (>=1)
 const uint8_t       SUMMARY_MAX_EVENTS  = 12;   // significant events listed before +more@SD
 const uint16_t      SUMMARY_LINES_PER_TICK = 40;   // bounded SD lines parsed per loop (non-blocking)
+// FULL SUMMARY: hourly nutrient/moisture/power record + deduped errors + events + peaks.
+// Uncapped by request (full day/night); 0 = unlimited segments. A busy day can be many SMS.
+const uint8_t       FULL_SUMMARY_MAX_SMS = 0;   // 0 = unlimited (user choice)
+const uint8_t       FULL_MAX_EVENTS      = 60;  // RAM cap on the in-report run/dose event list
+const uint8_t       SUM_MAX_ERRORS       = 12;  // distinct error codes tracked (deduped, first ts)
 
 /* ---- Daily schedule (minutes since midnight) ----------------------------- */
 const uint16_t DAILY_REPORT_MIN     = 18*60;   // 18:00 daily summary (sec.12.1.3) [TBD]
@@ -225,6 +273,7 @@ LiquidCrystal_I2C lcd(LCD_ADDR, 20, 4);
 RTC_DS3231        rtc;
 INA226            ina(INA226_ADDR);
 Preferences       prefs;
+Preferences       prefsCal;        // separate calibration namespace (§A.5 / §C: never reset by defaults)
 SoftwareSerial    nanoSerial(NANO_RX_PIN, NANO_TX_PIN);   // EspSoftwareSerial
 HardwareSerial    esp2Serial(1);
 HardwareSerial    simSerial(2);
@@ -283,7 +332,6 @@ SensorData sensor;
 
 /* ---- Nano garbage tracking / recovery ------------------------------------ */
 uint8_t garbageCount = 0;
-uint8_t nanoHwResetsToday = 0;
 long    lastResetDayStamp = -1;
 bool    nanoResetReqInFlight = false;
 unsigned long nanoResetReqMs = 0;
@@ -306,19 +354,30 @@ uint8_t esp2PowerCycles = 0;
 unsigned long lastRecoveryMs = 0;
 unsigned long esp2OffMs = 0;     // timestamp ESP2 power was cut, for the power-cycle OFF hold
 const unsigned long POWER_CYCLE_OFF_MS = 1500;   // hold ESP2 relay OFF this long for a real cycle
+// Recovery escalation ladder: soft reset (RESET_SELF) first, power-cycle as last resort (sec.18.9).
+bool esp2SoftResetTried = false; // soft reset already attempted this recovery episode
+unsigned long esp2RecoverMs = 0; // when RESET_SELF was sent (soft-reset READY-wait timeout reference)
 
 /* ---- ESP2 power lifecycle (OFF-during-idle model) ------------------------- *
  * esp2Powered  : current relay state mirror (avoids redundant digitalWrites + lets
  *                callers reason about power without reading the pin).
  * pendingRun   : a column run waiting for ESP2 to finish booting (warm-up phase).
- * esp2WarmupMs : start of the current warm-up wait (READY budget).
- * pendingNanoHwReset : a Layer-3 HW Nano reset deferred until ESP2 is powered+ready. */
+ * esp2WarmupMs : start of the current warm-up wait (READY budget).                  */
 bool esp2Powered = false;
 struct PendingRun { bool active; int colIdx; bool fertigate; };
 PendingRun pendingRun = { false, -1, false };
 unsigned long esp2WarmupMs = 0;
-bool pendingNanoHwReset = false;
 bool testArmPending = false;     // Testing: TEST,ENTER deferred until ESP2 READY (sec.18.10.8.1)
+// Testing arming robustness: ESP2 is cold-booted by the GPIO4 relay on entry, so its single
+// boot READY can be lost. We PRIME (let ESP2 boot) then re-send TEST,ENTER until ESP2 confirms
+// with ACK,TEST,ENTER. esp2TestArmed gates the LCD + stops the retries.
+bool esp2TestArmed = false;      // ESP2 has confirmed it is in TEST mode (ACK,TEST,ENTER)
+unsigned long lastTestArmMs = 0; // last TEST,ENTER (re)send
+uint8_t testArmTries = 0;        // sends since entering Testing (for a NO-ACK link hint)
+const unsigned long TEST_PRIME_MS     = 2000;  // GPIO4 power-on -> let ESP2 boot before arming
+const unsigned long TEST_ARM_RETRY_MS = 1000;  // re-send TEST,ENTER this often until ACK
+const uint8_t       TEST_ARM_NOACK_HINT = 5;   // sends w/o ACK (ESP2 alive) -> suspect ESP1->ESP2 link
+const uint8_t       TEST_ARM_MAX_TRIES  = 20;  // stop re-sending after this (link likely broken; no log spam)
 
 /* ---- Preventive pump exercise (ESP1-owned; sec.14.9.1) -------------------- *
  * lastPumpUseMs[]: last time each AC pump ran (real run OR exercise). Indices:
@@ -331,7 +390,9 @@ PendingExercise pendingExercise = { false, -1, false };
 
 /* ---- GSM ----------------------------------------------------------------- */
 bool reportPending  = false;    // deferred STATUS report (sec.12.1.3.1)
-bool summaryPending = false;    // deferred SUMMARY report (same pattern as STATUS)
+bool summaryPending = false;    // deferred SUMMARY/FULL report (same pattern as STATUS)
+// Remembered request shape for a deferred summary (fired by scheduleTick when idle).
+// (SumMode/long defined with the summary globals below; declared here for the pending slot.)
 
 /* ---- GSM live health (LCD PAGE_GSM) -------------------------------------- */
 int  lastRssi      = -1;        // AT+CSQ RSSI 0..31 (99/-1 = no signal)
@@ -359,6 +420,47 @@ String   gtxTo;                        // recipient of the in-flight outbound me
 const unsigned long GSM_CMGF_SETTLE_MS    = 300;
 const unsigned long GSM_PROMPT_TIMEOUT_MS = 5000;
 const unsigned long GSM_BODY_SETTLE_MS    = 1500;
+
+/* ---- WiFi + ThingSpeak telemetry (Part A) -------------------------------- *
+ * ESP32 #1 joins the nearby WiFi and uploads a numeric snapshot to ThingSpeak,
+ * which draws a live graph per field (viewable from anywhere). All network work
+ * runs in a core-0 FreeRTOS task so blocking HTTP never disturbs the core-1 loop
+ * or the 8 s task WDT. Credentials + write keys are set by SMS (Part B), NVS-kept.
+ * Channel 1 "Columns" = per-column moisture + N,P,K. Channel 2 "System" = temp,
+ * hum, lux, reservoir%, mixing%, battV, battW, flow. Channel 3 "Chem" = per-column
+ * EC + pH.                                                                       */
+const char *TS_HOST = "api.thingspeak.com";
+const unsigned long TS_UPLOAD_IDLE_MS   = 60000;   // upload cadence when idle
+const unsigned long TS_UPLOAD_ACTIVE_MS = 20000;   // faster during ACTIVE_STATE
+const unsigned long WIFI_RETRY_MS       = 15000;   // reconnect backoff
+const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
+
+// Creds/keys live in RAM (loaded from NVS); guarded by netMux between the two cores.
+String wifiSsid = "", wifiPass = "";
+String tsKey1 = "", tsKey2 = "", tsKey3 = "";      // ThingSpeak write keys (ch1 cols, ch2 system, ch3 EC/pH)
+SemaphoreHandle_t netMux = NULL;                   // guards the cred/key Strings across cores
+volatile bool wifiConnected = false;
+volatile int  wifiRssiVal   = 0;
+char    wifiIpStr[16] = "0.0.0.0";                 // fixed buffer (written core 0, read core 1; no String race)
+volatile bool wifiCredsChanged = false;            // SMS sets new creds -> task reconnects
+volatile unsigned long lastTsUploadMs = 0;
+volatile bool lastTsOk = false;
+TaskHandle_t  netTaskHandle = NULL;
+
+// Inter-core telemetry snapshot: filled on core 1 (telemetryCollect, POD only -> spinlock),
+// read on core 0 by the upload task.
+struct TelemetrySnapshot {
+  float temp, hum, lux, resLevel, mixLevel, flow;
+  int   soil[NUM_COLUMNS];
+  float npkN[NUM_COLUMNS], npkP[NUM_COLUMNS], npkK[NUM_COLUMNS];
+  float npkEC[NUM_COLUMNS], npkPH[NUM_COLUMNS];
+  bool  npkValid[NUM_COLUMNS];
+  float battV, battP;
+  bool  valid;
+};
+TelemetrySnapshot telem = {};
+portMUX_TYPE telemMux = portMUX_INITIALIZER_UNLOCKED;
+unsigned long lastTelemCollectMs = 0;
 
 /* ---- Power --------------------------------------------------------------- */
 float battV = 0, battI = 0, battP = 0;
@@ -388,16 +490,43 @@ unsigned long lastLogFlushMs = 0;
  * Opens today's log once and parses a bounded number of lines per loop tick so a
  * large daily file can never stall the loop past the 8 s WDT. Accumulates counts
  * and a capped chronological list of SIGNIFICANT events, then enqueues <=3 SMS.   */
-enum SummaryStage { SUM_IDLE, SUM_OPEN, SUM_READ, SUM_EMIT };
+enum SummaryStage { SUM_IDLE, SUM_OPEN, SUM_READ, SUM_BUILD, SUM_STREAM };
 SummaryStage summaryStage = SUM_IDLE;
+enum SumMode { SUM_SHORT, SUM_FULL };      // SHORT = daily averages; FULL = hourly record
+SumMode      sumMode = SUM_SHORT;
+SumMode      pendingSumMode = SUM_SHORT;   // deferred-request shape (fired when idle)
+long         pendingSumTarget = -1;
+long         summaryTargetStamp = -1;      // yyyymmdd to open; 0 = NODATE file; resolved at request
 File         summaryFile;
 String       summaryReplyTo = "";          // who asked (reply target captured at request)
 uint16_t     sumFltC = 0, sumFltM = 0, sumFltm = 0;   // faults by tier
 uint16_t     sumRst = 0, sumFert = 0, sumIrr = 0, sumDose = 0;
-uint8_t      sumEvtCount = 0;              // significant events captured (<= SUMMARY_MAX_EVENTS)
-bool         sumTruncated = false;         // more significant events than the cap
-String       sumEvents = "";               // pipe-joined compact event list
+uint8_t      sumEvtCount = 0;              // significant events captured
+bool         sumTruncated = false;         // more events than the cap
+String       sumEvents = "";               // pipe-joined compact event list (run/dose, FULL)
 String       sumPartial = "";              // carry for a CSV line split across read chunks
+
+/* ---- SUMMARY numeric accumulators (averages for SHORT, peaks shared) ------- */
+double   sumNsum[NUM_COLUMNS] = {0}, sumPsum[NUM_COLUMNS] = {0}, sumKsum[NUM_COLUMNS] = {0};
+uint16_t sumNPKc[NUM_COLUMNS] = {0};
+double   sumMoistSum[NUM_COLUMNS] = {0}; uint16_t sumMoistC[NUM_COLUMNS] = {0};
+double   sumBattVsum = 0, sumBattWsum = 0; uint32_t sumBattC = 0;
+float    sumConsWh = 0, sumChgWh = 0;      // last cumulative Wh seen in PWR rows
+float    sumWaterTot[NUM_COLUMNS] = {0}, sumNutTot[NUM_COLUMNS] = {0};
+float    sumMaxTemp = -1000, sumMinBattV = 100000, sumPeakW = 0;
+
+/* ---- FULL SUMMARY hourly buckets (24h x per-column) ----------------------- */
+float    hrNsum[24][NUM_COLUMNS], hrPsum[24][NUM_COLUMNS], hrKsum[24][NUM_COLUMNS];
+uint16_t hrNPKc[24][NUM_COLUMNS];
+float    hrMoistSum[24][NUM_COLUMNS]; uint16_t hrMoistC[24][NUM_COLUMNS];
+float    hrBattVsum[24], hrBattWsum[24]; uint16_t hrBattC[24];
+
+/* ---- Error dedup (each code once, with first timestamp) ------------------- */
+String   sumErrCode[SUM_MAX_ERRORS]; String sumErrTs[SUM_MAX_ERRORS]; uint8_t sumErrN = 0;
+
+/* ---- Paced report streaming (build once, emit one segment per tick) -------- */
+String   sumReport = "";                   // full assembled report text
+int      sumSegIdx = 0, sumSegTotal = 0;   // segment cursor / count
 
 /* ---- LCD UI -------------------------------------------------------------- */
 enum LcdPage { PAGE_HOME, PAGE_SENSORS, PAGE_COLUMNS, PAGE_POWER, PAGE_GSM, PAGE_FAULT, PAGE_COUNT };
@@ -408,27 +537,113 @@ unsigned long lastLcdMs = 0;
 String    lastFaultMsg = "none";
 
 /* ---- Settings / Testing UI (MODE button, spec sec.18.10) ----------------- */
-enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST };
+enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST, UI_CAL };
 UiMode    uiMode = UI_DATA;
 // Top-level Settings menu rows
-enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_TESTING, SET_EXIT, SET_COUNT };
-const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Testing", "Exit" };
+enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_CALIB, SET_TESTING, SET_RESTORE, SET_LOCK, SET_EXIT, SET_COUNT };
+const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Calibration", "Testing", "Restore Defaults", "Lock Screen", "Exit" };
 int  setSel    = 0;          // selected settings row
 int  editItem  = -1;         // SetItem currently being edited
 int  editField = 0;          // field index within the editor
 int  editCol   = 0;          // column index for per-column editors
 int  editTmp[6] = { 0 };     // working copy of the field values being edited
+// Edit-Confirmation (companion spec §B): a "dirty" edit shows SAVE/DISCARD/CANCEL on exit.
+bool editDirty   = false;    // any value changed since the editor opened
+bool editConfirm = false;    // the three-way unsaved-changes dialog is open
+int  confirmSel  = 0;        // 0 SAVE, 1 DISCARD, 2 CANCEL
+// Restore-Defaults (companion spec §C): destructive, double-confirm.
+bool restoreConfirm = false; // the YES/NO restore dialog is open
+int  restoreSel  = 0;        // 0 NO, 1 YES
+// Remote SMS config-write deferral while a local edit is open (companion spec §B.3.1).
+String pendingCfgSms = "";   // queued config SMS, applied when the local edit exits
 // Testing submenu: PCF8575 OUT_* bit -> short name (MUST match ESP2 OUT_* numbering)
 const char *TEST_NAMES[16] = {
   "ResValve", "Col A Vlv", "Col B Vlv", "Col C Vlv", "Mix Valve", "Inverter",
   "Transfer", "Booster", "Mixer", "Nut A", "Nut B", "Nut C", "Nut D",
-  "pH Up", "pH Down", "Nano RST"
+  "pH Up", "pH Down", "Mast Cutoff"
 };
 int  testSel   = 0;          // selected component row
 int  testOnBit = -1;         // which bit is currently ON (-1 = none)
 
+/* ---- Calibration UI (companion spec §A) ---------------------------------- */
+enum CalKind { CK_SOIL, CK_PH, CK_EC, CK_ACS, CK_LEVEL_RES, CK_LEVEL_MIX, CK_FLOW, CK_OFFSET, CK_NPK };
+struct CalTgt { const char *name; const char *id; uint8_t kind; int col; };
+const CalTgt CAL_TGTS[] = {
+  { "Soil A",      "SOIL_A",      CK_SOIL,      0 },
+  { "Soil B",      "SOIL_B",      CK_SOIL,      1 },
+  { "Soil C",      "SOIL_C",      CK_SOIL,      2 },
+  { "pH (7 then 4)", "PH",        CK_PH,       -1 },
+  { "EC (0 then std)", "EC",      CK_EC,       -1 },
+  { "ACS712 zero", "ACS712",      CK_ACS,      -1 },
+  { "Ultra Res empty", "ULTRA_RES", CK_LEVEL_RES, -1 },
+  { "Ultra Mix empty", "ULTRA_MIX", CK_LEVEL_MIX, -1 },
+  { "Temp offset", "DHT_T",       CK_OFFSET,    0 },   // col selects tOff/hOff/lOff (0/1/2)
+  { "Hum offset",  "DHT_H",       CK_OFFSET,    1 },
+  { "Lux offset",  "LUX",         CK_OFFSET,    2 },
+  { "NPK trim A",  "NPK_A",       CK_NPK,       0 },
+  { "NPK trim B",  "NPK_B",       CK_NPK,       1 },
+  { "NPK trim C",  "NPK_C",       CK_NPK,       2 },
+  { "Flow ResMix", "FLOW_RESMIX", CK_FLOW,     -1 },
+  { "Flow MixIrr", "FLOW_MIXIRR", CK_FLOW,     -1 },
+  { "Flow Nut A",  "FLOW_NUTA",   CK_FLOW,      0 },
+  { "Flow Nut B",  "FLOW_NUTB",   CK_FLOW,      1 },
+  { "Flow Nut C",  "FLOW_NUTC",   CK_FLOW,      2 },
+};
+const int CAL_TGT_COUNT = sizeof(CAL_TGTS) / sizeof(CAL_TGTS[0]);
+int   calSel = 0;            // selected target in the list
+bool  calOpen = false;       // a target is open (streaming/capturing)
+int   calStep = 0;           // capture step within the open target
+float calCap[2] = { 0, 0 };  // captured raw points (or NPK N/P/K offsets being edited)
+float calVolL = 0.50f;       // flow: entered reference volume (L); reused as the offset/ref entry
+unsigned long calFlowPulses = 0;  // flow: captured pulse count for the current run
+bool  calEnterWasDown = false;    // edge tracking for the flow dead-man
+// 3-run flow K (§A.4.1.4/.7)
+float calKRuns[3] = { 0, 0, 0 };
+int   calRunIdx = 0;
+float calNpkEdit[3] = { 0, 0, 0 };   // N/P/K offsets being edited in the NPK trim screen
+const unsigned long CAL_STALE_MS = 2500;   // raw sample considered stale after this
+const float CAL_OUTLIER_PCT = 8.0f;        // 3-run K disagreement tolerance [TBD]
+const float EC_STD_MSCM = 1.413f;          // EC calibration standard solution [TBD]
+
 /* ---- Heartbeat ----------------------------------------------------------- */
 bool nanoSilent = false;        // one-shot latch so silence alerts/counts fire once per outage
+
+/* ---- Reservoir-low latch (A1: one-shot, prevents fault/SMS storm) --------- */
+bool resLowLatched = false;     // raised once per low-reservoir episode; cleared on recovery
+
+/* ---- Nano interval pacing (A2: ACTIVE / DAY / NIGHT, sent only on change) -- */
+enum NanoPace { PACE_NONE, PACE_ACTIVE, PACE_DAY, PACE_NIGHT };
+NanoPace lastNanoPace = PACE_NONE;
+
+/* ---- LCD lock (Part D: manual stranger-lock, independent of uiMode) -------- *
+ * lcdLocked gates ONLY the buttons + LCD render -- automation still runs because
+ * controlTick/exerciseTick gate on uiMode (which stays UI_DATA while locked).    */
+bool lcdLocked = false;
+
+/* ---- Emergency-Off combo + recovery (Part B: MODE+BACK) ------------------- */
+bool estopComboLatch = false;   // one-shot so the held combo fires E-stop once
+int  estopSel = 0;              // recovery cursor: 0 = Return to normal, 1 = Stay stopped
+
+/* ---- ESP2 fault hold + user-gated recovery (sec.19.4.8) ------------------- *
+ * On a hard ESP2 fault, ESP2 drops the P17 master cutoff, PAUSES with the mix-tank
+ * volume retained, and STAYS ALIVE. ESP1 keeps it powered (does NOT cut GPIO4),
+ * alerts over GSM with the operation + column, and waits for the user's reply:
+ *   STOP (hold/ack) | RELEASE (dump tank to its column) | IRRIGATE (water-only finish)
+ *   | NORMAL (resume the paused sequence). Sent over SMS or chosen on the LCD.        */
+bool esp2Held = false;          // an ESP2 hard fault is held, awaiting user recovery
+int  faultRecovSel = 0;         // LCD recovery cursor: 0 Hold, 1 Release, 2 OnlyIrr, 3 Normal
+const char *RECOV_NAMES[4] = { "Hold (wait)", "Release tank", "Only irrigate", "Resume normal" };
+
+/* ---- Device health / daily self-reset (Part C) --------------------------- *
+ * bootPresent[] = devices seen at boot; a present->absent transition at runtime
+ * triggers ONE self-reset per calendar day. Order: RTC, LCD, INA226, SD.        */
+enum DevId { DEV_RTC = 0, DEV_LCD, DEV_INA, DEV_SD, DEV_COUNT };
+bool bootPresent[DEV_COUNT] = { false, false, false, false };
+unsigned long lastDevHealthMs = 0;
+const unsigned long DEV_HEALTH_INTERVAL_MS = 30000;   // re-probe cadence
+RTC_NOINIT_ATTR uint32_t g_lastSelfResetDay;          // yyyymmdd of last self-reset (survives SW reset)
+RTC_NOINIT_ATTR uint32_t g_selfResetMagic;
+#define SELFRESET_MAGIC 0x5E1F0001u
 
 /* ---- Forward declarations ------------------------------------------------ */
 void wdtSetup();
@@ -438,6 +653,9 @@ uint16_t minuteOfDay();
 String tsString();
 void setState(SystemState s);
 void loadConfig();
+void loadCal();
+void pushAllCalToEsp2();
+bool setCalPushBlocking(const String &id, const String &payload);
 void saveColumn(int c);
 void saveSchedule(int c);
 void saveColEnable(int c);
@@ -466,13 +684,20 @@ void gsmHealthTick();
 void handleSms(const String &body);
 void sendSMS(const String &msg);
 void sendDailyReport();
-void startSummaryJob();
+void startSummaryJob(SumMode mode, long targetStamp);
+static long resolveSummaryDay(const String &arg);
 void summaryTick();
 
 void handleButtons();
 void settingsButton(int i);
 void enterEditor(int item);
+void commitEditor();
+void restoreDefaults();
 void lcdRenderSettings();
+void enterCal();
+void calButton(int i);
+void calHoldTick();
+void lcdRenderCal();
 void sendEsp2(const String &body);
 void lcdTick();
 void wakeBacklight();
@@ -483,9 +708,20 @@ bool decideFertigate(int c);
 void powerTick();
 void scheduleTick();
 void heartbeatTick();
+void nanoPaceTick();
+void deviceHealthTick();
+static bool i2cPresent(uint8_t addr);
+void saveLock();
+void saveWifi();
+void saveTsKey();
+void telemetryCollect();
+void netTask(void *pv);
+static bool senderIsOwner();
 
 void raiseFault(char tier, const char *code, const char *loc);
 void enterEmergencyStop(bool cutPower);
+void enterFaultHold(const char *code, const char *loc);
+void issueRecovery(int sel);
 
 void logEvent(const char *source, const char *type, const String &detail);
 void logFlush(bool force);
@@ -512,6 +748,10 @@ void setup() {
   }
   g_stageMagic = STAGE_MAGIC;
   g_lastStage  = 'S';   // 'S' = still in setup()
+
+  // Daily self-reset stamp (Part C): validate the RTC-RAM marker; init on a cold boot to a
+  // sentinel that no real yyyymmdd can equal (so the first device-loss can always reset).
+  if (g_selfResetMagic != SELFRESET_MAGIC) { g_selfResetMagic = SELFRESET_MAGIC; g_lastSelfResetDay = 0xFFFFFFFFu; }
 
   pinMode(ESP2_PWR_PIN, OUTPUT);
   digitalWrite(ESP2_PWR_PIN, LOW);          // ESP2 powered off until STARTUP_SYNC
@@ -568,9 +808,18 @@ void setup() {
   sdOk = SD.begin(SD_CS);
   if (!sdOk) Serial.println(F("WARN: microSD init failed (logging degraded)"));
 
+  // ---- Device-presence snapshot (Part C) ----
+  // Record which devices answered at boot. Only a present->absent dropout at runtime
+  // triggers the daily self-reset, so a never-connected device cannot cause a boot loop.
+  bootPresent[DEV_RTC] = i2cPresent(0x68);
+  bootPresent[DEV_LCD] = i2cPresent(LCD_ADDR);
+  bootPresent[DEV_INA] = i2cPresent(INA226_ADDR);
+  bootPresent[DEV_SD]  = sdOk;
+
   // ---- Config (NVS) ----
   prefs.begin("irrig", false);
   loadConfig();
+  loadCal();                          // calibration constants (separate namespace, §A.5)
 
   // ---- UART links ----
   nanoSerial.begin(NANO_BAUD);
@@ -596,7 +845,12 @@ void setup() {
   logBuf.reserve(1024);
   logEvent("SYS", "STATE", "BOOT_STATE");
 
-  wdtSetup();                               // arm task watchdog
+  // ---- WiFi/ThingSpeak uplink task on core 0 (Part A) ----
+  // Started after NVS load so creds are ready. Runs network I/O off the core-1 loop.
+  netMux = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(netTask, "netTask", 8192, NULL, 1, &netTaskHandle, 0);
+
+  wdtSetup();                               // arm task watchdog (core-1 loop only)
   setState(STARTUP_SYNC);
   Serial.println(F("Setup complete -> STARTUP_SYNC"));
 }
@@ -621,10 +875,18 @@ void loop() {
   g_lastStage = 'P'; powerTick();          // INA226 I2C read
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
+  g_lastStage = 'n'; nanoPaceTick();       // drive Nano ACTIVE/DAY/NIGHT interval (A2)
+  g_lastStage = 'd'; deviceHealthTick();   // device-loss watchdog -> daily self-reset (Part C)
+  g_lastStage = 'w'; telemetryCollect();   // snapshot for the WiFi/ThingSpeak uplink task (Part A)
   g_lastStage = 'U'; summaryTick();        // incremental SD parse for SUMMARY (bounded)
 
   g_lastStage = 'B'; handleButtons();
   g_lastStage = 'T'; testHoldTick();
+  g_lastStage = 'C'; calHoldTick();        // flow-cal dead-man (prime pump while ENTER held)
+  // Apply a config SMS that was deferred during a local edit, once the edit has closed (§B.3.1).
+  if (pendingCfgSms.length() && uiMode != UI_EDIT && !editConfirm) {
+    String s = pendingCfgSms; pendingCfgSms = ""; handleSms(s);
+  }
   g_lastStage = 'L'; lcdTick();            // LCD I2C writes
   g_lastStage = 'F'; logFlush(false);      // microSD (SPI) write
   g_lastStage = '.';                       // idle: loop completed cleanly
@@ -729,6 +991,85 @@ void loadConfig() {
   soilStartPct = prefs.getInt("sstart", soilStartPct);
   soilStopPct  = prefs.getInt("sstop",  soilStopPct);
   fertGap      = prefs.getFloat("fgap", fertGap);
+  lcdLocked    = prefs.getBool("lock", false);   // LCD lock persists across reboot (Part D)
+  // WiFi + ThingSpeak (Part A/B): creds + write keys persist in NVS.
+  wifiSsid = prefs.getString("wssid", "");
+  wifiPass = prefs.getString("wpass", "");
+  tsKey1   = prefs.getString("tsk1", "");
+  tsKey2   = prefs.getString("tsk2", "");
+  tsKey3   = prefs.getString("tsk3", "");
+}
+/* =============================================================================
+ *  CALIBRATION NVS + DISTRIBUTION  (companion spec §A.5.1)
+ * ========================================================================== */
+void loadCal() {
+  prefsCal.begin("calib", false);                 // separate namespace; Restore-Defaults never touches it
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    String k = "s" + String(c);
+    calSoilAir[c]   = prefsCal.getInt((k + "a").c_str(), calSoilAir[c]);
+    calSoilWater[c] = prefsCal.getInt((k + "w").c_str(), calSoilWater[c]);
+    calNpkOff[c][0] = prefsCal.getFloat((k + "N").c_str(), 0);
+    calNpkOff[c][1] = prefsCal.getFloat((k + "P").c_str(), 0);
+    calNpkOff[c][2] = prefsCal.getFloat((k + "K").c_str(), 0);
+  }
+  calResEmptyCm = prefsCal.getFloat("reCm", calResEmptyCm);
+  calResFullCm  = prefsCal.getFloat("rfCm", calResFullCm);
+  calMixEmptyCm = prefsCal.getFloat("meCm", calMixEmptyCm);
+  calMixFullCm  = prefsCal.getFloat("mfCm", calMixFullCm);
+  calFlowResScale = prefsCal.getFloat("frS", calFlowResScale);
+  calTempOff = prefsCal.getFloat("tOff", 0);
+  calHumOff  = prefsCal.getFloat("hOff", 0);
+  calLuxOff  = prefsCal.getFloat("lOff", 0);
+  calKResMix = prefsCal.getFloat("kRM", calKResMix);
+  calKMixIrr = prefsCal.getFloat("kMI", calKMixIrr);
+  calKNut[0] = prefsCal.getFloat("kNA", calKNut[0]);
+  calKNut[1] = prefsCal.getFloat("kNB", calKNut[1]);
+  calKNut[2] = prefsCal.getFloat("kNC", calKNut[2]);
+  calKNutD   = prefsCal.getFloat("kND", calKNutD);
+  calKPhUp   = prefsCal.getFloat("kPU", calKPhUp);
+  calKPhDn   = prefsCal.getFloat("kPD", calKPhDn);
+  calPhM = prefsCal.getFloat("phM", calPhM); calPhB = prefsCal.getFloat("phB", calPhB);
+  calEcM = prefsCal.getFloat("ecM", calEcM); calEcB = prefsCal.getFloat("ecB", calEcB);
+  calAcs712Zero = prefsCal.getFloat("acs", calAcs712Zero);
+}
+
+// Push every ESP2-owned calibration constant (baseline after any ESP2 reset, §A.5.1 #2).
+// Best-effort fire (not block-until-ACK); the work order re-carries job-critical values anyway.
+void pushAllCalToEsp2() {
+  sendEsp2("SET_CAL,FLOW_RESMIX," + String(calKResMix, 1));
+  sendEsp2("SET_CAL,FLOW_MIXIRR," + String(calKMixIrr, 1));
+  sendEsp2("SET_CAL,FLOW_NUTA," + String(calKNut[0], 1));
+  sendEsp2("SET_CAL,FLOW_NUTB," + String(calKNut[1], 1));
+  sendEsp2("SET_CAL,FLOW_NUTC," + String(calKNut[2], 1));
+  sendEsp2("SET_CAL,ACS712," + String(calAcs712Zero, 4));
+  sendEsp2("SET_CAL,PH," + String(calPhM, 6) + "," + String(calPhB, 4));
+  sendEsp2("SET_CAL,EC," + String(calEcM, 6) + "," + String(calEcB, 4));
+}
+
+// Save-time push with block-until-ACK (§A.5.1 #1): returns false if ESP2 never confirms.
+bool setCalPushBlocking(const String &id, const String &payload) {
+  lastSetCalAck = "";
+  sendEsp2("SET_CAL," + id + "," + payload);
+  unsigned long t0 = millis();
+  while (millis() - t0 < 2500) {                  // bounded; runs in the idle calibration UI
+    feedWDT();
+    pollESP2();
+    if (lastSetCalAck == String("SET_CAL,") + id) return true;
+  }
+  return false;
+}
+
+void saveLock() {
+  prefs.putBool("lock", lcdLocked);
+}
+void saveWifi() {
+  prefs.putString("wssid", wifiSsid);
+  prefs.putString("wpass", wifiPass);
+}
+void saveTsKey() {
+  prefs.putString("tsk1", tsKey1);
+  prefs.putString("tsk2", tsKey2);
+  prefs.putString("tsk3", tsKey3);
 }
 void saveColumn(int c) {
   char key[8];
@@ -821,24 +1162,36 @@ bool classifyAndApply(const String &payload, const String &raw) {
   if (n == 0) return false;
   String cmd = tok[0];
 
+  if (cmd == "CAL" && n == 3) {               // live raw sample from the Nano (§A.3): id,raw
+    calRxId = tok[1]; calRxRaw = tok[2].toFloat();
+    calRxValid = (tok[2] != "-1"); calRxMs = millis();
+    sensor.lastNanoMs = millis();
+    return true;                              // expected calibration traffic, not garbage
+  }
   if (cmd == "ENV" && n == 3) {
     float t = tok[1].toFloat(), h = tok[2].toFloat();
     bool tInv = (tok[1] == "-1"), hInv = (tok[2] == "-1");
-    if (!tInv && (t < TEMP_MIN || t > TEMP_MAX)) return false;   // Tier 2
+    if (!tInv && (t < TEMP_MIN || t > TEMP_MAX)) return false;   // Tier 2 (raw range)
     if (!hInv && (h < 0 || h > 100)) return false;
-    sensor.temp = t; sensor.hum = h;
+    sensor.temp = tInv ? t : t + calTempOff;     // apply calibration offset (§A)
+    sensor.hum  = hInv ? h : h + calHumOff;
     sensor.envValid = !(tInv || hInv);
     sensor.lastNanoMs = millis();
     logEvent("NANO", "SENSOR", "ENV|" + tok[1] + "|" + tok[2]);
     return true;
   }
   if (cmd == "TANK" && n == 4) {
-    float r = tok[1].toFloat(), m = tok[2].toFloat();
+    // RAW distances in cm (companion spec §A); ESP1 maps to % with the stored geometry.
+    float rd = tok[1].toFloat(), md = tok[2].toFloat();
     bool rInv = (tok[1] == "-1"), mInv = (tok[2] == "-1");
-    if (!rInv && (r < 0 || r > 100)) return false;
-    if (!mInv && (m < 0 || m > 100)) return false;
-    sensor.resLevel = r; sensor.mixLevel = m; sensor.flow = tok[3].toFloat();
+    if (!rInv && (rd < 0 || rd > 500)) return false;   // raw distance plausibility (Tier 2)
+    if (!mInv && (md < 0 || md > 500)) return false;
+    sensor.resLevel = rInv ? -1 : levelPct(rd, calResEmptyCm, calResFullCm);
+    sensor.mixLevel = mInv ? -1 : levelPct(md, calMixEmptyCm, calMixFullCm);
+    sensor.flow = tok[3].toFloat() * calFlowResScale;
     sensor.tankValid = !(rInv || mInv);
+    // A1: clear the reservoir-low latch once the level recovers (with hysteresis).
+    if (!rInv && sensor.resLevel >= RES_LOW_PCT + 5.0f) resLowLatched = false;
     sensor.lastNanoMs = millis();
     logEvent("NANO", "SENSOR", "TANK|" + tok[1] + "|" + tok[2] + "|" + tok[3]);
     return true;
@@ -852,9 +1205,9 @@ bool classifyAndApply(const String &payload, const String &raw) {
       int c = -1;
       for (int j = 0; j < NUM_COLUMNS; j++) if (tok[i] == String(COL_TAG[j])) c = j;
       if (c < 0) return false;                          // unknown tag = Tier 1 garbage
-      int v = tok[i + 1].toInt();
-      if (v < 0 || v > 100) return false;               // Tier 2 (no -1 in SOIL anymore)
-      tmp[c] = v;
+      int v = tok[i + 1].toInt();                        // RAW averaged ADC (companion spec §A)
+      if (v < 0 || v > 1023) return false;               // Tier 2: 10-bit ADC range
+      tmp[c] = soilPct(c, v);                            // map to % with the stored endpoints
     }
     for (int c = 0; c < NUM_COLUMNS; c++) sensor.soil[c] = tmp[c];
     sensor.lastNanoMs = millis();
@@ -871,7 +1224,8 @@ bool classifyAndApply(const String &payload, const String &raw) {
   if (cmd == "LIGHT" && n == 2) {
     float l = tok[1].toFloat();
     if (tok[1] != "-1" && l < 0) return false;
-    sensor.lux = l; sensor.lightValid = (tok[1] != "-1");
+    sensor.lux = (tok[1] == "-1") ? l : l + calLuxOff;   // apply calibration offset (§A)
+    sensor.lightValid = (tok[1] != "-1");
     sensor.lastNanoMs = millis();
     logEvent("NANO", "SENSOR", "LIGHT|" + tok[1]);
     return true;
@@ -881,9 +1235,11 @@ bool classifyAndApply(const String &payload, const String &raw) {
     for (int i = 0; i < NUM_COLUMNS; i++) if (tok[1] == String(COL_TAG[i])) c = i;
     if (c < 0) return false;
     bool anyInvalid = false;
-    for (int i = 0; i < 7; i++) {
-      if (tok[i + 2] == "-1") anyInvalid = true;
-      sensor.npk[c][i] = tok[i + 2].toFloat();
+    for (int i = 0; i < 7; i++) {                 // RAW registers (companion spec §A): apply scale + offset
+      if (tok[i + 2] == "-1") { anyInvalid = true; sensor.npk[c][i] = -1; continue; }
+      float val = tok[i + 2].toFloat() / calNpkScale[i];
+      if (i >= 4) val += calNpkOff[c][i - 4];     // N/P/K offset trim (i=4/5/6)
+      sensor.npk[c][i] = val;
     }
     sensor.npkValid[c] = !anyInvalid;     // -1 sentinel is honest, NOT garbage
     sensor.lastNanoMs = millis();
@@ -900,7 +1256,10 @@ bool classifyAndApply(const String &payload, const String &raw) {
 }
 
 void escalateNanoRecovery() {
-  // Layer 2: software RESET_REQ first (sec.18.9.5.0.2)
+  // 2-LAYER LADDER (sec.18.9.5): the Nano hardware-reset layer was REMOVED when PCF8575 P17 was
+  // repurposed to the master actuator-power cutoff (sec.19.4.8) -- the Nano RESET pin is no longer
+  // driven. Recovery is now (1) the Nano's own internal WDT and (2) the software RESET_REQ below.
+  // Layer 2: software RESET_REQ (sec.18.9.5.0.2)
   if (!nanoResetReqInFlight) {
     sendNanoCommand("RESET_REQ");
     nanoResetReqInFlight = true;
@@ -911,22 +1270,11 @@ void escalateNanoRecovery() {
     garbageCount = 0;
     return;
   }
-  // Layer 3: hardware reset via ESP2 (last resort, rate-limited). The HW reset path runs
-  // ESP1 -> ESP2 -> PCF8575 P17 -> Nano RESET, so it REQUIRES ESP2 powered (sec.18.9.5.2).
-  // Under the OFF-during-idle model ESP2 is usually off here, so power it up and defer the
-  // RESET_NANO until it reports READY (handleEsp2Response fires pendingNanoHwReset).
+  // No further automatic reset: if RESET_REQ does not restore valid data, ESP1 logs/alerts once
+  // and keeps operating on the most recent valid data (deliberate reduction, sec.18.9.5.1).
   if (millis() - nanoResetReqMs > 10000) {   // software path didn't restore valid data
-    if (nanoHwResetsToday < MAX_NANO_HW_RESET_PER_DAY) {
-      if (esp2Available) {
-        esp2Serial.print(FRAME_START); esp2Serial.print(",RESET_NANO,"); esp2Serial.println(FRAME_END);
-        nanoHwResetsToday++;
-        logEvent("ESP1", "RESET", "NANO|HW|GARBAGE5");
-        raiseFault('W', "NANO_RESET", "HW");
-      } else if (!pendingNanoHwReset) {
-        pendingNanoHwReset = true;           // wait for ESP2 to boot, then issue RESET_NANO
-        esp2SetPower(true);
-      }
-    }
+    logEvent("ESP1", "RESET", "NANO|RESET_REQ_FAILED|LAST_VALID");
+    raiseFault('M', "NANO_GARBAGE", "PERSIST");
     nanoResetReqInFlight = false;
     garbageCount = 0;
   }
@@ -963,7 +1311,8 @@ void pollESP2() {
     } else if (line.length() < 140) line += c; else line = "";
   }
 
-  // ACK / DONE timeout supervision
+  // ACK / DONE timeout supervision (suspended while a fault is HELD -- ESP2 is paused, not hung)
+  if (esp2Held) return;
   if (wo.active && wo.stage == WO_SENT && millis() - wo.sentMs > UART_ACK_TIMEOUT_MS) {
     if (wo.retries < MAX_UART_RETRY) {
       wo.retries++;
@@ -972,9 +1321,9 @@ void pollESP2() {
       logEvent("ESP1", "RESP", "RETRY|" + wo.cmd + "|" + String(wo.retries));
     } else {
       logEvent("ESP1", "RESP", "TIMEOUT|" + wo.cmd);
-      setState(RECOVERY_STATE);
-      esp2PowerCycle();
       wo.active = false; wo.stage = WO_IDLE;
+      esp2SoftResetTried = false;            // fresh ladder: soft reset (RESET_SELF) before power-cycle
+      setState(RECOVERY_STATE);              // RECOVERY_STATE tick owns the escalation now
     }
   }
   if (wo.active && wo.stage == WO_ACKED && millis() - wo.sentMs > UART_DONE_TIMEOUT_MS) {
@@ -990,20 +1339,27 @@ void handleEsp2Response(const String &payload) {
   String resp = (comma < 0) ? payload : payload.substring(0, comma);
   String arg  = (comma < 0) ? ""      : payload.substring(comma + 1);
 
+  if (resp == "CAL") {                                    // live raw sample from ESP2 (§A.3): id,raw
+    int c2 = arg.indexOf(',');
+    if (c2 > 0) { calRxId = arg.substring(0, c2); calRxRaw = arg.substring(c2 + 1).toFloat();
+                  calRxValid = (calRxRaw != -1); calRxMs = millis(); }
+    return;
+  }
   if (resp == "READY") {
     // ESP2 finished booting (OFF-during-idle model). Fire whatever was waiting on it.
     logEvent("ESP2", "RESP", payload);
-    if (testArmPending && uiMode == UI_TEST) {                 // Testing: arm now (sec.18.10.8.1)
-      sendEsp2("TEST,ENTER"); testArmPending = false;
+    // Soft-reset recovery: ESP2 came back after a RESET_SELF -> recovered WITHOUT a power-cycle.
+    // (Gated on READY, not esp2Available: ESP2 ACKs RESET_SELF before it reboots, sec.9.7.2.)
+    if (esp2SoftResetTried && sysState == RECOVERY_STATE) {
+      logEvent("ESP2", "RESP", "SOFT_RECOVERED");
+      esp2SoftResetTried = false;
+      pendingRun.active = false; pendingRun.colIdx = -1;          // drop anything abandoned at failure
+      pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
+      setState(STARTUP_SYNC);                                     // re-validate before resuming (sec.10.7.7)
+      return;
     }
-    if (pendingNanoHwReset) {                                  // Layer-3 HW Nano reset waited for power
-      esp2Serial.print(FRAME_START); esp2Serial.print(",RESET_NANO,"); esp2Serial.println(FRAME_END);
-      nanoHwResetsToday++;
-      logEvent("ESP1", "RESET", "NANO|HW|GARBAGE5");
-      raiseFault('W', "NANO_RESET", "HW");
-      pendingNanoHwReset = false;
-      if (!pendingRun.active && uiMode != UI_TEST) esp2SetPower(false);   // done with ESP2 -> back off
-    }
+    // Testing arming is handled by the primed retry in testHoldTick (the single READY here
+    // can be lost on a cold relay boot), so we do NOT send TEST,ENTER from this one message.
     if (pendingRun.active && !wo.active) dispatchPendingRun();  // scheduled-run warm-up complete
     if (pendingExercise.active && !pendingExercise.sent) dispatchPendingExercise();  // exercise warm-up done
     return;
@@ -1028,6 +1384,8 @@ void handleEsp2Response(const String &payload) {
   logEvent("ESP2", "RESP", payload);
 
   if (resp == "ACK") {
+    if (arg.startsWith("TEST")) esp2TestArmed = true;          // ESP2 confirmed TEST mode -> stop retrying
+    if (arg.startsWith("SET_CAL")) lastSetCalAck = arg;        // block-until-ACK on calibration save (§A.5.1)
     if (wo.active) { wo.stage = WO_ACKED; wo.sentMs = millis(); }
   } else if (resp == "DONE") {
     if (arg.startsWith("EXERCISE")) {                          // preventive exercise finished
@@ -1043,9 +1401,11 @@ void handleEsp2Response(const String &payload) {
         col[c].lastServicedStamp = currentDayStamp;
         // B1: optional measured water volume reported as ...,WATER,<liters> on DONE.
         int wi = payload.indexOf("WATER,");
-        if (wi >= 0) waterUsedToday[c] += payload.substring(wi + 6).toFloat();
+        float liters = (wi >= 0) ? payload.substring(wi + 6).toFloat() : 0.0f;
+        if (wi >= 0) waterUsedToday[c] += liters;
+        // Log the litres in the ACT row (|W=) so SUMMARY/FULL can recover per-day water totals.
         logEvent("ESP1", "ACT", String(wo.fertigate ? "FERTIGATION" : "IRRIGATION")
-                                  + "|STOP|COL_" + COL_TAG[c]);
+                                  + "|STOP|COL_" + COL_TAG[c] + "|W=" + String(liters, 2));
       }
       // A real run exercises transfer+booster (and mixer if fertigating) -> reset their clocks.
       lastPumpUseMs[0] = millis(); lastPumpUseMs[1] = millis();
@@ -1061,21 +1421,37 @@ void handleEsp2Response(const String &payload) {
     // Major, NOT Critical -- do not abort or cut power, just log+alert (sec.23.2.2.1/.4).
     raiseFault('M', "ESP2_DEGRADED", arg.c_str());
   } else if (resp == "ERROR") {
-    raiseFault('C', "ESP2_ERROR", arg.c_str());
-    wo.active = false; wo.stage = WO_IDLE;
+    enterFaultHold("ESP2_ERROR", arg.c_str());   // ESP2 holds (P17 dropped); keep wo for user-gated RESUME
   } else if (resp == "FLOW_FAIL") {
-    raiseFault('C', "FLOW_FAIL", arg.c_str());
-    wo.active = false; wo.stage = WO_IDLE;
+    enterFaultHold("FLOW_FAIL", arg.c_str());
   } else if (resp == "PWR_FAIL") {
-    raiseFault('C', "PWR_FAIL", arg.c_str());
-    wo.active = false; wo.stage = WO_IDLE;
+    enterFaultHold("PWR_FAIL", arg.c_str());
   } else if (resp == "EC_FAIL") {
     raiseFault('M', "EC_FAIL", arg.c_str());
   } else if (resp == "PH_FAIL") {
     raiseFault('M', "PH_FAIL", arg.c_str());
+  } else if (resp == "SENSOR_FAIL") {
+    // ESP2 EC/pH probe railed (disconnected/shorted) -- hardware sensor fault, distinct from
+    // EC_FAIL/PH_FAIL (out-of-window). Major: alert + log, batch still delivered.
+    raiseFault('M', "SENSOR_FAIL", arg.c_str());
+  } else if (resp == "PCF_FAIL") {
+    // ESP2 relay driver (PCF8575) not responding. Major: alert + log, no shutdown (user policy);
+    // other safeties (PZEM no-current, flow timeout) still apply.
+    raiseFault('M', "PCF_FAIL", arg.c_str());
+  } else if (resp == "PCF_OK") {
+    logEvent("ESP2", "RESP", "PCF_RECOVERED");                 // informational (relay bus back)
   } else if (resp == "SAFE_STOP") {
-    raiseFault('C', "SAFE_STOP", arg.c_str());
-    wo.active = false; wo.stage = WO_IDLE;
+    enterFaultHold("SAFE_STOP", arg.c_str());
+  } else if (resp == "INVALID") {
+    // A recovery RESUME was refused. The usual cause is that ESP2 restarted during the hold and
+    // lost its paused sequence (the mix-tank volume still survives in its NVS). Clear the held UI
+    // and let the still-due column re-run normally -- ESP2 will fill only the remaining liters.
+    if (esp2Held && arg.startsWith("NOT_HELD")) {
+      esp2Held = false; wo.active = false; wo.stage = WO_IDLE;
+      logEvent("ESP1", "RESP", "RESUME_REFUSED|ESP2_RESTARTED");
+      sendSMS("ESP2 restarted; tank volume kept. Column will re-run on its own.");
+      if (sysState == EMERGENCY_STOP) setState(IDLE_STATE);
+    }
   }
 }
 
@@ -1093,6 +1469,14 @@ void sendWorkOrder(int c, bool fertigate) {
     cmd += ",PH," + String(PH_MIN, 1) + "," + String(PH_MAX, 1);
     cmd += ",MIX," + String(MIXING_DURATION_MS);
   }
+  // Job-critical calibration (companion spec §A.5.1 #3): make the job self-contained so a reset
+  // moments before it runs can never execute on stale K-factors / EC-pH cal.
+  cmd += ",KMAIN," + String(calKResMix, 1) + "," + String(calKMixIrr, 1);
+  if (fertigate) {
+    cmd += ",KNUT," + String(calKNut[0], 1) + "," + String(calKNut[1], 1) + "," + String(calKNut[2], 1);
+    cmd += ",ECCAL," + String(calEcM, 6) + "," + String(calEcB, 4);
+    cmd += ",PHCAL," + String(calPhM, 6) + "," + String(calPhB, 4);
+  }
   cmd += "," + String(FRAME_END);
 
   wo.active = true; wo.stage = WO_SENT; wo.colIdx = c; wo.fertigate = fertigate;
@@ -1109,6 +1493,7 @@ void sendWorkOrder(int c, bool fertigate) {
 void esp2PowerCycle() {
   if (millis() - lastRecoveryMs < RECOVERY_COOLDOWN_MS) return;
   lastRecoveryMs = millis();
+  esp2SoftResetTried = false;            // power-cycle ends the ladder; a future episode soft-resets first
   esp2PowerCycles++;
   logEvent("ESP1", "RESET", "ESP2|HW|POWERCYCLE");
   digitalWrite(ESP2_PWR_PIN, LOW);
@@ -1127,7 +1512,7 @@ void esp2SetPower(bool on) {
   if (on == esp2Powered) return;                 // no redundant relay writes
   digitalWrite(ESP2_PWR_PIN, on ? HIGH : LOW);
   esp2Powered = on;
-  if (!on) { esp2Available = false; testArmPending = false; }
+  if (!on) { esp2Available = false; testArmPending = false; esp2TestArmed = false; testArmTries = 0; }
 }
 
 // Warm-up complete (ESP2 READY): send the queued scheduled run, then clear the pending slot.
@@ -1227,7 +1612,26 @@ void handleSms(const String &body) {
   String b = body; b.trim();
   String U = b; U.toUpperCase();
 
-  // STOP,ALL
+  // Defer a remote config-write that collides with an open LOCAL edit (companion spec §B.3.1):
+  // apply it once the operator finishes the edit, so neither silently overwrites the other.
+  if ((uiMode == UI_EDIT || editConfirm) &&
+      (U.startsWith("SET") || U.startsWith("MODE") || U.startsWith("NAME"))) {
+    pendingCfgSms = b;
+    sendSMS("BUSY,local edit; applied after");
+    return;
+  }
+
+  // ---- ESP2 fault recovery (only while a fault is HELD, sec.19.4.8.2) ----
+  // While held, STOP means acknowledge & keep holding (NOT the global emergency stop); the
+  // other three resolve the held tank to the column.
+  if (esp2Held) {
+    if (U == "STOP")     { issueRecovery(0); return; }   // hold / acknowledge
+    if (U == "RELEASE")  { issueRecovery(1); return; }   // dump tank to its column as-is
+    if (U == "IRRIGATE") { issueRecovery(2); return; }   // top up water + deliver (no dosing)
+    if (U == "NORMAL")   { issueRecovery(3); return; }   // resume the paused sequence
+  }
+
+  // STOP,ALL  (global emergency stop when nothing is held)
   if (U.startsWith("STOP")) {
     enterEmergencyStop(false);
     sendSMS("ACK,STOP,ALL");
@@ -1246,21 +1650,48 @@ void handleSms(const String &body) {
     }
     return;
   }
-  // SUMMARY -- today's-activity digest parsed from the SD log (NEW kw; extends sec.12.2).
-  // Same deferred behaviour as STATUS during ACTIVE (sec.12.1.3.1): immediate ack, then
-  // run the (non-blocking, incremental) SD parse once the operation completes.
-  if (U == "SUMMARY") {
-    if (sysState == ACTIVE_STATE) {
-      sendSMS("ACK,BUSY,SUMMARY");
-      summaryReplyTo = replyTarget;         // remember requester for the deferred reply
-      summaryPending = true;                // collapses duplicates (single pending job)
-    } else if (summaryStage != SUM_IDLE) {
-      sendSMS("ACK,SUMMARY,BUSY");          // a summary job is already running -> don't stack
-    } else {
-      summaryReplyTo = replyTarget;
-      startSummaryJob();
-    }
+  // NET -- WiFi/ThingSpeak link status (Part B)
+  if (U == "NET") {
+    String ss; xSemaphoreTake(netMux, portMAX_DELAY); ss = wifiSsid; xSemaphoreGive(netMux);
+    String r = "NET,WiFi:" + String(wifiConnected ? "OK" : "DOWN");
+    if (wifiConnected) r += ",RSSI" + String(wifiRssiVal) + ",IP" + String(wifiIpStr);
+    r += ",TS:" + String(lastTsOk ? "ok" : "--");
+    if (lastTsUploadMs) r += ",age" + String((millis() - lastTsUploadMs) / 1000) + "s";
+    r += ",SSID:" + (ss.length() ? ss : String("-"));
+    sendSMS(r);
     return;
+  }
+  // SUMMARY [,day]  and  FULL SUMMARY [,day]  -- SD-log digest (extends sec.12.2).
+  //   SUMMARY      -> day's AVERAGES (NPK + moisture per column, power) for the paper.
+  //   FULL SUMMARY -> uncapped HOURLY record + deduped errors + run/dose events + peaks.
+  //   day = (none)=today | YESTERDAY | YYYYMMDD | NODATE (RTC-dead 00:00:00 file).
+  // Same deferred behaviour as STATUS during ACTIVE (immediate ack, run when idle).
+  {
+    bool isFull = U.startsWith("FULL");
+    bool isSum  = isFull || U == "SUMMARY" || U.startsWith("SUMMARY,") || U.startsWith("SUMMARY ");
+    if (isSum) {
+      String arg = U;                       // strip the keyword(s), leave the optional day token
+      if (isFull) arg.replace("FULL", " ");
+      arg.replace("SUMMARY", " ");
+      arg.replace(",", " ");
+      arg.trim();
+      long target = resolveSummaryDay(arg);
+      if (target == -2) { sendSMS("ERR,SUMDATE"); return; }
+      SumMode mode = isFull ? SUM_FULL : SUM_SHORT;
+      const char *ackName = isFull ? "FULLSUMMARY" : "SUMMARY";
+      if (sysState == ACTIVE_STATE) {
+        sendSMS(String("ACK,BUSY,") + ackName);
+        summaryReplyTo = replyTarget;
+        pendingSumMode = mode; pendingSumTarget = target;
+        summaryPending = true;
+      } else if (summaryStage != SUM_IDLE) {
+        sendSMS(String("ACK,") + ackName + ",BUSY");   // a job is already running -> don't stack
+      } else {
+        summaryReplyTo = replyTarget;
+        startSummaryJob(mode, target);
+      }
+      return;
+    }
   }
   // tokenize
   const int MAXT = 14; String tok[MAXT]; int n = 0, start = 0;
@@ -1323,6 +1754,31 @@ void handleSms(const String &body) {
     }
     saveColumn(c);
     sendSMS(String("ACK,SET,COL_") + COL_TAG[c]);
+    return;
+  }
+  // WIFI,<ssid>,<pass>  -- set WiFi credentials (owner-only). Password is the remainder
+  // after the 2nd comma, so it may contain commas/spaces (SSID may not). (Part B)
+  if (k0 == "WIFI") {
+    if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+    int p1 = b.indexOf(','), p2 = (p1 >= 0) ? b.indexOf(',', p1 + 1) : -1;
+    if (p1 < 0 || p2 < 0) { sendSMS("ERR,WIFI"); return; }
+    String ss = b.substring(p1 + 1, p2), pw = b.substring(p2 + 1);
+    xSemaphoreTake(netMux, portMAX_DELAY); wifiSsid = ss; wifiPass = pw; xSemaphoreGive(netMux);
+    saveWifi(); wifiCredsChanged = true;
+    sendSMS("ACK,WIFI," + ss);
+    return;
+  }
+  // TSKEY,<1|2>,<writeApiKey>  -- set a ThingSpeak channel write key (owner-only). (Part B)
+  if (k0 == "TSKEY") {
+    if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+    if (n < 3) { sendSMS("ERR,TSKEY"); return; }
+    int ch = tok[1].toInt(); String key = tok[2];
+    if (ch < 1 || ch > 3) { sendSMS("ERR,TSCH"); return; }
+    xSemaphoreTake(netMux, portMAX_DELAY);
+    if (ch == 1) tsKey1 = key; else if (ch == 2) tsKey2 = key; else tsKey3 = key;
+    xSemaphoreGive(netMux);
+    saveTsKey();
+    sendSMS("ACK,TSKEY," + String(ch));
     return;
   }
   sendSMS("ERR,CMD");
@@ -1417,8 +1873,27 @@ void sendDailyReport() {
 /* =============================================================================
  *  SUMMARY  --  today's-activity digest from the SD log (incremental, sec.25)
  * ========================================================================== */
-// Parse one CSV row (timestamp,source,type,detail) into the running summary tallies.
-// Only SIGNIFICANT rows are listed; SENSOR/PWR/GARBAGE/CMD/RESP/state-transitions skipped.
+// Split a CSV detail field by '|' into out[]; returns the token count.
+static int splitPipe(const String &s, String *out, int maxn) {
+  int n = 0, start = 0;
+  for (int i = 0; i <= (int)s.length() && n < maxn; i++) {
+    if (i == (int)s.length() || s[i] == '|') { out[n++] = s.substring(start, i); start = i + 1; }
+  }
+  return n;
+}
+static int colFromTag(const String &t) {
+  for (int j = 0; j < NUM_COLUMNS; j++) if (t == String(COL_TAG[j])) return j;
+  return -1;
+}
+// Record an error code once (with its first timestamp) for the FULL dedup list.
+static void sumAddError(const String &code, const String &hhmm) {
+  for (int i = 0; i < sumErrN; i++) if (sumErrCode[i] == code) return;
+  if (sumErrN < SUM_MAX_ERRORS) { sumErrCode[sumErrN] = code; sumErrTs[sumErrN] = hhmm; sumErrN++; }
+}
+
+// Parse one CSV row (timestamp,source,type,detail). Numeric SENSOR/PWR rows feed the
+// day-average accumulators AND the 24 hourly buckets (FULL); FAULT/RESET/DOSE/ACT/config
+// rows feed counts, the deduped error list, and the run/dose event list.
 static void summaryParseLine(const String &ln) {
   if (ln.length() < 12) return;
   int c1 = ln.indexOf(',');            if (c1 < 0) return;
@@ -1428,95 +1903,247 @@ static void summaryParseLine(const String &ln) {
   String type   = ln.substring(c2 + 1, c3);
   String detail = ln.substring(c3 + 1);
   String hhmm   = (ts.length() >= 16) ? (ts.substring(11, 13) + ts.substring(14, 16)) : "----";
+  int hh = (ts.length() >= 13) ? ts.substring(11, 13).toInt() : 0;
+  if (hh < 0 || hh > 23) hh = 0;          // NODATE rows (00:00:00) -> hour 0
 
+  // ---- numeric rows: averages + hourly buckets ----
+  if (type == "SENSOR") {
+    String f[10]; int nf = splitPipe(detail, f, 10);
+    if (nf >= 9 && f[0] == "NPK") {                 // NPK|tag|moist|temp|EC|pH|N|P|K
+      int c = colFromTag(f[1]);
+      if (c >= 0 && f[6] != "-1") {
+        float N = f[6].toFloat(), P = f[7].toFloat(), K = f[8].toFloat();
+        sumNsum[c] += N; sumPsum[c] += P; sumKsum[c] += K; sumNPKc[c]++;
+        hrNsum[hh][c] += N; hrPsum[hh][c] += P; hrKsum[hh][c] += K; hrNPKc[hh][c]++;
+      }
+      return;
+    }
+    if (nf >= 2 && f[0] == "SOIL") {                // SOIL|A=41|B=53|C=DISABLED
+      for (int i = 1; i < nf; i++) {
+        int eq = f[i].indexOf('=');
+        if (eq < 1) continue;
+        int c = colFromTag(f[i].substring(0, eq));
+        String v = f[i].substring(eq + 1);
+        if (c < 0 || v == "DISABLED" || v == "-1") continue;
+        float m = v.toFloat();
+        sumMoistSum[c] += m; sumMoistC[c]++;
+        hrMoistSum[hh][c] += m; hrMoistC[hh][c]++;
+      }
+      return;
+    }
+    if (nf >= 2 && f[0] == "ENV" && f[1] != "-1") { // ENV|temp|hum  (peak temp)
+      float t = f[1].toFloat(); if (t > sumMaxTemp) sumMaxTemp = t;
+    }
+    return;                                          // TANK/LIGHT not aggregated
+  }
+  if (type == "PWR") {                               // INA226|V=..|I=..|P=..|CONS=..Wh|CHG=..Wh
+    String f[8]; int nf = splitPipe(detail, f, 8);
+    float v = 0, p = 0; bool haveV = false, haveP = false;
+    for (int i = 1; i < nf; i++) {
+      if      (f[i].startsWith("V="))   { v = f[i].substring(2).toFloat(); haveV = true; }
+      else if (f[i].startsWith("P="))   { p = f[i].substring(2).toFloat(); haveP = true; }
+      else if (f[i].startsWith("CONS=")) sumConsWh = f[i].substring(5).toFloat();
+      else if (f[i].startsWith("CHG="))  sumChgWh  = f[i].substring(4).toFloat();
+    }
+    if (haveV) { sumBattVsum += v; if (v < sumMinBattV) sumMinBattV = v; hrBattVsum[hh] += v; }
+    if (haveP) { sumBattWsum += p; if (p > sumPeakW)    sumPeakW    = p; hrBattWsum[hh] += p; }
+    if (haveV || haveP) { sumBattC++; hrBattC[hh]++; }
+    return;
+  }
+
+  // ---- event / significant rows ----
   String code;
   if (type == "FAULT") {
     if      (detail.startsWith("CRIT")) sumFltC++;
     else if (detail.startsWith("MAJ"))  sumFltM++;
     else if (detail.startsWith("MIN"))  sumFltm++;
-    else return;                         // WARN etc: not a counted fault (resets listed via RESET)
+    else return;
+    { String f[4]; int nf = splitPipe(detail, f, 4); if (nf >= 2) sumAddError(f[1], hhmm); }  // dedup code
     code = "F:" + detail;
-  } else if (type == "RESET") { sumRst++;  code = "R:" + detail; }
-  else if   (type == "DOSE")  { sumDose++; code = "D:" + detail; }
-  else if   (type == "ACT") {
+  } else if (type == "RESET") { sumRst++; { String f[4]; int nf = splitPipe(detail, f, 4); if (nf >= 1) sumAddError(String("RST_") + f[0], hhmm); } code = "R:" + detail; }
+  else if   (type == "DOSE")  {                      // NUT_A|target|measured|COL_A
+    sumDose++;
+    String f[4]; int nf = splitPipe(detail, f, 4);
+    if (nf >= 4) { int c = colFromTag(f[3].substring(f[3].length() - 1)); if (c >= 0) sumNutTot[c] += f[2].toFloat(); }
+    code = "D:" + detail;
+  }
+  else if   (type == "ACT") {                        // IRRIGATION|START|COL_A or ...|STOP|COL_A|W=3.2
     if      (detail.startsWith("FERTIGATION") && detail.indexOf("START") >= 0) sumFert++;
     else if (detail.startsWith("IRRIGATION")  && detail.indexOf("START") >= 0) sumIrr++;
+    int wi = detail.indexOf("W=");
+    if (wi >= 0) {                                    // STOP carries delivered litres (log enhancement)
+      String f[6]; int nf = splitPipe(detail, f, 6);
+      int c = -1; for (int i = 0; i < nf; i++) if (f[i].startsWith("COL_")) c = colFromTag(f[i].substring(f[i].length() - 1));
+      if (c >= 0) sumWaterTot[c] += detail.substring(wi + 2).toFloat();
+    }
     code = "A:" + detail;
   } else if (type == "STATE" && detail.indexOf("_SET") >= 0) {
-    code = "C:" + detail;                 // config change (mode/preset/schedule/threshold/clock)
+    code = "C:" + detail;                            // config change
   } else {
-    return;                               // not significant
+    return;
   }
 
   code.replace("|", ":");
-  if (code.length() > 22) code = code.substring(0, 22);
-  if (sumEvtCount < SUMMARY_MAX_EVENTS) { sumEvents += "|" + hhmm + " " + code; sumEvtCount++; }
-  else                                  { sumTruncated = true; }
+  if (code.length() > 26) code = code.substring(0, 26);
+  uint8_t cap = (sumMode == SUM_FULL) ? FULL_MAX_EVENTS : SUMMARY_MAX_EVENTS;
+  if (sumEvtCount < cap) { sumEvents += "|" + hhmm + " " + code; sumEvtCount++; }
+  else                   { sumTruncated = true; }
 }
 
-void startSummaryJob() {
+// Resolve a SUMMARY day token to a yyyymmdd stamp (0 = NODATE file, -2 = invalid).
+static long resolveSummaryDay(const String &arg) {
+  String a = arg; a.trim(); a.toUpperCase();
+  if (a.length() == 0 || a == "TODAY") return (rtcOk && currentDayStamp > 0) ? currentDayStamp : 0;
+  if (a == "NODATE")                   return 0;
+  if (a == "YESTERDAY") {
+    if (!rtcOk) return 0;
+    DateTime y = rtc.now() - TimeSpan(1, 0, 0, 0);     // correct month/year rollover
+    return dayStamp(y);
+  }
+  if (a.length() == 8) { long v = a.toInt(); if (v > 20000000L) return v; }   // explicit YYYYMMDD
+  return -2;                                            // unrecognized
+}
+
+void startSummaryJob(SumMode mode, long targetStamp) {
   if (summaryStage != SUM_IDLE) return;  // one job at a time
+  sumMode = mode;
+  summaryTargetStamp = targetStamp;
   summaryStage = SUM_OPEN;
 }
 
-// Drives the incremental read across loop iterations so a large daily file never
-// blocks the loop/WDT (bounded SUMMARY_LINES_PER_TICK per tick).
+static String sumDayLabel() {
+  return (summaryTargetStamp > 0) ? String(summaryTargetStamp) : String("NODATE");
+}
+
+// Clear every accumulator + hourly bucket before a fresh parse.
+static void sumResetAccumulators() {
+  sumFltC = sumFltM = sumFltm = 0; sumRst = sumFert = sumIrr = sumDose = 0;
+  sumEvtCount = 0; sumTruncated = false; sumEvents = ""; sumPartial = ""; sumErrN = 0;
+  sumBattVsum = sumBattWsum = 0; sumBattC = 0; sumConsWh = sumChgWh = 0;
+  sumMaxTemp = -1000; sumMinBattV = 100000; sumPeakW = 0;
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    sumNsum[c] = sumPsum[c] = sumKsum[c] = 0; sumNPKc[c] = 0;
+    sumMoistSum[c] = 0; sumMoistC[c] = 0; sumWaterTot[c] = 0; sumNutTot[c] = 0;
+  }
+  for (int h = 0; h < 24; h++) {
+    hrBattVsum[h] = hrBattWsum[h] = 0; hrBattC[h] = 0;
+    for (int c = 0; c < NUM_COLUMNS; c++) {
+      hrNsum[h][c] = hrPsum[h][c] = hrKsum[h][c] = 0; hrNPKc[h][c] = 0;
+      hrMoistSum[h][c] = 0; hrMoistC[h][c] = 0;
+    }
+  }
+}
+
+// SHORT SUMMARY = the day's averages (paper-ready), into sumReport.
+static void buildShortReport() {
+  String s = "SUM," + sumDayLabel();
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    if (!COLUMN_ENABLED[c]) continue;
+    s += String(" ") + COL_TAG[c] + ":";
+    if (sumNPKc[c]) s += "N" + String((int)(sumNsum[c] / sumNPKc[c] + 0.5)) + "P" + String((int)(sumPsum[c] / sumNPKc[c] + 0.5)) + "K" + String((int)(sumKsum[c] / sumNPKc[c] + 0.5));
+    else            s += "N-P-K-";
+    if (sumMoistC[c]) s += "M" + String((int)(sumMoistSum[c] / sumMoistC[c] + 0.5));
+    else              s += "M-";
+  }
+  if (sumBattC) s += " BAT" + String(sumBattVsum / sumBattC, 1) + "V " + String(sumBattWsum / sumBattC, 1) + "W";
+  s += " CONS" + String((int)(sumConsWh + 0.5)) + " CHG" + String((int)(sumChgWh + 0.5)) + "Wh";
+  float wtot = 0, ntot = 0; for (int c = 0; c < NUM_COLUMNS; c++) { wtot += sumWaterTot[c]; ntot += sumNutTot[c]; }
+  s += " H2O" + String(wtot, 1) + "L NUT" + String(ntot, 0) + "mL";
+  s += " FLT C" + String(sumFltC) + "M" + String(sumFltM) + "m" + String(sumFltm);
+  s += " RST" + String(sumRst) + " IRR" + String(sumIrr) + " FERT" + String(sumFert) + " DOSE" + String(sumDose);
+  if (!sdOk) s += " (noSD)";
+  sumReport = s;
+}
+
+// FULL SUMMARY = hourly nutrient/moisture/power record + deduped errors + events + peaks.
+static void buildFullReport() {
+  String s = "FULL," + sumDayLabel() + " hourly";
+  for (int h = 0; h < 24; h++) {
+    bool any = (hrBattC[h] > 0);
+    for (int c = 0; c < NUM_COLUMNS; c++) if (hrNPKc[h][c] || hrMoistC[h][c]) any = true;
+    if (!any) continue;                                // skip hours with no samples
+    char hb[6]; snprintf(hb, sizeof(hb), "%02dh", h);
+    s += String("\n") + hb;
+    for (int c = 0; c < NUM_COLUMNS; c++) {
+      if (!COLUMN_ENABLED[c]) continue;
+      s += String(" ") + COL_TAG[c];
+      if (hrNPKc[h][c]) s += " N" + String((int)(hrNsum[h][c] / hrNPKc[h][c] + 0.5)) + " P" + String((int)(hrPsum[h][c] / hrNPKc[h][c] + 0.5)) + " K" + String((int)(hrKsum[h][c] / hrNPKc[h][c] + 0.5));
+      if (hrMoistC[h][c]) s += " M" + String((int)(hrMoistSum[h][c] / hrMoistC[h][c] + 0.5));
+    }
+    if (hrBattC[h]) s += " | " + String(hrBattVsum[h] / hrBattC[h], 1) + "V " + String(hrBattWsum[h] / hrBattC[h], 1) + "W";
+  }
+  if (sumErrN) { s += "\nERR:"; for (int i = 0; i < sumErrN; i++) s += " " + sumErrTs[i] + " " + sumErrCode[i]; }
+  else         { s += "\nERR: none"; }
+  if (sumEvents.length()) { String e = sumEvents; e.replace("|", "\n"); s += "\nEVT:" + e; if (sumTruncated) s += "\n+more evt@SD"; }
+  float wtot = 0, ntot = 0; for (int c = 0; c < NUM_COLUMNS; c++) { wtot += sumWaterTot[c]; ntot += sumNutTot[c]; }
+  s += "\nPEAK Tmax" + (sumMaxTemp > -999 ? String(sumMaxTemp, 1) : String("-"))
+     + " Vmin" + (sumMinBattV < 99999 ? String(sumMinBattV, 1) : String("-"))
+     + " Wpk" + String(sumPeakW, 1);
+  s += " H2O" + String(wtot, 1) + "L NUT" + String(ntot, 0) + "mL FLT" + String(sumFltC + sumFltM + sumFltm) + " RST" + String(sumRst);
+  if (!sdOk) s += "\n(noSD)";
+  sumReport = s;
+}
+
+// Non-blocking FSM: open -> incremental read (bounded/tick) -> build -> stream SMS paced
+// to the queue so an uncapped FULL report never overflows the 8-slot queue or stalls the WDT.
 void summaryTick() {
+  const int SEG = 140;                                  // each SMS under the 160-char GSM7 limit
   switch (summaryStage) {
     case SUM_IDLE: return;
 
     case SUM_OPEN: {
-      sumFltC = sumFltM = sumFltm = 0; sumRst = sumFert = sumIrr = sumDose = 0;
-      sumEvtCount = 0; sumTruncated = false; sumEvents = ""; sumPartial = "";
-      if (!sdOk) { summaryStage = SUM_EMIT; return; }   // no SD -> emit an empty summary
+      sumResetAccumulators();
+      if (!sdOk) { summaryStage = SUM_BUILD; return; }   // no SD -> build an empty report
       char fname[16];
-      if (rtcOk && currentDayStamp > 0) snprintf(fname, sizeof(fname), "/%08ld.CSV", currentDayStamp);
-      else                              strcpy(fname, "/NODATE.CSV");
+      if (summaryTargetStamp > 0) snprintf(fname, sizeof(fname), "/%08ld.CSV", summaryTargetStamp);
+      else                        strcpy(fname, "/NODATE.CSV");
       summaryFile = SD.open(fname, FILE_READ);
-      summaryStage = SUM_READ;                          // SUM_READ tolerates a failed open
+      summaryStage = SUM_READ;                           // SUM_READ tolerates a failed open
       return;
     }
 
     case SUM_READ: {
-      if (!summaryFile) { summaryStage = SUM_EMIT; return; }
+      if (!summaryFile) { summaryStage = SUM_BUILD; return; }
       uint16_t lines = 0;
       while (summaryFile.available() && lines < SUMMARY_LINES_PER_TICK) {
         char c = (char)summaryFile.read();
         if (c == '\n')      { summaryParseLine(sumPartial); sumPartial = ""; lines++; }
         else if (c != '\r') { if (sumPartial.length() < 200) sumPartial += c; }
       }
-      if (!summaryFile.available()) {                   // EOF: flush a trailing unterminated line
+      if (!summaryFile.available()) {                    // EOF: flush a trailing unterminated line
         if (sumPartial.length()) { summaryParseLine(sumPartial); sumPartial = ""; }
-        summaryStage = SUM_EMIT;
+        summaryStage = SUM_BUILD;
       }
-      return;                                           // bounded work; resume next loop
+      return;
     }
 
-    case SUM_EMIT: {
+    case SUM_BUILD: {
       if (summaryFile) summaryFile.close();
-      String s = "SUM," + String((rtcOk && currentDayStamp > 0) ? currentDayStamp : 0);
-      s += ",FLT,C" + String(sumFltC) + "M" + String(sumFltM) + "m" + String(sumFltm);
-      s += ",RST," + String(sumRst) + ",FERT," + String(sumFert) + ",IRR," + String(sumIrr) + ",DOSE," + String(sumDose);
-      s += "|EVTS" + (sumEvents.length() ? sumEvents : String("|none"));
-      if (sumTruncated) s += "|+more@SD";
+      if (sumMode == SUM_FULL) buildFullReport(); else buildShortReport();
+      int len = sumReport.length();
+      sumSegTotal = (len + SEG - 1) / SEG; if (sumSegTotal < 1) sumSegTotal = 1;
+      uint8_t capN = (sumMode == SUM_FULL) ? FULL_SUMMARY_MAX_SMS : SUMMARY_MAX_SMS;
+      if (capN > 0 && sumSegTotal > capN) sumSegTotal = capN;   // 0 = unlimited (FULL by request)
+      sumSegIdx = 0;
+      summaryStage = SUM_STREAM;
+      return;
+    }
 
-      const int SEG = 140;                              // keep each SMS under the 160-char GSM7 limit
-      int total = (s.length() + SEG - 1) / SEG;
-      if (total < 1) total = 1;
-      if (total > SUMMARY_MAX_SMS) total = SUMMARY_MAX_SMS;
-      for (int i = 0; i < total; i++) {
-        int from = i * SEG;
-        String seg = s.substring(from, min((int)s.length(), from + SEG));
-        if (i == total - 1 && (int)s.length() > total * SEG) {   // capped by SUMMARY_MAX_SMS
-          if ((int)seg.length() > SEG - 9) seg = seg.substring(0, SEG - 9);
-          seg += "+more@SD";
-        }
-        replyTarget = summaryReplyTo;                   // direct the reply to the requester
-        sendSMS((total > 1 ? ("(" + String(i + 1) + "/" + String(total) + ")") : String("")) + seg);
-        replyTarget = "";
+    case SUM_STREAM: {
+      if (sumSegIdx >= sumSegTotal) {                    // done
+        sumReport = ""; summaryPending = false; summaryStage = SUM_IDLE; return;
       }
-      summaryPending = false;
-      summaryStage = SUM_IDLE;
+      if (smsCount >= SMS_QUEUE_SIZE - 1) return;        // queue nearly full -> wait (paced, no drops)
+      int len = sumReport.length();
+      int from = sumSegIdx * SEG;
+      String seg = sumReport.substring(from, min(len, from + SEG));
+      if (sumSegIdx == sumSegTotal - 1 && len > sumSegTotal * SEG) {   // capped, more text remains
+        if ((int)seg.length() > SEG - 9) seg = seg.substring(0, SEG - 9);
+        seg += "+more@SD";
+      }
+      String pfx = (sumSegTotal > 1) ? ("(" + String(sumSegIdx + 1) + "/" + String(sumSegTotal) + ")") : String("");
+      replyTarget = summaryReplyTo; sendSMS(pfx + seg); replyTarget = "";
+      sumSegIdx++;
       return;
     }
   }
@@ -1540,6 +2167,7 @@ void stateMachineTick() {
       bool nanoFresh = (millis() - sensor.lastNanoMs < HEARTBEAT_TIMEOUT_MS);
       if (esp2Available && nanoFresh) {
         syncStart = 0;
+        pushAllCalToEsp2();                          // baseline calibration after any reset (§A.5.1 #2)
         esp2SetPower(false);                         // validated -> ESP2 OFF for idle (sec.18.8)
         setState(IDLE_STATE);
       } else if (millis() - syncStart > STARTUP_SYNC_TIMEOUT_MS) {
@@ -1579,11 +2207,29 @@ void stateMachineTick() {
       }
       break;
     }
-    case RECOVERY_STATE:
-      // Drive ESP2 recovery: power-cycle (cooldown-gated) then re-sync. esp2PowerCycle()
-      // transitions to STARTUP_SYNC when it fires, so this is no longer a dead end.
-      esp2PowerCycle();
+    case RECOVERY_STATE: {
+      // ESP2 recovery escalation ladder (sec.18.9 / CLAUDE.md): try the cheap soft reset
+      // (RESET_SELF) first; fall back to the GPIO4 power-cycle only if ESP2 does not come back.
+      if (!esp2SoftResetTried) {
+        esp2SoftResetTried = true;
+        if (esp2Powered) {
+          sendEsp2("RESET_SELF");                  // ESP2 ACKs, goes SAFE, reboots, re-emits READY,ESP2
+          logEvent("ESP1", "RESET", "ESP2|SOFT|RESET_SELF");
+          esp2Available = false;                   // success = READY (handleEsp2Response), not the ACK
+          esp2RecoverMs = millis();
+        } else {
+          esp2PowerCycle();                        // unpowered: soft reset impossible -> cycle re-powers
+        }
+        break;
+      }
+      // Soft reset issued: success is detected in the READY branch of handleEsp2Response.
+      // If ESP2 never returns within the budget, escalate to the power-cycle (last resort).
+      if (millis() - esp2RecoverMs > ESP2_SOFT_RESET_TIMEOUT_MS) {
+        logEvent("ESP1", "RESET", "ESP2|SOFT_FAILED|POWERCYCLE");
+        esp2PowerCycle();
+      }
       break;
+    }
     default: break;
   }
 }
@@ -1613,12 +2259,13 @@ void controlTick() {
     if (sensor.soil[c] < 0) continue;                              // invalid soil (faulted elsewhere)
     if (sensor.soil[c] >= soilStartPct) continue;                 // not dry enough
     if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT) {        // reservoir guard (sec.14.4.1)
-      raiseFault('M', "RES_LOW", "RESERVOIR");
+      // A1: latch so the fault/SMS fires ONCE per low episode (cleared on recovery in powerTick-
+      // style check below), not every loop while a column sits due over a low reservoir.
+      if (!resLowLatched) { resLowLatched = true; raiseFault('M', "RES_LOW", "RESERVOIR"); }
       continue;
     }
     bool fert = decideFertigate(c) && !batteryLow;                 // low batt -> irrigation only
-    setState(ACTIVE_STATE);
-    sendNanoCommand("ACTIVE");                                     // fast Nano interval
+    setState(ACTIVE_STATE);                                        // nanoPaceTick sends ACTIVE on this transition
     // OFF-during-idle (sec.18.8): queue the run, power ESP2 up, and let its READY dispatch the
     // work order (stateMachineTick ACTIVE_STATE is the warm-up timeout safety net).
     pendingRun.active = true; pendingRun.colIdx = c; pendingRun.fertigate = fert;
@@ -1696,7 +2343,7 @@ void scheduleTick() {
   if (ds != currentDayStamp) {                 // midnight rollover -> reset daily counters
     currentDayStamp = ds;
     faultsToday[0] = faultsToday[1] = faultsToday[2] = 0;
-    nanoResetsToday = 0; nanoHwResetsToday = 0; esp2PowerCycles = 0;
+    nanoResetsToday = 0; esp2PowerCycles = 0;
     reportSentToday = false; nanoDailyResetDone = false;
     energyConsumedWh = energyChargedWh = 0.0;  // reset daily energy totals (B2)
     for (int c = 0; c < NUM_COLUMNS; c++) { waterUsedToday[c] = nutrientUsedToday[c] = 0; }
@@ -1714,8 +2361,8 @@ void scheduleTick() {
   if (reportPending && sysState != ACTIVE_STATE) sendDailyReport();   // deferred STATUS
   // Deferred SUMMARY: operation finished -> run the (non-blocking) SD parse now (sec.12.1.3.1).
   if (summaryPending && sysState != ACTIVE_STATE && summaryStage == SUM_IDLE) {
-    summaryPending = false;            // cleared again in SUM_EMIT; prevents re-trigger mid-job
-    startSummaryJob();
+    summaryPending = false;            // cleared again in SUM_STREAM; prevents re-trigger mid-job
+    startSummaryJob(pendingSumMode, pendingSumTarget);
   }
 }
 
@@ -1736,8 +2383,203 @@ void heartbeatTick() {
   if (esp2Available && millis() - lastEsp2Ms > HEARTBEAT_TIMEOUT_MS) {
     esp2Available = false;
     raiseFault('M', "ESP2_SILENCE", "ESP2");                  // counts + queued SMS (sec.12.1.1)
-    if (sysState != EMERGENCY_STOP) setState(RECOVERY_STATE);
+    // Start the recovery ladder fresh (soft reset first, then power-cycle).
+    if (sysState != EMERGENCY_STOP) { esp2SoftResetTried = false; setState(RECOVERY_STATE); }
   }
+}
+
+/* =============================================================================
+ *  NANO INTERVAL PACING  (A2: own the ACTIVE/DAY/NIGHT command; send only on change)
+ * -----------------------------------------------------------------------------
+ *  The Nano boots ACTIVE (10 s) and only changes interval when ESP1 tells it to.
+ *  This is the single owner of that command: ACTIVE during runs, else DAY/NIGHT by
+ *  the RTC clock. Sending only on a state change avoids spamming the SoftwareSerial
+ *  link. NIGHT window wraps midnight (NIGHT_START_MIN..NIGHT_END_MIN).             */
+void nanoPaceTick() {
+  NanoPace desired;
+  if (sysState == ACTIVE_STATE || wo.active || pendingRun.active) {
+    desired = PACE_ACTIVE;
+  } else if (!rtcOk) {
+    desired = PACE_DAY;                                  // no clock -> default to day idle
+  } else {
+    uint16_t mod = minuteOfDay();
+    bool night = (mod >= NIGHT_START_MIN) || (mod < NIGHT_END_MIN);
+    desired = night ? PACE_NIGHT : PACE_DAY;
+  }
+  if (desired == lastNanoPace) return;
+  lastNanoPace = desired;
+  if      (desired == PACE_ACTIVE) sendNanoCommand("ACTIVE");
+  else if (desired == PACE_DAY)    sendNanoCommand("DAY");
+  else if (desired == PACE_NIGHT)  sendNanoCommand("NIGHT");
+}
+
+/* =============================================================================
+ *  DEVICE HEALTH  (Part C: present-at-boot -> absent-at-runtime => daily self-reset)
+ * -----------------------------------------------------------------------------
+ *  ESP1's RTC/LCD/INA226/SD can wedge (suspected I2C lock-up). If a device that was
+ *  present at boot stops responding at runtime, reboot ESP1 -- but at most ONCE per
+ *  calendar day. Boot-loop-safe: only a present->absent TRANSITION triggers a reset,
+ *  so a device that is simply absent from boot just runs degraded (no loop).        */
+static bool i2cPresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+void deviceHealthTick() {
+  if (millis() - lastDevHealthMs < DEV_HEALTH_INTERVAL_MS) return;
+  lastDevHealthMs = millis();
+
+  // Re-probe current presence. SD has no cheap probe: on a flush failure logFlush sets
+  // sdOk=false after a failed re-init, so we trust that flag here.
+  bool nowPresent[DEV_COUNT];
+  nowPresent[DEV_RTC] = i2cPresent(0x68);
+  nowPresent[DEV_LCD] = i2cPresent(LCD_ADDR);
+  nowPresent[DEV_INA] = i2cPresent(INA226_ADDR);
+  nowPresent[DEV_SD]  = sdOk;
+
+  const char *DEV_NAME[DEV_COUNT] = { "RTC", "LCD", "INA226", "SD" };
+  int lost = -1;
+  for (int d = 0; d < DEV_COUNT; d++) {
+    if (bootPresent[d] && !nowPresent[d]) { lost = d; break; }   // dropout transition
+  }
+  if (lost < 0) return;
+
+  // Once per calendar day (RTC-RAM stamp survives the software reset). If the RTC has no
+  // valid date (today==0, e.g. RTC itself wedged) this still allows exactly ONE reset, then
+  // matches (0==0) and stops -- no boot loop -- until a real day stamp re-arms it.
+  uint32_t today = (currentDayStamp > 0) ? (uint32_t)currentDayStamp : 0;
+  if (g_lastSelfResetDay == today) return;                      // already reset for this day stamp
+
+  logEvent("ESP1", "RESET", String("SELF|DEVICE_LOST|") + DEV_NAME[lost]);
+  sendSMS(String("ALERT,MAJ,SELF_RESET,") + DEV_NAME[lost]);    // best-effort (may not flush before reboot)
+  logFlush(true);                                               // persist what we can
+  g_lastSelfResetDay = today;
+  delay(50);                                                    // let the last UART/SD bytes drain
+  ESP.restart();
+}
+
+/* =============================================================================
+ *  WiFi + THINGSPEAK TELEMETRY  (Part A: core-0 task, non-blocking uplink)
+ * ========================================================================== */
+// Core 1: snapshot the latest readings into the shared struct (POD -> spinlock). Throttled.
+void telemetryCollect() {
+  if (millis() - lastTelemCollectMs < 1000) return;
+  lastTelemCollectMs = millis();
+  portENTER_CRITICAL(&telemMux);
+  telem.temp = sensor.temp; telem.hum = sensor.hum; telem.lux = sensor.lux;
+  telem.resLevel = sensor.resLevel; telem.mixLevel = sensor.mixLevel; telem.flow = sensor.flow;
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    telem.soil[c] = sensor.soil[c];
+    telem.npkValid[c] = sensor.npkValid[c];
+    telem.npkN[c] = sensor.npk[c][4]; telem.npkP[c] = sensor.npk[c][5]; telem.npkK[c] = sensor.npk[c][6];
+    telem.npkEC[c] = sensor.npk[c][2]; telem.npkPH[c] = sensor.npk[c][3];
+  }
+  telem.battV = battV; telem.battP = battP;
+  telem.valid = true;
+  portEXIT_CRITICAL(&telemMux);
+}
+
+// Core 0: one ThingSpeak update GET. Returns true on HTTP 200.
+static bool tsGet(const String &url) {
+  HTTPClient http;
+  http.setConnectTimeout(6000);
+  http.setTimeout(6000);
+  if (!http.begin(url)) return false;
+  int code = http.GET();
+  http.end();
+  return code == 200;
+}
+
+// Core 0: push channel 1 (per-column moisture+NPK) and channel 2 (system) from the snapshot.
+static void tsUpload() {
+  TelemetrySnapshot t;
+  portENTER_CRITICAL(&telemMux); t = telem; portEXIT_CRITICAL(&telemMux);
+  if (!t.valid) return;
+
+  String k1, k2, k3;
+  xSemaphoreTake(netMux, portMAX_DELAY); k1 = tsKey1; k2 = tsKey2; k3 = tsKey3; xSemaphoreGive(netMux);
+  bool ok = false;
+
+  if (k1.length()) {                                  // Channel 1: columns (moisture + NPK)
+    String url = "http://" + String(TS_HOST) + "/update?api_key=" + k1;
+    int fld = 1;
+    for (int c = 0; c < NUM_COLUMNS && fld <= 8; c++) {
+      if (!COLUMN_ENABLED[c]) continue;
+      url += "&field" + String(fld++) + "=" + String(t.soil[c]);
+      if (t.npkValid[c] && fld + 2 <= 8) {
+        url += "&field" + String(fld++) + "=" + String(t.npkN[c], 1);
+        url += "&field" + String(fld++) + "=" + String(t.npkP[c], 1);
+        url += "&field" + String(fld++) + "=" + String(t.npkK[c], 1);
+      } else fld += 3;
+    }
+    ok = tsGet(url) || ok;
+  }
+  if (k2.length()) {                                  // Channel 2: system
+    String url = "http://" + String(TS_HOST) + "/update?api_key=" + k2;
+    url += "&field1=" + String(t.temp, 1);
+    url += "&field2=" + String(t.hum, 1);
+    url += "&field3=" + String(t.lux, 0);
+    url += "&field4=" + String(t.resLevel, 1);
+    url += "&field5=" + String(t.mixLevel, 1);
+    url += "&field6=" + String(t.battV, 2);
+    url += "&field7=" + String(t.battP, 1);
+    url += "&field8=" + String(t.flow, 1);
+    ok = tsGet(url) || ok;
+  }
+  if (k3.length()) {                                  // Channel 3: chemistry (per-column EC + pH)
+    String url = "http://" + String(TS_HOST) + "/update?api_key=" + k3;
+    int fld = 1;
+    for (int c = 0; c < NUM_COLUMNS && fld <= 8; c++) {
+      if (!COLUMN_ENABLED[c]) continue;
+      if (t.npkValid[c]) {
+        url += "&field" + String(fld++) + "=" + String(t.npkEC[c], 2);
+        url += "&field" + String(fld++) + "=" + String(t.npkPH[c], 2);
+      } else fld += 2;
+    }
+    ok = tsGet(url) || ok;
+  }
+  lastTsOk = ok; lastTsUploadMs = millis();
+}
+
+// Core-0 task: keep the WiFi STA link up and upload on a cadence. NOT on the task WDT
+// (it may legitimately block on the network); the core-1 loop is never disturbed.
+void netTask(void *pv) {
+  (void)pv;
+  unsigned long lastUpload = 0;
+  for (;;) {
+    char ssid[33] = "", pass[65] = "";
+    xSemaphoreTake(netMux, portMAX_DELAY);
+    strncpy(ssid, wifiSsid.c_str(), sizeof(ssid) - 1);
+    strncpy(pass, wifiPass.c_str(), sizeof(pass) - 1);
+    xSemaphoreGive(netMux);
+
+    if (ssid[0] == '\0') { wifiConnected = false; vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+    if (wifiCredsChanged) { wifiCredsChanged = false; WiFi.disconnect(); vTaskDelay(pdMS_TO_TICKS(200)); }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiConnected = false;
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(ssid, pass);
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) vTaskDelay(pdMS_TO_TICKS(250));
+      if (WiFi.status() != WL_CONNECTED) { vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_MS)); continue; }
+      WiFi.localIP().toString().toCharArray(wifiIpStr, sizeof(wifiIpStr));
+    }
+    wifiConnected = true;
+    wifiRssiVal = WiFi.RSSI();
+
+    unsigned long interval = (sysState == ACTIVE_STATE) ? TS_UPLOAD_ACTIVE_MS : TS_UPLOAD_IDLE_MS;
+    if (millis() - lastUpload >= interval) { lastUpload = millis(); tsUpload(); }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// Loose owner check for config commands: compare the last 9 digits of sender vs owner.
+static bool senderIsOwner() {
+  if (replyTarget.length() == 0) return true;           // internally generated
+  String da = "", db = "";
+  for (int i = replyTarget.length() - 1; i >= 0 && da.length() < 9; i--) if (isDigit(replyTarget[i])) da = String(replyTarget[i]) + da;
+  for (int i = PHONE_NUMBER.length() - 1; i >= 0 && db.length() < 9; i--) if (isDigit(PHONE_NUMBER[i])) db = String(PHONE_NUMBER[i]) + db;
+  return da.length() >= 9 && da == db;
 }
 
 /* =============================================================================
@@ -1756,8 +2598,10 @@ void raiseFault(char tier, const char *code, const char *loc) {
     sendEsp2("TEST,EXIT"); testArmPending = false; esp2SetPower(false);
     if (sysState == TEST_MODE) setState(IDLE_STATE);
   }
-  uiMode = UI_DATA;
-  lcdPage = PAGE_FAULT; wakeBacklight();
+  // Non-critical faults wait BEHIND an open confirm dialog (companion spec §B.3.1); Critical
+  // force-dismisses (handled in enterEmergencyStop below).
+  if (tier == 'C' || !(editConfirm || restoreConfirm)) { uiMode = UI_DATA; lcdPage = PAGE_FAULT; }
+  wakeBacklight();
 
   // GSM alert for all tiers (sec.12.1.1)
   sendSMS(String("ALERT,") + t + "," + code + "," + loc);
@@ -1769,11 +2613,356 @@ void enterEmergencyStop(bool cutPower) {
   // stop all actuators (sec.22.3) then optionally cut ESP2 power (sec.23.1.1)
   esp2Serial.print(FRAME_START); esp2Serial.print(",STOP_ALL,"); esp2Serial.println(FRAME_END);
   logEvent("ESP1", "CMD", "ESP2|STOP_ALL");
+  esp2Held = false;                                // a hard E-stop supersedes any held-fault recovery
   wo.active = false; wo.stage = WO_IDLE;
   pendingRun.active = false; pendingRun.colIdx = -1;
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
   if (cutPower) esp2SetPower(false);              // (sec.23.1.1) -- mirror kept in sync
+  editConfirm = false; restoreConfirm = false; editDirty = false;   // force-dismiss + auto-discard (§B.3.1)
+  // Take over the screen with the recovery prompt (Part B): leave any Settings/Testing UI,
+  // default the cursor to "Return to normal".
+  uiMode = UI_DATA; lcdPage = PAGE_FAULT; estopSel = 0; wakeBacklight();
   setState(EMERGENCY_STOP);
+}
+
+/* =============================================================================
+ *  ESP2 FAULT HOLD  --  hard ESP2 fault: ESP2 is holding (P17 dropped) WITH the mix-tank
+ *  volume retained, so ESP1 keeps it POWERED (no GPIO4 cut) and waits for the user's
+ *  GSM/LCD recovery choice. Alerts carry the operation + column (sec.19.4.8 / user req).
+ * ========================================================================== */
+void enterFaultHold(const char *code, const char *loc) {
+  faultsToday[0]++;                                    // critical-tier count
+  String op   = wo.fertigate ? "FERTIGATION" : "IRRIGATION";
+  String colS = (wo.colIdx >= 0 && wo.colIdx < NUM_COLUMNS) ? String("COL_") + COL_TAG[wo.colIdx] : "COL_?";
+  String detail = String("CRIT|") + code + "|" + loc + "|" + op + "|" + colS + "|HELD";
+  logEvent("ESP1", "FAULT", detail);
+  lastFaultMsg = String(code) + " " + loc + " " + colS;
+  // GSM alert WITH operation + column, and the reply menu (sec.12.1.1 + user req).
+  sendSMS(String("ALERT,CRIT,") + code + "," + loc + "," + op + "," + colS +
+          ",reply STOP/RELEASE/IRRIGATE/NORMAL");
+  esp2Held = true; faultRecovSel = 0;                  // default cursor = Hold (safe; pushes no water)
+  editConfirm = false; restoreConfirm = false; editDirty = false;   // force-dismiss any open dialog (§B.3.1)
+  // ESP2 STAYS POWERED (it holds the tank) -- do NOT esp2SetPower(false) here.
+  uiMode = UI_DATA; lcdPage = PAGE_FAULT; wakeBacklight();
+  setState(EMERGENCY_STOP);                            // halted; the held UI/buttons branch on esp2Held
+}
+
+// Apply a recovery choice (from LCD ENTER or an SMS reply): 0 Hold, 1 Release, 2 OnlyIrr, 3 Normal.
+void issueRecovery(int sel) {
+  if (!esp2Held) return;
+  if (sel == 0) {                                      // Hold / acknowledge: stay held, push nothing
+    sendSMS("ACK,STOP,HELD");
+    return;
+  }
+  const char *mode = (sel == 1) ? "RELEASE" : (sel == 2) ? "IRRIGATE" : "NORMAL";
+  sendEsp2(String("RESUME,") + mode);                  // ESP2 re-energizes P17 and resumes/rewrites the run
+  logEvent("ESP1", "ACT", String("RESUME|") + mode + "|COL_" +
+           (wo.colIdx >= 0 ? String(COL_TAG[wo.colIdx]) : String("?")));
+  sendSMS(String("ACK,RESUME,") + mode);
+  esp2Held = false;
+  if (wo.active) { wo.stage = WO_ACKED; wo.sentMs = millis(); }   // restart the DONE-timeout supervision
+  setState(ACTIVE_STATE);                              // supervising the resumed run again
+}
+
+/* =============================================================================
+ *  CALIBRATION MODE UI  (companion spec §A)  -- IDLE-only, automation suspended
+ * ========================================================================== */
+static bool calTgtVisible(int idx) {
+  const CalTgt &t = CAL_TGTS[idx];
+  if (t.kind == CK_SOIL || t.kind == CK_NPK) return COLUMN_ENABLED[t.col];  // hide disabled columns (§14.1.4.1)
+  return true;
+}
+static bool calIsNano(uint8_t kind) {                    // Nano-owned sensors (ESP1 applies their cal)
+  return kind == CK_SOIL || kind == CK_LEVEL_RES || kind == CK_LEVEL_MIX || kind == CK_OFFSET || kind == CK_NPK;
+}
+static const char *calPrimeLine(const char *id, int *col) {
+  *col = -1;
+  if (!strcmp(id, "FLOW_MIXIRR")) { *col = 0; return "MIXIRR"; }   // prime via column A
+  if (!strcmp(id, "FLOW_RESMIX")) return "RESMIX";
+  if (!strcmp(id, "FLOW_NUTA"))   return "NUTA";
+  if (!strcmp(id, "FLOW_NUTB"))   return "NUTB";
+  if (!strcmp(id, "FLOW_NUTC"))   return "NUTC";
+  return "";
+}
+
+void enterCal() {
+  if (sysState != IDLE_STATE) return;            // idle-only lockout (§A.6)
+  uiMode = UI_CAL; calSel = 0; calOpen = false; calStep = 0;
+  esp2SetPower(true);                            // power ESP2 so its sensors/pumps are reachable
+  logEvent("ESP1", "CAL", "ENTER");
+}
+
+static void calOpenTarget() {
+  const CalTgt &t = CAL_TGTS[calSel];
+  calOpen = true; calStep = 0; calCap[0] = calCap[1] = 0; calFlowPulses = 0; calVolL = 0.50f;
+  calRunIdx = 0; calKRuns[0] = calKRuns[1] = calKRuns[2] = 0;
+  calRxId = ""; calRxValid = false;
+  if (t.kind == CK_NPK) { for (int j = 0; j < 3; j++) calNpkEdit[j] = calNpkOff[t.col][j]; }  // seed current
+  String cs = String("CAL_START,") + t.id;
+  if (calIsNano(t.kind)) sendNanoCommand(cs.c_str()); else sendEsp2(cs);
+}
+
+static void calCloseTarget() {
+  const CalTgt &t = CAL_TGTS[calSel];
+  String cs = String("CAL_STOP,") + t.id;
+  if (calIsNano(t.kind)) sendNanoCommand(cs.c_str());
+  else {
+    sendEsp2(cs);
+    int col; const char *ln = calPrimeLine(t.id, &col);
+    if (*ln) sendEsp2(String("PRIME_STOP,") + ln);   // make sure any prime is stopped
+  }
+  calOpen = false;
+}
+
+// Compute the captured points for the open target, save to NVS, push ESP2-owned to ESP2 (§A.5.1).
+static void calCommit() {
+  const CalTgt &t = CAL_TGTS[calSel];
+  char buf[40];
+  switch (t.kind) {
+    case CK_SOIL: {
+      int air = (int)calCap[0], wat = (int)calCap[1];
+      String k = "s" + String(t.col);
+      prefsCal.putInt((k + "a").c_str(), air); prefsCal.putInt((k + "w").c_str(), wat);
+      snprintf(buf, sizeof(buf), "SAVE|SOIL_%c|%d/%d", COL_TAG[t.col], air, wat);
+      calSoilAir[t.col] = air; calSoilWater[t.col] = wat;
+      logEvent("ESP1", "CAL", buf);
+      break;
+    }
+    case CK_PH: {
+      float m = (7.0f - 4.0f) / (calCap[0] - calCap[1]);   // (raw7,7.0),(raw4,4.0)
+      float b = 7.0f - m * calCap[0];
+      calPhM = m; calPhB = b;
+      prefsCal.putFloat("phM", m); prefsCal.putFloat("phB", b);
+      setCalPushBlocking("PH", String(m, 6) + "," + String(b, 4));
+      logEvent("ESP1", "CAL", "SAVE|PH");
+      break;
+    }
+    case CK_EC: {
+      float m = EC_STD_MSCM / (calCap[1] - calCap[0]);     // (raw0,0),(rawstd,EC_STD_MSCM)
+      float b = 0.0f - m * calCap[0];
+      calEcM = m; calEcB = b;
+      prefsCal.putFloat("ecM", m); prefsCal.putFloat("ecB", b);
+      setCalPushBlocking("EC", String(m, 6) + "," + String(b, 4));
+      logEvent("ESP1", "CAL", "SAVE|EC");
+      break;
+    }
+    case CK_ACS: {
+      calAcs712Zero = calCap[0] / 4095.0f * 3.3f;
+      prefsCal.putFloat("acs", calAcs712Zero);
+      setCalPushBlocking("ACS712", String(calAcs712Zero, 4));
+      logEvent("ESP1", "CAL", "SAVE|ACS712");
+      break;
+    }
+    case CK_LEVEL_RES: calResEmptyCm = calCap[0]; prefsCal.putFloat("reCm", calResEmptyCm); logEvent("ESP1","CAL","SAVE|ULTRA_RES"); break;
+    case CK_LEVEL_MIX: calMixEmptyCm = calCap[0]; prefsCal.putFloat("meCm", calMixEmptyCm); logEvent("ESP1","CAL","SAVE|ULTRA_MIX"); break;
+    case CK_FLOW: {
+      // 3-run result (§A.4.1.7): average if the runs agree, median if an outlier remains.
+      float a = calKRuns[0], b = calKRuns[1], c = calKRuns[2];
+      float med = a + b + c - max(a, max(b, c)) - min(a, min(b, c));   // middle value
+      bool outlier = (fabs(a - med) > CAL_OUTLIER_PCT / 100.0f * med) ||
+                     (fabs(b - med) > CAL_OUTLIER_PCT / 100.0f * med) ||
+                     (fabs(c - med) > CAL_OUTLIER_PCT / 100.0f * med);
+      float kf = outlier ? med : (a + b + c) / 3.0f;
+      if (kf <= 0) break;
+      const char *id = t.id;
+      if      (!strcmp(id, "FLOW_RESMIX")) { calKResMix = kf; prefsCal.putFloat("kRM", kf); }
+      else if (!strcmp(id, "FLOW_MIXIRR")) { calKMixIrr = kf; prefsCal.putFloat("kMI", kf); }
+      else if (!strcmp(id, "FLOW_NUTA"))   { calKNut[0] = kf; prefsCal.putFloat("kNA", kf); }
+      else if (!strcmp(id, "FLOW_NUTB"))   { calKNut[1] = kf; prefsCal.putFloat("kNB", kf); }
+      else if (!strcmp(id, "FLOW_NUTC"))   { calKNut[2] = kf; prefsCal.putFloat("kNC", kf); }
+      setCalPushBlocking(id, String(kf, 1));
+      snprintf(buf, sizeof(buf), "SAVE|%s|K=%d|%s", id, (int)kf, outlier ? "MED" : "AVG3");
+      logEvent("ESP1", "CAL", buf);
+      break;
+    }
+    case CK_OFFSET: {     // offset = reference reading (calVolL) - captured raw (calCap[0]); Nano-applied
+      float off = calVolL - calCap[0];
+      if (t.col == 0)      { calTempOff = off; prefsCal.putFloat("tOff", off); }
+      else if (t.col == 1) { calHumOff  = off; prefsCal.putFloat("hOff", off); }
+      else                 { calLuxOff  = off; prefsCal.putFloat("lOff", off); }
+      snprintf(buf, sizeof(buf), "SAVE|%s|off=%s", t.id, String(off, 2).c_str());
+      logEvent("ESP1", "CAL", buf);
+      break;
+    }
+    case CK_NPK: {        // per-column N/P/K offset trim (guarded, §A.4.3); Nano stays raw
+      String k = "s" + String(t.col);
+      prefsCal.putFloat((k + "N").c_str(), calNpkEdit[0]);
+      prefsCal.putFloat((k + "P").c_str(), calNpkEdit[1]);
+      prefsCal.putFloat((k + "K").c_str(), calNpkEdit[2]);
+      for (int j = 0; j < 3; j++) calNpkOff[t.col][j] = calNpkEdit[j];
+      snprintf(buf, sizeof(buf), "SAVE|NPK_%c|%d/%d/%d", COL_TAG[t.col],
+               (int)calNpkEdit[0], (int)calNpkEdit[1], (int)calNpkEdit[2]);
+      logEvent("ESP1", "CAL", buf);
+      break;
+    }
+  }
+}
+
+void calButton(int i) {
+  // i: 0=UP 1=DOWN 2=ENTER 3=BACK  (MODE handled in handleButtons)
+  if (!calOpen) {                                  // browsing the target list
+    if (i == 0)      { do { calSel = (calSel + CAL_TGT_COUNT - 1) % CAL_TGT_COUNT; } while (!calTgtVisible(calSel)); }
+    else if (i == 1) { do { calSel = (calSel + 1) % CAL_TGT_COUNT; } while (!calTgtVisible(calSel)); }
+    else if (i == 3) { esp2SetPower(false); uiMode = UI_MENU; logEvent("ESP1", "CAL", "EXIT"); }
+    else if (i == 2) calOpenTarget();
+    return;
+  }
+  const CalTgt &t = CAL_TGTS[calSel];
+  if (i == 3) { calCloseTarget(); return; }        // BACK = abandon this target (no save)
+
+  if (t.kind == CK_FLOW) {
+    if (calStep == 0) {                            // run step: ENTER held = pump (calHoldTick); UP = proceed
+      if (i == 0) { calFlowPulses = (calRxValid ? (unsigned long)calRxRaw : 0); calStep = 1; }
+    } else if (calStep == 1) {                      // volume entry for this run
+      if (i == 0) calVolL += 0.01f;
+      else if (i == 1) { calVolL -= 0.01f; if (calVolL < 0.0f) calVolL = 0.0f; }
+      else if (i == 2) {                            // store this run's K, then next run or review
+        calKRuns[calRunIdx] = (calVolL > 0.01f) ? (float)calFlowPulses / calVolL : 0;
+        if (++calRunIdx < 3) { calStep = 0; calVolL = 0.50f; calFlowPulses = 0;
+                               sendEsp2(String("CAL_START,") + t.id); }   // re-zero ISR for the next run
+        else calStep = 2;                           // review the 3 runs
+      }
+    } else {                                        // review step: UP = redo worst run, ENTER = save
+      if (i == 2) { calCommit(); calCloseTarget(); }
+      else if (i == 0) {                            // jump back to the run furthest from the median
+        float a = calKRuns[0], b = calKRuns[1], c = calKRuns[2];
+        float med = a + b + c - max(a, max(b, c)) - min(a, min(b, c));
+        int worst = 0; float wd = fabs(a - med);
+        if (fabs(b - med) > wd) { worst = 1; wd = fabs(b - med); }
+        if (fabs(c - med) > wd) { worst = 2; }
+        calRunIdx = worst; calStep = 0; calVolL = 0.50f; calFlowPulses = 0;
+        sendEsp2(String("CAL_START,") + t.id);
+      }
+    }
+    return;
+  }
+
+  if (t.kind == CK_OFFSET) {
+    if (calStep == 0) {                            // capture the raw sensor reading
+      if (i == 2) { if (calRxValid) calCap[0] = calRxRaw; calVolL = calCap[0]; calStep = 1; }
+    } else {                                        // enter the true reference reading -> offset
+      if (i == 0) calVolL += 0.1f;
+      else if (i == 1) calVolL -= 0.1f;
+      else if (i == 2) { calCommit(); calCloseTarget(); }
+    }
+    return;
+  }
+
+  if (t.kind == CK_NPK) {                          // guarded N/P/K offset editor (§A.4.3)
+    if (calStep == 0) {                            // warning gate
+      if (i == 2) calStep = 1;                      // ENTER = proceed to edit
+      else if (i == 1) { calNpkEdit[0] = calNpkEdit[1] = calNpkEdit[2] = 0; calCommit(); calCloseTarget(); }  // DOWN = reset to 0
+    } else {                                        // edit N (1), P (2), K (3)
+      int idx = calStep - 1;
+      if (i == 0) calNpkEdit[idx] += 1.0f;
+      else if (i == 1) calNpkEdit[idx] -= 1.0f;
+      else if (i == 2) { if (++calStep > 3) { calCommit(); calCloseTarget(); } }
+    }
+    return;
+  }
+
+  // capture kinds: ENTER captures current raw; 2-pt (soil/pH/EC) needs 2, others 1
+  int needed = (t.kind == CK_PH || t.kind == CK_EC || t.kind == CK_SOIL) ? 2 : 1;
+  if (i == 2) {
+    if (calRxValid) calCap[calStep] = calRxRaw;
+    if (++calStep >= needed) { calCommit(); calCloseTarget(); }
+  }
+}
+
+// Flow dead-man: while ENTER is physically held in the flow run step, stream PRIME_START as the
+// keep-alive (ESP2 caps locally); release -> PRIME_STOP. Mirrors testHoldTick (sec.18.10.8).
+void calHoldTick() {
+  if (uiMode != UI_CAL || !calOpen) { calEnterWasDown = false; return; }
+  const CalTgt &t = CAL_TGTS[calSel];
+  if (t.kind != CK_FLOW || calStep != 0) { calEnterWasDown = false; return; }
+  static unsigned long lastHold = 0;
+  int col; const char *ln = calPrimeLine(t.id, &col);
+  bool down = (digitalRead(BTN_ENTER) == LOW);
+  if (down) {
+    if (millis() - lastHold >= 150) {
+      lastHold = millis();
+      String c = String("PRIME_START,") + ln;
+      if (col >= 0) c += String(",") + COL_TAG[col];
+      sendEsp2(c);
+    }
+    calEnterWasDown = true;
+  } else if (calEnterWasDown) {
+    sendEsp2(String("PRIME_STOP,") + ln);
+    calEnterWasDown = false;
+  }
+}
+
+void lcdRenderCal() {
+  char l[21];
+  if (!calOpen) {
+    lcd.setCursor(0, 0); lcd.print("CALIBRATION  IDLE   ");
+    int top = calSel - 1; if (top < 0) top = 0; if (top > CAL_TGT_COUNT - 3) top = CAL_TGT_COUNT - 3; if (top < 0) top = 0;
+    for (int r = 0; r < 3; r++) {
+      int idx = top + r;
+      lcd.setCursor(0, r + 1);
+      if (idx < CAL_TGT_COUNT) { snprintf(l, 21, "%c%-19s", idx == calSel ? '>' : ' ', CAL_TGTS[idx].name); lcd.print(l); }
+      else lcd.print("                    ");
+    }
+    return;
+  }
+  const CalTgt &t = CAL_TGTS[calSel];
+  bool fresh = calRxValid && (millis() - calRxMs < CAL_STALE_MS);
+  lcd.setCursor(0, 0); snprintf(l, 21, "CAL %-16s", t.name); lcd.print(l);
+  if (t.kind == CK_FLOW) {
+    if (calStep == 0) {
+      lcd.setCursor(0, 1); snprintf(l, 21, "Run %d/3 hold ENTER  ", calRunIdx + 1); lcd.print(l);
+      lcd.setCursor(0, 2); snprintf(l, 21, "pulses:%-13ld", fresh ? (long)calRxRaw : 0L); lcd.print(l);
+      lcd.setCursor(0, 3); lcd.print("UP=done  BACK=cancel");
+    } else if (calStep == 1) {
+      lcd.setCursor(0, 1); snprintf(l, 21, "Run %d pulses=%-7ld", calRunIdx + 1, (long)calFlowPulses); lcd.print(l);
+      lcd.setCursor(0, 2); snprintf(l, 21, "vol: %s L         ", String(calVolL, 2).c_str()); lcd.print(l);
+      lcd.setCursor(0, 3); lcd.print("UP/DN vol  ENT=next ");
+    } else {                                          // review the 3 runs
+      float a = calKRuns[0], b = calKRuns[1], c = calKRuns[2];
+      float med = a + b + c - max(a, max(b, c)) - min(a, min(b, c));
+      bool out = (fabs(a - med) > CAL_OUTLIER_PCT / 100.0f * med) || (fabs(b - med) > CAL_OUTLIER_PCT / 100.0f * med) ||
+                 (fabs(c - med) > CAL_OUTLIER_PCT / 100.0f * med);
+      lcd.setCursor(0, 1); snprintf(l, 21, "K %d %d %d   ", (int)a, (int)b, (int)c); lcd.print(l);
+      lcd.setCursor(0, 2); snprintf(l, 21, "%s K=%d        ", out ? "OUTLIER med" : "avg", (int)(out ? med : (a + b + c) / 3.0f)); lcd.print(l);
+      lcd.setCursor(0, 3); lcd.print(out ? "UP=redo  ENT=save  " : "ENT=save  BACK=esc ");
+    }
+    return;
+  }
+  if (t.kind == CK_OFFSET) {
+    if (calStep == 0) {
+      lcd.setCursor(0, 1); lcd.print("Read reference, then");
+      lcd.setCursor(0, 2); snprintf(l, 21, "raw:%-9s ENTER ", fresh ? String(calRxRaw, 1).c_str() : "--"); lcd.print(l);
+      lcd.setCursor(0, 3); lcd.print("ENT=capture BACK=esc");
+    } else {
+      lcd.setCursor(0, 1); snprintf(l, 21, "raw was %s     ", String(calCap[0], 1).c_str()); lcd.print(l);
+      lcd.setCursor(0, 2); snprintf(l, 21, "ref: %s   off %s", String(calVolL, 1).c_str(), String(calVolL - calCap[0], 1).c_str()); lcd.print(l);
+      lcd.setCursor(0, 3); lcd.print("UP/DN ref  ENT=save ");
+    }
+    return;
+  }
+  if (t.kind == CK_NPK) {
+    if (calStep == 0) {
+      lcd.setCursor(0, 1); lcd.print("WARN: biases data!  ");
+      lcd.setCursor(0, 2); lcd.print("Not needed normally ");
+      lcd.setCursor(0, 3); lcd.print("ENT=edit DN=zero/sav");
+    } else {
+      const char *el = (calStep == 1) ? "N" : (calStep == 2) ? "P" : "K";
+      lcd.setCursor(0, 1); snprintf(l, 21, "NPK trim %c  edit %s ", COL_TAG[t.col], el); lcd.print(l);
+      lcd.setCursor(0, 2); snprintf(l, 21, "N%d P%d K%d        ", (int)calNpkEdit[0], (int)calNpkEdit[1], (int)calNpkEdit[2]); lcd.print(l);
+      lcd.setCursor(0, 3); lcd.print("UP/DN  ENT=next/save");
+    }
+    return;
+  }
+  int needed = (t.kind == CK_PH || t.kind == CK_EC || t.kind == CK_SOIL) ? 2 : 1;
+  const char *prompt = "Steady, then ENTER";
+  if      (t.kind == CK_SOIL) prompt = (calStep == 0) ? "Probe in AIR, ENTER" : "Probe in WATER, ENT";
+  else if (t.kind == CK_PH)   prompt = (calStep == 0) ? "In pH7 buf, ENTER"   : "In pH4 buf, ENTER";
+  else if (t.kind == CK_EC)   prompt = (calStep == 0) ? "Dry/air, ENTER"      : "In std soln, ENTER";
+  else if (t.kind == CK_ACS)  prompt = "Motor OFF, ENTER";
+  else                        prompt = "Tank EMPTY, ENTER";
+  lcd.setCursor(0, 1); snprintf(l, 21, "%-20s", prompt); lcd.print(l);
+  lcd.setCursor(0, 2); snprintf(l, 21, "raw:%-8s pt%d/%d ", fresh ? String(calRxRaw, 1).c_str() : "--", calStep + 1, needed); lcd.print(l);
+  lcd.setCursor(0, 3); lcd.print("ENT=capture BACK=esc");
 }
 
 /* =============================================================================
@@ -1788,6 +2977,42 @@ void handleButtons() {
   static bool last[5] = { HIGH, HIGH, HIGH, HIGH, HIGH };
   static unsigned long lastChange[5] = { 0, 0, 0, 0, 0 };
   const uint8_t pins[5] = { BTN_UP, BTN_DOWN, BTN_ENTER, BTN_BACK, BTN_MODE };
+
+  // ---- Emergency-Off combo: MODE + BACK held TOGETHER (Part B) ----------------
+  // Highest priority, fires regardless of lock (safety override). One-shot via latch.
+  bool modeDown = (digitalRead(BTN_MODE) == LOW);
+  bool backDown = (digitalRead(BTN_BACK) == LOW);
+  if (modeDown && backDown) {
+    if (!estopComboLatch) {
+      estopComboLatch = true;
+      if (uiMode == UI_TEST) { sendEsp2("TEST,EXIT"); testArmPending = false; }
+      logEvent("ESP1", "CMD", "ESTOP|MODE+BACK");
+      enterEmergencyStop(true);                    // stops actuators, cuts ESP2 power, shows recovery
+    }
+    for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]);   // swallow these edges
+    return;
+  }
+  estopComboLatch = false;                          // combo released -> re-arm
+
+  // ---- Locked: ignore all buttons except the UP+DOWN unlock combo (Part D) -----
+  if (lcdLocked) {
+    static bool unlockLatch = false;
+    bool upDown   = (digitalRead(BTN_UP)   == LOW);
+    bool downDown = (digitalRead(BTN_DOWN) == LOW);
+    if (upDown && downDown) {
+      if (!unlockLatch) {
+        unlockLatch = true;
+        lcdLocked = false; saveLock(); wakeBacklight();
+        logEvent("ESP1", "STATE", "LCD_UNLOCK");
+      }
+    } else {
+      unlockLatch = false;
+      if (upDown || downDown || digitalRead(BTN_ENTER) == LOW) wakeBacklight();  // keep hint visible
+    }
+    for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]);   // don't replay edges after unlock
+    return;
+  }
+
   for (int i = 0; i < 5; i++) {
     bool cur = digitalRead(pins[i]);
     // Debounced edge only: a noisy/floating contact (esp. on strapping-pin MODE/GPIO2)
@@ -1800,14 +3025,36 @@ void handleButtons() {
 
         // MODE (i==4): toggle into/out of the Settings menu (spec sec.18.10)
         if (i == 4) {
+          if (sysState == EMERGENCY_STOP) continue;  // keep the recovery prompt up; use the combo to re-stop
           if (uiMode == UI_DATA) { uiMode = UI_MENU; setSel = 0; }
           else {
             if (uiMode == UI_TEST) {                 // leaving Testing: stop + power ESP2 off
               sendEsp2("TEST,EXIT"); testArmPending = false; esp2SetPower(false);
               if (sysState == TEST_MODE) setState(IDLE_STATE);
             }
+            if (uiMode == UI_CAL) {                   // leaving Calibration: stop stream + power ESP2 off
+              if (calOpen) calCloseTarget();
+              esp2SetPower(false); logEvent("ESP1", "CAL", "EXIT");
+            }
             uiMode = UI_DATA;
           }
+          continue;
+        }
+
+        // ESP2 fault-hold recovery selector (sec.19.4.8.2): UP/DOWN choose one of the 4
+        // options, ENTER issues it (mirror of the GSM STOP/RELEASE/IRRIGATE/NORMAL reply).
+        if (esp2Held && uiMode == UI_DATA) {
+          if      (i == 0) faultRecovSel = (faultRecovSel + 3) % 4;   // UP
+          else if (i == 1) faultRecovSel = (faultRecovSel + 1) % 4;   // DOWN
+          else if (i == 2) issueRecovery(faultRecovSel);             // ENTER -> act
+          continue;
+        }
+
+        // E-stop recovery selector (Part B): UP/DOWN choose, ENTER confirms. Takes over
+        // the other buttons while stopped so the operator must deliberately return.
+        if (sysState == EMERGENCY_STOP && uiMode == UI_DATA) {
+          if (i == 0 || i == 1) estopSel ^= 1;                 // toggle Return / Stay
+          else if (i == 2 && estopSel == 0) setState(STARTUP_SYNC);  // re-powers + re-validates ESP2
           continue;
         }
 
@@ -1817,9 +3064,6 @@ void handleButtons() {
         // ---- normal data-page navigation (UI_DATA) ----
         if (i == 0) lcdPage = (lcdPage + PAGE_COUNT - 1) % PAGE_COUNT;   // UP
         else if (i == 1) lcdPage = (lcdPage + 1) % PAGE_COUNT;           // DOWN
-        else if (i == 3 && sysState == EMERGENCY_STOP) {                 // BACK clears E-STOP
-          setState(STARTUP_SYNC);                  // STARTUP_SYNC re-powers + re-validates ESP2
-        }
       }
     }
   }
@@ -1845,9 +3089,69 @@ static void seedSchedule() {
   editTmp[3] = COL_WIN_END[editCol]   / 60; editTmp[4] = COL_WIN_END[editCol]   % 60;
 }
 
+static int clampi(int v, int lo, int hi);   // defined below; used by commitEditor's THRESH clamp
+
+// Apply the working copy (editTmp) for the current editItem to live config + NVS. Called by the
+// editor's final ENTER and by the three-way confirm dialog's SAVE (companion spec §B).
+void commitEditor() {
+  switch (editItem) {
+    case SET_CLOCK:
+      if (rtcOk) rtc.adjust(DateTime(editTmp[0], editTmp[1], editTmp[2], editTmp[3], editTmp[4], 0));
+      logEvent("ESP1", "STATE", "CLOCK_SET");
+      break;
+    case SET_SCHEDULE:
+      colSchedMode[editCol] = editTmp[0];
+      if (editTmp[0] == SCHED_MANUAL) {
+        COL_WIN_START[editCol] = editTmp[1] * 60 + editTmp[2];
+        COL_WIN_END[editCol]   = editTmp[3] * 60 + editTmp[4];
+      }
+      saveSchedule(editCol);
+      logEvent("ESP1", "STATE", String("SCHED_SET|COL_") + COL_TAG[editCol]);
+      break;
+    case SET_COLMODE:
+      if (editTmp[0] == 2) { COLUMN_ENABLED[editCol] = false; }
+      else { COLUMN_ENABLED[editCol] = true; col[editCol].mode = (editTmp[0] == 0) ? MODE_AUTO : MODE_IRRIGATION_ONLY; saveColumn(editCol); }
+      saveColEnable(editCol);
+      logEvent("ESP1", "STATE", String("MODE_SET|COL_") + COL_TAG[editCol]);
+      break;
+    case SET_PRESET:
+      if (editTmp[0] == 0) { const CropPreset &p = CROP_PRESETS[editTmp[1]];
+        col[editCol].targetN = p.N; col[editCol].targetP = p.P; col[editCol].targetK = p.K; col[editCol].targetPH = p.pH;
+      } else {
+        col[editCol].targetN = editTmp[2]; col[editCol].targetP = editTmp[3];
+        col[editCol].targetK = editTmp[4]; col[editCol].targetPH = editTmp[5] / 10.0f;
+      }
+      saveColumn(editCol);
+      logEvent("ESP1", "STATE", String("PRESET_SET|COL_") + COL_TAG[editCol]);
+      break;
+    case SET_THRESH:
+      if (editTmp[1] <= editTmp[0]) editTmp[1] = clampi(editTmp[0] + 1, 0, 100);   // stop > start
+      soilStartPct = editTmp[0]; soilStopPct = editTmp[1]; fertGap = editTmp[2]; saveThresholds();
+      logEvent("ESP1", "STATE", "THRESH_SET");
+      break;
+  }
+}
+
+// Restore operational config to compiled defaults (companion spec §C). Resets automation settings;
+// KEEPS calibration (separate NVS namespace), column-enable flags (physical wiring), and WiFi/TS
+// connectivity setup. Idle-only; no reboot. EC/pH safe windows are compile constants (not in NVS,
+// re-sent each work order), so there is nothing stale to ACK-push here.
+void restoreDefaults() {
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    col[c].mode = MODE_AUTO;
+    col[c].targetN = col[c].targetP = col[c].targetK = 0.0f; col[c].targetPH = 6.0f;
+    col[c].name[0] = '\0';
+    colSchedMode[c] = SCHED_AUTO;
+    COL_WIN_START[c] = DEF_WIN_START[c]; COL_WIN_END[c] = DEF_WIN_END[c];
+    saveColumn(c); saveSchedule(c);
+  }
+  soilStartPct = 35; soilStopPct = 45; fertGap = 20.0f; saveThresholds();
+  logEvent("ESP1", "RESET", "CONFIG|DEFAULTS|kept cal+cols+wifi");
+}
+
 // Seed the working copy when an editor is opened.
 void enterEditor(int item) {
-  editItem = item; editField = 0; editCol = 0;
+  editItem = item; editField = 0; editCol = 0; editDirty = false;
   switch (item) {
     case SET_CLOCK: {
       DateTime n = rtcOk ? rtc.now() : DateTime(2026, 1, 1, 0, 0, 0);
@@ -1872,23 +3176,49 @@ static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v
 
 void settingsButton(int i) {
   // i: 0=UP 1=DOWN 2=ENTER 3=BACK  (MODE handled in handleButtons)
+  if (uiMode == UI_CAL) { calButton(i); return; }
+
+  // ---- Restore Defaults double-confirm (companion spec §C.3) ----
+  if (restoreConfirm) {
+    if (i == 0 || i == 1) restoreSel ^= 1;                 // toggle NO / YES
+    else if (i == 3) restoreConfirm = false;               // BACK = abort
+    else if (i == 2) {
+      if (restoreSel == 1) restoreDefaults();              // YES -> wipe operational config
+      restoreConfirm = false; uiMode = UI_DATA;
+    }
+    return;
+  }
+
   if (uiMode == UI_MENU) {
     if (i == 0) setSel = (setSel + SET_COUNT - 1) % SET_COUNT;
     else if (i == 1) setSel = (setSel + 1) % SET_COUNT;
     else if (i == 3) uiMode = UI_DATA;                         // BACK = exit
     else if (i == 2) {                                         // ENTER = open item
       if (setSel == SET_EXIT) { uiMode = UI_DATA; }
+      else if (setSel == SET_LOCK) {                            // lock the LCD (Part D)
+        lcdLocked = true; saveLock();
+        logEvent("ESP1", "STATE", "LCD_LOCK");
+        uiMode = UI_DATA;                                      // back to data view (automation unaffected)
+      }
       else if (setSel == SET_TESTING) {
-        // Idle-only (spec sec.18.10.8.1). ESP2 is OFF during idle, so we do NOT require it
-        // up here: power it ON now and DEFER TEST,ENTER until it reports READY (G1).
+        // Idle-only (spec sec.18.10.8.1). Power ESP2 via the GPIO4 relay, PRIME it (let it
+        // boot), then send TEST,ENTER repeatedly until it ACKs -- the single boot READY can be
+        // lost on a cold relay power-up (see testHoldTick arming retry).
         if (sysState != IDLE_STATE) return;
-        esp2SetPower(true);                                    // power ESP2 -> boot -> READY
-        testArmPending = true;                                 // handleEsp2Response sends TEST,ENTER
-        esp2WarmupMs = millis();
+        esp2SetPower(true);                                    // power ESP2 -> boot
+        testArmPending = true;
+        esp2TestArmed = false; testArmTries = 0; lastTestArmMs = 0;
+        esp2WarmupMs = millis();                               // prime reference (TEST_PRIME_MS)
         setState(TEST_MODE);
         uiMode = UI_TEST; testSel = 0; testOnBit = -1;
-        if (esp2Available) { sendEsp2("TEST,ENTER"); testArmPending = false; }  // already up: arm now
-      } else enterEditor(setSel);
+        // No immediate send: the primed retry in testHoldTick owns arming (after TEST_PRIME_MS).
+      }
+      else if (setSel == SET_CALIB) enterCal();                 // idle-only calibration (§A.6)
+      else if (setSel == SET_RESTORE) {                          // Restore Defaults (§C): idle-only, double-confirm
+        if (sysState != IDLE_STATE) return;
+        restoreConfirm = true; restoreSel = 0;                  // default cursor = NO
+      }
+      else enterEditor(setSel);
     }
     return;
   }
@@ -1908,7 +3238,28 @@ void settingsButton(int i) {
 
   if (uiMode == UI_EDIT) {
     int delta = (i == 0) ? +1 : (i == 1) ? -1 : 0;
-    if (i == 3) { uiMode = UI_MENU; editItem = -1; return; }    // BACK = cancel, no save
+
+    // ---- three-way "unsaved changes" dialog (companion spec §B) ----
+    if (editConfirm) {
+      if (i == 0)      confirmSel = (confirmSel + 2) % 3;
+      else if (i == 1) confirmSel = (confirmSel + 1) % 3;
+      else if (i == 3) editConfirm = false;                    // BACK on dialog = CANCEL (stay)
+      else if (i == 2) {
+        if (confirmSel == 0)      { commitEditor(); editConfirm = false; editDirty = false; uiMode = UI_MENU; editItem = -1; }  // SAVE
+        else if (confirmSel == 1) { editConfirm = false; editDirty = false; uiMode = UI_MENU; editItem = -1; }                  // DISCARD
+        else                      { editConfirm = false; }                                                                     // CANCEL -> stay
+      }
+      return;
+    }
+    // BACK: silent exit if clean, else open the three-way dialog (catches accidental edits).
+    if (i == 3) {
+      if (editDirty) { editConfirm = true; confirmSel = 0; }
+      else { uiMode = UI_MENU; editItem = -1; }
+      return;
+    }
+    // Mark dirty on a value change (exclude the column-select field 0 of per-column editors).
+    if (delta && !(editField == 0 && (editItem == SET_SCHEDULE || editItem == SET_COLMODE || editItem == SET_PRESET)))
+      editDirty = true;
 
     switch (editItem) {
       case SET_CLOCK:
@@ -1919,11 +3270,7 @@ void settingsButton(int i) {
           else if (editField == 3) editTmp[3] = clampi(editTmp[3] + delta, 0, 23);
           else if (editField == 4) editTmp[4] = clampi(editTmp[4] + delta, 0, 59);
         } else if (i == 2) {                                    // ENTER advances / commits
-          if (++editField > 4) {
-            if (rtcOk) rtc.adjust(DateTime(editTmp[0], editTmp[1], editTmp[2], editTmp[3], editTmp[4], 0));
-            logEvent("ESP1", "STATE", "CLOCK_SET");
-            uiMode = UI_MENU; editItem = -1;
-          }
+          if (++editField > 4) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
         break;
 
@@ -1938,16 +3285,7 @@ void settingsButton(int i) {
           else if (editField == 5) editTmp[4] = clampi(editTmp[4] + delta, 0, 59);
         } else if (i == 2) {
           int lastField = (editTmp[0] == SCHED_MANUAL) ? 5 : 1;
-          if (++editField > lastField) {
-            colSchedMode[editCol] = editTmp[0];
-            if (editTmp[0] == SCHED_MANUAL) {
-              COL_WIN_START[editCol] = editTmp[1] * 60 + editTmp[2];
-              COL_WIN_END[editCol]   = editTmp[3] * 60 + editTmp[4];
-            }
-            saveSchedule(editCol);
-            logEvent("ESP1", "STATE", String("SCHED_SET|COL_") + COL_TAG[editCol]);
-            uiMode = UI_MENU; editItem = -1;
-          }
+          if (++editField > lastField) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
         break;
 
@@ -1956,13 +3294,7 @@ void settingsButton(int i) {
           if (editField == 0) { editCol = clampi(editCol + delta, 0, NUM_COLUMNS - 1); editTmp[0] = colMode3(editCol); }
           else if (editField == 1) editTmp[0] = (editTmp[0] + (delta > 0 ? 1 : 2)) % 3;
         } else if (i == 2) {
-          if (++editField > 1) {
-            if (editTmp[0] == 2) { COLUMN_ENABLED[editCol] = false; }   // OFF
-            else { COLUMN_ENABLED[editCol] = true; col[editCol].mode = (editTmp[0] == 0) ? MODE_AUTO : MODE_IRRIGATION_ONLY; saveColumn(editCol); }
-            saveColEnable(editCol);
-            logEvent("ESP1", "STATE", String("MODE_SET|COL_") + COL_TAG[editCol]);
-            uiMode = UI_MENU; editItem = -1;
-          }
+          if (++editField > 1) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
         break;
 
@@ -1982,18 +3314,7 @@ void settingsButton(int i) {
           else if (editField == 5) editTmp[5] = clampi(editTmp[5] + delta, 0, 140);   // pH*10
         } else if (i == 2) {
           int lastField = (editTmp[0] == 0) ? 2 : 5;                          // named: up to idx; manual: up to pH
-          if (++editField > lastField) {
-            if (editTmp[0] == 0) {                                            // NAMED preset
-              const CropPreset &p = CROP_PRESETS[editTmp[1]];
-              col[editCol].targetN = p.N; col[editCol].targetP = p.P; col[editCol].targetK = p.K; col[editCol].targetPH = p.pH;
-            } else {                                                          // MANUAL
-              col[editCol].targetN = editTmp[2]; col[editCol].targetP = editTmp[3];
-              col[editCol].targetK = editTmp[4]; col[editCol].targetPH = editTmp[5] / 10.0f;
-            }
-            saveColumn(editCol);
-            logEvent("ESP1", "STATE", String("PRESET_SET|COL_") + COL_TAG[editCol]);
-            uiMode = UI_MENU; editItem = -1;
-          }
+          if (++editField > lastField) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
         break;
 
@@ -2003,12 +3324,7 @@ void settingsButton(int i) {
           else if (editField == 1) editTmp[1] = clampi(editTmp[1] + delta, 0, 100);
           else if (editField == 2) editTmp[2] = clampi(editTmp[2] + delta, 0, 500);
         } else if (i == 2) {
-          if (++editField > 2) {
-            if (editTmp[1] <= editTmp[0]) editTmp[1] = clampi(editTmp[0] + 1, 0, 100);  // stop > start
-            soilStartPct = editTmp[0]; soilStopPct = editTmp[1]; fertGap = editTmp[2]; saveThresholds();
-            logEvent("ESP1", "STATE", "THRESH_SET");
-            uiMode = UI_MENU; editItem = -1;
-          }
+          if (++editField > 2) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
         break;
     }
@@ -2021,6 +3337,20 @@ void settingsButton(int i) {
  * and the 10 s hard cap. */
 void testHoldTick() {
   if (uiMode != UI_TEST) return;
+
+  // ---- Primed arming: prove ESP2 is actually in TEST mode before relying on HOLD ----
+  // After the GPIO4 power-on prime (TEST_PRIME_MS, lets ESP2 finish booting), re-send
+  // TEST,ENTER every TEST_ARM_RETRY_MS until ESP2 confirms with ACK,TEST,ENTER (esp2TestArmed).
+  // This is the actual fix: the single boot-time READY is easily lost on a cold relay power-up.
+  if (!esp2TestArmed && testArmTries < TEST_ARM_MAX_TRIES
+      && (unsigned long)(millis() - esp2WarmupMs) >= TEST_PRIME_MS
+      && (unsigned long)(millis() - lastTestArmMs) >= TEST_ARM_RETRY_MS) {
+    lastTestArmMs = millis();
+    testArmPending = false;
+    testArmTries++;
+    sendEsp2("TEST,ENTER");                                    // sent repeatedly until ACK (or cap)
+  }
+
   static bool wasHeld = false;
   static unsigned long lastSendMs = 0;
   bool held = (digitalRead(BTN_ENTER) == LOW);
@@ -2060,9 +3390,25 @@ void lcdTick() {
     backlightOn = false; lcd.noBacklight();
   }
 
+  // LCD lock screen (Part D): takes over rendering only -- automation keeps running
+  // (controlTick etc. gate on uiMode, which stays UI_DATA while locked). Shows the
+  // unlock combo. E-stop still shows here so a held operator knows action is needed.
+  static bool lastLocked = false;
+  if (lcdLocked) {
+    if (!lastLocked) { lcd.clear(); lastLocked = true; }
+    lcd.setCursor(0, 0); lcd.print("***   LOCKED   ***  ");
+    lcd.setCursor(0, 1); lcd.print(sysState == EMERGENCY_STOP ? "E-STOP active!      "
+                                                              : "System running OK   ");
+    lcd.setCursor(0, 2); lcd.print("Hold UP + DOWN      ");
+    lcd.setCursor(0, 3); lcd.print("together to unlock  ");
+    return;
+  }
+  if (lastLocked) { lcd.clear(); lastLocked = false; }    // just unlocked -> force a clean redraw
+
   // Settings / Testing UI takes over the screen when active (spec sec.18.10).
   static uint8_t lastUi = 255;
   if (lastUi != uiMode) { lcd.clear(); lastUi = uiMode; }
+  if (uiMode == UI_CAL) { lcdRenderCal(); return; }
   if (uiMode != UI_DATA) { lcdRenderSettings(); return; }
 
   static uint8_t lastPage = 255;
@@ -2098,21 +3444,43 @@ void lcdTick() {
       lcd.setCursor(0, 2); snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP); lcd.print(l);
       lcd.setCursor(0, 3); snprintf(l, 21, "SD:%s RTC:%s", sdOk ? "OK" : "--", rtcOk ? "OK" : "--"); lcd.print(l);
       break;
-    case PAGE_GSM:   // live SIM800L health (modeled on the GSM-WITH-LCD bench layout)
-      lcd.setCursor(0, 0); lcd.print("GSM Status          ");
-      lcd.setCursor(0, 1); snprintf(l, 21, "Net:%-4s Sig:%-3s",
+    case PAGE_GSM:   // GSM (SIM800L) + WiFi/ThingSpeak link health
+      lcd.setCursor(0, 0); lcd.print("GSM + WiFi          ");
+      lcd.setCursor(0, 1); snprintf(l, 21, "GSM:%-4s Sig:%-3s Q%d",
                                     netRegistered ? "REG" : "NO",
-                                    (lastRssi < 0 || lastRssi == 99) ? "--" : String(lastRssi).c_str());
+                                    (lastRssi < 0 || lastRssi == 99) ? "--" : String(lastRssi).c_str(),
+                                    smsCount);
       lcd.print(l);
-      lcd.setCursor(0, 2); lcd.print(simReady ? "SIM ready           " : "SIM NOT ready!      ");
-      lcd.setCursor(0, 3); snprintf(l, 21, "TxQ:%d %s", smsCount, gtx == GTX_IDLE ? "idle" : "sending");
+      lcd.setCursor(0, 2);
+      if (wifiConnected) snprintf(l, 21, "WiFi:OK %ddBm       ", wifiRssiVal);
+      else               snprintf(l, 21, "WiFi:DOWN          ");
+      lcd.print(l);
+      lcd.setCursor(0, 3);
+      snprintf(l, 21, "TS:%s %lus ago      ", lastTsOk ? "ok" : "--",
+               lastTsUploadMs ? (millis() - lastTsUploadMs) / 1000 : 0);
       lcd.print(l);
       break;
-    default: // PAGE_FAULT
-      lcd.setCursor(0, 0); lcd.print("Last Fault:");
-      lcd.setCursor(0, 1); lcd.print(lastFaultMsg.substring(0, 20));
-      lcd.setCursor(0, 2); snprintf(l, 21, "C%d M%d m%d today", faultsToday[0], faultsToday[1], faultsToday[2]); lcd.print(l);
-      lcd.setCursor(0, 3); lcd.print(sysState == EMERGENCY_STOP ? "BACK=clear E-STOP" : "");
+    default: // PAGE_FAULT  (doubles as the E-stop / fault-hold recovery prompt)
+      if (esp2Held) {
+        // ESP2 fault HELD: 4-way recovery in a 3-row window over rows 1..3 (sec.19.4.8.2).
+        lcd.setCursor(0, 0); snprintf(l, 21, "HELD:%-15s", lastFaultMsg.substring(0, 15).c_str()); lcd.print(l);
+        int top = faultRecovSel - 1; if (top < 0) top = 0; if (top > 1) top = 1;
+        for (int r = 0; r < 3; r++) {
+          int idx = top + r;
+          lcd.setCursor(0, r + 1);
+          snprintf(l, 21, "%c%-19s", idx == faultRecovSel ? '>' : ' ', RECOV_NAMES[idx]); lcd.print(l);
+        }
+      } else if (sysState == EMERGENCY_STOP) {
+        lcd.setCursor(0, 0); lcd.print("** EMERGENCY OFF  **");
+        lcd.setCursor(0, 1); snprintf(l, 21, "%cReturn to normal   ", estopSel == 0 ? '>' : ' '); lcd.print(l);
+        lcd.setCursor(0, 2); snprintf(l, 21, "%cStay stopped       ", estopSel == 1 ? '>' : ' '); lcd.print(l);
+        lcd.setCursor(0, 3); lcd.print("UP/DN pick  ENT=ok  ");
+      } else {
+        lcd.setCursor(0, 0); lcd.print("Last Fault:         ");
+        lcd.setCursor(0, 1); snprintf(l, 21, "%-20s", lastFaultMsg.substring(0, 20).c_str()); lcd.print(l);
+        lcd.setCursor(0, 2); snprintf(l, 21, "C%d M%d m%d today     ", faultsToday[0], faultsToday[1], faultsToday[2]); lcd.print(l);
+        lcd.setCursor(0, 3); lcd.print("                    ");
+      }
       break;
   }
 }
@@ -2137,6 +3505,23 @@ static void drawList(int sel, int count, const char *const *names) {
 void lcdRenderSettings() {
   char l[21];
 
+  // ---- Restore-Defaults double-confirm (companion spec §C.3) ----
+  if (restoreConfirm) {
+    lcd.setCursor(0, 0); lcd.print("Restore defaults?   ");
+    lcd.setCursor(0, 1); lcd.print("Keeps cal+col setup ");
+    lcd.setCursor(0, 2); snprintf(l, 21, "%cNO                 ", restoreSel == 0 ? '>' : ' '); lcd.print(l);
+    lcd.setCursor(0, 3); snprintf(l, 21, "%cYES, RESET         ", restoreSel == 1 ? '>' : ' '); lcd.print(l);
+    return;
+  }
+  // ---- Edit "unsaved changes" three-way dialog (companion spec §B.3) ----
+  if (editConfirm) {
+    lcd.setCursor(0, 0); lcd.print("Unsaved changes     ");
+    lcd.setCursor(0, 1); snprintf(l, 21, "%cSAVE               ", confirmSel == 0 ? '>' : ' '); lcd.print(l);
+    lcd.setCursor(0, 2); snprintf(l, 21, "%cDISCARD            ", confirmSel == 1 ? '>' : ' '); lcd.print(l);
+    lcd.setCursor(0, 3); snprintf(l, 21, "%cCANCEL             ", confirmSel == 2 ? '>' : ' '); lcd.print(l);
+    return;
+  }
+
   if (uiMode == UI_MENU) {
     lcd.setCursor(0, 0); lcd.print("=== SETTINGS ===    ");
     drawList(setSel, SET_COUNT, SET_NAMES);
@@ -2144,7 +3529,16 @@ void lcdRenderSettings() {
   }
 
   if (uiMode == UI_TEST) {
-    lcd.setCursor(0, 0); lcd.print(esp2Available ? "TESTING (dead-man)  " : "TESTING: ESP2 DOWN  ");
+    // Header reflects the REAL arming state, not just the heartbeat:
+    //  ESP2 DOWN   = no heartbeat (ESP2 off / link both-ways or RX dead)
+    //  ARMING...   = ESP2 alive, waiting for it to confirm TEST mode (priming/retrying)
+    //  NO ACK!     = ESP2 alive but not ACKing TEST,ENTER after several tries (suspect ESP1->ESP2 TX)
+    //  (dead-man)  = confirmed in TEST mode, relays controllable
+    const char *hdr = !esp2Available     ? "TESTING: ESP2 DOWN  "
+                    : esp2TestArmed       ? "TESTING (dead-man)  "
+                    : (testArmTries >= TEST_ARM_NOACK_HINT) ? "TEST NO ACK-chk link"
+                    :                        "TESTING: ARMING...  ";
+    lcd.setCursor(0, 0); lcd.print(hdr);
     int top = testSel - 1; if (top < 0) top = 0; if (top > 16 - 2) top = 16 - 2;
     for (int r = 0; r < 2; r++) {
       int idx = top + r;
@@ -2259,5 +3653,10 @@ void logFlush(bool force) {
 
   File f = SD.open(fname, FILE_APPEND);
   if (f) { f.print(logBuf); f.close(); logBuf = ""; logLineCount = 0; }
-  else   { logBuf = ""; logLineCount = 0; }   // avoid unbounded growth on write failure
+  else {
+    // Write failed: try ONE re-init. If the card is really gone, mark it lost so
+    // deviceHealthTick (Part C) sees the present->absent transition.
+    if (!SD.begin(SD_CS)) { sdOk = false; Serial.println(F("WARN: microSD lost (write failed, re-init failed)")); }
+    logBuf = ""; logLineCount = 0;            // avoid unbounded growth on write failure
+  }
 }

@@ -41,7 +41,8 @@ Three microcontrollers with strict role separation:
 - **ESP2 powered off during idle** (power saving); ESP32 #1 powers it up on demand for each run and powers it back off.
 - **GSM (SIM800L)** alerts for all fault tiers, consolidated scheduled-run notices, and on-demand reports.
 - **SD logging** — RTC-timestamped CSV, one file per day (`YYYYMMDD.CSV`), buffered/batched writes.
-- **Recovery ladder** — Nano internal WDT → ESP32 #1 `RESET_REQ` (after 5 consecutive garbage packets) → hardware reset via ESP32 #2.
+- **Nano recovery ladder (2 layers)** — Nano internal WDT → ESP32 #1 `RESET_REQ` (after 5 consecutive garbage packets). The old hardware-reset layer was removed when PCF8575 **P17** became the master actuator-power cutoff.
+- **P17 master cutoff + tank-aware fault hold** — on a hard ESP2 fault, ESP2 drops the P17 master power relay (bank goes dead, fail-safe), pauses, and *stays alive* holding the metered mixing-tank volume (persisted to NVS). ESP1 keeps ESP2 powered and alerts over GSM with the operation + column; recovery is user-gated: reply `STOP` / `RELEASE` / `IRRIGATE` / `NORMAL`.
 - **Preventive pump exercise** (every 2 days) scheduled by the always-on ESP32 #1.
 
 ---
@@ -113,6 +114,7 @@ RS485/NPK D8/D9/D10 · soil A0–A3 + A6/A7 · BH1750 I2C A4/A5.
 | `STATUS` | Live status + daily summary report |
 | `SUMMARY` | Today's-activity digest, parsed from the SD log |
 | `STOP,ALL` | Emergency stop |
+| `STOP` / `RELEASE` / `IRRIGATE` / `NORMAL` | Fault-hold recovery (only while a fault is held): acknowledge & hold / dump tank to its column / finish irrigation-only / resume the paused run |
 
 Outbound: fault/warning alerts (`ALERT,...`), scheduled-run notices (`RUN,...`),
 and compact daily/on-demand reports (`RPT,...` / `SUM,...`).

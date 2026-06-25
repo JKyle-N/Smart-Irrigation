@@ -28,7 +28,8 @@
  *      2. ESP32 #1 RESET_REQ over UART              <-- handled here (self-reset)
  *      3. Hardware reset via ESP32 #2 / PCF8575     <-- not the Nano's concern
  *
- *  NON-BLOCKING: no delay() anywhere except a single one-time settle in setup().
+ *  NON-BLOCKING: no delay() in loop() except a single one-time settle in setup() and
+ *      one bounded ~5 ms RS485 DE settle inside the NPK read (well under WDTO_4S).
  *      Bounded micro-waits (pulseIn timeout, ultrasonic trigger, sensor reads)
  *      are sub-second and never stall the loop past the watchdog timeout.
  *
@@ -194,6 +195,14 @@ uint8_t inLen = 0;
 
 bool ledState = false;
 
+/* ---- Calibration raw streaming (companion spec §A.3) --------------------- *
+ * While ESP32 #1 has a Nano sensor selected, stream ONLY that sensor's raw value fast
+ * (~1.6 Hz) via <START>,CAL,<id>,<raw>,<END>. Additive: normal cadence is unaffected.       */
+char     calId[12]   = "";
+bool     calActive   = false;
+unsigned long lastCalMs = 0;
+const unsigned long CAL_STREAM_MS = 600;
+
 /* ---- Forward declarations ------------------------------------------------ */
 void pollUart();
 void handleLine(char *line);
@@ -208,6 +217,9 @@ void sendNpk();
 void sendStatus();
 bool  readEnv(float &t, float &h);
 float readLevelPct(uint8_t trig, uint8_t echo, float emptyCm, float fullCm);
+float readDistanceCm(uint8_t trig, uint8_t echo);
+void  calStreamTick();
+bool  calReadRaw(float &raw);
 float readLux();
 float computeFlowLpm();
 bool  readNpkColumn(uint8_t addr, float out[7]);
@@ -272,7 +284,8 @@ void setup() {
 void loop() {
   wdt_reset();                      // pet the watchdog every iteration
 
-  pollUart();                       // handle inbound ACTIVE/DAY/NIGHT/RESET_REQ
+  pollUart();                       // handle inbound ACTIVE/DAY/NIGHT/RESET_REQ/CAL_*
+  calStreamTick();                  // §A.3: stream the selected sensor's raw value when active
 
   unsigned long now = millis();
 
@@ -335,6 +348,14 @@ void handleLine(char *line) {
   else if (strcmp(cmd, "DAY")       == 0) setTxState(TX_DAY);
   else if (strcmp(cmd, "NIGHT")     == 0) setTxState(TX_NIGHT);
   else if (strcmp(cmd, "RESET_REQ") == 0) softwareReset();
+  else if (strcmp(cmd, "CAL_START") == 0) {       // §A.3: begin fast raw stream for one sensor
+    if (*p == ',') p++;
+    uint8_t k = 0;                                 // copy the SENSOR_ID token
+    while (*p && *p != ',' && *p != '<' && k < (uint8_t)(sizeof(calId) - 1)) calId[k++] = *p++;
+    calId[k] = '\0';
+    calActive = (k > 0);
+  }
+  else if (strcmp(cmd, "CAL_STOP")  == 0) { calActive = false; calId[0] = '\0'; }
   // else: ignore
 }
 
@@ -371,9 +392,11 @@ void sendEnv() {
   endPkt();
 }
 
+// RAW packet (companion spec §A): reservoir + mixing distances in cm (ESP32 #1 maps to %
+// using the stored empty/full geometry + zero offset); flow in L/min (ESP1 applies its scale).
 void sendTank() {
-  float res  = readLevelPct(PIN_TRIG_RES, PIN_ECHO_RES, RES_EMPTY_CM, RES_FULL_CM);
-  float mix  = readLevelPct(PIN_TRIG_MIX, PIN_ECHO_MIX, MIX_EMPTY_CM, MIX_FULL_CM);
+  float res  = readDistanceCm(PIN_TRIG_RES, PIN_ECHO_RES);
+  float mix  = readDistanceCm(PIN_TRIG_MIX, PIN_ECHO_MIX);
   float flow = computeFlowLpm();    // always valid (0 if no flow)
   startPkt("TANK");
   pktAddFloatOrInvalid(res, 1, res >= 0.0f);
@@ -385,17 +408,21 @@ void sendTank() {
 // Tag-based, variable-length: one <tag>,<val> pair per ENABLED column; disabled
 // columns are omitted entirely (no field, no -1) -- their pins are never read.
 void sendSoil() {
+  // If every column is disabled there are no pairs to send; an empty <START>,SOIL,<END>
+  // would be rejected as garbage by ESP32 #1, so skip the packet entirely.
+  bool anyEnabled = false;
+  for (uint8_t c = 0; c < NUM_COLUMNS; c++) if (COLUMN_ENABLED[c]) { anyEnabled = true; break; }
+  if (!anyEnabled) return;
+
   char tag[2] = { 0, 0 };
   startPkt("SOIL");
   for (uint8_t c = 0; c < NUM_COLUMNS; c++) {
     if (!COLUMN_ENABLED[c]) continue;               // omit disabled column entirely
     tag[0] = COLUMN_TAG[c];
     pktAddRaw(tag);                                  // column tag
+    // RAW averaged ADC (companion spec §A): ESP32 #1 maps to % using the stored air/water endpoints.
     int raw = (analogRead(SOIL_PINS[c][0]) + analogRead(SOIL_PINS[c][1])) / 2;
-    long pct = map(raw, SOIL_ADC_DRY, SOIL_ADC_WET, 0, 100);
-    if (pct < 0)   pct = 0;
-    if (pct > 100) pct = 100;
-    pktAddIntOrInvalid(pct, true);                  // averaged moisture %
+    pktAddIntOrInvalid(raw, true);
   }
   endPkt();
 }
@@ -458,14 +485,78 @@ float readLevelPct(uint8_t trig, uint8_t echo, float emptyCm, float fullCm) {
   return pct;
 }
 
+// Raw one-way distance in cm (echo timing), or -1.0 on timeout. Used for ultrasonic CAL.
+float readDistanceCm(uint8_t trig, uint8_t echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  unsigned long dur = pulseIn(echo, HIGH, ULTRASONIC_TIMEOUT_US);
+  if (dur == 0) return -1.0f;
+  return (float)dur * SOUND_CM_PER_US;
+}
+
 // Returns lux, or -1.0 on sensor error.
 float readLux() {
   float lux = lightMeter.readLightLevel();
   return (lux < 0.0f) ? -1.0f : lux;
 }
 
+/* =============================================================================
+ *  CALIBRATION RAW STREAM  (companion spec §A.3)
+ * ========================================================================== */
+// Read the RAW value for the active CAL sensor. Returns false if the id is unknown.
+bool calReadRaw(float &raw) {
+  if (!strncmp(calId, "SOIL_", 5)) {
+    int col = calId[5] - 'A';                      // A/B/C
+    if (col < 0 || col >= NUM_COLUMNS) return false;
+    if (calId[6] == '\0') {                         // "SOIL_A" -> column AVERAGE (matches normal packet)
+      raw = (float)((analogRead(SOIL_PINS[col][0]) + analogRead(SOIL_PINS[col][1])) / 2);
+      return true;
+    }
+    int ch = calId[6] - '1';                        // "SOIL_A1"/"A2" -> single channel 0/1
+    if (ch < 0 || ch > 1) return false;
+    raw = (float)analogRead(SOIL_PINS[col][ch]);    // raw 10-bit ADC
+    return true;
+  }
+  if (!strncmp(calId, "NPK_", 4)) {                 // raw N register for that column (display-only, §A.3)
+    int col = calId[4] - 'A';
+    if (col < 0 || col >= NUM_COLUMNS) return false;
+    float vals[7];
+    if (!readNpkColumn(NPK_ADDR[col], vals)) return false;
+    raw = vals[4];                                  // N (index 4) raw register
+    return true;
+  }
+  if (!strcmp(calId, "ULTRA_RES")) { raw = readDistanceCm(PIN_TRIG_RES, PIN_ECHO_RES); return true; }
+  if (!strcmp(calId, "ULTRA_MIX")) { raw = readDistanceCm(PIN_TRIG_MIX, PIN_ECHO_MIX); return true; }
+  if (!strcmp(calId, "DHT_T")) { float t = dht.readTemperature(); if (isnan(t)) return false; raw = t; return true; }
+  if (!strcmp(calId, "DHT_H")) { float h = dht.readHumidity();    if (isnan(h)) return false; raw = h; return true; }
+  if (!strcmp(calId, "LUX"))   { raw = readLux(); return true; }
+  if (!strcmp(calId, "FLOW")) {                    // reservoir flow: accumulated raw pulses
+    noInterrupts(); unsigned long p = flowPulseCount; interrupts();
+    raw = (float)p; return true;
+  }
+  return false;
+}
+
+void calStreamTick() {
+  if (!calActive) return;
+  // DHT22 (~0.5 Hz) and NPK (slow Modbus) cap their cal cadence at 2 s; others stream fast.
+  unsigned long cadence = (strncmp(calId, "DHT", 3) == 0 || strncmp(calId, "NPK", 3) == 0) ? 2000UL : CAL_STREAM_MS;
+  if ((unsigned long)(millis() - lastCalMs) < cadence) return;
+  lastCalMs = millis();
+  float raw;
+  bool ok = calReadRaw(raw);
+  startPkt("CAL");
+  pktAddRaw(calId);
+  pktAddFloatOrInvalid(raw, 1, ok);                // -1 if the id is unknown / read failed
+  endPkt();
+}
+
 // Converts pulses accumulated since the last call to L/min. Always returns >=0.
 float computeFlowLpm() {
+  // While the reservoir flow is being CALIBRATED, the CAL stream owns flowPulseCount (it must
+  // accumulate across the run) -- do NOT consume/zero it here, just report 0 for the normal packet.
+  if (calActive && !strcmp(calId, "FLOW")) return 0.0f;
   unsigned long now = millis();
   noInterrupts();
   unsigned long pulses = flowPulseCount;
@@ -501,7 +592,9 @@ bool readNpkColumn(uint8_t addr, float out[7]) {
   while (npkSerial.available()) npkSerial.read();   // drop stale bytes
 
   digitalWrite(PIN_RS485_DE, HIGH);                 // transmit
-  delay(5);                                         // proven DE settle (bounded micro-wait)
+  // The ONE exception to the "no delay() outside setup()" rule: a single bounded ~5 ms
+  // RS485 DE settle (proven value). Far under WDTO_4S and the loop pets the WDT around it.
+  delay(5);
   npkSerial.write(q, 8);                            // SoftwareSerial.write blocks until sent
   npkSerial.flush();                                // ensure last stop bit is shifted out
   digitalWrite(PIN_RS485_DE, LOW);                  // back to receive
@@ -523,9 +616,10 @@ bool readNpkColumn(uint8_t addr, float out[7]) {
   if (lowByte(rcrc) != resp[expected - 2] ||
       highByte(rcrc) != resp[expected - 1]) return false;
 
+  // RAW 16-bit registers (companion spec §A): ESP32 #1 applies NPK_SCALE + per-element offset.
   for (uint8_t i = 0; i < 7; i++) {
     uint16_t raw = ((uint16_t)resp[3 + 2 * i] << 8) | resp[4 + 2 * i];
-    out[i] = (float)raw / NPK_SCALE[i];
+    out[i] = (float)raw;
   }
   return true;
 }

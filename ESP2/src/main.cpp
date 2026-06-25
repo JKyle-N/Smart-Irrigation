@@ -16,9 +16,18 @@
  *    IN : <START>,SEQ_IRRIGATION_<X>,FLUSH,<pct>,<END>
  *         <START>,SEQ_FERTIGATION_<X>,FLUSH,<pct>,DOSE,<mlA>,<mlB>,<mlC>,
  *                 EC,<lo>,<hi>,PH,<lo>,<hi>,MIX,<ms>,<END>
- *         <START>,STOP_ALL,<END> / RESET_NANO / STATUS_REQ
+ *         <START>,STOP_ALL,<END> / RESET_SELF / STATUS_REQ
+ *         RESUME,<NORMAL|IRRIGATE|RELEASE>  (user-gated fault recovery, sec.19.4.8.2):
+ *                 NORMAL  = re-energize P17, resume the paused sequence from where it stopped;
+ *                 IRRIGATE= finish as irrigation only (top up plain water to budget, no dosing);
+ *                 RELEASE = dump the current tank contents to the assigned column as-is.
  *         EXERCISE,<TRANSFER|BOOSTER|MIXER>  (preventive 5 s pump run, scheduled by
  *                 ESP1 sec.14.9.1 -> ACK,EXERCISE then DONE,EXERCISE,<pump>)
+ *         CAL_START,<SENSOR_ID> / CAL_STOP,<SENSOR_ID>  (calibration raw stream, spec §A.3):
+ *                 ESP2 streams CAL,<id>,<raw> ~1.6 Hz for pH/EC/ACS712/FLOW_*; idle-only.
+ *         SET_CAL,<SENSOR_ID>,<VALUE>[,<VALUE2>]  (push a runtime cal const; ACK,SET_CAL,<id>)
+ *         PRIME_START,<LINE_ID>[,<COL>] / PRIME_STOP,<LINE_ID>  (purge a line: valve(s)+pump
+ *                 under dead-man + generous cap, spec §A.4.2)
  *         TEST,ENTER / TEST,EXIT / TEST,HOLD,<bit> / TEST,RELEASE  (dead-man manual
  *                 relay test, sec.18.10.8): ESP1 streams HOLD while ENTER held; ESP2
  *                 keeps ONE relay ON only while HOLD arrives (timeout), with a 10s
@@ -26,8 +35,19 @@
  *    OUT: ACK,<cmd> -> DONE,<cmd>[,WATER,<L>];  DOSE,NUT_x,<target>,<measured>,COL_y
  *         (per-nutrient result, sec.25.2.1); FLOW_FAIL/PWR_FAIL/EC_FAIL/PH_FAIL/
  *         SAFE_STOP/ERROR; DEGRADED,<chan> (channel disabled, sequence continues ->
- *         ESP1 Major, no shutdown); BUSY,ACTIVE/TEST; INVALID,<reason>;
- *         STATUS,ESP2,OK; READY,ESP2; DONE,EXERCISE,<pump>; DONE,RESET_NANO
+ *         ESP1 Major, no shutdown); BUSY,ACTIVE/TEST/HELD; INVALID,<reason>;
+ *         PCF_FAIL,I2C (relay bus dead -> ESP1 Major) + PCF_OK (recovered);
+ *         SENSOR_FAIL,EC / SENSOR_FAIL,PH (probe railed/disconnected -> ESP1 Major,
+ *         distinct from EC_FAIL/PH_FAIL = out-of-window); STATUS,ESP2,OK; READY,ESP2;
+ *         DONE,EXERCISE,<pump>; DONE,RESUME,<mode>
+ *
+ *  P17 MASTER ACTUATOR-POWER CUTOFF & FAULT HOLD (sec.19.4.8): PCF8575 P17 (bit 15) is
+ *  a master relay gating power to the whole P0-P16 actuator bank (fail-safe: loss of P17 =
+ *  all actuators OFF). On a hard fault ESP2 drops P17, PAUSES the sequence, and STAYS ALIVE
+ *  holding the mixing-tank volume (it does NOT power itself off -- that would forget the
+ *  water and overfill on resume). Recovery is the user-gated RESUME,<mode> above. The mix-tank
+ *  volume is metered from ESP2's OWN flow sensors and persisted to NVS (survives a reboot);
+ *  the Nano ultrasonic level is display-only and NOT trusted for control.
  *
  *  NON-BLOCKING: no delay() anywhere; every stage is a millis()-based step in a
  *  FSM. Task watchdog petted each loop iteration.
@@ -38,6 +58,7 @@
  *    Booster pump  (P7): mixing tank -> columns      (metered by flow sensor 5)
  *    Nutrient pumps (P11/12/13): dose into mixing tank (metered by 18/19/23)
  *    Inverter relay (P5) enabled before any AC pump (transfer/booster/mixer).
+ *    The mixing tank's ONLY outlet is the booster -> a column (no drain line).
  *
  *  >>> Values to MEASURE / set at commissioning are tagged [MEASURE] / [TBD].
  * ========================================================================== */
@@ -46,6 +67,7 @@
 #include <Wire.h>
 #include <PZEM004Tv30.h>
 #include <esp_task_wdt.h>
+#include <Preferences.h>       // NVS: persist mixing-tank volume across reboot/power-down
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -86,7 +108,8 @@
 #define OUT_NUT_D     12    // P14 nutrient D pump -- UNUSED (never driven)
 #define OUT_PH_UP     13    // P15 pH up pump
 #define OUT_PH_DN     14    // P16 pH down pump
-#define OUT_NANO_RST  15    // P17 Nano RESET transistor
+#define OUT_MASTER_CUTOFF 15 // P17 master actuator-power cutoff (sec.19.4.8; was Nano RESET).
+                             // Gates power to the whole P0-P16 bank. Fail-safe: de-energized = all OFF.
 const uint8_t COL_VALVE_BIT[3] = { OUT_COL_A, OUT_COL_B, OUT_COL_C };
 const uint8_t NUT_PUMP_BIT[3]  = { OUT_NUT_A, OUT_NUT_B, OUT_NUT_C };
 
@@ -105,10 +128,12 @@ const uint8_t NUT_FLOW_PIN[3] = { FLOW_NUT_A, FLOW_NUT_B, FLOW_NUT_C };
 #define PIN_MIXER_I   36       // ACS712 mixer current
 #define PIN_SPARE     39
 
-/* ---- Flow K-factors (pulses per LITER) [MEASURE] ------------------------- */
-const float K_RES_MIX = 450.0f;
-const float K_MIX_IRR = 450.0f;
-const float K_NUT[3]   = { 450.0f, 450.0f, 450.0f };   // small dosing sensors differ [MEASURE]
+/* ---- Flow K-factors (pulses per LITER) [MEASURE] ------------------------- *
+ * RUNTIME (not const): set on the fly by ESP1 Calibration Mode via SET_CAL, refreshed at
+ * STARTUP_SYNC and carried in each work order (spec §A.5.1). Defaults are the bench values.  */
+float K_RES_MIX = 450.0f;
+float K_MIX_IRR = 450.0f;
+float K_NUT[3]   = { 450.0f, 450.0f, 450.0f };   // small dosing sensors differ [MEASURE]
 
 /* ---- Per-column water budget (liters per service) [TBD] ------------------ */
 const float WATER_BUDGET_L[3] = { 5.0f, 5.0f, 5.0f };
@@ -131,13 +156,15 @@ const unsigned long PZEM_POLL_MS       = 500;     // throttle Modbus reads (sec.
 
 /* ---- ACS712 mixer current (spec sec.21.3 / 23.2.2.4) --------------------- */
 const float ACS712_SENS_V_PER_A = 0.100f; // 20A module ~100 mV/A; 30A ~66mV/A [MEASURE]
-const float ACS712_ZERO_V       = 1.65f;  // quiescent output at 0 A           [MEASURE]
+float       ACS712_ZERO_V       = 1.65f;  // quiescent output at 0 A -- RUNTIME (SET_CAL ACS712)
 const float MIXER_MIN_CURRENT_A = 0.3f;   // mixer ON but below this = no load
 const float MIXER_OVERCURRENT_A = 2.5f;
 
-/* ---- pH / EC analog calibration (linear: value = M*adc + B) [MEASURE] ----- */
-const float PH_CAL_M = 0.0036621f, PH_CAL_B = 0.0f;   // placeholder [MEASURE]
-const float EC_CAL_M = 0.0009766f, EC_CAL_B = 0.0f;   // placeholder [MEASURE]
+/* ---- pH / EC analog calibration (linear: value = M*adc + B) [MEASURE] ----- *
+ * RUNTIME (not const): set by ESP1 Calibration Mode (SET_CAL PH/EC), refreshed at startup
+ * sync + in each work order. Stored as slope (M) + offset (B). Defaults are bench values.     */
+float PH_CAL_M = 0.0036621f, PH_CAL_B = 0.0f;   // [MEASURE]
+float EC_CAL_M = 0.0009766f, EC_CAL_B = 0.0f;   // [MEASURE]
 
 /* ---- Preventive pump exercise (spec sec.19.4.2) -------------------------- *
  * The 2-day SCHEDULE lives on ESP1 (always-on/RTC); ESP1 sends EXERCISE,<pump>.
@@ -146,8 +173,30 @@ const unsigned long PUMP_EXERCISE_RUN_MS = 5000;             // 5 s
 
 /* ---- Misc ---------------------------------------------------------------- */
 const unsigned long HEARTBEAT_MS    = 5000;
-const unsigned long NANO_RST_PULSE_MS = 150;
 #define WDT_TIMEOUT_S 8
+
+/* ---- Calibration Mode support (companion spec §A) ------------------------ *
+ * CAL streaming: while ESP1 has a sensor selected, ESP2 streams that one raw value fast.
+ * Prime: open a line's valve(s) + run its paired pump under a dead-man + generous cap.      */
+const unsigned long CAL_STREAM_MS        = 600;     // ~1.6 Hz raw stream cadence
+const unsigned long PRIME_CAP_MS         = 45000;   // generous hard cap for purging air [TBD]
+const unsigned long PRIME_HOLD_TIMEOUT_MS = 400;    // no keep-alive within this -> stop (dead-man)
+
+/* ---- Mixing-tank volume tolerance ---------------------------------------- *
+ * A FILL stage whose remaining target is below this is treated as "already full"
+ * (no pump run) -- avoids a zero/negative-target pump cycle when resuming.       */
+const float TANK_EPS_L = 0.05f;
+
+/* ---- PCF8575 health / fault reporting ------------------------------------ */
+const unsigned long PCF_PROBE_MS    = 2000;    // active I2C probe cadence
+const uint8_t       PCF_FAIL_LIMIT  = 3;       // consecutive failures before declaring a fault
+const unsigned long PCF_REPORT_MS   = 10000;   // re-assert PCF_FAIL this often while faulted
+
+/* ---- EC / pH sensor-fault rails (raw ADC, 12-bit) ------------------------ *
+ * A railed reading means the probe is disconnected/shorted -- distinct from an
+ * in-range value that is merely outside the EC/pH safe window.       [MEASURE] */
+const int EC_ADC_FAULT_LO = 5,  EC_ADC_FAULT_HI = 4090;
+const int PH_ADC_FAULT_LO = 5,  PH_ADC_FAULT_HI = 4090;
 
 /* =============================================================================
  *  PROTOCOL FRAMING
@@ -163,6 +212,12 @@ PZEM004Tv30      pzem(Serial1, PZEM_RX_PIN, PZEM_TX_PIN);
 
 uint16_t pcfShadow = 0xFFFF;          // all OFF (active-LOW)
 
+/* ---- PCF8575 health state ------------------------------------------------ */
+uint8_t  pcfFailCount = 0;            // consecutive write/probe failures
+bool     pcfFaultReported = false;    // PCF_FAIL currently asserted to ESP1
+unsigned long lastPcfProbeMs = 0;
+unsigned long lastPcfReportMs = 0;
+
 /* ---- Manual TEST mode (dead-man, spec sec.18.10.8) ----------------------- *
  * ESP1 streams TEST,HOLD,<bit> while the operator holds ENTER. ESP2 keeps the
  * relay ON only while those keep arriving (dead-man), one relay at a time, with
@@ -174,6 +229,15 @@ unsigned long testRelayOnMs = 0;      // when the current relay went ON (for the
 unsigned long testLastHoldMs = 0;     // last TEST,HOLD received (for the release timeout)
 const unsigned long TEST_HOLD_TIMEOUT_MS = 400;     // no HOLD within this -> release (fail-safe)
 const unsigned long TEST_HARD_CAP_MS     = 10000;   // max continuous ON (spec sec.18.10.8.3)
+
+/* ---- Calibration: raw stream + Prime (companion spec §A) ----------------- */
+String   calId = "";                  // active CAL sensor id ("" = none)
+unsigned long lastCalMs = 0;
+// Prime dead-man (valve+pump pairing, §A.4.2): one line at a time, generous cap.
+String   primeLine = "";              // active prime line ("" = none)
+int      primeValveA = -1, primeValveB = -1, primePump = -1;
+bool     primeIsAC = false, primeCapped = false;
+unsigned long primeOnMs = 0, primeLastMs = 0;
 
 /* ---- Flow ISR (one active sensor at a time) ------------------------------ */
 volatile unsigned long flowPulses = 0;
@@ -205,9 +269,20 @@ bool    ecphFailed = false;
 unsigned long stepStart = 0;
 float   woWaterL = 0.0f;        // metered water delivered to the column this work order (for DONE,WATER)
 
+/* ---- Mixing-tank volume + fault hold (sec.19.4.8) ------------------------- *
+ * mixTankL is the authoritative liters currently in the mixing tank, metered from
+ * ESP2's OWN fill/deliver flow sensors (the Nano ultrasonic is display-only). It is
+ * persisted to NVS so a reboot/power-down can NEVER make ESP2 forget the water and
+ * overfill on the next run. faultHeld pauses the sequence after a hard fault until the
+ * user-gated RESUME,<mode> arrives; the work order + step are kept (not cleared).      */
+Preferences prefs;
+float   mixTankL  = 0.0f;       // liters currently in the mixing tank (persisted)
+bool    faultHeld = false;      // sequence paused after a fault, awaiting RESUME
+
 /* ---- Metered-stage state ------------------------------------------------- */
 int   sgPump = -1, sgFlow = -1;
 float sgK = 1, sgTarget = 0;
+int   sgTankSign = 0;          // +1 = this stage FILLS the mix tank, -1 = DRAINS it, 0 = neither (dose)
 bool  sgIsAC = false, sgPumpOn = false, sgSawFlow = false;
 unsigned long sgT0 = 0;
 unsigned long acNoCurrentSince = 0;
@@ -215,7 +290,6 @@ unsigned long lastPzemMs = 0;     // PZEM read throttle (see PZEM_POLL_MS)
 
 /* ---- Misc state ---------------------------------------------------------- */
 unsigned long lastHeartbeat = 0;
-unsigned long nanoRstOffAt = 0;
 // ESP1-commanded preventive pump exercise (sec.14.9.1). The schedule lives on ESP1
 // (always-on, RTC); ESP2 just runs the named pump briefly when told to. Non-blocking:
 // turn the pump on, note the off-time, and complete it in loop() (like the Nano-RST pulse).
@@ -227,10 +301,18 @@ String rxLine;
 /* ---- Forward declarations ------------------------------------------------ */
 void wdtSetup();
 void feedWDT();
-void pcfWrite(uint16_t s);
+bool pcfWrite(uint16_t s);
 void pcfOn(uint8_t bit);
 void pcfOff(uint8_t bit);
 void stopAll();
+void cutoffEnergize();
+void cutoffDeenergize();
+void tankSave();
+void tankLoad();
+void holdFault(const char *resp, const char *loc);
+void resumeWork(const String &mode);
+bool pcfPresent();
+void pcfHealth();
 void reply(const String &body);
 void attachFlow(int pin);
 void detachFlow();
@@ -244,13 +326,19 @@ int  stagePoll();          // 1 done, 0 running, -1 no-flow fail
 void stageEnd();
 void goStep(SeqStep s);
 void finishOk();
-void failSequence(const char *resp, const char *loc);
+float endMeteredStage();
 void safetyMonitor();
 float readMixerCurrent();
 float readPH();
 float readEC();
 void heartbeat();
 void testSafety();
+void calStreamTick();
+int  flowPinForId(const String &id);
+bool applySetCal(const String &id, const String *tok, int n, int i);
+void setupPrime(const String &line, const String &col);
+void stopPrime();
+void primeSafety();
 
 /* =============================================================================
  *  SETUP  --  SAFE boot: all outputs OFF before anything else (sec.19.5.4)
@@ -261,7 +349,7 @@ void setup() {
   Serial.println(F("\n=== ESP32 #2 Actuator Controller boot ==="));
 
   Wire.begin(I2C_SDA, I2C_SCL);
-  pcfWrite(0xFFFF);                         // ALL actuators OFF first (SAFE state)
+  pcfWrite(0xFFFF);                         // ALL actuators OFF + master cutoff de-energized (SAFE)
 
   esp1Serial.begin(ESP1_BAUD, SERIAL_8N1, ESP1_RX_PIN, ESP1_TX_PIN);
   pzem.setAddress(0x01);                    // default PZEM Modbus address (begins Serial1)
@@ -271,6 +359,9 @@ void setup() {
   wo.active = false;
   lastHeartbeat = millis();
   rxLine.reserve(160);
+
+  tankLoad();                               // restore persisted mixing-tank volume (overfill guard)
+  Serial.printf("Restored mixing-tank volume: %.2f L\n", mixTankL);
 
   wdtSetup();
   reply("READY,ESP2");                      // tell ESP32 #1 we are up & SAFE (sec.10.7.4)
@@ -286,19 +377,16 @@ void loop() {
   runSequence();
   safetyMonitor();
   testSafety();
+  calStreamTick();             // Calibration Mode: stream the selected sensor's raw value (§A.3)
+  primeSafety();               // Prime dead-man + generous cap (§A.4.2)
+  pcfHealth();                 // PCF8575 bus watchdog -> PCF_FAIL / PCF_OK
   heartbeat();
-
-  // non-blocking Nano-RESET pulse completion
-  if (nanoRstOffAt && millis() >= nanoRstOffAt) {
-    pcfOff(OUT_NANO_RST);
-    nanoRstOffAt = 0;
-    reply("DONE,RESET_NANO");
-  }
 
   // non-blocking preventive-exercise completion (5 s pump run commanded by ESP1)
   if (exRunOffAt && millis() >= exRunOffAt) {
     pcfOff(exRunBit);
     pcfOff(OUT_INVERTER);
+    cutoffDeenergize();                  // drop the master cutoff again (back to safe idle)
     exRunOffAt = 0; exRunBit = -1;
     reply("DONE,EXERCISE," + exRunName);
   }
@@ -323,16 +411,73 @@ void feedWDT() { esp_task_wdt_reset(); }
 /* =============================================================================
  *  PCF8575  (raw I2C, active-LOW -- proven pattern)
  * ========================================================================== */
-void pcfWrite(uint16_t s) {
+bool pcfWrite(uint16_t s) {
   Wire.beginTransmission(PCF_ADDR);
   Wire.write(lowByte(s));
   Wire.write(highByte(s));
-  Wire.endTransmission();
+  bool ok = (Wire.endTransmission() == 0);          // 0 = ACKed; non-zero = bus/device fault
   pcfShadow = s;
+  if (!ok) { if (pcfFailCount < 250) pcfFailCount++; }   // consecutive-failure counter (debounce)
+  else     { pcfFailCount = 0; }
+  return ok;
 }
 void pcfOn(uint8_t bit)  { pcfWrite(pcfShadow & ~(1 << bit)); }   // clear bit = ON
 void pcfOff(uint8_t bit) { pcfWrite(pcfShadow |  (1 << bit)); }   // set bit  = OFF
-void stopAll()           { pcfWrite(0xFFFF); }
+void stopAll()           { pcfWrite(0xFFFF); }                    // all OFF incl. cutoff de-energized
+
+/* ---- P17 master actuator-power cutoff (sec.19.4.8) ----------------------- *
+ * Active-LOW: clearing bit 15 ENERGIZES the master relay (bank powered); setting it
+ * DE-energizes (whole P0-P16 bank goes hardware-dead, fail-safe). Energize before any
+ * actuation; de-energize on fault / completion / idle.                                */
+void cutoffEnergize()    { pcfOn(OUT_MASTER_CUTOFF); }
+void cutoffDeenergize()  { pcfOff(OUT_MASTER_CUTOFF); }
+
+/* ---- Mixing-tank volume persistence (NVS) -------------------------------- *
+ * Persist mixTankL so a reboot/brown-out/power-down can never make ESP2 assume an
+ * empty tank and overfill on the next fill (sec.19.4.8). Written on every change.      */
+void tankSave() { prefs.putFloat("mixL", mixTankL); }
+void tankLoad() {
+  prefs.begin("esp2", false);
+  mixTankL = prefs.getFloat("mixL", 0.0f);
+  if (mixTankL < 0.0f) mixTankL = 0.0f;
+}
+// Apply a metered stage's delivered volume to the tank: +liters for a FILL (reservoir->
+// mix), -liters for a DELIVER (mix->column). Clamps at 0 and persists.
+void tankApply(float deltaL) {
+  mixTankL += deltaL;
+  if (mixTankL < 0.0f) mixTankL = 0.0f;
+  tankSave();
+}
+
+/* =============================================================================
+ *  PCF8575 HEALTH  --  detect a dead/unresponsive relay bus, report to ESP1
+ * -----------------------------------------------------------------------------
+ *  Active-probes the PCF every PCF_PROBE_MS and watches pcfWrite() failures via a
+ *  consecutive-failure counter (so a single I2C glitch can't false-trip). On a real
+ *  fault it reports PCF_FAIL,I2C (re-asserted every PCF_REPORT_MS so a missed UART
+ *  line still gets through) and PCF_OK on recovery. Major on ESP1 (no shutdown) --
+ *  other safeties (PZEM no-current, flow timeout) still apply.                    */
+bool pcfPresent() {
+  Wire.beginTransmission(PCF_ADDR);
+  return (Wire.endTransmission() == 0);
+}
+void pcfHealth() {
+  if (millis() - lastPcfProbeMs >= PCF_PROBE_MS) {  // periodic active probe (covers idle)
+    lastPcfProbeMs = millis();
+    if (pcfPresent()) pcfFailCount = 0;
+    else if (pcfFailCount < 250) pcfFailCount++;
+  }
+  bool faulted = (pcfFailCount >= PCF_FAIL_LIMIT);
+  if (faulted) {
+    if (!pcfFaultReported || millis() - lastPcfReportMs >= PCF_REPORT_MS) {
+      pcfFaultReported = true; lastPcfReportMs = millis();
+      reply("PCF_FAIL,I2C");                        // ESP1 = Major (alert + log)
+    }
+  } else if (pcfFaultReported) {                    // recovered
+    pcfFaultReported = false;
+    reply("PCF_OK");
+  }
+}
 
 /* =============================================================================
  *  UART reply helper
@@ -395,24 +540,82 @@ void dispatch(const String &payload) {
 
   // ---- always-honored commands ----
   if (cmd == "STOP_ALL") {
-    stopAll(); step = SEQ_NONE; wo.active = false; detachFlow();
+    stopAll(); step = SEQ_NONE; wo.active = false; faultHeld = false; detachFlow();
     testMode = false; testHeldBit = -1; testCapped = false;
+    if (primeLine != "") stopPrime(); calId = "";        // drop any calibration stream / prime
+
+    // Cancel any in-flight one-shot timers so loop() can't emit a stray late DONE
+    // (DONE,EXERCISE) after the stop. NOTE: mixTankL is kept (persisted) -- the tank may
+    // still physically hold water, and the next run must account for it (no overfill).
+    exRunOffAt = 0; exRunBit = -1;
     reply("DONE,STOP_ALL");
     return;
   }
   if (cmd == "STATUS_REQ") { reply("STATUS,ESP2,OK"); return; }
+  if (cmd == "RESET_SELF") {                 // soft reboot on ESP1 request (spec sec.9.7.2)
+    reply("ACK,RESET_SELF");
+    stopAll();                               // force SAFE (all outputs OFF) before reboot
+    esp1Serial.flush();                      // shift the ACK out before we reset (no delay(); we reboot next)
+    ESP.restart();
+  }
+  // ---- user-gated fault recovery (sec.19.4.8.2): RESUME,<NORMAL|IRRIGATE|RELEASE> ----
+  if (cmd == "RESUME") {
+    if (!faultHeld) { reply("INVALID,NOT_HELD"); return; }
+    String mode = (n >= 2) ? tok[1] : "NORMAL";
+    if (mode != "NORMAL" && mode != "IRRIGATE" && mode != "RELEASE") { reply("INVALID,RESUME_MODE"); return; }
+    resumeWork(mode);                        // re-energizes P17, resumes/rewrites the FSM, replies ACK,RESUME
+    return;
+  }
+
+  // ---- Calibration Mode (companion spec §A): raw stream / push const / prime ----
+  if (cmd == "CAL_START") {
+    if (wo.active || faultHeld || testMode) { reply("BUSY,ACTIVE"); return; }
+    if (n < 2) { reply("INVALID,CAL_START"); return; }
+    calId = tok[1];
+    int fp = flowPinForId(calId);
+    if (fp >= 0) attachFlow(fp);             // arm + zero this flow ISR (pulses accumulate across bursts)
+    reply("ACK,CAL_START," + calId);
+    return;
+  }
+  if (cmd == "CAL_STOP") {
+    if (calId.startsWith("FLOW_")) detachFlow();
+    calId = "";
+    reply("ACK,CAL_STOP");
+    return;
+  }
+  if (cmd == "SET_CAL") {                     // push one runtime calibration constant (block-until-ACK on ESP1)
+    if (n < 3) { reply("INVALID,SET_CAL"); return; }
+    bool ok = applySetCal(tok[1], tok, n, 2);
+    reply(ok ? ("ACK,SET_CAL," + tok[1]) : "INVALID,SET_CAL_ID");
+    return;
+  }
+  if (cmd == "PRIME_START") {
+    if (wo.active || faultHeld || testMode) { reply("BUSY,ACTIVE"); return; }
+    if (n < 2) { reply("INVALID,PRIME"); return; }
+    if (primeLine == "" || primeLine != tok[1]) setupPrime(tok[1], (n >= 3) ? tok[2] : "");
+    primeLastMs = millis();                   // (re)arm the dead-man keep-alive
+    return;
+  }
+  if (cmd == "PRIME_STOP") { stopPrime(); reply("DONE,PRIME"); return; }
 
   // ---- manual relay test, dead-man (ESP1 Settings>Testing, spec sec.18.10.8) ----
   if (cmd == "TEST") {
     String sub = (n >= 2) ? tok[1] : "";
     if (sub == "ENTER") {                                  // enter TEST_MODE, force SAFE
-      if (wo.active || step != SEQ_NONE) { reply("BUSY,ACTIVE"); return; }
+      if (wo.active || step != SEQ_NONE) { reply(faultHeld ? "BUSY,HELD" : "BUSY,ACTIVE"); return; }
       stopAll(); testMode = true; testHeldBit = -1; testCapped = false;
+      cutoffEnergize();                                    // power the bank so manual relay control works (sec.19.4.8.4)
+      exRunOffAt = 0; exRunBit = -1;                       // drop any pending one-shot timers
       reply("ACK,TEST,ENTER"); return;
     }
-    if (sub == "EXIT") { stopAll(); testMode = false; testHeldBit = -1; reply("DONE,TEST"); return; }
+    if (sub == "EXIT") {
+      stopAll(); testMode = false; testHeldBit = -1;       // all OFF incl. master cutoff de-energized
+      exRunOffAt = 0; exRunBit = -1;                       // drop any pending one-shot timers
+      reply("DONE,TEST"); return;
+    }
     if (sub == "RELEASE") {                                // explicit button-up
       if (testHeldBit >= 0) pcfOff(testHeldBit);
+      cutoffEnergize();                                    // resting test state: bank stays powered
       testHeldBit = -1; testCapped = false; return;
     }
     if (sub == "HOLD") {                                   // dead-man keep-alive for <bit>
@@ -420,7 +623,15 @@ void dispatch(const String &payload) {
       int bit = tok[2].toInt();
       if (bit < 0 || bit > 15) { reply("INVALID,TEST_BIT"); return; }
       if (bit != testHeldBit) {                            // new selection -> one-at-a-time switch
-        stopAll(); pcfOn(bit);
+        stopAll();
+        if (bit == OUT_MASTER_CUTOFF) {
+          // REVERSED in test mode: the bank is kept powered by default, so holding the master
+          // cutoff entry DE-energizes it (lets the operator verify the cutoff drops the bank).
+          cutoffDeenergize();
+        } else {
+          cutoffEnergize();                                // keep the bank powered so the relay actuates
+          pcfOn(bit);
+        }
         testHeldBit = bit; testRelayOnMs = millis(); testCapped = false;
       }
       testLastHoldMs = millis();                           // refresh dead-man timer
@@ -428,14 +639,9 @@ void dispatch(const String &payload) {
     }
     reply("INVALID,TEST_SUB"); return;
   }
-  if (cmd == "RESET_NANO") {
-    pcfOn(OUT_NANO_RST);                    // transistor pulls Nano RESET low
-    nanoRstOffAt = millis() + NANO_RST_PULSE_MS;
-    reply("ACK,RESET_NANO");
-    return;
-  }
   // ---- preventive pump exercise, commanded by ESP1 (sec.14.9.1) ----
   if (cmd == "EXERCISE") {
+    if (faultHeld) { reply("BUSY,HELD"); return; }
     if (wo.active || step != SEQ_NONE || testMode) { reply("BUSY,ACTIVE"); return; }
     if (n < 2) { reply("INVALID,EXERCISE"); return; }
     int bit = (tok[1] == "TRANSFER") ? OUT_TRANSFER
@@ -443,6 +649,7 @@ void dispatch(const String &payload) {
             : (tok[1] == "MIXER")    ? OUT_MIXER : -1;
     if (bit < 0) { reply("INVALID,EXERCISE_DEV"); return; }
     reply("ACK,EXERCISE");
+    cutoffEnergize();                                  // power the bank (sec.19.4.8)
     pcfOn(OUT_INVERTER); pcfOn(bit);                   // AC source on, then the pump
     exRunBit = bit; exRunName = tok[1];
     exRunOffAt = millis() + PUMP_EXERCISE_RUN_MS;       // loop() turns it off + reports DONE
@@ -453,6 +660,7 @@ void dispatch(const String &payload) {
   bool isIrr  = cmd.startsWith("SEQ_IRRIGATION_");
   bool isFert = cmd.startsWith("SEQ_FERTIGATION_");
   if (!isIrr && !isFert) { reply("INVALID,UNKNOWN_CMD"); return; }
+  if (faultHeld) { reply("BUSY,HELD"); return; }                 // a held fault must be resolved (RESUME) first
   if (testMode) { reply("BUSY,TEST"); return; }                  // never auto-run during a manual test
   if (wo.active || step != SEQ_NONE) { reply("BUSY,ACTIVE"); return; }
 
@@ -474,6 +682,11 @@ void dispatch(const String &payload) {
     else if (tok[i] == "EC" && i + 2 < n)    { wo.ecLo = tok[++i].toFloat(); wo.ecHi = tok[++i].toFloat(); }
     else if (tok[i] == "PH" && i + 2 < n)    { wo.phLo = tok[++i].toFloat(); wo.phHi = tok[++i].toFloat(); }
     else if (tok[i] == "MIX" && i + 1 < n)   { wo.mixMs = (unsigned long)tok[++i].toInt(); }
+    // Job-critical calibration carried in the work order (§A.5.1 #3): never run a dose on stale K/cal.
+    else if (tok[i] == "KMAIN" && i + 2 < n) { K_RES_MIX = tok[++i].toFloat(); K_MIX_IRR = tok[++i].toFloat(); }
+    else if (tok[i] == "KNUT" && i + 3 < n)  { K_NUT[0] = tok[++i].toFloat(); K_NUT[1] = tok[++i].toFloat(); K_NUT[2] = tok[++i].toFloat(); }
+    else if (tok[i] == "ECCAL" && i + 2 < n) { EC_CAL_M = tok[++i].toFloat(); EC_CAL_B = tok[++i].toFloat(); }
+    else if (tok[i] == "PHCAL" && i + 2 < n) { PH_CAL_M = tok[++i].toFloat(); PH_CAL_B = tok[++i].toFloat(); }
   }
   if (wo.flushPct < 0) wo.flushPct = 0; if (wo.flushPct > 90) wo.flushPct = 90;
 
@@ -486,10 +699,13 @@ void dispatch(const String &payload) {
  * ========================================================================== */
 void startWorkOrder() {
   wo.active = true;
+  faultHeld = false;
   ecphFailed = false;
   doseIdx = 0;
   woWaterL = 0.0f;
-  Serial.printf("Work order: %s fert=%d flush=%.0f%%\n", wo.cmdName.c_str(), wo.fertigate, wo.flushPct);
+  cutoffEnergize();              // power the actuator bank (sec.19.4.8); individual relays still gate each load
+  Serial.printf("Work order: %s fert=%d flush=%.0f%% tank=%.2fL\n",
+                wo.cmdName.c_str(), wo.fertigate, wo.flushPct, mixTankL);
   goStep(SEQ_FILL);
 }
 
@@ -497,9 +713,21 @@ void goStep(SeqStep s) { step = s; stepInit = false; }
 
 void stageBegin(int pumpBit, bool isAC, int flowPin, float k, float targetL) {
   sgPump = pumpBit; sgIsAC = isAC; sgFlow = flowPin; sgK = k; sgTarget = targetL;
+  sgTankSign = 0;                // default: stage does not move tank water (set by caller for fill/deliver)
   sgPumpOn = false; sgSawFlow = false; sgT0 = millis();
   acNoCurrentSince = 0;
   if (isAC) pcfOn(OUT_INVERTER);
+}
+
+// End a metered FILL/DELIVER stage, crediting the liters it moved to the persisted tank
+// volume (and, for a DELIVER, to the per-order water-to-column tally). Reads before stageEnd
+// so it works for both normal completion and a mid-stage fault (partial liters still count).
+float endMeteredStage() {
+  float liters = litersSoFar(sgK);
+  if      (sgTankSign > 0) tankApply(+liters);                 // reservoir -> mix
+  else if (sgTankSign < 0) { tankApply(-liters); woWaterL += liters; }  // mix -> column
+  stageEnd();
+  return liters;
 }
 int stagePoll() {
   if (!sgPumpOn) {                          // valve/inverter settle, then start pump
@@ -523,45 +751,79 @@ void stageEnd() {
 }
 
 void finishOk() {
-  stopAll();
+  stopAll();                         // all OFF + master cutoff de-energized
+  mixTankL = 0.0f; tankSave();       // tank emptied to the column -> clear the persisted volume
   String name = wo.cmdName;
   float water = woWaterL;
-  wo.active = false; step = SEQ_NONE;
+  wo.active = false; faultHeld = false; step = SEQ_NONE;
   // Append measured water so ESP1 can tally per-column daily usage (sec.12.1.3 / B1).
   reply("DONE," + name + ",WATER," + String(water, 2));
 }
-void failSequence(const char *resp, const char *loc) {
-  stageEnd();
-  stopAll();
-  wo.active = false; step = SEQ_NONE;
+
+// Hard fault (sec.19.4.8.1): drop the master cutoff (bank hardware-dead), PAUSE the sequence
+// but KEEP the work order + step + the persisted mix-tank volume, and STAY ALIVE awaiting a
+// user-gated RESUME,<mode>. ESP2 does NOT power itself off -- that would forget the water and
+// overfill on resume; ESP1 keeps it powered while held.
+void holdFault(const char *resp, const char *loc) {
+  stageEnd();                        // pump off + flow detached (partial liters already credited by caller)
+  stopAll();                         // all OFF, master cutoff de-energized
+  faultHeld = true;
+  stepInit  = false;                 // on RESUME the paused step re-inits with the updated tank volume
   reply(String(resp) + "," + loc);
+}
+
+// User-gated recovery (sec.19.4.8.2). NORMAL resumes the paused step; IRRIGATE finishes as
+// irrigation-only (top up plain water to the column budget, no dosing); RELEASE dumps the
+// current tank contents to the assigned column as-is. All re-energize P17 first.
+void resumeWork(const String &mode) {
+  faultHeld = false;
+  cutoffEnergize();
+  if (mode == "IRRIGATE") {
+    wo.fertigate = false; wo.flushPct = 0;     // top-up FILL to budget, then DELIVER, no flush/dosing
+    goStep(SEQ_FILL);
+  } else if (mode == "RELEASE") {
+    wo.fertigate = false; wo.flushPct = 0;     // skip fill/dose: just DELIVER whatever is in the tank
+    goStep(SEQ_DELIVER);
+  } else {                                     // NORMAL: continue the paused sequence as-is
+    stepInit = false;                          // re-init the current step with the updated tank volume
+  }
+  reply("ACK,RESUME," + mode);
 }
 
 void runSequence() {
   if (step == SEQ_NONE) return;
+  if (faultHeld) return;                 // paused after a fault -> wait for RESUME (sec.19.4.8)
   int c = wo.col;
   const char *colLoc = (c == 0) ? "COL_A" : (c == 1) ? "COL_B" : "COL_C";
 
   switch (step) {
 
-    /* ---- FILL: reservoir -> mixing tank (transfer pump, flow 4) ---------- */
+    /* ---- FILL: reservoir -> mixing tank (transfer pump, flow 4) ---------- *
+     * Target is the REMAINING liters to reach the desired mix level minus what is
+     * already in the tank (mixTankL) -- so a resume never re-fills from 0 and overfills. */
     case SEQ_FILL: {
       if (!stepInit) {
-        float target = wo.fertigate ? WATER_BUDGET_L[c] * (1.0f - wo.flushPct / 100.0f)
+        float desired = wo.fertigate ? WATER_BUDGET_L[c] * (1.0f - wo.flushPct / 100.0f)
                                      : WATER_BUDGET_L[c];
+        float remaining = desired - mixTankL;
+        if (remaining < TANK_EPS_L) {                 // already enough in the tank -> skip the fill
+          goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); break;
+        }
         pcfOn(OUT_RES_VALVE);
-        stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, target);
+        stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
+        sgTankSign = +1;                              // this stage adds water to the mix tank
         stepInit = true;
       }
       int r = stagePoll();
-      if (r == 1)      { stageEnd(); pcfOff(OUT_RES_VALVE); goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); }
-      else if (r == -1){ pcfOff(OUT_RES_VALVE); failSequence("FLOW_FAIL", "TRANSFER"); }
+      if (r == 1)      { endMeteredStage(); pcfOff(OUT_RES_VALVE); goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); }
+      else if (r == -1){ endMeteredStage(); pcfOff(OUT_RES_VALVE); holdFault("FLOW_FAIL", "TRANSFER"); }
       break;
     }
 
     /* ---- DOSE: nutrients A/B/C into mixing tank (sequential) ------------- */
     case SEQ_DOSE: {
       if (!stepInit) {
+        pcfOff(OUT_INVERTER);                            // nutrient pumps are DC; drop the AC source
         // skip zero / disabled doses
         while (doseIdx < 3 && wo.dose[doseIdx] <= 0.0f) doseIdx++;
         if (doseIdx >= 3) { goStep(SEQ_MIX); break; }
@@ -596,7 +858,7 @@ void runSequence() {
     case SEQ_MIX: {
       if (!stepInit) { pcfOn(OUT_INVERTER); pcfOn(OUT_MIXER); stepStart = millis(); stepInit = true; }
       float mi = readMixerCurrent();
-      if (mi > MIXER_OVERCURRENT_A) { pcfOff(OUT_MIXER); failSequence("SAFE_STOP", "MIXER_OC"); break; }
+      if (mi > MIXER_OVERCURRENT_A) { pcfOff(OUT_MIXER); holdFault("SAFE_STOP", "MIXER_OC"); break; }
       if (millis() - stepStart >= wo.mixMs) {
         // no-load check at end of mix window (spec sec.23.2.2.4). DEGRADED (not ERROR):
         // Major condition, ESP1 must not critical-stop -- the batch still delivers.
@@ -609,32 +871,40 @@ void runSequence() {
 
     /* ---- EC/pH validation (local protective check, spec sec.14.2.4) ------ */
     case SEQ_ECPH: {
-      float ph = readPH(), ec = readEC();
-      if (ph < wo.phLo || ph > wo.phHi) { ecphFailed = true; reply(String("PH_FAIL,") + colLoc); }
-      else if (ec < wo.ecLo || ec > wo.ecHi) { ecphFailed = true; reply(String("EC_FAIL,") + colLoc); }
+      int phRaw = analogRead(PIN_PH), ecRaw = analogRead(PIN_EC);
+      float ph = PH_CAL_M * phRaw + PH_CAL_B;
+      float ec = EC_CAL_M * ecRaw + EC_CAL_B;
+      // HARDWARE fault first (railed ADC = probe disconnected/shorted) -> SENSOR_FAIL, distinct
+      // from an in-range value that is merely outside the safe window (EC_FAIL/PH_FAIL). Both
+      // are Major on ESP1; check EC and pH independently so a double-fault reports both.
+      if (phRaw <= PH_ADC_FAULT_LO || phRaw >= PH_ADC_FAULT_HI) { ecphFailed = true; reply("SENSOR_FAIL,PH"); }
+      else if (ph < wo.phLo || ph > wo.phHi)                    { ecphFailed = true; reply(String("PH_FAIL,") + colLoc); }
+      if (ecRaw <= EC_ADC_FAULT_LO || ecRaw >= EC_ADC_FAULT_HI) { ecphFailed = true; reply("SENSOR_FAIL,EC"); }
+      else if (ec < wo.ecLo || ec > wo.ecHi)                    { ecphFailed = true; reply(String("EC_FAIL,") + colLoc); }
       // Plumbing has no drain: deliver the mixed batch regardless, fault already reported.
       goStep(SEQ_DELIVER);
       break;
     }
 
-    /* ---- DELIVER: mixing tank -> column (booster pump, flow 5) ----------- */
+    /* ---- DELIVER: mixing tank -> column (booster pump, flow 5) ----------- *
+     * Target is the whole current tank volume (mixTankL) -- delivering empties it. On a
+     * resume this is exactly the remaining water, so it never under/over-delivers.        */
     case SEQ_DELIVER: {
       if (!stepInit) {
-        float target = wo.fertigate ? WATER_BUDGET_L[c] * (1.0f - wo.flushPct / 100.0f)
-                                     : WATER_BUDGET_L[c];
+        if (mixTankL < TANK_EPS_L) { finishOk(); break; }   // nothing to deliver
         pcfOn(OUT_MIX_VALVE); pcfOn(COL_VALVE_BIT[c]);
-        stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, target);
+        stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
+        sgTankSign = -1;                                     // this stage drains the mix tank
         stepInit = true;
       }
       int r = stagePoll();
       if (r == 1) {
-        woWaterL += litersSoFar(K_MIX_IRR);            // metered water to the column (read before stageEnd)
-        stageEnd(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]);
+        endMeteredStage(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]);
         if (wo.fertigate && wo.flushPct > 0) goStep(SEQ_FLUSH_FILL);
         else finishOk();
       } else if (r == -1) {
-        pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]);
-        failSequence("FLOW_FAIL", "MAIN");
+        endMeteredStage(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]);
+        holdFault("FLOW_FAIL", "MAIN");
       }
       break;
     }
@@ -642,28 +912,31 @@ void runSequence() {
     /* ---- FLUSH_FILL: plain reservoir water -> mixing tank ---------------- */
     case SEQ_FLUSH_FILL: {
       if (!stepInit) {
-        float target = WATER_BUDGET_L[c] * (wo.flushPct / 100.0f);
+        float remaining = WATER_BUDGET_L[c] * (wo.flushPct / 100.0f) - mixTankL;
+        if (remaining < TANK_EPS_L) { goStep(SEQ_FLUSH_DELIVER); break; }
         pcfOn(OUT_RES_VALVE);
-        stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, target);
+        stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
+        sgTankSign = +1;
         stepInit = true;
       }
       int r = stagePoll();
-      if (r == 1)      { stageEnd(); pcfOff(OUT_RES_VALVE); goStep(SEQ_FLUSH_DELIVER); }
-      else if (r == -1){ pcfOff(OUT_RES_VALVE); failSequence("FLOW_FAIL", "TRANSFER"); }
+      if (r == 1)      { endMeteredStage(); pcfOff(OUT_RES_VALVE); goStep(SEQ_FLUSH_DELIVER); }
+      else if (r == -1){ endMeteredStage(); pcfOff(OUT_RES_VALVE); holdFault("FLOW_FAIL", "TRANSFER"); }
       break;
     }
 
     /* ---- FLUSH_DELIVER: plain water -> column (final flush step) --------- */
     case SEQ_FLUSH_DELIVER: {
       if (!stepInit) {
-        float target = WATER_BUDGET_L[c] * (wo.flushPct / 100.0f);
+        if (mixTankL < TANK_EPS_L) { finishOk(); break; }
         pcfOn(OUT_MIX_VALVE); pcfOn(COL_VALVE_BIT[c]);
-        stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, target);
+        stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
+        sgTankSign = -1;
         stepInit = true;
       }
       int r = stagePoll();
-      if (r == 1)      { woWaterL += litersSoFar(K_MIX_IRR); stageEnd(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]); finishOk(); }
-      else if (r == -1){ pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]); failSequence("FLOW_FAIL", "MAIN"); }
+      if (r == 1)      { endMeteredStage(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]); finishOk(); }
+      else if (r == -1){ endMeteredStage(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]); holdFault("FLOW_FAIL", "MAIN"); }
       break;
     }
 
@@ -686,12 +959,14 @@ void safetyMonitor() {
   float i = pzem.current();
   if (isnan(v) || isnan(i)) return;         // PZEM absent/unreadable -> skip (graceful)
 
-  if (i > PZEM_OVERCURRENT_A)        { failSequence("PWR_FAIL", "OVERCURRENT"); return; }
-  if (v < PZEM_V_MIN || v > PZEM_V_MAX) { failSequence("PWR_FAIL", "VOLTAGE"); return; }
+  // Credit the partial liters this metered stage moved before holding (overfill guard), then
+  // PAUSE on the master cutoff awaiting RESUME (sec.19.4.8) -- ESP2 stays alive holding the tank.
+  if (i > PZEM_OVERCURRENT_A)        { endMeteredStage(); holdFault("PWR_FAIL", "OVERCURRENT"); return; }
+  if (v < PZEM_V_MIN || v > PZEM_V_MAX) { endMeteredStage(); holdFault("PWR_FAIL", "VOLTAGE"); return; }
 
   if (i < PZEM_MIN_CURRENT_A) {             // pump ON but drawing no current
     if (acNoCurrentSince == 0) acNoCurrentSince = millis();
-    else if (millis() - acNoCurrentSince > PZEM_NO_CURRENT_MS) { failSequence("PWR_FAIL", "NO_CURRENT"); return; }
+    else if (millis() - acNoCurrentSince > PZEM_NO_CURRENT_MS) { endMeteredStage(); holdFault("PWR_FAIL", "NO_CURRENT"); return; }
   } else {
     acNoCurrentSince = 0;
   }
@@ -725,13 +1000,108 @@ void testSafety() {
   // 10 s HARD CAP: force OFF regardless of ESP1, stay capped until the operator
   // releases (HOLD stream stops -> the timeout below clears testHeldBit).
   if (!testCapped && now - testRelayOnMs >= TEST_HARD_CAP_MS) {
-    pcfOff(testHeldBit); testCapped = true;
+    pcfOff(testHeldBit); cutoffEnergize(); testCapped = true;   // back to resting (bank powered)
     reply("DONE,TEST_CAP");
   }
   // Dead-man: no HOLD within the timeout (button released, ESP1 hung, or link lost)
-  // -> relay OFF and clear selection (fail-safe).
+  // -> relay OFF and clear selection (fail-safe). Restore the resting bank-powered state.
   if (now - testLastHoldMs > TEST_HOLD_TIMEOUT_MS) {
     if (!testCapped) pcfOff(testHeldBit);
+    cutoffEnergize();
     testHeldBit = -1; testCapped = false;
   }
+}
+
+/* =============================================================================
+ *  CALIBRATION MODE  (companion spec §A)  --  raw stream, SET_CAL, Prime dead-man
+ * ========================================================================== */
+// Map a FLOW_* CAL/Prime id to its hardware pin (-1 if not a flow id).
+int flowPinForId(const String &id) {
+  if (id == "FLOW_RESMIX") return FLOW_RES_MIX;
+  if (id == "FLOW_MIXIRR") return FLOW_MIX_IRR;
+  if (id == "FLOW_NUTA")   return FLOW_NUT_A;
+  if (id == "FLOW_NUTB")   return FLOW_NUT_B;
+  if (id == "FLOW_NUTC")   return FLOW_NUT_C;
+  if (id == "FLOW_NUTD")   return 25;   // wired but not metered in normal operation
+  if (id == "FLOW_PHUP")   return 26;
+  if (id == "FLOW_PHDN")   return 27;
+  return -1;
+}
+
+// Stream the selected sensor's RAW value (~1.6 Hz) for interactive calibration (§A.3).
+void calStreamTick() {
+  if (calId == "") return;
+  if (millis() - lastCalMs < CAL_STREAM_MS) return;
+  lastCalMs = millis();
+  long raw;
+  if      (calId == "PH")     raw = analogRead(PIN_PH);
+  else if (calId == "EC")     raw = analogRead(PIN_EC);
+  else if (calId == "ACS712") raw = analogRead(PIN_MIXER_I);
+  else if (calId.startsWith("FLOW_")) { noInterrupts(); raw = (long)flowPulses; interrupts(); }
+  else return;
+  reply("CAL," + calId + "," + String(raw));
+}
+
+// Apply one pushed calibration constant to the matching runtime variable. pH/EC carry two
+// values (slope M then offset B). Flow ids that ESP2 does not meter in normal operation
+// (NUTD/PHUP/PHDN) are accepted as a no-op so the ESP1 block-until-ACK save still completes.
+bool applySetCal(const String &id, const String *tok, int n, int i) {
+  if      (id == "FLOW_RESMIX") K_RES_MIX = tok[i].toFloat();
+  else if (id == "FLOW_MIXIRR") K_MIX_IRR = tok[i].toFloat();
+  else if (id == "FLOW_NUTA")   K_NUT[0]  = tok[i].toFloat();
+  else if (id == "FLOW_NUTB")   K_NUT[1]  = tok[i].toFloat();
+  else if (id == "FLOW_NUTC")   K_NUT[2]  = tok[i].toFloat();
+  else if (id == "ACS712")      ACS712_ZERO_V = tok[i].toFloat();
+  else if (id == "PH") { PH_CAL_M = tok[i].toFloat(); if (i + 1 < n) PH_CAL_B = tok[i + 1].toFloat(); }
+  else if (id == "EC") { EC_CAL_M = tok[i].toFloat(); if (i + 1 < n) EC_CAL_B = tok[i + 1].toFloat(); }
+  else if (id == "FLOW_NUTD" || id == "FLOW_PHUP" || id == "FLOW_PHDN") { /* not metered here: accept */ }
+  else return false;
+  return true;
+}
+
+// Arm a prime line: open its valve(s) + run its paired pump together (§A.4.2.1). Energizes the
+// master cutoff first so the bank has power. Switching lines stops the previous one.
+void setupPrime(const String &line, const String &col) {
+  if (primeLine != "") stopPrime();
+  int valveA = -1, valveB = -1, pump = -1; bool isAC = false;
+  if      (line == "RESMIX") { valveA = OUT_RES_VALVE; pump = OUT_TRANSFER; isAC = true; }
+  else if (line == "MIXIRR") {
+    valveA = OUT_MIX_VALVE; pump = OUT_BOOSTER; isAC = true;
+    int c = (col == "A") ? 0 : (col == "B") ? 1 : (col == "C") ? 2 : -1;
+    if (c >= 0) valveB = COL_VALVE_BIT[c];
+  }
+  else if (line == "NUTA") pump = OUT_NUT_A;
+  else if (line == "NUTB") pump = OUT_NUT_B;
+  else if (line == "NUTC") pump = OUT_NUT_C;
+  else if (line == "NUTD") pump = OUT_NUT_D;
+  else if (line == "PHUP") pump = OUT_PH_UP;
+  else if (line == "PHDN") pump = OUT_PH_DN;
+  else { reply("INVALID,PRIME_LINE"); return; }
+
+  cutoffEnergize();
+  if (isAC) pcfOn(OUT_INVERTER);
+  if (valveA >= 0) pcfOn(valveA);
+  if (valveB >= 0) pcfOn(valveB);
+  pcfOn(pump);
+  primeLine = line; primeValveA = valveA; primeValveB = valveB; primePump = pump;
+  primeIsAC = isAC; primeOnMs = millis(); primeCapped = false;
+  reply("ACK,PRIME_START," + line);
+}
+
+void stopPrime() {
+  if (primeLine == "") return;
+  if (primePump  >= 0) pcfOff(primePump);
+  if (primeValveA >= 0) pcfOff(primeValveA);
+  if (primeValveB >= 0) pcfOff(primeValveB);
+  if (primeIsAC) pcfOff(OUT_INVERTER);
+  cutoffDeenergize();
+  primeLine = ""; primeValveA = primeValveB = primePump = -1; primeIsAC = false; primeCapped = false;
+}
+
+// Prime dead-man + generous cap (§A.4.2.2): stop if no keep-alive arrives in time, or the cap elapses.
+void primeSafety() {
+  if (primeLine == "") return;
+  unsigned long now = millis();
+  if (now - primeOnMs >= PRIME_CAP_MS) { stopPrime(); reply("DONE,PRIME_CAP"); return; }
+  if (now - primeLastMs > PRIME_HOLD_TIMEOUT_MS) { stopPrime(); reply("DONE,PRIME"); }
 }
