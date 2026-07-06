@@ -107,7 +107,7 @@ enum SchedMode { SCHED_AUTO = 0, SCHED_MANUAL = 1 };
 uint8_t colSchedMode[NUM_COLUMNS] = { SCHED_AUTO, SCHED_AUTO, SCHED_AUTO };
 
 /* ---- Fertigation decision (spec sec.14.2.0) ------------------------------ */
-float fertGap = 20.0f;                        // mg/kg below target -> fertigate (NVS) [TBD]
+float fertGap = 30.0f;                        // mg/kg below target -> fertigate (FERTIGATE_TRIGGER_GAP, §6; NVS) [TBD]
 const float FLUSH_PCT             = 20.0f;    // post-fertigation flush % (sec.14.2.0.2)
 const unsigned long MIXING_DURATION_MS = 30000UL;  // homogenize time           [TBD]
 
@@ -226,39 +226,49 @@ const uint16_t NIGHT_END_MIN        = 6*60;    // night idle ends
 const float TEMP_MIN = -10.0f, TEMP_MAX = 70.0f;
 
 /* =============================================================================
- *  DOSING -- DELEGATED STUB (spec sec.12.4 / CLAUDE.md)  -- EDIT TABLES ONLY
+ *  NUTRIENT DOSING  (companion spec Nutrient_Dosing_Firmware_Spec.md)  -- EDIT TABLES
  * -----------------------------------------------------------------------------
- *  The mg/kg -> mL conversion is intentionally NOT implemented. Below are the
- *  editable tables the future calculation will consume; calcDoseML() returns a
- *  documented placeholder so the rest of the system compiles and runs.
+ *  Open-loop, gap-based: ESP32 #1 computes per-nutrient mL from the lab soil baseline,
+ *  quantizes to whole flow-sensor pulses (with a floor), derives a 2x timed ceiling, and
+ *  ships it in the work order. ESP32 #2 doses flow-metered and trips DOSE_TIMEOUT on a
+ *  ceiling/no-flow. NPK sensor is the recorded OUTCOME, never a mid-dose input (§12.4).
+ *  >>> The §3.1 gap arithmetic is transcribed literally; final unit/soil-mass basis +
+ *      diluted STOCK_* values are commissioning math (one editable block).
  * ========================================================================== */
-// Element contribution per mL of each nutrient bottle (mg of N/P/K per mL) [MEASURE]
-struct NutrientConc { float nPerML, pPerML, kPerML; };
-const NutrientConc NUTRIENT_CONC[3] = {   // A=CalNitrate, B=MAP, C=KNO3
-  { 0.0f, 0.0f, 0.0f },   // Nutrient A  [MEASURE]
-  { 0.0f, 0.0f, 0.0f },   // Nutrient B  [MEASURE]
-  { 0.0f, 0.0f, 0.0f },   // Nutrient C  [MEASURE]
-};
-// Lab-measured existing soil N-P-K baseline per column (mg/kg) [MEASURE]
-float LAB_SOIL_BASELINE[NUM_COLUMNS][3] = {
-  { 0.0f, 0.0f, 0.0f },   // Column A {N,P,K}
-  { 0.0f, 0.0f, 0.0f },   // Column B
-  { 0.0f, 0.0f, 0.0f },   // Column C
-};
-// Built-in crop presets: name -> target N,P,K (mg/kg) + pH. Expandable.
+// ---- Soil baseline (mg/kg) -- F.A.S.T. Labs MC2812-6783 (§6) [MEASURE] ----
+const float SOIL_BASELINE_N = 1060.0f;   // Kjeldahl
+const float SOIL_BASELINE_P = 80.0f;     // elemental (from P2O5)
+const float SOIL_BASELINE_K = 200.0f;    // elemental (from K2O)
+// ---- Stock concentrations (mg/L) -- DILUTE at commissioning so doses clear the floor (§3.5) ----
+const float STOCK_A_N = 3100.0f, STOCK_A_Ca = 3800.0f;   // CALCINIT (A) -- N driver, gap-gated (§3.3)
+const float STOCK_B_P = 1338.0f, STOCK_B_N  = 590.0f;    // MAP (B) -- carries the P gap
+const float STOCK_C_K = 3383.0f, STOCK_C_N  = 566.0f;    // KNO3 (C) -- carries the K gap
+// ---- Pulse-quantized dosing (§3.4) ----
+const int   MIN_DOSE_PULSES = 3;         // ~12 mL floor; below this -> skip + log (LOCKED)
+// (pulses/mL "SCALE" comes live from the per-channel flow K-factor calKNut[i]/1000, not a constant.)
+// ---- Timed-ceiling backstop (§2.4) ----
+const float CEILING_MARGIN  = 2.0f;      // ceiling_s = 2x expected runtime (LOCKED)
+const float PUMP_FLOWRATE_MLPM[3] = { 50.0f, 50.0f, 50.0f };   // pre-cal default mL/min [MEASURE]
+// ---- Mixing tank (§1.1): batch volume is VARIABLE; MAX is a ceiling, not the formula input ----
+const float MIXING_TANK_MAX_VOLUME = 50.0f;   // L (safety ceiling)
+const float MIXING_TANK_SAFE_MIN   = 5.0f;    // L (refuse dosing below)
+// Per-column water budget per service (must mirror ESP2's WATER_BUDGET_L) [TBD]
+const float WATER_BUDGET_L[NUM_COLUMNS] = { 5.0f, 5.0f, 5.0f };
+
+// Built-in crop presets (mg/kg, §6) -> target N,P,K + pH (pH is the EC/pH-window concern, not in §6).
 struct CropPreset { const char* name; float N, P, K, pH; };
 const CropPreset CROP_PRESETS[] = {
-  { "LETTUCE", 150, 40, 200, 5.8f },
-  { "CARROT",  120, 50, 250, 6.2f },
-  { "TOMATO",  180, 45, 300, 6.0f },
+  { "PECHAY",    180,  60, 120, 6.0f },
+  { "TOMATO_S1", 200,  80, 160, 6.0f },
+  { "TOMATO_S2", 240, 100, 200, 6.0f },
+  { "TOMATO_S3", 150,  80, 300, 6.0f },
 };
 const uint8_t NUM_PRESETS = sizeof(CROP_PRESETS) / sizeof(CROP_PRESETS[0]);
 
-// STUB: target mg/kg -> mL per bottle. DEFINED-BUT-PENDING (separate task).
-void calcDoseML(int colIdx, float &mlA, float &mlB, float &mlC) {
-  (void)colIdx;
-  mlA = 0.0f; mlB = 0.0f; mlC = 0.0f;   // placeholder; real open-loop calc pending
-}
+// Open-loop gap dose (§3): fills per-nutrient delivered mL[0..2]=A/B/C and the 2x timed ceiling
+// seconds ceilS[0..2]. Quantizes to whole pulses with a floor; logs intended vs delivered + skips.
+// Defined later (needs col[]/calKNut/logEvent); forward-declared here next to its tables.
+void calcDose(int c, float mL[3], float ceilS[3]);
 
 /* =============================================================================
  *  PROTOCOL FRAMING
@@ -570,7 +580,7 @@ const int TEST_FILL_ROW = 16;
 const int TEST_ROWS = 16 + 1 + NUM_COLUMNS;        // = 20
 
 /* ---- Calibration UI (companion spec §A) ---------------------------------- */
-enum CalKind { CK_SOIL, CK_PH, CK_EC, CK_ACS, CK_LEVEL_RES, CK_LEVEL_MIX, CK_FLOW, CK_OFFSET, CK_NPK };
+enum CalKind { CK_SOIL, CK_PH, CK_EC, CK_ACS, CK_LEVEL_RES, CK_LEVEL_MIX, CK_FLOW, CK_OFFSET, CK_NPK, CK_FLOW_RES };
 struct CalTgt { const char *name; const char *id; uint8_t kind; int col; };
 const CalTgt CAL_TGTS[] = {
   { "Soil A",      "SOIL_A",      CK_SOIL,      0 },
@@ -581,6 +591,7 @@ const CalTgt CAL_TGTS[] = {
   { "ACS712 zero", "ACS712",      CK_ACS,      -1 },
   { "Ultra Res empty", "ULTRA_RES", CK_LEVEL_RES, -1 },
   { "Ultra Mix empty", "ULTRA_MIX", CK_LEVEL_MIX, -1 },
+  { "Flow Reservoir", "FLOW",      CK_FLOW_RES,  -1 },   // Nano fill-flow: manual run, scale cal
   { "Temp offset", "DHT_T",       CK_OFFSET,    0 },   // col selects tOff/hOff/lOff (0/1/2)
   { "Hum offset",  "DHT_H",       CK_OFFSET,    1 },
   { "Lux offset",  "LUX",         CK_OFFSET,    2 },
@@ -608,6 +619,9 @@ float calNpkEdit[3] = { 0, 0, 0 };   // N/P/K offsets being edited in the NPK tr
 const unsigned long CAL_STALE_MS = 2500;   // raw sample considered stale after this
 const float CAL_OUTLIER_PCT = 8.0f;        // 3-run K disagreement tolerance [TBD]
 const float EC_STD_MSCM = 1.413f;          // EC calibration standard solution [TBD]
+const float CAL_MIN_SPAN_ADC = 20.0f;      // reject pH/EC cal if the two raw points are this close (degenerate)
+const float NANO_FLOW_K = 450.0f;          // MUST mirror the Nano's FLOW_K_PULSES_PER_LITER (reservoir-flow scale)
+String calMsg = "";                        // transient calibration message (e.g. "pts too close")
 
 /* ---- Heartbeat ----------------------------------------------------------- */
 bool nanoSilent = false;        // one-shot latch so silence alerts/counts fire once per outage
@@ -1446,6 +1460,10 @@ void handleEsp2Response(const String &payload) {
     logEvent("ESP2", "RESP", "PCF_RECOVERED");                 // informational (relay bus back)
   } else if (resp == "SAFE_STOP") {
     enterFaultHold("SAFE_STOP", arg.c_str());
+  } else if (resp == "DOSE_TIMEOUT") {
+    // A nutrient pump ran past its 2x timed ceiling (stuck-low flow sensor or unprimed line, §5).
+    // NOT a fallback -- hold for the user (prime the line, then RELEASE/IRRIGATE/NORMAL).
+    enterFaultHold("DOSE_TIMEOUT", arg.c_str());
   } else if (resp == "INVALID") {
     // A recovery RESUME was refused. The usual cause is that ESP2 restarted during the hold and
     // lost its paused sequence (the mix-tank volume still survives in its NVS). Clear the held UI
@@ -1459,16 +1477,44 @@ void handleEsp2Response(const String &payload) {
   }
 }
 
-void sendWorkOrder(int c, bool fertigate) {
-  float mlA = 0, mlB = 0, mlC = 0;
-  if (fertigate) calcDoseML(c, mlA, mlB, mlC);   // stub -> 0 (sec.12.4)
+// Open-loop gap dose (§3): see the forward-declared comment in the dosing tables block.
+void calcDose(int c, float mL[3], float ceilS[3]) {
+  for (int i = 0; i < 3; i++) { mL[i] = 0; ceilS[i] = 0; }
+  float V = WATER_BUDGET_L[c] * (1.0f - FLUSH_PCT / 100.0f);   // planned batch volume this run (§1.1)
+  if (V < MIXING_TANK_SAFE_MIN) { logEvent("ESP1", "DOSE", "BATCH_LOW|water-only"); return; }
+  if (V > MIXING_TANK_MAX_VOLUME) V = MIXING_TANK_MAX_VOLUME;
+  // gaps (mg/kg); only positive gaps dose. A=N (gated), B=P, C=K (§3.2/3.3). dose_mL = gap*V/stock (§3.1).
+  float gap[3]   = { col[c].targetN - SOIL_BASELINE_N, col[c].targetP - SOIL_BASELINE_P, col[c].targetK - SOIL_BASELINE_K };
+  float stock[3] = { STOCK_A_N, STOCK_B_P, STOCK_C_K };
+  for (int i = 0; i < 3; i++) {
+    if (gap[i] <= 0 || stock[i] <= 0 || calKNut[i] <= 0) continue;   // non-positive gap -> skip (A gap_N gate)
+    float dose = gap[i] * V / stock[i];                              // §3.1 (literal)
+    long pulses = lround(dose * calKNut[i] / 1000.0f);               // SCALE = K/1000 pulses/mL (§3.4)
+    char b[48];
+    if (pulses < MIN_DOSE_PULSES) {                                  // sub-resolution -> skip + log (thesis record)
+      snprintf(b, sizeof(b), "SUBRES|NUT_%c|int=%dmL", (char)('A' + i), (int)(dose + 0.5f));
+      logEvent("ESP1", "DOSE", b);
+      continue;
+    }
+    mL[i] = pulses * 1000.0f / calKNut[i];                           // honest whole-pulse delivered volume
+    ceilS[i] = mL[i] / PUMP_FLOWRATE_MLPM[i] * 60.0f * CEILING_MARGIN;
+    snprintf(b, sizeof(b), "NUT_%c|int=%d|del=%dmL", (char)('A' + i), (int)(dose + 0.5f), (int)(mL[i] + 0.5f));
+    logEvent("ESP1", "DOSE", b);
+  }
+}
 
-  // Complete work order: column, water/flush split, dose mL, EC/pH window (sec.9.8.1.1)
+void sendWorkOrder(int c, bool fertigate) {
+  float mL[3] = { 0, 0, 0 }, ceilS[3] = { 0, 0, 0 };
+  if (fertigate) calcDose(c, mL, ceilS);
+
+  // Complete work order: column, water/flush split, dose mL + ceilings, EC/pH window (sec.9.8.1.1)
   String name = String("SEQ_") + (fertigate ? "FERTIGATION_" : "IRRIGATION_") + COL_TAG[c];
   String cmd = String(FRAME_START) + "," + name +
                ",FLUSH," + String((int)FLUSH_PCT);
   if (fertigate) {
-    cmd += ",DOSE," + String(mlA, 1) + "," + String(mlB, 1) + "," + String(mlC, 1);
+    cmd += ",DOSE," + String(mL[0], 1) + "," + String(mL[1], 1) + "," + String(mL[2], 1);
+    cmd += ",DCEIL," + String(ceilS[0], 0) + "," + String(ceilS[1], 0) + "," + String(ceilS[2], 0);  // 2x timed ceilings (s)
+    cmd += ",BATCHV," + String(WATER_BUDGET_L[c] * (1.0f - FLUSH_PCT / 100.0f), 1);                   // planned batch L (§1.1)
     cmd += ",EC," + String(EC_MIN, 1) + "," + String(EC_MAX, 1);
     cmd += ",PH," + String(PH_MIN, 1) + "," + String(PH_MAX, 1);
     cmd += ",MIX," + String(MIXING_DURATION_MS);
@@ -2677,7 +2723,8 @@ static bool calTgtVisible(int idx) {
   return true;
 }
 static bool calIsNano(uint8_t kind) {                    // Nano-owned sensors (ESP1 applies their cal)
-  return kind == CK_SOIL || kind == CK_LEVEL_RES || kind == CK_LEVEL_MIX || kind == CK_OFFSET || kind == CK_NPK;
+  return kind == CK_SOIL || kind == CK_LEVEL_RES || kind == CK_LEVEL_MIX || kind == CK_OFFSET ||
+         kind == CK_NPK || kind == CK_FLOW_RES;
 }
 static const char *calPrimeLine(const char *id, int *col) {
   *col = -1;
@@ -2699,7 +2746,7 @@ void enterCal() {
 static void calOpenTarget() {
   const CalTgt &t = CAL_TGTS[calSel];
   calOpen = true; calStep = 0; calCap[0] = calCap[1] = 0; calFlowPulses = 0; calVolL = 0.50f;
-  calRunIdx = 0; calKRuns[0] = calKRuns[1] = calKRuns[2] = 0;
+  calRunIdx = 0; calKRuns[0] = calKRuns[1] = calKRuns[2] = 0; calMsg = "";
   calRxId = ""; calRxValid = false;
   if (t.kind == CK_NPK) { for (int j = 0; j < 3; j++) calNpkEdit[j] = calNpkOff[t.col][j]; }  // seed current
   String cs = String("CAL_START,") + t.id;
@@ -2719,7 +2766,8 @@ static void calCloseTarget() {
 }
 
 // Compute the captured points for the open target, save to NVS, push ESP2-owned to ESP2 (§A.5.1).
-static void calCommit() {
+// Returns false if the capture was rejected (e.g. degenerate pH/EC points) -- nothing is saved.
+static bool calCommit() {
   const CalTgt &t = CAL_TGTS[calSel];
   char buf[40];
   switch (t.kind) {
@@ -2733,6 +2781,7 @@ static void calCommit() {
       break;
     }
     case CK_PH: {
+      if (fabs(calCap[0] - calCap[1]) < CAL_MIN_SPAN_ADC) return false;   // degenerate -> reject (no div-by-0)
       float m = (7.0f - 4.0f) / (calCap[0] - calCap[1]);   // (raw7,7.0),(raw4,4.0)
       float b = 7.0f - m * calCap[0];
       calPhM = m; calPhB = b;
@@ -2742,6 +2791,7 @@ static void calCommit() {
       break;
     }
     case CK_EC: {
+      if (fabs(calCap[1] - calCap[0]) < CAL_MIN_SPAN_ADC) return false;   // degenerate -> reject (no div-by-0)
       float m = EC_STD_MSCM / (calCap[1] - calCap[0]);     // (raw0,0),(rawstd,EC_STD_MSCM)
       float b = 0.0f - m * calCap[0];
       calEcM = m; calEcB = b;
@@ -2799,7 +2849,17 @@ static void calCommit() {
       logEvent("ESP1", "CAL", buf);
       break;
     }
+    case CK_FLOW_RES: {   // Nano reservoir fill-flow: single run -> correction scale on the Nano's L/min
+      float kMeas = (calVolL > 0.01f) ? (float)calFlowPulses / calVolL : 0;
+      if (kMeas <= 0) return false;
+      calFlowResScale = NANO_FLOW_K / kMeas;          // Nano reports L/min with NANO_FLOW_K; this rescales it
+      prefsCal.putFloat("frS", calFlowResScale);
+      snprintf(buf, sizeof(buf), "SAVE|FLOW_RES|x%s", String(calFlowResScale, 3).c_str());
+      logEvent("ESP1", "CAL", buf);
+      break;
+    }
   }
+  return true;
 }
 
 void calButton(int i) {
@@ -2865,11 +2925,26 @@ void calButton(int i) {
     return;
   }
 
+  if (t.kind == CK_FLOW_RES) {                    // Nano reservoir flow: manual external fill, no pump
+    if (calStep == 0) {                            // watch pulses climb during the fill; UP = done
+      if (i == 0) { calFlowPulses = (calRxValid ? (unsigned long)calRxRaw : 0); calStep = 1; }
+    } else {                                        // volume entry
+      if (i == 0) calVolL += 0.01f;
+      else if (i == 1) { calVolL -= 0.01f; if (calVolL < 0.0f) calVolL = 0.0f; }
+      else if (i == 2) { calCommit(); calCloseTarget(); }
+    }
+    return;
+  }
+
   // capture kinds: ENTER captures current raw; 2-pt (soil/pH/EC) needs 2, others 1
   int needed = (t.kind == CK_PH || t.kind == CK_EC || t.kind == CK_SOIL) ? 2 : 1;
   if (i == 2) {
+    calMsg = "";
     if (calRxValid) calCap[calStep] = calRxRaw;
-    if (++calStep >= needed) { calCommit(); calCloseTarget(); }
+    if (++calStep >= needed) {
+      if (calCommit()) calCloseTarget();
+      else { calStep = 0; calMsg = "pts too close"; }   // degenerate pH/EC -> recapture (§B audit fix)
+    }
   }
 }
 
@@ -2957,6 +3032,18 @@ void lcdRenderCal() {
     }
     return;
   }
+  if (t.kind == CK_FLOW_RES) {                      // Nano reservoir flow: manual fill (no pump)
+    if (calStep == 0) {
+      lcd.setCursor(0, 1); lcd.print("Run fill; watch pul ");
+      lcd.setCursor(0, 2); snprintf(l, 21, "pulses:%-13ld", fresh ? (long)calRxRaw : 0L); lcd.print(l);
+      lcd.setCursor(0, 3); lcd.print("UP=done  BACK=cancel");
+    } else {
+      lcd.setCursor(0, 1); snprintf(l, 21, "pulses=%-13ld", (long)calFlowPulses); lcd.print(l);
+      lcd.setCursor(0, 2); snprintf(l, 21, "vol: %s L         ", String(calVolL, 2).c_str()); lcd.print(l);
+      lcd.setCursor(0, 3); lcd.print("UP/DN vol  ENT=save ");
+    }
+    return;
+  }
   int needed = (t.kind == CK_PH || t.kind == CK_EC || t.kind == CK_SOIL) ? 2 : 1;
   const char *prompt = "Steady, then ENTER";
   if      (t.kind == CK_SOIL) prompt = (calStep == 0) ? "Probe in AIR, ENTER" : "Probe in WATER, ENT";
@@ -2966,7 +3053,9 @@ void lcdRenderCal() {
   else                        prompt = "Tank EMPTY, ENTER";
   lcd.setCursor(0, 1); snprintf(l, 21, "%-20s", prompt); lcd.print(l);
   lcd.setCursor(0, 2); snprintf(l, 21, "raw:%-8s pt%d/%d ", fresh ? String(calRxRaw, 1).c_str() : "--", calStep + 1, needed); lcd.print(l);
-  lcd.setCursor(0, 3); lcd.print("ENT=capture BACK=esc");
+  lcd.setCursor(0, 3);
+  if (calMsg.length()) { snprintf(l, 21, "%-20s", calMsg.c_str()); lcd.print(l); }   // e.g. "pts too close"
+  else lcd.print("ENT=capture BACK=esc");
 }
 
 /* =============================================================================

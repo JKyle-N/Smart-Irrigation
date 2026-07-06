@@ -107,6 +107,7 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | `FLOW_FAIL` | CRIT | A pump ran but no/!enough flow was metered (dry line, blockage, dead pump). The run is **held**. | Reply with a recovery choice (§5) after checking the line. |
 | `PWR_FAIL` | CRIT | Power fault on an AC pump (no current / overcurrent / mains voltage out of range). Run **held**. | Check pump/inverter/mains, then recover. |
 | `SAFE_STOP` | CRIT | Local protective stop (e.g. mixer overcurrent). Run **held**. | Check the mixer/load, then recover. |
+| `DOSE_TIMEOUT` | CRIT | A nutrient pump ran past its time ceiling without reaching the target dose — the dosing line is unprimed or its flow sensor is stuck. Run **held**. | Prime that nutrient line (Testing combos / Prime), check the dosing flow sensor, then recover. |
 | `ESP2_ERROR` | CRIT | Actuator controller reported a generic execution failure. Run **held**. | Recover or `STOP,ALL`. |
 | `ESP2_DONE_TIMEOUT` | CRIT | A run didn't finish within the time budget. | Inspect; system has stopped supervising that run. |
 | `BATTERY_CRITICAL` | CRIT | Battery below the critical threshold — everything stops. | Charge / check the solar/battery. |

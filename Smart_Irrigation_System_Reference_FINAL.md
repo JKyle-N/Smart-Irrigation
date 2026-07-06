@@ -329,6 +329,7 @@ ESP32 #2 is the SOLE safety authority in TEST mode (sec.18.10.8.3): it turns the
 | DEGRADED  | A single channel disabled (nutrient no-flow / mixer no-load) but the sequence CONTINUES; ESP32 #1 classifies Major (alert + log, no shutdown, work order stays active). Used instead of ERROR for recoverable per-channel faults (sec.23.2.2.1, .4) |
 | FLOW_FAIL | Flow validation failed. ESP32 #2 drops P17 and HOLDS with the mixing-tank volume retained; recovery is user-gated (sec.19.4.8) |
 | PWR_FAIL  | PZEM power validation failed (pump ON but no current / overcurrent / voltage out of range). Triggers the same fault HOLD as FLOW_FAIL |
+| DOSE_TIMEOUT,NUT_x | A nutrient pump ran past its 2× timed ceiling before reaching target mL (stuck-low dosing flow sensor or unprimed line). Hard dosing fault → ESP32 #1 enters the user-gated fault-hold (prime the line, then RELEASE/IRRIGATE/NORMAL). Distinct from FLOW_FAIL (main line) and SENSOR_FAIL. (Nutrient-dosing spec §5) |
 | EC_FAIL   | EC outside safe window during dosing (local protective stop) |
 | PH_FAIL   | pH outside safe window during dosing (local protective stop) |
 | SENSOR_FAIL,EC / SENSOR_FAIL,PH | EC/pH probe railed (disconnected/shorted) during dosing — HARDWARE sensor fault, distinct from EC_FAIL/PH_FAIL (out-of-window). ESP32 #1 = Major (alert + log); batch still delivered (no drain). |
@@ -373,7 +374,8 @@ A work order includes (as applicable to the operation):
 * the relay/actuator on-off sequence (which valves, pumps, mixer, in what order)
 * pump assignments
 * expected/target water volume (and the flush split, Section 14.2.0.2)
-* nutrient dosing targets (mL per bottle, from the dosing calculation)
+* nutrient dosing targets (`target_mL` per bottle, whole-pulse quantized, from the dosing calculation)
+* per-dose `ceiling_s` (2× expected runtime — the DOSE_TIMEOUT backstop) and `batch_volume_L` (the variable batch the doses were computed against) — Nutrient-dosing spec §4
 * EC/pH safe-window thresholds to enforce locally
 * sequence timings and flow-timeout limits
 
@@ -2053,7 +2055,7 @@ Design requirements for the firmware:
 * Built-in crop presets (name → target N-P-K mg/kg + pH) MUST be stored in an editable, expandable table.
 * The system accepts BOTH the explicit mg/kg format (12.2.1) and the named-preset format (12.2.2); explicit is default, named is used only when PRESET is specified.
 
-Calculation status: DEFINED-BUT-PENDING. The conversion from target mg/kg → mL per bottle (accounting for mixing-tank batch volume, salt composition, and the lab soil baseline) is documented as a placeholder and will be implemented as a separate task. It is an open-loop approximation, not a closed-loop guarantee.
+Calculation status: IMPLEMENTED (open-loop) per the companion `Nutrient_Dosing_Firmware_Spec.md` — gap formula `dose_mL = gap × batch_volume_L ÷ stock_conc`, whole-pulse quantization with a `MIN_DOSE_PULSES` floor, variable batch volume, and a 2× timed ceiling (`DOSE_TIMEOUT` backstop). The §3.1 arithmetic's exact unit/soil-mass basis and the diluted `STOCK_*` values are commissioning math. It is an open-loop approximation, not a closed-loop guarantee.
 
 Note on nutrient bottles vs. elements: the physical system doses Nutrient A/B/C salts (Section 16; Nutrient D is unused). Each contributes multiple elements (Calcium Nitrate → N + Ca, MAP → N + P, Potassium Nitrate → N + K), and there is no pure-N source — so N is supplied jointly by A, B, and C. The preset is specified by ELEMENT (N-P-K, elemental, mg/kg) and the firmware computes the BOTTLE volumes; the concentration constants above define the element-per-mL contribution of each bottle. The dosing-calculation task must also handle the fertilizer-label reporting convention (P as P₂O₅, K as K₂O) versus the elemental mg/kg the NPK sensor reads.
 

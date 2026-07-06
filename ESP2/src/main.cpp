@@ -15,7 +15,8 @@
  *  PROTOCOL (must match what ESP32 #1 emits; framed sec.9.9):
  *    IN : <START>,SEQ_IRRIGATION_<X>,FLUSH,<pct>,<END>
  *         <START>,SEQ_FERTIGATION_<X>,FLUSH,<pct>,DOSE,<mlA>,<mlB>,<mlC>,
- *                 EC,<lo>,<hi>,PH,<lo>,<hi>,MIX,<ms>,<END>
+ *                 DCEIL,<sA>,<sB>,<sC>,BATCHV,<L>,EC,<lo>,<hi>,PH,<lo>,<hi>,MIX,<ms>,<END>
+ *                 (DCEIL = per-dose 2x timed ceiling s; a dose past it -> DOSE_TIMEOUT hold, dosing spec §2.4/§5)
  *         <START>,STOP_ALL,<END> / RESET_SELF / STATUS_REQ
  *         RESUME,<NORMAL|IRRIGATE|RELEASE>  (user-gated fault recovery, sec.19.4.8.2):
  *                 NORMAL  = re-energize P17, resume the paused sequence from where it stopped;
@@ -34,7 +35,8 @@
  *                 hard cap. bit = PCF8575 OUT_* index 0..15.
  *    OUT: ACK,<cmd> -> DONE,<cmd>[,WATER,<L>];  DOSE,NUT_x,<target>,<measured>,COL_y
  *         (per-nutrient result, sec.25.2.1); FLOW_FAIL/PWR_FAIL/EC_FAIL/PH_FAIL/
- *         SAFE_STOP/ERROR; DEGRADED,<chan> (channel disabled, sequence continues ->
+ *         SAFE_STOP/ERROR; DOSE_TIMEOUT,NUT_x (dosing pump past its ceiling -> ESP1 fault-hold);
+ *         DEGRADED,<chan> (channel disabled, sequence continues ->
  *         ESP1 Major, no shutdown); BUSY,ACTIVE/TEST/HELD; INVALID,<reason>;
  *         PCF_FAIL,I2C (relay bus dead -> ESP1 Major) + PCF_OK (recovered);
  *         SENSOR_FAIL,EC / SENSOR_FAIL,PH (probe railed/disconnected -> ESP1 Major,
@@ -145,7 +147,6 @@ const unsigned long INVERTER_WARMUP_MS = 2000;  // inverter+valve settle before 
 const unsigned long FLOW_TIMEOUT_MS   = 10000;  // no-flow after pump start -> FLOW_FAIL
 const unsigned long STAGE_MAX_MS      = 180000; // hard safety cap per metered stage
 const unsigned long MIX_DEFAULT_MS    = 30000;  // used if work order omits MIX
-const unsigned long SAFE_STOP_MS      = 500;
 
 /* ---- PZEM AC validation (spec sec.23.1.2.1) ------------------------------ */
 const float PZEM_MIN_CURRENT_A = 0.5f;    // pump ON but below this = no draw
@@ -260,6 +261,7 @@ struct WorkOrder {
   bool   fertigate;
   float  flushPct;       // 0..100
   float  dose[3];        // mL A,B,C
+  unsigned long doseCeilMs[3];   // per-dose 2x timed ceiling (ms); DOSE_TIMEOUT if exceeded (dosing spec §2.4)
   float  ecLo, ecHi, phLo, phHi;
   unsigned long mixMs;
   String cmdName;        // for ACK/DONE echo
@@ -292,6 +294,7 @@ bool    faultHeld = false;      // sequence paused after a fault, awaiting RESUM
 int   sgPump = -1, sgFlow = -1;
 float sgK = 1, sgTarget = 0;
 int   sgTankSign = 0;          // +1 = this stage FILLS the mix tank, -1 = DRAINS it, 0 = neither (dose)
+unsigned long sgCapMs = STAGE_MAX_MS;   // per-stage hard cap (dose stages override with the 2x ceiling)
 bool  sgIsAC = false, sgPumpOn = false, sgSawFlow = false;
 unsigned long sgT0 = 0;
 unsigned long acNoCurrentSince = 0;
@@ -338,8 +341,6 @@ void finishOk();
 float endMeteredStage();
 void safetyMonitor();
 float readMixerCurrent();
-float readPH();
-float readEC();
 void heartbeat();
 void testSafety();
 void testComboOn(int idx);
@@ -705,6 +706,7 @@ void dispatch(const String &payload) {
   // defaults
   wo.col = c; wo.fertigate = isFert; wo.flushPct = 0;
   wo.dose[0] = wo.dose[1] = wo.dose[2] = 0;
+  wo.doseCeilMs[0] = wo.doseCeilMs[1] = wo.doseCeilMs[2] = 0;   // 0 -> fall back to STAGE_MAX_MS
   wo.ecLo = 0.0f; wo.ecHi = 99; wo.phLo = 0; wo.phHi = 14;   // wide defaults; ESP1 sends real window
   wo.mixMs = MIX_DEFAULT_MS; wo.cmdName = cmd;
 
@@ -712,6 +714,8 @@ void dispatch(const String &payload) {
   for (int i = 1; i < n; i++) {
     if (tok[i] == "FLUSH" && i + 1 < n)      { wo.flushPct = tok[++i].toFloat(); }
     else if (tok[i] == "DOSE" && i + 3 < n)  { wo.dose[0] = tok[++i].toFloat(); wo.dose[1] = tok[++i].toFloat(); wo.dose[2] = tok[++i].toFloat(); }
+    else if (tok[i] == "DCEIL" && i + 3 < n) { for (int j = 0; j < 3; j++) wo.doseCeilMs[j] = (unsigned long)(tok[++i].toFloat() * 1000.0f); }  // per-dose 2x ceiling (s->ms)
+    else if (tok[i] == "BATCHV" && i + 1 < n){ ++i; /* planned batch L: ESP1 dose-calc input; logged there */ }
     else if (tok[i] == "EC" && i + 2 < n)    { wo.ecLo = tok[++i].toFloat(); wo.ecHi = tok[++i].toFloat(); }
     else if (tok[i] == "PH" && i + 2 < n)    { wo.phLo = tok[++i].toFloat(); wo.phHi = tok[++i].toFloat(); }
     else if (tok[i] == "MIX" && i + 1 < n)   { wo.mixMs = (unsigned long)tok[++i].toInt(); }
@@ -747,6 +751,7 @@ void goStep(SeqStep s) { step = s; stepInit = false; }
 void stageBegin(int pumpBit, bool isAC, int flowPin, float k, float targetL) {
   sgPump = pumpBit; sgIsAC = isAC; sgFlow = flowPin; sgK = k; sgTarget = targetL;
   sgTankSign = 0;                // default: stage does not move tank water (set by caller for fill/deliver)
+  sgCapMs = STAGE_MAX_MS;        // default cap (dose stages override with the per-dose ceiling)
   sgPumpOn = false; sgSawFlow = false; sgT0 = millis();
   acNoCurrentSince = 0;
   if (isAC) pcfOn(OUT_INVERTER);
@@ -774,7 +779,7 @@ int stagePoll() {
   if (L >= sgTarget) return 1;
   unsigned long el = millis() - sgT0;
   if (!sgSawFlow && el > FLOW_TIMEOUT_MS) return -1;   // dry run / no flow
-  if (el > STAGE_MAX_MS) return -1;
+  if (el > sgCapMs) return -1;                          // hard cap (per-dose ceiling for dose stages)
   return 0;
 }
 void stageEnd() {
@@ -862,6 +867,7 @@ void runSequence() {
         if (doseIdx >= 3) { goStep(SEQ_MIX); break; }
         float targetL = wo.dose[doseIdx] / 1000.0f;     // mL -> L
         stageBegin(NUT_PUMP_BIT[doseIdx], false, NUT_FLOW_PIN[doseIdx], K_NUT[doseIdx], targetL);
+        sgCapMs = wo.doseCeilMs[doseIdx] ? wo.doseCeilMs[doseIdx] : STAGE_MAX_MS;   // per-dose 2x ceiling (spec §2.4)
         stepInit = true;
       }
       int r = stagePoll();
@@ -876,13 +882,11 @@ void runSequence() {
         stepInit = false;                    // re-enter to dose next (or advance to MIX)
         if (doseIdx >= 3) goStep(SEQ_MIX);
       } else if (r == -1) {
-        // nutrient channel no-flow: disable that channel, continue (spec sec.23.2.2.1).
-        // DEGRADED (not ERROR) so ESP1 classifies Major and does NOT critical-stop/cut power.
+        // Dosing pump ran past its timed ceiling (or never flowed) -> DOSE_TIMEOUT, NOT a fallback
+        // (dosing spec §2.3/§5): stuck-low flow sensor or unprimed line. Stop and HOLD for the user.
         stageEnd();
-        reply(String("DEGRADED,NUT_") + (char)('A' + doseIdx));
-        doseIdx++;
-        stepInit = false;
-        if (doseIdx >= 3) goStep(SEQ_MIX);
+        String nut = String("NUT_") + (char)('A' + doseIdx);
+        holdFault("DOSE_TIMEOUT", nut.c_str());
       }
       break;
     }
@@ -1011,8 +1015,7 @@ float readMixerCurrent() {
   float a = (v - ACS712_ZERO_V) / ACS712_SENS_V_PER_A;
   return fabs(a);
 }
-float readPH() { return PH_CAL_M * analogRead(PIN_PH) + PH_CAL_B; }
-float readEC() { return EC_CAL_M * analogRead(PIN_EC) + EC_CAL_B; }
+// (EC/pH are read inline in the SEQ_ECPH stage; standalone readPH()/readEC() removed as unused.)
 
 /* =============================================================================
  *  HEARTBEAT  (spec sec.10.8.3)

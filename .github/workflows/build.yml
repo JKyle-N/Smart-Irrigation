@@ -1,0 +1,55 @@
+name: Build firmware
+
+# Builds all three controllers in the cloud (no laptop needed) and publishes the compiled
+# binaries as downloadable artifacts. Runs on every push/PR, and can be started by hand from
+# the Actions tab (Run workflow) -- e.g. from a phone.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ESP1
+            dir: ESP1
+          - name: ESP2
+            dir: ESP2
+          - name: Nano
+            dir: Nano
+    name: Build ${{ matrix.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('**/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build ${{ matrix.name }}
+        run: pio run -d ${{ matrix.dir }}
+
+      - name: Upload firmware (${{ matrix.name }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-firmware
+          path: |
+            ${{ matrix.dir }}/.pio/build/*/firmware.bin
+            ${{ matrix.dir }}/.pio/build/*/firmware.hex
+            ${{ matrix.dir }}/.pio/build/*/firmware.elf
+          if-no-files-found: error

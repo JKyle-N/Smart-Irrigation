@@ -77,14 +77,23 @@ cd ESP2 && pio run -e esp32dev -t upload
 Library dependencies are declared in each `platformio.ini` and fetched automatically
 (LiquidCrystal_I2C, RTClib, EspSoftwareSerial, INA226 for ESP1; PZEM-004T-v30 for ESP2).
 
-### Arduino Nano — Arduino IDE
+### Arduino Nano — PlatformIO or Arduino IDE
 
-Open `Nano/Nano.ino` (folder name must match the file name).
-
-- **Board:** Tools → Board → Arduino AVR → Arduino Nano, Processor *ATmega328P*
-  (use *Old Bootloader* on older clones).
-- **Libraries** (Library Manager): *DHT sensor library* (Adafruit), *Adafruit Unified Sensor*, *BH1750* (Christopher Laws).
+- **PlatformIO:** `cd Nano && pio run` (env `nanoatmega328`; `-t upload` to flash). Libraries
+  (DHT, Adafruit Unified Sensor, BH1750) are declared in `Nano/platformio.ini` and fetched
+  automatically. Use board `nanoatmega328new` for a 115200 (new) bootloader.
+- **Arduino IDE:** open `Nano/Nano.ino` — Board *Arduino Nano*, Processor *ATmega328P* (use
+  *Old Bootloader* on older clones); install *DHT sensor library*, *Adafruit Unified Sensor*,
+  *BH1750* from Library Manager.
 - **Upload:** disconnect D0/D1 (the UART link to ESP32 #1) while flashing, then reconnect.
+
+### Build without a laptop (GitHub Actions → phone)
+
+Every push builds all three controllers in the cloud; you can also trigger it by hand from the
+**Actions** tab → *Build firmware* → **Run workflow** (works from a phone browser). When the run
+finishes, open it and download the artifacts — `ESP1-firmware` / `ESP2-firmware` (`firmware.bin`)
+and `Nano-firmware` (`firmware.hex`) — then flash from the phone (e.g. an ESP32/AVR USB-OTG
+flasher app or a web flasher). No compiler needed on the device.
 
 ---
 

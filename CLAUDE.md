@@ -78,10 +78,11 @@ Daily fresh-start `RESET_REQ` once/day.
 
 ---
 
-## LOCKED: Nutrient dosing — DELEGATED, leave as stub
-- The mg/kg → mL dosing calculation is being done separately. Do NOT implement the formula.
-- Leave concentration constants, lab soil baseline, and crop presets as clearly-labeled **editable constants/stubs** at the top of the relevant file.
-- Preset input: target N-P-K in mg/kg (elemental) + pH. Output: mL per bottle. Open-loop (no live sensor feedback during dosing).
+## LOCKED: Nutrient dosing (companion `Nutrient_Dosing_Firmware_Spec.md`)
+- **Open-loop, gap-based:** ESP1 `calcDose()` computes per-nutrient mL = `gap × batch_volume_L ÷ STOCK_*` from the lab soil baseline (§3.1, transcribed literally — the final unit/soil-mass basis + diluted `STOCK_*` are commissioning/the classmate's math). A=N (gap-gated, never fires for these crops), B=P, C=K. NPK sensor is the recorded OUTCOME, never a mid-dose input.
+- **Pulse-quantized (§3.4):** round to whole flow-sensor pulses; below `MIN_DOSE_PULSES=3` (~12 mL floor) → skip + log intended/gap (stock must be diluted at commissioning so real doses clear the floor). Log intended vs delivered.
+- **Flow-primary + timed ceiling:** ESP2 doses by flow-meter volume; ESP1 sends a per-dose `ceiling_s = 2× expected` in the work order (`DCEIL`). A dose past its ceiling/no-flow → **`DOSE_TIMEOUT`** (NOT a DEGRADED fallback) → user-gated fault-hold.
+- Batch volume is **variable** per run (from the column water budget; `MIXING_TANK_MAX/SAFE_MIN` bound it). Editable constants (`SOIL_BASELINE_*`, `STOCK_*`, `PUMP_FLOWRATE_MLPM`, presets PECHAY/TOMATO_S1–S3) live at the top of `ESP1/src/main.cpp`.
 - Nutrients A, B, C only. **Nutrient D (P14 / GPIO25) is wired but UNUSED** — do not drive it.
 
 ---

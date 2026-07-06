@@ -120,23 +120,16 @@ const unsigned long HB_INTERVAL_NIGHT_MS  = 120000UL;    // 2 min
 /* ---- One-time sensor settle (setup() only) ------------------------------- */
 const unsigned long SENSOR_SETTLE_MS = 2000;   // DHT22 warm-up + ultrasonic settle
 
-/* ---- Soil moisture calibration (capacitive) ------------------------------ *
- * Capacitive probes read a HIGHER ADC in dry air and LOWER ADC in water.
- * Measure each probe: note the raw ADC fully dry and fully submerged.  [MEASURE]
- * (Single shared pair here; per-probe pairs can be added without logic change.) */
-const int SOIL_ADC_DRY = 800;   // raw ADC, probe in dry air        [MEASURE] (proven test value)
-const int SOIL_ADC_WET = 300;   // raw ADC, probe fully saturated   [MEASURE] (proven test value)
+/* ---- Conversion constants moved to ESP32 #1 (companion spec §A) ----------- *
+ * This Nano now streams RAW signals (raw soil ADC, raw ultrasonic distance cm, raw NPK
+ * registers); ESP32 #1 owns and applies all calibration via its Calibration menu. So the soil
+ * dry/wet ADC endpoints, the ultrasonic empty/full tank geometry, and the NPK scale factors live
+ * on ESP32 #1 (NVS) -- do NOT tune them here, it would have no effect.                          */
 
-/* ---- Ultrasonic tank geometry (HC-SR04 style) ---------------------------- *
- * distance(cm) = echo_us * SOUND_CM_PER_US. Level% maps EMPTY..FULL -> 0..100.
- * EMPTY = sensor-to-water distance when tank empty (far); FULL = when full (near).
- * Measure both distances on the real tanks.                            [MEASURE] */
+/* ---- Ultrasonic raw read (HC-SR04 style) --------------------------------- *
+ * distance(cm) = echo_us * SOUND_CM_PER_US. Sent raw; ESP32 #1 maps to %.                       */
 const float         SOUND_CM_PER_US      = 0.0343f / 2.0f;  // round-trip -> one way
 const unsigned long ULTRASONIC_TIMEOUT_US = 25000UL;        // ~4.3 m cap, bounds pulseIn
-const float RES_EMPTY_CM = 53.0f;    // reservoir empty distance   [MEASURE] (proven: 0.53 m)
-const float RES_FULL_CM  = 3.0f;     // reservoir full distance    [MEASURE] (proven: 0.03 m)
-const float MIX_EMPTY_CM = 50.0f;    // mixing tank empty distance [MEASURE] (proven: 0.50 m)
-const float MIX_FULL_CM  = 4.0f;     // mixing tank full distance  [MEASURE] (proven: 0.04 m)
 
 /* ---- Reservoir flow sensor (interrupt-counted, never polled) -------------- *
  * Pulses are counted in an ISR and converted to L/min with this K-factor.
@@ -152,8 +145,9 @@ const float FLOW_K_PULSES_PER_LITER = 450.0f;   // [MEASURE]
  *  the single RS485 bus on D8/D9/D10. readNPK() polls only ENABLED columns.
  *  Everything in this block is vendor-specific -- replace with your working
  *  values. The parser reads NPK_REG_COUNT 16-bit big-endian registers starting
- *  at NPK_REG_START via function NPK_FUNCTION, checks the CRC, then divides each
- *  raw value by NPK_SCALE[i]. On ANY failure every field is reported as -1.
+ *  at NPK_REG_START via function NPK_FUNCTION, checks the CRC, and sends the RAW registers.
+ *  ESP32 #1 applies the per-element scale + offset (the scale lives there now). On ANY failure
+ *  every field is reported as -1.
  * ========================================================================== */
 const uint8_t  NPK_ADDR[NUM_COLUMNS] = { 0x01, 0x02, 0x03 };  // per-column slave addr [CONFIRM]
 const unsigned long NPK_BAUD = 4800;            // proven working baud (bench test code) [CONFIRM]
@@ -161,9 +155,7 @@ const uint8_t  NPK_FUNCTION  = 0x03;            // 0x03 read-holding (some use 0
 const uint16_t NPK_REG_START = 0x0000;          // first register               [CONFIRM]
 const uint16_t NPK_REG_COUNT = 7;               // moist,temp,EC,pH,N,P,K        [CONFIRM]
 const unsigned long NPK_RESPONSE_TIMEOUT_MS = 1000;  // bounded wait for reply (proven test value)
-// Raw-to-engineering divisors, in register order moist,temp,EC,pH,N,P,K   [CONFIRM]
-const float   NPK_SCALE[7] = { 10.0f, 10.0f, 1.0f, 10.0f, 1.0f, 1.0f, 1.0f };
-// Print precision per field (decimals) for the outbound packet.
+// Print precision per field (decimals) for the RAW register outbound packet (moist,temp,EC,pH,N,P,K).
 const uint8_t NPK_PREC[7]  = { 1, 1, 0, 1, 0, 0, 0 };
 /* ---- end NPK editable block ---------------------------------------------- */
 
@@ -216,7 +208,6 @@ void sendLight();
 void sendNpk();
 void sendStatus();
 bool  readEnv(float &t, float &h);
-float readLevelPct(uint8_t trig, uint8_t echo, float emptyCm, float fullCm);
 float readDistanceCm(uint8_t trig, uint8_t echo);
 void  calStreamTick();
 bool  calReadRaw(float &raw);
@@ -354,6 +345,9 @@ void handleLine(char *line) {
     while (*p && *p != ',' && *p != '<' && k < (uint8_t)(sizeof(calId) - 1)) calId[k++] = *p++;
     calId[k] = '\0';
     calActive = (k > 0);
+    if (!strcmp(calId, "FLOW")) {                  // reservoir-flow cal: zero so the run starts at 0
+      noInterrupts(); flowPulseCount = 0; interrupts();
+    }
   }
   else if (strcmp(cmd, "CAL_STOP")  == 0) { calActive = false; calId[0] = '\0'; }
   // else: ignore
@@ -467,25 +461,7 @@ bool readEnv(float &t, float &h) {
   return !(isnan(h) || isnan(t));
 }
 
-// Returns 0..100 (%), or -1.0 on echo timeout / out-of-range.
-float readLevelPct(uint8_t trig, uint8_t echo, float emptyCm, float fullCm) {
-  digitalWrite(trig, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trig, HIGH);
-  delayMicroseconds(10);            // mandatory 10us trigger pulse (microseconds)
-  digitalWrite(trig, LOW);
-
-  unsigned long dur = pulseIn(echo, HIGH, ULTRASONIC_TIMEOUT_US);
-  if (dur == 0) return -1.0f;       // no echo within timeout
-
-  float distCm = (float)dur * SOUND_CM_PER_US;
-  float pct = (emptyCm - distCm) * 100.0f / (emptyCm - fullCm);
-  if (pct < 0.0f)   pct = 0.0f;
-  if (pct > 100.0f) pct = 100.0f;
-  return pct;
-}
-
-// Raw one-way distance in cm (echo timing), or -1.0 on timeout. Used for ultrasonic CAL.
+// Raw one-way distance in cm (echo timing), or -1.0 on timeout. Sent raw (ESP1 maps to %).
 float readDistanceCm(uint8_t trig, uint8_t echo) {
   digitalWrite(trig, LOW);  delayMicroseconds(2);
   digitalWrite(trig, HIGH); delayMicroseconds(10);
