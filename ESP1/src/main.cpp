@@ -39,6 +39,8 @@
 #include <esp_task_wdt.h>
 #include <WiFi.h>                // built-in ESP32 WiFi (telemetry uplink, Part A)
 #include <HTTPClient.h>          // ThingSpeak HTTP upload
+#include <WebServer.h>           // SoftAP provisioning portal (WiFi setup form)
+#include <DNSServer.h>           // captive-portal DNS for the provisioning AP
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -171,6 +173,10 @@ const uint8_t       MAX_UART_RETRY        = 3;
 const unsigned long RECOVERY_COOLDOWN_MS  = 30000;
 const unsigned long STARTUP_SYNC_TIMEOUT_MS = 15000;
 const unsigned long HEARTBEAT_TIMEOUT_MS  = 120000;  // subsystem freshness
+// ESP2 silence is CONFIRMED, not assumed: after the freshness gap, actively probe with STATUS_REQ a few
+// times before declaring ESP2_SILENCE, so a dropped-frame / starved-loop glitch doesn't force a needless reset.
+const unsigned long SILENCE_PROBE_INTERVAL_MS = 2000;  // spacing between confirm probes
+const uint8_t       SILENCE_PROBE_MAX          = 5;     // unanswered probes before ESP2_SILENCE (~10 s)
 const unsigned long INA_READ_INTERVAL_MS  = 5000;
 const unsigned long LCD_REFRESH_MS        = 500;
 const unsigned long LCD_BACKLIGHT_MS      = 10000;   // button backlight timeout
@@ -360,6 +366,8 @@ struct WorkOrder {
 WorkOrder wo = { false, WO_IDLE, -1, false, "", 0, 0 };
 bool esp2Available = false;
 unsigned long lastEsp2Ms = 0;
+uint8_t       silenceProbes  = 0;    // consecutive unanswered STATUS_REQ probes (silence confirmation)
+unsigned long silenceProbeMs = 0;    // last silence-probe send time
 uint8_t esp2PowerCycles = 0;
 unsigned long lastRecoveryMs = 0;
 unsigned long esp2OffMs = 0;     // timestamp ESP2 power was cut, for the power-cycle OFF hold
@@ -449,6 +457,7 @@ const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
 String wifiSsid = "", wifiPass = "";
 String tsKey1 = "", tsKey2 = "", tsKey3 = "";      // ThingSpeak write keys (ch1 cols, ch2 system, ch3 EC/pH)
 SemaphoreHandle_t netMux = NULL;                   // guards the cred/key Strings across cores
+volatile bool wifiEnabled   = true;                // Settings > WiFi master switch (STA + telemetry); NVS-kept
 volatile bool wifiConnected = false;
 volatile int  wifiRssiVal   = 0;
 char    wifiIpStr[16] = "0.0.0.0";                 // fixed buffer (written core 0, read core 1; no String race)
@@ -456,6 +465,18 @@ volatile bool wifiCredsChanged = false;            // SMS sets new creds -> task
 volatile unsigned long lastTsUploadMs = 0;
 volatile bool lastTsOk = false;
 TaskHandle_t  netTaskHandle = NULL;
+
+// ---- WiFi provisioning portal (SoftAP + captive web form, edit SSID/pass from a phone) ----
+// The ESP32 briefly hosts its own WPA2 AP + a web form so creds can be set without SMS/buttons.
+// Runs entirely in netTask (core 0); NVS is written by the core-1 loop (wifiPersistPending).
+const char *AP_SSID = "Irrig-Setup";               // provisioning AP name
+const char *AP_PASS = "irrigate123";               // WPA2 (>=8 chars) -- NOT open (documented in manual)
+const unsigned long PORTAL_TIMEOUT_MS = 600000;    // auto-close after 10 min unused
+volatile bool portalRequested    = false;          // core1/SMS -> netTask: start the portal
+volatile bool portalActive       = false;          // netTask -> core1: AP is up (LCD banner)
+volatile bool portalCancel       = false;          // core1/SMS -> netTask: tear down now
+volatile bool wifiPersistPending = false;          // netTask -> core1: persist staged creds to NVS
+char portalApIp[16] = "192.168.4.1";               // softAP IP, shown on LCD/SMS
 
 // Inter-core telemetry snapshot: filled on core 1 (telemetryCollect, POD only -> spinlock),
 // read on core 0 by the upload task.
@@ -550,8 +571,9 @@ String    lastFaultMsg = "none";
 enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST, UI_CAL };
 UiMode    uiMode = UI_DATA;
 // Top-level Settings menu rows
-enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_CALIB, SET_TESTING, SET_RESTORE, SET_LOCK, SET_EXIT, SET_COUNT };
-const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Calibration", "Testing", "Restore Defaults", "Lock Screen", "Exit" };
+enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_CALIB, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_EXIT, SET_COUNT };
+// SET_WIFI and SET_SOFTAP show a live [ON]/[OFF] suffix via setRowLabel(); their base names here are placeholders.
+const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Calibration", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Exit" };
 int  setSel    = 0;          // selected settings row
 int  editItem  = -1;         // SetItem currently being edited
 int  editField = 0;          // field index within the editor
@@ -730,6 +752,7 @@ void nanoPaceTick();
 void deviceHealthTick();
 static bool i2cPresent(uint8_t addr);
 void saveLock();
+void saveWifiEn();
 void saveWifi();
 void saveTsKey();
 void telemetryCollect();
@@ -866,7 +889,7 @@ void setup() {
   // ---- WiFi/ThingSpeak uplink task on core 0 (Part A) ----
   // Started after NVS load so creds are ready. Runs network I/O off the core-1 loop.
   netMux = xSemaphoreCreateMutex();
-  xTaskCreatePinnedToCore(netTask, "netTask", 8192, NULL, 1, &netTaskHandle, 0);
+  xTaskCreatePinnedToCore(netTask, "netTask", 16384, NULL, 1, &netTaskHandle, 0);  // +stack for WebServer/scan (portal)
 
   wdtSetup();                               // arm task watchdog (core-1 loop only)
   setState(STARTUP_SYNC);
@@ -905,6 +928,8 @@ void loop() {
   if (pendingCfgSms.length() && uiMode != UI_EDIT && !editConfirm) {
     String s = pendingCfgSms; pendingCfgSms = ""; handleSms(s);
   }
+  // Persist WiFi creds saved by the core-0 portal (all NVS writes stay on core 1).
+  if (wifiPersistPending) { wifiPersistPending = false; saveWifi(); saveWifiEn(); logEvent("ESP1", "CFG", "WIFI|PORTAL"); }
   g_lastStage = 'L'; lcdTick();            // LCD I2C writes
   g_lastStage = 'F'; logFlush(false);      // microSD (SPI) write
   g_lastStage = '.';                       // idle: loop completed cleanly
@@ -1011,6 +1036,7 @@ void loadConfig() {
   fertGap      = prefs.getFloat("fgap", fertGap);
   lcdLocked    = prefs.getBool("lock", false);   // LCD lock persists across reboot (Part D)
   // WiFi + ThingSpeak (Part A/B): creds + write keys persist in NVS.
+  wifiEnabled = prefs.getBool("wifien", true);   // WiFi master switch (Settings > WiFi)
   wifiSsid = prefs.getString("wssid", "");
   wifiPass = prefs.getString("wpass", "");
   tsKey1   = prefs.getString("tsk1", "");
@@ -1079,6 +1105,9 @@ bool setCalPushBlocking(const String &id, const String &payload) {
 
 void saveLock() {
   prefs.putBool("lock", lcdLocked);
+}
+void saveWifiEn() {
+  prefs.putBool("wifien", wifiEnabled);
 }
 void saveWifi() {
   prefs.putString("wssid", wifiSsid);
@@ -1319,6 +1348,7 @@ void pollESP2() {
         String raw = line; line = "";
         lastEsp2Ms = millis();
         esp2Available = true;
+        silenceProbes = 0;                       // any frame clears an in-progress silence probe
         int s = raw.indexOf(FRAME_START), e = raw.indexOf(FRAME_END);
         String payload = (s >= 0 && e > s) ? raw.substring(s + 7, e) : raw;
         payload.trim();
@@ -1383,6 +1413,7 @@ void handleEsp2Response(const String &payload) {
     return;
   }
   if (resp == "STATUS") return;                                // heartbeat
+  if (resp == "INFO") { logEvent("ESP2", "RESP", payload); return; }  // e.g. INFO,IDLE_RESET (self-heal notice)
 
   if (resp == "DOSE") {
     // Per-nutrient dose result: DOSE,NUT_x,target_mL,measured_mL,COL_y (sec.25.2.1).
@@ -1703,8 +1734,9 @@ void handleSms(const String &body) {
   // NET -- WiFi/ThingSpeak link status (Part B)
   if (U == "NET") {
     String ss; xSemaphoreTake(netMux, portMAX_DELAY); ss = wifiSsid; xSemaphoreGive(netMux);
-    String r = "NET,WiFi:" + String(wifiConnected ? "OK" : "DOWN");
-    if (wifiConnected) r += ",RSSI" + String(wifiRssiVal) + ",IP" + String(wifiIpStr);
+    String r = "NET,WiFi:" + String(portalActive ? "PORTAL" : !wifiEnabled ? "OFF" : wifiConnected ? "OK" : "DOWN");
+    if (portalActive) r += ",AP:" + String(AP_SSID) + ",IP" + String(portalApIp);
+    else if (wifiConnected) r += ",RSSI" + String(wifiRssiVal) + ",IP" + String(wifiIpStr);
     r += ",TS:" + String(lastTsOk ? "ok" : "--");
     if (lastTsUploadMs) r += ",age" + String((millis() - lastTsUploadMs) / 1000) + "s";
     r += ",SSID:" + (ss.length() ? ss : String("-"));
@@ -1810,12 +1842,28 @@ void handleSms(const String &body) {
   // after the 2nd comma, so it may contain commas/spaces (SSID may not). (Part B)
   if (k0 == "WIFI") {
     if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+    // WIFI,ON / WIFI,OFF -- master switch (mirrors the Settings > WiFi toggle). Checked before the
+    // ssid/pass parse; a real SSID of literally "ON"/"OFF" with no password is not a valid pair anyway.
+    if (n == 2 && (tok[1] == "ON" || tok[1] == "OFF")) {
+      wifiEnabled = (tok[1] == "ON"); saveWifiEn();
+      sendSMS(String("ACK,WIFI,") + tok[1]);
+      return;
+    }
     int p1 = b.indexOf(','), p2 = (p1 >= 0) ? b.indexOf(',', p1 + 1) : -1;
     if (p1 < 0 || p2 < 0) { sendSMS("ERR,WIFI"); return; }
     String ss = b.substring(p1 + 1, p2), pw = b.substring(p2 + 1);
     xSemaphoreTake(netMux, portMAX_DELAY); wifiSsid = ss; wifiPass = pw; xSemaphoreGive(netMux);
     saveWifi(); wifiCredsChanged = true;
     sendSMS("ACK,WIFI," + ss);
+    return;
+  }
+  // WIFIPORTAL [,STOP] -- start/stop the SoftAP WiFi-setup portal (owner-only). Join AP_SSID from a
+  // phone, browse to the AP IP, pick a network + type the password, Save. (Part B)
+  if (k0 == "WIFIPORTAL") {
+    if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+    if (n >= 2 && tok[1] == "STOP") { portalCancel = true; sendSMS("ACK,WIFIPORTAL,STOP"); return; }
+    portalRequested = true;
+    sendSMS(String("ACK,WIFIPORTAL,join ") + AP_SSID + " pw " + AP_PASS + " -> http://192.168.4.1");
     return;
   }
   // TSKEY,<1|2>,<writeApiKey>  -- set a ThingSpeak channel write key (owner-only). (Part B)
@@ -2431,7 +2479,17 @@ void heartbeatTick() {
   // ESP2 silence: major fault + recovery. Inherently one-shot (esp2Available latches false
   // until ESP2 speaks again). RECOVERY_STATE drives the power-cycle (no longer a dead end).
   if (esp2Available && millis() - lastEsp2Ms > HEARTBEAT_TIMEOUT_MS) {
-    esp2Available = false;
+    // Don't declare silence on missed heartbeats alone -- actively probe first. A working ESP2 whose
+    // frames were dropped answers a STATUS_REQ; each reply refreshes lastEsp2Ms + clears silenceProbes.
+    if (silenceProbes < SILENCE_PROBE_MAX) {
+      if (millis() - silenceProbeMs >= SILENCE_PROBE_INTERVAL_MS) {
+        esp2Serial.print(FRAME_START); esp2Serial.print(",STATUS_REQ,"); esp2Serial.println(FRAME_END);
+        silenceProbeMs = millis(); silenceProbes++;
+        logEvent("ESP1", "PROBE", "ESP2_SILENCE_CHECK|" + String(silenceProbes));
+      }
+      return;                                                 // wait out the confirm window before deciding
+    }
+    esp2Available = false; silenceProbes = 0;
     raiseFault('M', "ESP2_SILENCE", "ESP2");                  // counts + queued SMS (sec.12.1.1)
     // Start the recovery ladder fresh (soft reset first, then power-cycle).
     if (sysState != EMERGENCY_STOP) { esp2SoftResetTried = false; setState(RECOVERY_STATE); }
@@ -2590,12 +2648,108 @@ static void tsUpload() {
   lastTsOk = ok; lastTsUploadMs = millis();
 }
 
+/* ---- WiFi provisioning portal (SoftAP + captive web form) -------------------
+ * Lives on core 0 (serviced from netTask). Builds an HTML form listing scanned
+ * SSIDs; POST /save stages creds under netMux and flags the core-1 loop to persist
+ * (no NVS write from core 0). All Serial-only logging here (logBuf is core-1 only). */
+WebServer     portalServer(80);
+DNSServer     portalDns;
+IPAddress     portalApIpAddr;
+unsigned long portalStartMs = 0;
+bool          portalSaved   = false;
+
+static String portalFormHtml() {
+  int n = WiFi.scanNetworks(false, true);                    // sync scan, include hidden
+  String o = F("<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+               "<title>Irrigation WiFi Setup</title></head>"
+               "<body style='font-family:sans-serif;max-width:420px;margin:16px auto;padding:0 12px'>"
+               "<h2>Irrigation WiFi Setup</h2><form method=POST action=/save>"
+               "<p>Nearby network:<br><select name=ssid style='width:100%;padding:8px'>");
+  for (int i = 0; i < n && i < 30; i++) {
+    String s = WiFi.SSID(i);
+    if (s.length() == 0) continue;
+    o += "<option value='" + s + "'>" + s + "  (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+  }
+  o += F("</select></p>"
+         "<p>...or type a hidden SSID:<br><input name=ssid_manual style='width:100%;padding:8px'></p>"
+         "<p>Password:<br><input name=pass type=password style='width:100%;padding:8px'></p>"
+         "<p><button type=submit style='width:100%;padding:12px;font-size:1em'>Save &amp; Connect</button></p>"
+         "</form></body></html>");
+  WiFi.scanDelete();
+  return o;
+}
+static void portalHandleRoot() { portalServer.send(200, "text/html", portalFormHtml()); }
+static void portalHandleSave() {
+  String ss = portalServer.arg("ssid_manual"); ss.trim();
+  if (ss.length() == 0) ss = portalServer.arg("ssid");
+  String pw = portalServer.arg("pass");
+  if (ss.length() == 0) {
+    portalServer.send(200, "text/html", F("<html><body style='font-family:sans-serif'>"
+                                          "<h3>No SSID selected.</h3><a href=/>Go back</a></body></html>"));
+    return;
+  }
+  xSemaphoreTake(netMux, portMAX_DELAY); wifiSsid = ss; wifiPass = pw; xSemaphoreGive(netMux);
+  wifiEnabled = true;                                          // saving creds implies "connect" -> ensure radio on
+  wifiPersistPending = true; portalSaved = true;
+  portalServer.send(200, "text/html", "<html><body style='font-family:sans-serif'><h3>Saved.</h3>"
+                    "<p>Connecting to <b>" + ss + "</b>&hellip; you can close this page.</p></body></html>");
+}
+static void portalHandleNotFound() {                          // captive-portal: redirect probes to the form
+  portalServer.sendHeader("Location", String("http://") + portalApIpAddr.toString(), true);
+  portalServer.send(302, "text/plain", "");
+}
+static void portalStart() {
+  WiFi.mode(WIFI_AP_STA);                                     // AP_STA so scanNetworks() works while AP is up
+  WiFi.softAP(AP_SSID, AP_PASS);
+  vTaskDelay(pdMS_TO_TICKS(100));
+  portalApIpAddr = WiFi.softAPIP();
+  portalApIpAddr.toString().toCharArray(portalApIp, sizeof(portalApIp));
+  portalDns.start(53, "*", portalApIpAddr);                   // wildcard DNS -> AP IP
+  portalServer.on("/", portalHandleRoot);
+  portalServer.on("/save", HTTP_POST, portalHandleSave);
+  portalServer.onNotFound(portalHandleNotFound);
+  portalServer.begin();
+  portalSaved = false; portalStartMs = millis(); portalActive = true;
+  Serial.printf("[PORTAL] up: AP=%s IP=%s\n", AP_SSID, portalApIp);
+}
+static void portalStop() {
+  portalServer.stop();
+  portalDns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  portalActive = false; portalRequested = false; portalCancel = false;
+  Serial.println(F("[PORTAL] down"));
+}
+
 // Core-0 task: keep the WiFi STA link up and upload on a cadence. NOT on the task WDT
 // (it may legitimately block on the network); the core-1 loop is never disturbed.
 void netTask(void *pv) {
   (void)pv;
   unsigned long lastUpload = 0;
   for (;;) {
+    // WiFi provisioning portal takes over the radio when requested (SoftAP + web form).
+    if (portalRequested && !portalActive) portalStart();
+    if (portalActive) {
+      wifiConnected = false;
+      portalDns.processNextRequest();
+      portalServer.handleClient();
+      if (portalSaved || portalCancel || millis() - portalStartMs > PORTAL_TIMEOUT_MS) {
+        bool saved = portalSaved;
+        portalStop();
+        if (saved) wifiCredsChanged = true;                  // reconnect STA to the freshly-saved creds
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // WiFi radio master switch (Settings > WiFi). Off = drop the radio + skip telemetry.
+    if (!wifiEnabled) {
+      if (WiFi.getMode() != WIFI_OFF) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
+      wifiConnected = false;
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
     char ssid[33] = "", pass[65] = "";
     xSemaphoreTake(netMux, portMAX_DELAY);
     strncpy(ssid, wifiSsid.c_str(), sizeof(ssid) - 1);
@@ -3087,6 +3241,17 @@ void handleButtons() {
   }
   estopComboLatch = false;                          // combo released -> re-arm
 
+  // ---- WiFi portal active: BACK cancels it, other buttons are ignored ----------
+  if (portalActive) {
+    static bool portalBackLatch = false;
+    if (digitalRead(BTN_BACK) == LOW) {
+      if (!portalBackLatch) { portalBackLatch = true; portalCancel = true; wakeBacklight();
+                              logEvent("ESP1", "CMD", "WIFI_PORTAL|CANCEL"); }
+    } else portalBackLatch = false;
+    for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]);   // swallow edges while portal is up
+    return;
+  }
+
   // ---- Locked: ignore all buttons except the UP+DOWN unlock combo (Part D) -----
   if (lcdLocked) {
     static bool unlockLatch = false;
@@ -3177,8 +3342,9 @@ static int colMode3(int c) { return !COLUMN_ENABLED[c] ? 2 : (col[c].mode == MOD
 
 // Testing row helpers: rows 0..15 are single relays, 16 = Fill combo, 17+c = Push>Col c combo.
 static bool testRowVisible(int r) {
-  if (r <= TEST_FILL_ROW) return true;                       // single relays + Fill always shown
-  return COLUMN_ENABLED[r - (TEST_FILL_ROW + 1)];            // Push>Col c hidden if the column is off
+  (void)r;
+  return true;   // Testing is a manual hardware bench: show every relay, Fill, and all Push>Col rows
+                 // (incl. columns disabled in the run config, e.g. Col C) so any wiring can be actuated.
 }
 static String testRowName(int r) {
   if (r < 16) return TEST_NAMES[r];
@@ -3316,6 +3482,14 @@ void settingsButton(int i) {
         setState(TEST_MODE);
         uiMode = UI_TEST; testSel = 0; testOnBit = -1;
         // No immediate send: the primed retry in testHoldTick owns arming (after TEST_PRIME_MS).
+      }
+      else if (setSel == SET_WIFI) {                            // toggle STA WiFi + telemetry (persisted)
+        wifiEnabled = !wifiEnabled; saveWifiEn();
+        logEvent("ESP1", "CMD", wifiEnabled ? "WIFI|ON" : "WIFI|OFF");   // netTask gate acts next iteration
+      }
+      else if (setSel == SET_SOFTAP) {                          // toggle the SoftAP provisioning portal
+        if (portalActive || portalRequested) { portalCancel = true; logEvent("ESP1", "CMD", "WIFI_PORTAL|CANCEL"); }
+        else { portalRequested = true; logEvent("ESP1", "CMD", "WIFI_PORTAL|START"); }   // netTask brings up the AP (banner)
       }
       else if (setSel == SET_CALIB) enterCal();                 // idle-only calibration (§A.6)
       else if (setSel == SET_RESTORE) {                          // Restore Defaults (§C): idle-only, double-confirm
@@ -3489,7 +3663,7 @@ void lcdTick() {
   if (!lcdWasPresent) { lcd.init(); lcd.backlight(); lcdWasPresent = true; }   // recovered
 
   if (backlightOn && millis() - backlightMs > LCD_BACKLIGHT_MS
-      && uiMode == UI_DATA
+      && uiMode == UI_DATA && !portalActive
       && sysState != ACTIVE_STATE && sysState != EMERGENCY_STOP && lcdPage != PAGE_FAULT) {
     backlightOn = false; lcd.noBacklight();
   }
@@ -3508,6 +3682,19 @@ void lcdTick() {
     return;
   }
   if (lastLocked) { lcd.clear(); lastLocked = false; }    // just unlocked -> force a clean redraw
+
+  // WiFi provisioning portal banner: takes over the screen while the SoftAP is up (automation runs on).
+  static bool lcdInPortal = false;
+  if (portalActive) {
+    if (!lcdInPortal) { lcd.clear(); lcdInPortal = true; }
+    char lb[21];
+    lcd.setCursor(0, 0); lcd.print("WiFi Setup Mode     ");
+    snprintf(lb, 21, "AP:%-16s", AP_SSID);          lcd.setCursor(0, 1); lcd.print(lb);
+    snprintf(lb, 21, "http://%-13s", portalApIp);   lcd.setCursor(0, 2); lcd.print(lb);
+    lcd.setCursor(0, 3); lcd.print("BACK = cancel       ");
+    return;
+  }
+  if (lcdInPortal) { lcd.clear(); lcdInPortal = false; }  // just left portal -> clean redraw
 
   // Settings / Testing UI takes over the screen when active (spec sec.18.10).
   static uint8_t lastUi = 255;
@@ -3556,7 +3743,9 @@ void lcdTick() {
                                     smsCount);
       lcd.print(l);
       lcd.setCursor(0, 2);
-      if (wifiConnected) snprintf(l, 21, "WiFi:OK %ddBm       ", wifiRssiVal);
+      if (portalActive)  snprintf(l, 21, "WiFi:PORTAL %-8s", portalApIp);
+      else if (!wifiEnabled)  snprintf(l, 21, "WiFi:OFF           ");
+      else if (wifiConnected) snprintf(l, 21, "WiFi:OK %ddBm       ", wifiRssiVal);
       else               snprintf(l, 21, "WiFi:DOWN          ");
       lcd.print(l);
       lcd.setCursor(0, 3);
@@ -3606,6 +3795,13 @@ static void drawList(int sel, int count, const char *const *names) {
   }
 }
 
+// Settings-row label with a live [ON]/[OFF] suffix for the two WiFi toggles.
+static String setRowLabel(int i) {
+  if (i == SET_WIFI)   return String("WiFi        ") + (wifiEnabled ? "[ON]" : "[OFF]");
+  if (i == SET_SOFTAP) return String("Setup AP    ") + ((portalActive || portalRequested) ? "[ON]" : "[OFF]");
+  return SET_NAMES[i];
+}
+
 void lcdRenderSettings() {
   char l[21];
 
@@ -3628,7 +3824,16 @@ void lcdRenderSettings() {
 
   if (uiMode == UI_MENU) {
     lcd.setCursor(0, 0); lcd.print("=== SETTINGS ===    ");
-    drawList(setSel, SET_COUNT, SET_NAMES);
+    // Like drawList, but the two WiFi rows carry a live [ON]/[OFF] suffix.
+    int top = setSel - 1; if (top < 0) top = 0;
+    if (top > SET_COUNT - 3) top = (SET_COUNT > 3) ? SET_COUNT - 3 : 0;
+    for (int r = 0; r < 3; r++) {
+      int idx = top + r;
+      lcd.setCursor(0, r + 1);
+      if (idx < SET_COUNT) snprintf(l, 21, "%c%-19s", idx == setSel ? '>' : ' ', setRowLabel(idx).c_str());
+      else                 snprintf(l, 21, "%-20s", "");
+      lcd.print(l);
+    }
     return;
   }
 

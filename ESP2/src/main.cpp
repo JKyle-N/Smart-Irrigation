@@ -174,6 +174,7 @@ const unsigned long PUMP_EXERCISE_RUN_MS = 5000;             // 5 s
 
 /* ---- Misc ---------------------------------------------------------------- */
 const unsigned long HEARTBEAT_MS    = 5000;
+const unsigned long IDLE_RESET_MS   = 1800000;  // 30 min continuously idle -> self-reboot (self-heal)
 #define WDT_TIMEOUT_S 8
 
 /* ---- Calibration Mode support (companion spec §A) ------------------------ *
@@ -225,6 +226,7 @@ unsigned long lastPcfReportMs = 0;
  * a HARD 10 s cap regardless of ESP1. The cap lives SOLELY here on ESP2.        */
 bool     testMode      = false;
 int      testHeldBit   = -1;          // relay currently driven by the dead-man (-1 = none)
+unsigned long idleSinceMs = 0;        // when ESP2 became idle (0 = not idle now); drives IDLE_RESET_MS self-heal
 bool     testCapped    = false;       // 10 s hard cap reached -> stay OFF until release
 unsigned long testRelayOnMs = 0;      // when the current relay went ON (for the cap)
 unsigned long testLastHoldMs = 0;     // last TEST,HOLD received (for the release timeout)
@@ -317,6 +319,7 @@ bool pcfWrite(uint16_t s);
 void pcfOn(uint8_t bit);
 void pcfOff(uint8_t bit);
 void stopAll();
+void stopKeepBank();
 void cutoffEnergize();
 void cutoffDeenergize();
 void tankSave();
@@ -342,6 +345,7 @@ float endMeteredStage();
 void safetyMonitor();
 float readMixerCurrent();
 void heartbeat();
+void idleResetTick();
 void testSafety();
 void testComboOn(int idx);
 void testOff();
@@ -393,6 +397,7 @@ void loop() {
   primeSafety();               // Prime dead-man + generous cap (§A.4.2)
   pcfHealth();                 // PCF8575 bus watchdog -> PCF_FAIL / PCF_OK
   heartbeat();
+  idleResetTick();             // self-heal: reboot after prolonged idle (30 min)
 
   // non-blocking preventive-exercise completion (5 s pump run commanded by ESP1)
   if (exRunOffAt && millis() >= exRunOffAt) {
@@ -436,6 +441,9 @@ bool pcfWrite(uint16_t s) {
 void pcfOn(uint8_t bit)  { pcfWrite(pcfShadow & ~(1 << bit)); }   // clear bit = ON
 void pcfOff(uint8_t bit) { pcfWrite(pcfShadow |  (1 << bit)); }   // set bit  = OFF
 void stopAll()           { pcfWrite(0xFFFF); }                    // all OFF incl. cutoff de-energized
+// All actuators OFF but the master cutoff kept ENERGIZED (bank stays powered). One atomic write
+// (bit15=0 -> P17 on), so switching Testing components never pulses P17 off->on (sec.19.4.8.4).
+void stopKeepBank()      { pcfWrite(0x7FFF); }
 
 /* ---- P17 master actuator-power cutoff (sec.19.4.8) ----------------------- *
  * Active-LOW: clearing bit 15 ENERGIZES the master relay (bank powered); setting it
@@ -459,9 +467,9 @@ void testComboOn(int idx) {
 // Turn off whatever Testing item is held (single relay OR a whole combo) and return to the
 // resting bank-powered state.
 void testOff() {
-  if (testHeldBit > 15)      stopAll();              // combo: drop every bit
-  else if (testHeldBit >= 0) pcfOff(testHeldBit);    // single relay
-  cutoffEnergize();
+  if (testHeldBit > 15)      stopKeepBank();         // combo: all actuators off, bank stays powered (no P17 glitch)
+  else if (testHeldBit >= 0) pcfOff(testHeldBit);    // single relay off (P17 untouched)
+  cutoffEnergize();                                  // ensure bank powered on release (no-op if already on)
 }
 
 /* ---- Mixing-tank volume persistence (NVS) -------------------------------- *
@@ -654,16 +662,15 @@ void dispatch(const String &payload) {
       int bit = tok[2].toInt();
       if (bit < 0 || bit > 19) { reply("INVALID,TEST_BIT"); return; }   // 0..15 relays, 16..19 combos
       if (bit != testHeldBit) {                            // new selection -> one-at-a-time switch
-        stopAll();
-        if (bit > 15) {                                    // valve+pump priming combo
-          cutoffEnergize();
-          testComboOn(bit);
-        } else if (bit == OUT_MASTER_CUTOFF) {
+        if (bit == OUT_MASTER_CUTOFF) {
           // REVERSED in test mode: the bank is kept powered by default, so holding the master
-          // cutoff entry DE-energizes it (lets the operator verify the cutoff drops the bank).
-          cutoffDeenergize();
-        } else {
-          cutoffEnergize();                                // keep the bank powered so the relay actuates
+          // cutoff entry DE-energizes the WHOLE bank (operator verifies the cutoff drops power).
+          stopAll();                                       // all actuators + P17 off -- this IS the cutoff test
+        } else if (bit > 15) {                             // valve+pump priming combo
+          stopKeepBank();                                  // clear prev selection, keep P17 up (no glitch)
+          testComboOn(bit);
+        } else {                                           // single relay
+          stopKeepBank();                                  // clear prev selection, keep P17 up (no glitch)
           pcfOn(bit);
         }
         testHeldBit = bit; testRelayOnMs = millis(); testCapped = false;
@@ -1024,6 +1031,24 @@ void heartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
     lastHeartbeat = millis();
     reply("STATUS,ESP2,OK");
+  }
+}
+
+/* =============================================================================
+ *  IDLE SELF-HEAL  --  reboot after prolonged idle so a wedged-but-working ESP2
+ *  recovers on its own, even if ESP1 wrongly believes it is silent. Never fires
+ *  during any real activity (a held fault MUST survive until the operator resolves
+ *  it). mixTankL is NVS-persisted, so the tank volume survives the reboot.
+ * ========================================================================== */
+void idleResetTick() {
+  bool idle = (step == SEQ_NONE && !wo.active && !faultHeld && !testMode
+               && calId == "" && primeLine == "" && exRunOffAt == 0);
+  if (!idle)            { idleSinceMs = 0; return; }   // any activity restarts the idle clock
+  if (idleSinceMs == 0) { idleSinceMs = millis(); return; }
+  if (millis() - idleSinceMs >= IDLE_RESET_MS) {
+    reply("INFO,IDLE_RESET");                          // best-effort notice (ESP1 logs it)
+    delay(20);                                         // flush the UART line before the reboot
+    ESP.restart();                                     // returns as READY,ESP2; mixTankL persists
   }
 }
 

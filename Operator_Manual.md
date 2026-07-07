@@ -42,6 +42,8 @@ ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS 
 | `NAME,COL_x,<name>` | `NAME,COL_A,Lettuce` | Give a column a name (shown in reports; saved). | `ACK,NAME,COL_A,Lettuce` |
 | `STOP,ALL` | `STOP,ALL` | **Emergency stop** — halt all actuators now. | `ACK,STOP,ALL` |
 | `WIFI,<ssid>,<pass>` | `WIFI,MyNet,my pass,word` | Set WiFi credentials (**owner-only**). Password is everything after the 2nd comma, so it may contain commas/spaces; the SSID may not. | `ACK,WIFI,MyNet` |
+| `WIFI,ON` \| `WIFI,OFF` | `WIFI,OFF` | WiFi **master switch** (**owner-only**) — same as Settings → WiFi. OFF stops WiFi + uploads; ON reconnects. Persisted. | `ACK,WIFI,OFF` |
+| `WIFIPORTAL` | `WIFIPORTAL` | Start the **Setup AP** portal (**owner-only**) — see §6.6. `WIFIPORTAL,STOP` cancels it. | `ACK,WIFIPORTAL,join Irrig-Setup …` |
 | `TSKEY,<1\|2\|3>,<key>` | `TSKEY,1,ABCD1234EFGH5678` | Set a ThingSpeak channel **write** key (**owner-only**). Ch1=Columns, Ch2=System, Ch3=Chem. | `ACK,TSKEY,1` |
 
 **`<day>` token** (for SUMMARY / FULL SUMMARY): *omit* = today · `YESTERDAY` · `YYYYMMDD` (e.g.
@@ -54,7 +56,7 @@ ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS 
 
 ## 3. Owner gating
 
-`WIFI` and `TSKEY` are **owner-only**: the sender's number must match the configured owner number
+`WIFI`, `WIFIPORTAL`, and `TSKEY` are **owner-only**: the sender's number must match the configured owner number
 (compared on the last digits). If someone else sends them, you get **`ERR,AUTH`**. All other commands
 are accepted from any number that can reach the SIM, and replies go back to whoever texted.
 
@@ -115,7 +117,7 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | `SENSOR_FAIL` | MAJ | An EC/pH probe read railed (disconnected/shorted) — distinct from out-of-window. | Inspect/replace the probe. |
 | `PCF_FAIL` | MAJ | The actuator relay driver isn't responding (relay-bus fault). | Inspect ESP2 wiring/I²C; other safeties still apply. |
 | `ESP2_DEGRADED` | MAJ | One channel was disabled (a nutrient no-flow or mixer no-load) but the run **continued**. | Note which channel; service it later. |
-| `ESP2_SILENCE` | MAJ | The actuator controller went quiet; recovery is under way. | Usually self-recovers. |
+| `ESP2_SILENCE` | MAJ | The actuator controller went quiet **and did not answer 5 status probes (~10 s)**; recovery is under way. | Usually self-recovers. Only genuine no-reply raises this (fewer false alarms). ESP2 also auto-reboots after 30 min idle as a self-heal (harmless — returns `READY`). |
 | `ESP2_NO_READY` | MAJ | Actuator controller didn't come up for a run/startup. | Check ESP2 power (GPIO4 relay). |
 | `NPK_FAULT` | MAJ | A column's NPK sensor read invalid; that column won't fertigate this cycle. | Check the RS485/NPK probe. |
 | `RES_LOW` | MAJ | Reservoir below the low threshold — runs blocked until refilled. | Refill the reservoir. |
@@ -169,8 +171,9 @@ Multi-line / multi-text. Each populated hour: `02h A N148 P39 K198 M42 B … | 1
 
 ### 4.8 Network status — `NET,WiFi:…`
 Example: `NET,WiFi:OK,RSSI-58,IP192.168.1.42,TS:ok,age12s,SSID:MyNet`
-- `WiFi:OK/DOWN`, `RSSI` (dBm), `IP`, `TS:ok/--` (last ThingSpeak upload), `age…s` since that upload,
-  `SSID`.
+- `WiFi:OK/DOWN/OFF`, `RSSI` (dBm), `IP`, `TS:ok/--` (last ThingSpeak upload), `age…s` since that upload,
+  `SSID`. `WiFi:OFF` = the master switch is off (§6.6); `DOWN` = on but not yet connected. While the
+  Setup AP portal is up it reads `WiFi:PORTAL,AP:Irrig-Setup,IP192.168.4.1` (see §6.6).
 
 ---
 
@@ -260,7 +263,7 @@ actually moves through the pipes (hard cap ~30 s; re-hold to keep going):
 | Combo row | Energizes | Use |
 |---|---|---|
 | **Fill Res>Mix** | Inverter + Reservoir valve + Transfer pump | Prime/fill reservoir → mixing tank. |
-| **Push>Col A / B / …** | Inverter + Mix valve + that Column's valve + Booster pump | Prime mixing tank → the chosen column. One row per **enabled** column — scroll (UP/DOWN) to the column you want. |
+| **Push>Col A / B / C** | Inverter + Mix valve + that Column's valve + Booster pump | Prime mixing tank → the chosen column. **All** columns (A/B/C) are shown here regardless of the run config, so you can bench-test any column's wiring — scroll (UP/DOWN) to the one you want. |
 
 Hold ENTER to run a combo; release (or the 30 s cap) stops the pump and closes the valves immediately.
 This replaces the idea of a separate "Prime Lines" menu.
@@ -270,7 +273,32 @@ Double-confirm (NO/YES). Resets operational settings (modes, targets, names, sch
 factory defaults. **Keeps**: all calibration, which columns are enabled (physical wiring), and WiFi /
 ThingSpeak setup. Does not reboot.
 
-### 6.6 Lock screen & emergency stop
+### 6.6 WiFi controls (Settings menu)
+The MODE-button menu has two live WiFi toggles (each shows `[ON]`/`[OFF]`):
+
+- **`WiFi [ON/OFF]`** — master switch for the WiFi connection + ThingSpeak uploads. Turn it **OFF** to
+  stop using WiFi entirely (e.g. to save power or when no network is available); **ON** reconnects. The
+  setting is remembered across reboots. `NET` / the GSM+WiFi page then read `WiFi:OFF`. (SMS equivalent:
+  **`WIFI,ON`** / **`WIFI,OFF`**, owner-only.)
+- **`Setup AP [ON/OFF]`** — starts/stops the provisioning portal below.
+
+**Setup AP (provisioning portal)** — the easiest way to set the WiFi network the controller joins, with
+no SMS or button-typing:
+
+1. Start it: **Settings → Setup AP** (toggle to `[ON]`), or text **`WIFIPORTAL`** (owner-only). The LCD
+   shows a **WiFi Setup Mode** banner with the AP name and address. (Works even if `WiFi` is `[OFF]`.)
+2. On your phone's WiFi list, join **`Irrig-Setup`** (password **`irrigate123`**).
+3. Open a browser to **`http://192.168.4.1`** (most phones pop this up automatically). You'll see a
+   form listing **nearby networks** with signal strength.
+4. Pick your network (or type a hidden SSID), enter its **password**, tap **Save & Connect**.
+5. The controller leaves the setup AP and connects to your network; check with the **GSM+WiFi** LCD
+   page or by texting **`NET`** (shows `WiFi:OK`, signal, IP). Credentials are remembered across reboots.
+
+Cancel any time with the **BACK** button, by texting **`WIFIPORTAL,STOP`**, or just wait — it closes
+itself after **10 minutes** if unused. Irrigation keeps running normally the whole time. *(The AP name
+and password are fixed in firmware; change them there if needed.)*
+
+### 6.7 Lock screen & emergency stop
 - **Lock:** Settings → Lock Screen ignores all buttons except the unlock combo. **Press UP+DOWN
   together** to unlock. Automation keeps running while locked.
 - **Emergency-Off combo:** press **MODE + BACK together** any time to force an emergency stop (works

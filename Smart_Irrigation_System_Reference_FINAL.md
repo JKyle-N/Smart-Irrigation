@@ -1091,6 +1091,27 @@ Purpose:
 
 Heartbeat transmission continues even during idle actuator state.
 
+#### 10.8.3.1. ESP32 #2 silence is confirmed by active probing (not assumed)
+
+A missed heartbeat window alone does NOT declare `ESP2_SILENCE`. After the freshness gap
+(`HEARTBEAT_TIMEOUT_MS`, 120 s), ESP32 #1 first **actively probes** ESP32 #2 with `STATUS_REQ`
+up to **5 times at 2 s spacing (~10 s)**. Any single frame received from ESP32 #2 during this
+window — a heartbeat or a probe reply — cancels the probe and clears the condition. Only when all
+5 probes go unanswered does ESP32 #1 raise `ESP2_SILENCE` (Major) and enter the recovery ladder
+(soft `RESET_SELF` → power-cycle). This prevents a false silence declaration — caused by a
+transient link glitch, an RX buffer drop, or a momentarily starved ESP32 #1 loop — from needlessly
+resetting a healthy actuator controller.
+
+#### 10.8.3.2. ESP32 #2 idle self-heal (self-reboot)
+
+As an independent safety net, ESP32 #2 self-reboots (`ESP.restart()`) after **30 min of
+continuous idle** — i.e. no active work order, no held fault, not in Testing, not calibrating, not
+priming, and no pending pump exercise. It emits `INFO,IDLE_RESET` first (ESP32 #1 logs it) and
+returns with `READY,ESP2`. This lets a wedged-but-working ESP32 #2 recover on its own even if
+ESP32 #1 has (wrongly) concluded it is silent. The self-reboot **never** fires during a held fault
+(the hold must persist until the operator resolves it), and the mixing-tank volume (`mixTankL`) is
+NVS-persisted, so it survives the reboot.
+
 ---
 
 ### 10.8.4. Heartbeat Supervision Authority
@@ -2029,6 +2050,7 @@ Mode is set PER COLUMN. There is no manual fertigation command (fertigation is a
 | FULL SUMMARY[,\<day\>]    | Hourly record + deduped errors + events + peaks (Section 29.5)        |
 | NET                       | WiFi / ThingSpeak link status (Section 29.4)      |
 | WIFI,\<ssid\>,\<pass\>    | Set WiFi credentials — owner-only, NVS (Section 29.4) |
+| WIFIPORTAL                | Start the SoftAP WiFi-setup portal — owner-only (Section 29.4.1); `WIFIPORTAL,STOP` cancels |
 | TSKEY,\<1\|2\|3\>,\<key\> | Set a ThingSpeak channel write key — owner-only (Section 29.4) |
 
 (SUMMARY/FULL SUMMARY/NET/WIFI/TSKEY were added after the original catalog — full behavior in Section 29.4–29.5.)
@@ -3882,6 +3904,30 @@ ESP32 #2. The Nano is unchanged except where stated.
 * Upload cadence ≈ 20 s during ACTIVE, 60 s when idle. Transport is plain HTTP
   (unencrypted) for simplicity; HTTPS is a possible future upgrade.
 * Build note: ESP32 #1 uses the `huge_app` partition to fit WiFi + HTTPClient + SD + libs.
+
+### 29.4.1. WiFi provisioning portal (SoftAP web form)
+
+As an alternative to setting the SSID/password by SMS, ESP32 #1 can host a temporary
+provisioning access point + captive web form so credentials can be entered from a phone
+(no GSM, no on-device typing) — ideal for first-time commissioning at a site with no SIM.
+
+* **Menu controls:** the MODE-button (Settings) menu has two live `[ON]/[OFF]` toggles — **`WiFi`**
+  (`SET_WIFI`) is a persisted master switch for the STA radio + ThingSpeak telemetry (`wifiEnabled`,
+  NVS `wifien`; when off, `netTask` powers the radio down and `NET`/LCD show `WiFi:OFF`), and
+  **`Setup AP`** (`SET_SOFTAP`) starts/stops the provisioning portal. SMS equivalents: `WIFI,ON`/
+  `WIFI,OFF` and `WIFIPORTAL`/`WIFIPORTAL,STOP` (all owner-only).
+* **Start the portal:** Settings → **Setup AP**, or the SMS `WIFIPORTAL`. It runs even when the WiFi
+  master switch is off; a successful **Save** turns the switch back on so the device connects.
+* **Use:** join the WPA2 AP `Irrig-Setup` (password `irrigate123`), browse to
+  `http://192.168.4.1`, pick a **scanned** nearby SSID (or type a hidden one), enter the
+  password, **Save** → creds are staged and persisted to NVS, then the device reconnects in
+  STA mode. The old `WIFI,<ssid>,<pass>` SMS remains as a fallback.
+* **Close:** on Save, the LCD **BACK** button, `WIFIPORTAL,STOP`, or a 10-minute auto-timeout.
+* **Isolation:** the portal runs entirely in the core-0 network task (built-in `WebServer` +
+  captive `DNSServer`, no extra libraries). NVS is written only by the core-1 loop
+  (`wifiPersistPending`), preserving the single-core-NVS invariant. Irrigation/fertigation
+  (core 1 + ESP2) continue unaffected while the AP is up; only telemetry pauses. `NET` and the
+  LCD GSM+WiFi page report `WiFi:PORTAL` during setup.
 
 ## 29.5. SMS reports — day-selectable SUMMARY and new FULL SUMMARY
 
