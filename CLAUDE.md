@@ -38,7 +38,7 @@ Do NOT use legacy AVR SoftwareSerial on ESP32 — use EspSoftwareSerial.
 
 ## LOCKED: Communication protocol
 - Framed packets: `<START>,COMMAND,P1,P2,...,<END>`
-- UPPERCASE commands, comma-separated, no spaces, max 128 bytes
+- UPPERCASE commands, comma-separated, no spaces. Short frames (Nano↔ESP1, ESP2→ESP1 replies) stay ≤128 bytes; the **ESP1→ESP2 work order is the exception** — a full FERTIGATION order carries the self-contained job cal (`KMAIN`/`KNUT`/`ECCAL`/`PHCAL`, §A.5.1 #3) and runs ~200B, so **ESP2's receiver accepts up to 256 bytes** (buffer + frame check = 256). Do not shrink ESP2's RX cap below the largest work order or fertigation orders get dropped.
 - Never execute a packet unless both START and END markers validate
 - Non-blocking everywhere. No `delay()` in any main loop (one-time startup settle in `setup()` only). Protects watchdogs, UART, flow interrupts, GSM.
 
@@ -66,7 +66,8 @@ Daily fresh-start `RESET_REQ` once/day.
 - Scheduled-run notice: ONE consolidated SMS per run (all scheduled columns in one text).
 - Daily summary + on-demand both via `STATUS` keyword. Compact encoded for manual expansion.
 - Inbound: `SET,COL_A,N,150,P,40,K,200,pH,5.8` (explicit, default), `SET,COL_A,PRESET,CARROT` (named), `NAME,COL_A,Lettuce` (persistent NVS), `MODE,...`, `STOP,ALL`.
-- Inbound (added): `SUMMARY[,<day>]`, `FULL SUMMARY[,<day>]`, `NET`, `WIFI,<ssid>,<pass>`, `TSKEY,<1|2|3>,<key>` — see the report/telemetry sections below. `WIFI`/`TSKEY` are owner-gated (sender's last 9 digits must match `PHONE_NUMBER`).
+- Inbound (added): `SUMMARY[,<day>]`, `FULL SUMMARY[,<day>]`, `NET`, `WIFI,<ssid>,<pass>`, `WIFIPORTAL`, `TSKEY,<1|2|3>,<key>` — see the report/telemetry sections below.
+- **Owner-gating: ALL inbound commands require the owner number** — `handleSms` calls `senderIsOwner()` (sender's last 9 digits must match `PHONE_NUMBER`) up front and replies `ERR,AUTH` to anyone else. This covers STATUS/NET/SUMMARY, recovery (STOP/RELEASE/IRRIGATE/NORMAL), and all config. Internally-generated calls (empty `replyTarget`, e.g. the deferred-config replay) pass.
 
 ---
 

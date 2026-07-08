@@ -1693,6 +1693,11 @@ void handleSms(const String &body) {
   String b = body; b.trim();
   String U = b; U.toUpperCase();
 
+  // Owner-gate EVERY command: only the configured owner number may command the system (STATUS/NET/
+  // SUMMARY included). senderIsOwner() returns true for internally-generated calls (replyTarget empty,
+  // e.g. the deferred-config replay), so those still pass. Non-owner -> ERR,AUTH.
+  if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+
   // Defer a remote config-write that collides with an open LOCAL edit (companion spec §B.3.1):
   // apply it once the operator finishes the edit, so neither silently overwrites the other.
   if ((uiMode == UI_EDIT || editConfirm) &&

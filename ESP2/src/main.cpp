@@ -51,8 +51,8 @@
  *  volume is metered from ESP2's OWN flow sensors and persisted to NVS (survives a reboot);
  *  the Nano ultrasonic level is display-only and NOT trusted for control.
  *
- *  NON-BLOCKING: no delay() anywhere; every stage is a millis()-based step in a
- *  FSM. Task watchdog petted each loop iteration.
+ *  NON-BLOCKING: no delay() in normal operation (only a 20 ms UART flush right before a
+ *  self-reboot); every stage is a millis()-based step in a FSM. Task WDT petted each loop.
  *
  *  PLUMBING MODEL (documented assumption -- spec delegates HOW to ESP2 and does
  *  not step-specify the hydraulics; confirm against the real rig):
@@ -107,7 +107,7 @@
 #define OUT_NUT_A      9    // P11 nutrient A pump (DC dosing)
 #define OUT_NUT_B     10    // P12 nutrient B pump
 #define OUT_NUT_C     11    // P13 nutrient C pump
-#define OUT_NUT_D     12    // P14 nutrient D pump -- UNUSED (never driven)
+#define OUT_NUT_D     12    // P14 nutrient D pump -- not dosed (only 3 nutrients); driven solely by Prime NUTD
 #define OUT_PH_UP     13    // P15 pH up pump
 #define OUT_PH_DN     14    // P16 pH down pump
 #define OUT_MASTER_CUTOFF 15 // P17 master actuator-power cutoff (sec.19.4.8; was Nano RESET).
@@ -128,7 +128,6 @@ const uint8_t NUT_FLOW_PIN[3] = { FLOW_NUT_A, FLOW_NUT_B, FLOW_NUT_C };
 #define PIN_PH        32
 #define PIN_EC        33
 #define PIN_MIXER_I   36       // ACS712 mixer current
-#define PIN_SPARE     39
 
 /* ---- Flow K-factors (pulses per LITER) [MEASURE] ------------------------- *
  * RUNTIME (not const): set on the fly by ESP1 Calibration Mode via SET_CAL, refreshed at
@@ -374,7 +373,7 @@ void setup() {
 
   wo.active = false;
   lastHeartbeat = millis();
-  rxLine.reserve(160);
+  rxLine.reserve(260);   // headroom for the longest (fertigation) work order (~200B)
 
   tankLoad();                               // restore persisted mixing-tank volume (overfill guard)
   Serial.printf("Restored mixing-tank volume: %.2f L\n", mixTankL);
@@ -558,14 +557,16 @@ void pollEsp1() {
       if (rxLine.length() > 0) {
         String raw = rxLine; rxLine = "";
         int s = raw.indexOf(FRAME_START), e = raw.indexOf(FRAME_END);
-        if (s < 0 || e <= s || raw.length() > 128) { reply("INVALID,FRAMING"); continue; }
+        // 256B (not 128): a full FERTIGATION work order carries the self-contained job cal
+        // (KMAIN/KNUT/ECCAL/PHCAL, §A.5.1 #3) and runs ~200B. 128 would drop every fertigation order.
+        if (s < 0 || e <= s || raw.length() > 256) { reply("INVALID,FRAMING"); continue; }
         String p = raw.substring(s + 7, e);
         p.trim();
         if (p.startsWith(",")) p = p.substring(1);
         if (p.endsWith(","))   p = p.substring(0, p.length() - 1);
         dispatch(p);
       }
-    } else if (rxLine.length() < 150) rxLine += c; else rxLine = "";
+    } else if (rxLine.length() < 256) rxLine += c; else rxLine = "";   // 256: fits the ~200B fertigation order
   }
 }
 

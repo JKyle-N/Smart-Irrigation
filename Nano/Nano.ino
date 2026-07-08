@@ -159,9 +159,6 @@ const unsigned long NPK_RESPONSE_TIMEOUT_MS = 1000;  // bounded wait for reply (
 const uint8_t NPK_PREC[7]  = { 1, 1, 0, 1, 0, 0, 0 };
 /* ---- end NPK editable block ---------------------------------------------- */
 
-/* ---- Sentinel ------------------------------------------------------------ */
-const int INVALID_INT = -1;     // honest "invalid read" flag (NOT garbage)
-
 /* =============================================================================
  *  GLOBALS  (no further user tuning below this line)
  * ========================================================================== */

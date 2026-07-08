@@ -56,9 +56,10 @@ ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS 
 
 ## 3. Owner gating
 
-`WIFI`, `WIFIPORTAL`, and `TSKEY` are **owner-only**: the sender's number must match the configured owner number
-(compared on the last digits). If someone else sends them, you get **`ERR,AUTH`**. All other commands
-are accepted from any number that can reach the SIM, and replies go back to whoever texted.
+**All commands are owner-only**: the sender's number must match the configured owner number
+(compared on the last 9 digits). This includes STATUS/NET/SUMMARY, the recovery replies
+(STOP/RELEASE/IRRIGATE/NORMAL), and all config. A text from any other number is rejected with
+**`ERR,AUTH`**. Make sure `PHONE_NUMBER` is set to your handset.
 
 ---
 

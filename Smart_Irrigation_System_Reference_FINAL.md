@@ -481,7 +481,10 @@ The following rules apply to all controllers:
 * No spaces allowed inside packets
 * START and END markers are mandatory
 * Packets must remain human-readable ASCII
-* Maximum packet length: 128 bytes
+* Maximum packet length: 128 bytes for short frames (Nano↔ESP1, ESP2→ESP1 replies).
+  EXCEPTION: the ESP1→ESP2 work order carries the self-contained job calibration
+  (KMAIN/KNUT/ECCAL/PHCAL, §A.5.1) and a full fertigation order runs ~200 bytes, so ESP2's
+  receiver accepts up to 256 bytes (buffer + frame check). A tighter cap drops fertigation orders.
 
 ---
 
@@ -2035,6 +2038,11 @@ NAME,COL_A,Lettuce
 ### 12.2.4. Mode & Emergency Commands
 
 Mode is set PER COLUMN. There is no manual fertigation command (fertigation is automatic, Section 14.2.0).
+
+**Owner-gating:** ALL inbound SMS commands (every command in the tables below, including STATUS/NET/
+SUMMARY and the recovery replies STOP/RELEASE/IRRIGATE/NORMAL) require the owner number — `handleSms`
+checks `senderIsOwner()` (sender's last 9 digits vs `PHONE_NUMBER`) first and replies `ERR,AUTH` to any
+other sender. Internally-generated commands (empty reply target) pass.
 
 | Command                   | Function                                          |
 |---------------------------|---------------------------------------------------|
