@@ -488,6 +488,7 @@ String   pendingOwner = "";                        // core0 -> core1: new owner 
 volatile bool ownerPersistPending = false;
 String   pendingAdminPin = "";                     // core0 -> core1: new admin PIN to persist
 volatile bool adminPinPersistPending = false;
+volatile bool tsKeyPersistPending = false;         // core0 -> core1: persist tsKey1-3 to NVS (set directly on core0)
 SemaphoreHandle_t sdMux = NULL;                     // serializes ALL SD access across cores (core1 log/summary + core0 portal)
 
 // ---- Portal config queue (core0 -> core1): the portal builds SMS-format command strings from its
@@ -965,9 +966,13 @@ void loop() {
     xSemaphoreTake(netMux, portMAX_DELAY); adminPin = pendingAdminPin; xSemaphoreGive(netMux);
     saveAdminPin(); logEvent("ESP1", "CFG", "ADMINPIN|PORTAL");
   }
-  // Drain one portal config command (TSKEY/SET/MODE/NAME/THRESH) through handleSms with SMS muted.
-  // Gated on UI_DATA so it never collides with an open local LCD edit (like the deferred-config path).
-  if (cfgHead != cfgTail && uiMode == UI_DATA && !editConfirm) {
+  // Persist ThingSpeak keys set directly on core 0 by the portal (tsKey1-3 already updated under netMux).
+  if (tsKeyPersistPending) { tsKeyPersistPending = false; saveTsKey(); logEvent("ESP1", "CFG", "TSKEY|PORTAL"); }
+  // Drain one portal config command (SET/MODE/NAME/THRESH) through handleSms with SMS muted. Allowed in
+  // UI_DATA *and* UI_MENU: the portal is often launched from the Settings menu, which leaves uiMode==UI_MENU
+  // the whole time it runs -- gating on UI_DATA alone meant those edits never applied. Still never drains
+  // during an actual editor (UI_EDIT/editConfirm); handleSms re-defers SET/MODE/NAME if one opens anyway.
+  if (cfgHead != cfgTail && (uiMode == UI_DATA || uiMode == UI_MENU) && !editConfirm) {
     // Pop under netMux (barrier + mutual exclusion with the core-0 enqueue), then RELEASE before
     // handleSms -- handleSms/sendSMS take netMux themselves, so holding it across would deadlock.
     xSemaphoreTake(netMux, portMAX_DELAY);
@@ -2968,21 +2973,39 @@ static void portalHandleDownload() {                          // GET /download?f
   portalServer.streamFile(f, "application/octet-stream");
   f.close(); sdGive();
 }
+// Recursively delete everything under `dir` (files removed, sub-dirs emptied then rmdir'd). Collects each
+// level's names BEFORE deleting (deleting during openNextFile can invalidate the walk) and SKIPS -- never
+// stops on -- an entry it can't remove, so one un-deletable item (e.g. a "System Volume Information" dir)
+// no longer halts the whole erase. Caller holds sdMux. Returns the count of files removed.
+static int portalRmrf(const String &dir, int depth) {
+  int removed = 0;
+  File d = SD.open(dir);
+  if (!d) return 0;
+  const int MAXN = 48;
+  String child[MAXN]; bool isdir[MAXN]; int cnt = 0;
+  for (File e = d.openNextFile(); e && cnt < MAXN; e = d.openNextFile()) {
+    String nm = String(e.name());                             // normalize to basename (core may return a full path)
+    int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+    if (nm.length()) { child[cnt] = (dir == "/") ? "/" + nm : dir + "/" + nm; isdir[cnt] = e.isDirectory(); cnt++; }
+    e.close();
+  }
+  d.close();
+  for (int i = 0; i < cnt; i++) {
+    if (isdir[i]) { if (depth < 4) removed += portalRmrf(child[i], depth + 1); SD.rmdir(child[i]); }
+    else if (SD.remove(child[i])) removed++;
+  }
+  return removed;
+}
 static void portalHandleFormat() {                            // POST /format -- delete all files (chosen "format")
   if (!portalRequireAdmin()) return;
   if (portalServer.arg("confirm") != "yes") { portalServer.send(200, "text/html", portalAdminHtml("Cancelled (box unchecked).")); return; }
   if (summaryStage != SUM_IDLE) { portalServer.send(200, "text/html", portalAdminHtml("SD busy (report reading). Retry.")); return; }
   int removed = 0;
   if (sdTake(8000)) {
-    // Re-open root each pass and delete the first entry (avoids iterator invalidation while deleting).
-    for (int guard = 0; guard < 500; guard++) {
-      File root = SD.open("/"); if (!root) break;
-      File e = root.openNextFile();
-      if (!e) { root.close(); break; }
-      String nm = String(e.name()); e.close(); root.close();
-      if (!nm.startsWith("/")) nm = "/" + nm;
-      if (SD.remove(nm) || SD.rmdir(nm)) removed++; else break;   // stop on failure (no infinite spin)
-    }
+    // Repeat passes so a root with >MAXN files (or dirs freed this pass) is fully cleared; stops when a
+    // pass removes nothing (only un-deletable entries left) -- never spins.
+    int r, guard = 0;
+    do { r = portalRmrf("/", 0); removed += r; } while (r > 0 && ++guard < 100);
     SD.begin(SD_CS);                                           // ensure remounted; logging resumes into a fresh file
     sdGive();
   }
@@ -2997,22 +3020,28 @@ static void portalHandleTskey() {                             // POST /tskey
   int ch = portalServer.arg("ch").toInt();
   String key = portalServer.arg("key"); key.trim();
   bool bad = (key.length() == 0);
-  for (unsigned i = 0; i < key.length(); i++) if (!isalnum(key[i])) bad = true;
+  for (unsigned i = 0; i < key.length(); i++) if (!isalnum((unsigned char)key[i])) bad = true;
   if (ch < 1 || ch > 3 || bad) { portalServer.send(200, "text/html", portalAdminHtml("Invalid key (letters/digits).")); return; }
-  portalCfgReply("TSKEY," + String(ch) + "," + key, "ThingSpeak Ch" + String(ch) + " key queued.");
+  // tsKey1-3 are netMux-guarded RAM read by tsUpload on core 0 -> set directly here (like WiFi creds),
+  // so it applies immediately (label shows "set", uploads use it) and doesn't depend on the config drain.
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  if (ch == 1) tsKey1 = key; else if (ch == 2) tsKey2 = key; else tsKey3 = key;
+  xSemaphoreGive(netMux);
+  tsKeyPersistPending = true;                                 // core-1 loop saves it to NVS
+  portalServer.send(200, "text/html", portalAdminHtml("ThingSpeak Ch" + String(ch) + " key saved."));
 }
 static void portalHandleColMode() {                           // POST /colmode
   if (!portalRequireAdmin()) return;
   char cc = portalColArg(); String m = portalServer.arg("mode"); m.toUpperCase();
   if (!cc || (m != "AUTO" && m != "IRRIGATION_ONLY")) { portalServer.send(200, "text/html", portalAdminHtml("Bad mode.")); return; }
-  portalCfgReply("MODE,COL_" + String(cc) + "," + m, "Column " + String(cc) + " mode queued.");
+  portalCfgReply("MODE,COL_" + String(cc) + "," + m, "Column " + String(cc) + " mode saved (reload to confirm).");
 }
 static void portalHandleColName() {                           // POST /colname
   if (!portalRequireAdmin()) return;
   char cc = portalColArg(); String nm = portalServer.arg("name"); nm.trim(); nm.replace(",", " ");
   if (!cc || nm.length() == 0) { portalServer.send(200, "text/html", portalAdminHtml("Bad name.")); return; }
   if (nm.length() > 15) nm = nm.substring(0, 15);
-  portalCfgReply("NAME,COL_" + String(cc) + "," + nm, "Column " + String(cc) + " name queued.");
+  portalCfgReply("NAME,COL_" + String(cc) + "," + nm, "Column " + String(cc) + " name saved (reload to confirm).");
 }
 static void portalHandleColTargets() {                        // POST /coltargets
   if (!portalRequireAdmin()) return;
@@ -3023,19 +3052,19 @@ static void portalHandleColTargets() {                        // POST /coltarget
                ",P," + String(portalServer.arg("p").toInt()) +
                ",K," + String(portalServer.arg("k").toInt()) +
                ",pH," + String(portalServer.arg("ph").toFloat(), 1);
-  portalCfgReply(cmd, "Column " + String(cc) + " targets queued.");
+  portalCfgReply(cmd, "Column " + String(cc) + " targets saved (reload to confirm).");
 }
 static void portalHandleColPreset() {                         // POST /colpreset
   if (!portalRequireAdmin()) return;
   char cc = portalColArg(); String pr = portalServer.arg("preset"); pr.trim();
   if (!cc || pr.length() == 0) { portalServer.send(200, "text/html", portalAdminHtml("Bad preset.")); return; }
-  portalCfgReply("SET,COL_" + String(cc) + ",PRESET," + pr, "Column " + String(cc) + " preset queued.");
+  portalCfgReply("SET,COL_" + String(cc) + ",PRESET," + pr, "Column " + String(cc) + " preset saved (reload to confirm).");
 }
 static void portalHandleThresh() {                            // POST /thresh
   if (!portalRequireAdmin()) return;
   portalCfgReply("THRESH," + String(portalServer.arg("start").toInt()) + "," +
                  String(portalServer.arg("stop").toInt()) + "," +
-                 String(portalServer.arg("gap").toInt()), "Thresholds queued.");
+                 String(portalServer.arg("gap").toInt()), "Thresholds saved (reload to confirm).");
 }
 static void portalStart() {
   WiFi.mode(WIFI_AP_STA);                                     // AP_STA so scanNetworks() works while AP is up
