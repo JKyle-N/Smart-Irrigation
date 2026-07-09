@@ -478,6 +478,25 @@ volatile bool portalCancel       = false;          // core1/SMS -> netTask: tear
 volatile bool wifiPersistPending = false;          // netTask -> core1: persist staged creds to NVS
 char portalApIp[16] = "192.168.4.1";               // softAP IP, shown on LCD/SMS
 
+// ---- Portal admin (PIN-gated: SD format/download/review + owner-number edit) ----
+// Admin actions run on core 0 (portal) but touch core-1-owned resources: SD (guarded by sdMux) and
+// PHONE_NUMBER (staged to core 1 via pendingOwner). PIN + owner persist in NVS on core 1.
+const char *ADMIN_PIN_DEFAULT = "1234";            // change at commissioning (documented in manual)
+String   adminPin = ADMIN_PIN_DEFAULT;             // NVS "apin"
+volatile bool portalAdminUnlocked = false;         // set by correct PIN; cleared every portalStop()
+String   pendingOwner = "";                        // core0 -> core1: new owner number to persist
+volatile bool ownerPersistPending = false;
+String   pendingAdminPin = "";                     // core0 -> core1: new admin PIN to persist
+volatile bool adminPinPersistPending = false;
+SemaphoreHandle_t sdMux = NULL;                     // serializes ALL SD access across cores (core1 log/summary + core0 portal)
+
+// ---- Portal config queue (core0 -> core1): the portal builds SMS-format command strings from its
+// forms (TSKEY/SET/MODE/NAME/THRESH) and enqueues them here; the core-1 loop replays each through
+// handleSms() with SMS replies muted. Reuses all existing parsing/validation; no cross-core config write.
+String        portalCfgQ[6];
+volatile uint8_t cfgHead = 0, cfgTail = 0;
+volatile bool smsMute = false;                     // when set, sendSMS() drops (suppress ACKs for portal replays)
+
 // Inter-core telemetry snapshot: filled on core 1 (telemetryCollect, POD only -> spinlock),
 // read on core 0 by the upload task.
 struct TelemetrySnapshot {
@@ -700,6 +719,7 @@ void saveColumn(int c);
 void saveSchedule(int c);
 void saveColEnable(int c);
 void saveThresholds();
+static int clampi(int v, int lo, int hi);   // used by the THRESH SMS handler (defined near the LCD editor)
 void testHoldTick();
 
 void pollNano();
@@ -753,6 +773,8 @@ void deviceHealthTick();
 static bool i2cPresent(uint8_t addr);
 void saveLock();
 void saveWifiEn();
+void saveOwner();
+void saveAdminPin();
 void saveWifi();
 void saveTsKey();
 void telemetryCollect();
@@ -889,7 +911,8 @@ void setup() {
   // ---- WiFi/ThingSpeak uplink task on core 0 (Part A) ----
   // Started after NVS load so creds are ready. Runs network I/O off the core-1 loop.
   netMux = xSemaphoreCreateMutex();
-  xTaskCreatePinnedToCore(netTask, "netTask", 16384, NULL, 1, &netTaskHandle, 0);  // +stack for WebServer/scan (portal)
+  sdMux  = xSemaphoreCreateMutex();          // serialize SD across cores (must exist before netTask/logFlush)
+  xTaskCreatePinnedToCore(netTask, "netTask", 20480, NULL, 1, &netTaskHandle, 0);  // +stack for WebServer/scan/SD stream (portal)
 
   wdtSetup();                               // arm task watchdog (core-1 loop only)
   setState(STARTUP_SYNC);
@@ -930,6 +953,25 @@ void loop() {
   }
   // Persist WiFi creds saved by the core-0 portal (all NVS writes stay on core 1).
   if (wifiPersistPending) { wifiPersistPending = false; saveWifi(); saveWifiEn(); logEvent("ESP1", "CFG", "WIFI|PORTAL"); }
+  // Apply portal-staged owner number / admin PIN on core 1 (PHONE_NUMBER is read here by senderIsOwner/
+  // sendSMS, so the write must happen on this core, not core 0).
+  if (ownerPersistPending) {
+    ownerPersistPending = false;
+    xSemaphoreTake(netMux, portMAX_DELAY); PHONE_NUMBER = pendingOwner; xSemaphoreGive(netMux);
+    saveOwner(); logEvent("ESP1", "CFG", "OWNER|PORTAL");
+  }
+  if (adminPinPersistPending) {
+    adminPinPersistPending = false;
+    xSemaphoreTake(netMux, portMAX_DELAY); adminPin = pendingAdminPin; xSemaphoreGive(netMux);
+    saveAdminPin(); logEvent("ESP1", "CFG", "ADMINPIN|PORTAL");
+  }
+  // Drain one portal config command (TSKEY/SET/MODE/NAME/THRESH) through handleSms with SMS muted.
+  // Gated on UI_DATA so it never collides with an open local LCD edit (like the deferred-config path).
+  if (cfgHead != cfgTail && uiMode == UI_DATA && !editConfirm) {
+    String cmd = portalCfgQ[cfgHead]; cfgHead = (uint8_t)((cfgHead + 1) % 6);
+    logEvent("ESP1", "CFG", "PORTAL|" + cmd);
+    smsMute = true; handleSms(cmd); smsMute = false;
+  }
   g_lastStage = 'L'; lcdTick();            // LCD I2C writes
   g_lastStage = 'F'; logFlush(false);      // microSD (SPI) write
   g_lastStage = '.';                       // idle: loop completed cleanly
@@ -1037,6 +1079,8 @@ void loadConfig() {
   lcdLocked    = prefs.getBool("lock", false);   // LCD lock persists across reboot (Part D)
   // WiFi + ThingSpeak (Part A/B): creds + write keys persist in NVS.
   wifiEnabled = prefs.getBool("wifien", true);   // WiFi master switch (Settings > WiFi)
+  PHONE_NUMBER = prefs.getString("owner", PHONE_NUMBER);   // owner number (portal-editable; SMS gating)
+  adminPin     = prefs.getString("apin", ADMIN_PIN_DEFAULT); // portal admin PIN
   wifiSsid = prefs.getString("wssid", "");
   wifiPass = prefs.getString("wpass", "");
   tsKey1   = prefs.getString("tsk1", "");
@@ -1109,6 +1153,8 @@ void saveLock() {
 void saveWifiEn() {
   prefs.putBool("wifien", wifiEnabled);
 }
+void saveOwner()    { prefs.putString("owner", PHONE_NUMBER); }   // owner number (portal edit)
+void saveAdminPin() { prefs.putString("apin", adminPin); }        // portal admin PIN
 void saveWifi() {
   prefs.putString("wssid", wifiSsid);
   prefs.putString("wpass", wifiPass);
@@ -1766,7 +1812,7 @@ void handleSms(const String &body) {
       if (target == -2) { sendSMS("ERR,SUMDATE"); return; }
       SumMode mode = isFull ? SUM_FULL : SUM_SHORT;
       const char *ackName = isFull ? "FULLSUMMARY" : "SUMMARY";
-      if (sysState == ACTIVE_STATE) {
+      if (sysState == ACTIVE_STATE || portalActive) {   // portal owns the SD -> defer, run when it closes
         sendSMS(String("ACK,BUSY,") + ackName);
         summaryReplyTo = replyTarget;
         pendingSumMode = mode; pendingSumTarget = target;
@@ -1884,12 +1930,26 @@ void handleSms(const String &body) {
     sendSMS("ACK,TSKEY," + String(ch));
     return;
   }
+  // THRESH,<start%>,<stop%>,<gap>  -- soil start/stop thresholds + fertigation gap (also on the LCD
+  // Settings > Thresholds editor). Clamps stop>start like the editor. (Owner-gated above.)
+  if (k0 == "THRESH") {
+    if (n < 4) { sendSMS("ERR,THRESH"); return; }
+    int s  = clampi(tok[1].toInt(), 0, 100);
+    int st = clampi(tok[2].toInt(), 0, 100);
+    int g  = clampi((int)tok[3].toFloat(), 0, 500);
+    if (st <= s) st = clampi(s + 1, 0, 100);
+    soilStartPct = s; soilStopPct = st; fertGap = g;
+    saveThresholds();
+    sendSMS("ACK,THRESH," + String(s) + "," + String(st) + "," + String(g));
+    return;
+  }
   sendSMS("ERR,CMD");
 }
 
 // Enqueue only -- non-blocking. The AT exchange is driven by gsmTxTick() so alert
 // and fault paths never stall the loop.
 void sendSMS(const String &msg) {
+  if (smsMute) return;                                 // suppress ACK/ERR for portal-replayed config commands
   if (smsCount >= SMS_QUEUE_SIZE) {                     // queue full: drop oldest, keep newest alert
     smsHead = (smsHead + 1) % SMS_QUEUE_SIZE;
     smsCount--;
@@ -2107,8 +2167,24 @@ static long resolveSummaryDay(const String &arg) {
   return -2;                                            // unrecognized
 }
 
+// SD cross-core lock (sdMux). Timed take so the core-1 loop never blocks past the task WDT while the
+// core-0 portal holds the card; NULL sdMux (pre-init) -> proceed unlocked (single-threaded at that point).
+static bool sdTake(uint32_t ms) { return (!sdMux) || xSemaphoreTake(sdMux, pdMS_TO_TICKS(ms)) == pdTRUE; }
+static void sdGive()            { if (sdMux) xSemaphoreGive(sdMux); }
+
+// Enqueue an SMS-format config command from the core-0 portal for the core-1 loop to replay via
+// handleSms (muted). Returns false if the 6-slot ring is full. Producer = core 0, consumer = core 1.
+static bool portalCfgEnq(const String &cmd) {
+  uint8_t next = (uint8_t)((cfgTail + 1) % 6);
+  if (next == cfgHead) return false;                 // full
+  portalCfgQ[cfgTail] = cmd;
+  cfgTail = next;
+  return true;
+}
+
 void startSummaryJob(SumMode mode, long targetStamp) {
   if (summaryStage != SUM_IDLE) return;  // one job at a time
+  if (portalActive) return;              // portal owns the SD; the deferred trigger retries when it closes
   sumMode = mode;
   summaryTargetStamp = targetStamp;
   summaryStage = SUM_OPEN;
@@ -2200,20 +2276,25 @@ void summaryTick() {
       char fname[16];
       if (summaryTargetStamp > 0) snprintf(fname, sizeof(fname), "/%08ld.CSV", summaryTargetStamp);
       else                        strcpy(fname, "/NODATE.CSV");
+      if (!sdTake(200)) return;                          // portal holds SD -> retry this stage next tick
       summaryFile = SD.open(fname, FILE_READ);
+      sdGive();
       summaryStage = SUM_READ;                           // SUM_READ tolerates a failed open
       return;
     }
 
     case SUM_READ: {
       if (!summaryFile) { summaryStage = SUM_BUILD; return; }
+      if (!sdTake(200)) return;                          // portal holds SD -> retry next tick (handle stays open)
       uint16_t lines = 0;
       while (summaryFile.available() && lines < SUMMARY_LINES_PER_TICK) {
         char c = (char)summaryFile.read();
         if (c == '\n')      { summaryParseLine(sumPartial); sumPartial = ""; lines++; }
         else if (c != '\r') { if (sumPartial.length() < 200) sumPartial += c; }
       }
-      if (!summaryFile.available()) {                    // EOF: flush a trailing unterminated line
+      bool eof = !summaryFile.available();
+      sdGive();
+      if (eof) {                                         // EOF: flush a trailing unterminated line
         if (sumPartial.length()) { summaryParseLine(sumPartial); sumPartial = ""; }
         summaryStage = SUM_BUILD;
       }
@@ -2221,7 +2302,7 @@ void summaryTick() {
     }
 
     case SUM_BUILD: {
-      if (summaryFile) summaryFile.close();
+      if (summaryFile) { if (!sdTake(200)) return; summaryFile.close(); sdGive(); }
       if (sumMode == SUM_FULL) buildFullReport(); else buildShortReport();
       int len = sumReport.length();
       sumSegTotal = (len + SEG - 1) / SEG; if (sumSegTotal < 1) sumSegTotal = 1;
@@ -2463,7 +2544,7 @@ void scheduleTick() {
   }
   if (reportPending && sysState != ACTIVE_STATE) sendDailyReport();   // deferred STATUS
   // Deferred SUMMARY: operation finished -> run the (non-blocking) SD parse now (sec.12.1.3.1).
-  if (summaryPending && sysState != ACTIVE_STATE && summaryStage == SUM_IDLE) {
+  if (summaryPending && sysState != ACTIVE_STATE && summaryStage == SUM_IDLE && !portalActive) {
     summaryPending = false;            // cleared again in SUM_STREAM; prevents re-trigger mid-job
     startSummaryJob(pendingSumMode, pendingSumTarget);
   }
@@ -2679,7 +2760,11 @@ static String portalFormHtml() {
          "<p>...or type a hidden SSID:<br><input name=ssid_manual style='width:100%;padding:8px'></p>"
          "<p>Password:<br><input name=pass type=password style='width:100%;padding:8px'></p>"
          "<p><button type=submit style='width:100%;padding:12px;font-size:1em'>Save &amp; Connect</button></p>"
-         "</form></body></html>");
+         "</form>"
+         "<hr><h2>Admin</h2><form method=POST action=/admin>"      // PIN-gated: logs / owner / format
+         "<p>Admin PIN:<br><input name=pin type=password style='width:100%;padding:8px'></p>"
+         "<p><button type=submit style='width:100%;padding:12px'>Unlock admin</button></p></form>"
+         "</body></html>");
   WiFi.scanDelete();
   return o;
 }
@@ -2703,6 +2788,232 @@ static void portalHandleNotFound() {                          // captive-portal:
   portalServer.sendHeader("Location", String("http://") + portalApIpAddr.toString(), true);
   portalServer.send(302, "text/plain", "");
 }
+
+/* ---- Portal admin (PIN-gated): SD logs (list/view/download/format) + owner-number edit --------
+ * Runs on core 0. SD access takes sdMux; the owner-number write is staged to core 1 (pendingOwner).
+ * Path params are strictly sanitized to a root-level *.CSV basename (no traversal). */
+static String portalHead(const String &title) {
+  return "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+         "<title>" + title + "</title></head>"
+         "<body style='font-family:sans-serif;max-width:460px;margin:16px auto;padding:0 12px'>";
+}
+// Allow only "/<BASENAME>.CSV" (letters/digits/_), no path separators or "..". "" = reject.
+static String portalSafeCsv(const String &f) {
+  if (f.length() < 5 || f.length() > 20) return "";
+  String u = f; u.toUpperCase();
+  if (!u.endsWith(".CSV")) return "";
+  for (unsigned i = 0; i < f.length() - 4; i++) {
+    char c = f[i];
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+    if (!ok) return "";
+  }
+  return "/" + f;
+}
+static bool portalRequireAdmin() {                            // gate: send a "locked" page + return false
+  if (portalAdminUnlocked) return true;
+  portalServer.send(200, "text/html", portalHead("Admin") + "<h3>Locked.</h3><p>Enter the admin PIN.</p><a href=/>Back</a></body></html>");
+  return false;
+}
+// Validate the ?col= form field to a single column tag A/B/C (0 = invalid).
+static char portalColArg() {
+  String cv = portalServer.arg("col"); cv.toUpperCase();
+  return (cv.length() == 1 && cv[0] >= 'A' && cv[0] <= 'C') ? cv[0] : 0;
+}
+// Config forms: ThingSpeak keys, per-column mode/name/targets/preset, thresholds. Each posts structured
+// fields; the handler builds an SMS-format command and enqueues it for the core-1 handleSms replay.
+static String portalConfigHtml() {
+  String o;
+  bool k1, k2, k3;
+  xSemaphoreTake(netMux, portMAX_DELAY); k1 = tsKey1.length() > 0; k2 = tsKey2.length() > 0; k3 = tsKey3.length() > 0; xSemaphoreGive(netMux);
+  o += "<h3>ThingSpeak keys</h3><form method=POST action=/tskey>"
+       "<p>Channel: <select name=ch>"
+       "<option value=1>1 Columns (" + String(k1 ? "set" : "unset") + ")</option>"
+       "<option value=2>2 System (" + String(k2 ? "set" : "unset") + ")</option>"
+       "<option value=3>3 Chem (" + String(k3 ? "set" : "unset") + ")</option></select></p>"
+       "<p>Write key:<br><input name=key style='width:100%;padding:8px'></p>"
+       "<p><button type=submit style='width:100%;padding:10px'>Save key</button></p></form>";
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    String tag = String(COL_TAG[c]);
+    bool irr = (col[c].mode == MODE_IRRIGATION_ONLY);
+    o += "<h3>Column " + tag + "</h3>";
+    o += "<form method=POST action=/colmode><input type=hidden name=col value=" + tag + ">"
+         "<p>Mode: <label><input type=radio name=mode value=AUTO " + String(irr ? "" : "checked") + ">AUTO</label> "
+         "<label><input type=radio name=mode value=IRRIGATION_ONLY " + String(irr ? "checked" : "") + ">Irrig-only</label> "
+         "<button type=submit>Set</button></p></form>";
+    o += "<form method=POST action=/colname><input type=hidden name=col value=" + tag + ">"
+         "<p>Name: <input name=name value='" + String(col[c].name) + "' style='padding:6px'> <button type=submit>Rename</button></p></form>";
+    o += "<form method=POST action=/coltargets><input type=hidden name=col value=" + tag + ">"
+         "<p>N<input name=n type=number value=" + String((int)col[c].targetN) + " style='width:56px'> "
+         "P<input name=p type=number value=" + String((int)col[c].targetP) + " style='width:56px'> "
+         "K<input name=k type=number value=" + String((int)col[c].targetK) + " style='width:56px'> "
+         "pH<input name=ph type=number step=0.1 value=" + String(col[c].targetPH, 1) + " style='width:64px'> "
+         "<button type=submit>Save targets</button></p></form>";
+    o += "<form method=POST action=/colpreset><input type=hidden name=col value=" + tag + ">"
+         "<p>Preset: <select name=preset>";
+    for (int p = 0; p < NUM_PRESETS; p++) o += "<option>" + String(CROP_PRESETS[p].name) + "</option>";
+    o += "</select> <button type=submit>Apply</button></p></form>";
+  }
+  o += "<h3>Thresholds</h3><form method=POST action=/thresh>"
+       "<p>Start&lt;<input name=start type=number value=" + String(soilStartPct) + " style='width:56px'>% "
+       "Stop&gt;<input name=stop type=number value=" + String(soilStopPct) + " style='width:56px'>% "
+       "gap<input name=gap type=number value=" + String((int)fertGap) + " style='width:56px'>mg/kg "
+       "<button type=submit>Save</button></p></form>";
+  return o;
+}
+static String portalAdminHtml(const String &msg) {            // the unlocked admin dashboard
+  String o = portalHead("Irrigation Admin") + "<h2>Admin</h2>";
+  if (msg.length()) o += "<p style='color:#0a0'><b>" + msg + "</b></p>";
+  String owner; xSemaphoreTake(netMux, portMAX_DELAY); owner = PHONE_NUMBER; xSemaphoreGive(netMux);
+  o += "<h3>Owner number</h3><form method=POST action=/owner>"
+       "<p>Current: <b>" + owner + "</b><br><input name=owner value='" + owner + "' style='width:100%;padding:8px'></p>"
+       "<p><button type=submit style='width:100%;padding:10px'>Save owner</button></p></form>";
+  o += portalConfigHtml();                                     // ThingSpeak keys + columns + thresholds
+  o += "<h3>Logs</h3><table style='width:100%;border-collapse:collapse'>";
+  if (sdTake(1000)) {
+    File root = SD.open("/");
+    if (root) {
+      for (File e = root.openNextFile(); e; e = root.openNextFile()) {
+        String nm = String(e.name()); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+        String up = nm; up.toUpperCase();
+        if (up.endsWith(".CSV"))
+          o += "<tr><td>" + nm + "</td><td align=right>" + String((uint32_t)e.size()) + "B</td>"
+               "<td><a href='/view?f=" + nm + "'>view</a> &middot; <a href='/download?f=" + nm + "'>get</a></td></tr>";
+      }
+      root.close();
+    }
+    sdGive();
+  } else o += "<tr><td>(SD busy, reload)</td></tr>";
+  o += "</table>";
+  o += "<h3 style='color:#c33'>Format SD</h3><form method=POST action=/format "
+       "onsubmit=\"return confirm('Erase ALL files on the SD card?')\">"
+       "<p><label><input type=checkbox name=confirm value=yes> Yes, delete every log file.</label></p>"
+       "<p><button type=submit style='width:100%;padding:10px;background:#c33;color:#fff'>Erase SD</button></p></form>";
+  o += "<h3>Change admin PIN</h3><form method=POST action=/pin>"
+       "<p><input name=pin type=password placeholder='new PIN (4-12)' style='width:100%;padding:8px'></p>"
+       "<p><button type=submit style='width:100%;padding:10px'>Change PIN</button></p></form>";
+  o += "<hr><p><a href=/>&larr; WiFi setup</a></p></body></html>";
+  return o;
+}
+static void portalHandleAdmin() {                             // POST /admin -- verify PIN
+  String pin = portalServer.arg("pin");
+  String want; xSemaphoreTake(netMux, portMAX_DELAY); want = adminPin; xSemaphoreGive(netMux);
+  if (pin.length() && pin == want) { portalAdminUnlocked = true; portalServer.send(200, "text/html", portalAdminHtml("Unlocked.")); }
+  else portalServer.send(200, "text/html", portalHead("Admin") + "<h3>Wrong PIN.</h3><a href=/>Back</a></body></html>");
+}
+static void portalHandleOwner() {                             // POST /owner -- stage new owner number
+  if (!portalRequireAdmin()) return;
+  String o = portalServer.arg("owner"); o.trim();
+  int digits = 0; for (unsigned i = 0; i < o.length(); i++) if (isDigit(o[i])) digits++;
+  if (digits < 7 || o.length() > 15) { portalServer.send(200, "text/html", portalAdminHtml("Invalid number (7-15 digits).")); return; }
+  pendingOwner = o; ownerPersistPending = true;               // core-1 loop applies + persists
+  portalServer.send(200, "text/html", portalAdminHtml("Owner saved: " + o));
+}
+static void portalHandlePin() {                               // POST /pin -- stage new admin PIN
+  if (!portalRequireAdmin()) return;
+  String p = portalServer.arg("pin"); p.trim();
+  if (p.length() < 4 || p.length() > 12) { portalServer.send(200, "text/html", portalAdminHtml("PIN must be 4-12 chars.")); return; }
+  pendingAdminPin = p; adminPinPersistPending = true;
+  portalServer.send(200, "text/html", portalAdminHtml("Admin PIN changed."));
+}
+static void portalHandleView() {                              // GET /view?f= -- inline tail (last 16 KB)
+  if (!portalRequireAdmin()) return;
+  String path = portalSafeCsv(portalServer.arg("f"));
+  if (path == "") { portalServer.send(400, "text/plain", "bad file"); return; }
+  if (!sdTake(2000)) { portalServer.send(503, "text/plain", "SD busy, retry"); return; }
+  File f = SD.open(path, FILE_READ);
+  if (!f) { sdGive(); portalServer.send(404, "text/plain", "not found"); return; }
+  const uint32_t TAIL = 16384;
+  uint32_t sz = f.size();
+  bool tailed = sz > TAIL;
+  if (tailed) f.seek(sz - TAIL);
+  portalServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  portalServer.send(200, "text/plain", "");
+  if (tailed) portalServer.sendContent("...(tail; full file via download)...\n");
+  char buf[513];
+  while (f.available()) { int r = f.read((uint8_t*)buf, 512); if (r <= 0) break; buf[r] = 0; portalServer.sendContent(buf); }
+  f.close(); sdGive();
+  portalServer.sendContent("");                               // finalize chunked response
+}
+static void portalHandleDownload() {                          // GET /download?f= -- whole file as attachment
+  if (!portalRequireAdmin()) return;
+  String path = portalSafeCsv(portalServer.arg("f"));
+  if (path == "") { portalServer.send(400, "text/plain", "bad file"); return; }
+  if (!sdTake(2000)) { portalServer.send(503, "text/plain", "SD busy, retry"); return; }
+  File f = SD.open(path, FILE_READ);
+  if (!f) { sdGive(); portalServer.send(404, "text/plain", "not found"); return; }
+  portalServer.sendHeader("Content-Disposition", "attachment; filename=" + path.substring(1));
+  portalServer.streamFile(f, "application/octet-stream");
+  f.close(); sdGive();
+}
+static void portalHandleFormat() {                            // POST /format -- delete all files (chosen "format")
+  if (!portalRequireAdmin()) return;
+  if (portalServer.arg("confirm") != "yes") { portalServer.send(200, "text/html", portalAdminHtml("Cancelled (box unchecked).")); return; }
+  if (summaryStage != SUM_IDLE) { portalServer.send(200, "text/html", portalAdminHtml("SD busy (report reading). Retry.")); return; }
+  int removed = 0;
+  if (sdTake(8000)) {
+    // Re-open root each pass and delete the first entry (avoids iterator invalidation while deleting).
+    for (int guard = 0; guard < 500; guard++) {
+      File root = SD.open("/"); if (!root) break;
+      File e = root.openNextFile();
+      if (!e) { root.close(); break; }
+      String nm = String(e.name()); e.close(); root.close();
+      if (!nm.startsWith("/")) nm = "/" + nm;
+      if (SD.remove(nm) || SD.rmdir(nm)) removed++; else break;   // stop on failure (no infinite spin)
+    }
+    SD.begin(SD_CS);                                           // ensure remounted; logging resumes into a fresh file
+    sdGive();
+  }
+  portalServer.send(200, "text/html", portalAdminHtml("Erased " + String(removed) + " file(s). SD ready."));
+}
+// ---- config forms: build an SMS-format command, enqueue for the core-1 handleSms replay -----------
+static void portalCfgReply(const String &cmd, const String &okMsg) {
+  portalServer.send(200, "text/html", portalAdminHtml(portalCfgEnq(cmd) ? okMsg : "Busy, retry."));
+}
+static void portalHandleTskey() {                             // POST /tskey
+  if (!portalRequireAdmin()) return;
+  int ch = portalServer.arg("ch").toInt();
+  String key = portalServer.arg("key"); key.trim();
+  bool bad = (key.length() == 0);
+  for (unsigned i = 0; i < key.length(); i++) if (!isalnum(key[i])) bad = true;
+  if (ch < 1 || ch > 3 || bad) { portalServer.send(200, "text/html", portalAdminHtml("Invalid key (letters/digits).")); return; }
+  portalCfgReply("TSKEY," + String(ch) + "," + key, "ThingSpeak Ch" + String(ch) + " key queued.");
+}
+static void portalHandleColMode() {                           // POST /colmode
+  if (!portalRequireAdmin()) return;
+  char cc = portalColArg(); String m = portalServer.arg("mode"); m.toUpperCase();
+  if (!cc || (m != "AUTO" && m != "IRRIGATION_ONLY")) { portalServer.send(200, "text/html", portalAdminHtml("Bad mode.")); return; }
+  portalCfgReply("MODE,COL_" + String(cc) + "," + m, "Column " + String(cc) + " mode queued.");
+}
+static void portalHandleColName() {                           // POST /colname
+  if (!portalRequireAdmin()) return;
+  char cc = portalColArg(); String nm = portalServer.arg("name"); nm.trim(); nm.replace(",", " ");
+  if (!cc || nm.length() == 0) { portalServer.send(200, "text/html", portalAdminHtml("Bad name.")); return; }
+  if (nm.length() > 15) nm = nm.substring(0, 15);
+  portalCfgReply("NAME,COL_" + String(cc) + "," + nm, "Column " + String(cc) + " name queued.");
+}
+static void portalHandleColTargets() {                        // POST /coltargets
+  if (!portalRequireAdmin()) return;
+  char cc = portalColArg();
+  if (!cc) { portalServer.send(200, "text/html", portalAdminHtml("Bad column.")); return; }
+  String cmd = "SET,COL_" + String(cc) +
+               ",N," + String(portalServer.arg("n").toInt()) +
+               ",P," + String(portalServer.arg("p").toInt()) +
+               ",K," + String(portalServer.arg("k").toInt()) +
+               ",pH," + String(portalServer.arg("ph").toFloat(), 1);
+  portalCfgReply(cmd, "Column " + String(cc) + " targets queued.");
+}
+static void portalHandleColPreset() {                         // POST /colpreset
+  if (!portalRequireAdmin()) return;
+  char cc = portalColArg(); String pr = portalServer.arg("preset"); pr.trim();
+  if (!cc || pr.length() == 0) { portalServer.send(200, "text/html", portalAdminHtml("Bad preset.")); return; }
+  portalCfgReply("SET,COL_" + String(cc) + ",PRESET," + pr, "Column " + String(cc) + " preset queued.");
+}
+static void portalHandleThresh() {                            // POST /thresh
+  if (!portalRequireAdmin()) return;
+  portalCfgReply("THRESH," + String(portalServer.arg("start").toInt()) + "," +
+                 String(portalServer.arg("stop").toInt()) + "," +
+                 String(portalServer.arg("gap").toInt()), "Thresholds queued.");
+}
 static void portalStart() {
   WiFi.mode(WIFI_AP_STA);                                     // AP_STA so scanNetworks() works while AP is up
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -2712,6 +3023,18 @@ static void portalStart() {
   portalDns.start(53, "*", portalApIpAddr);                   // wildcard DNS -> AP IP
   portalServer.on("/", portalHandleRoot);
   portalServer.on("/save", HTTP_POST, portalHandleSave);
+  portalServer.on("/admin", HTTP_POST, portalHandleAdmin);   // PIN unlock
+  portalServer.on("/owner", HTTP_POST, portalHandleOwner);
+  portalServer.on("/pin", HTTP_POST, portalHandlePin);
+  portalServer.on("/view", portalHandleView);                // GET ?f=
+  portalServer.on("/download", portalHandleDownload);        // GET ?f=
+  portalServer.on("/format", HTTP_POST, portalHandleFormat);
+  portalServer.on("/tskey", HTTP_POST, portalHandleTskey);   // config forms (staged -> core-1 handleSms)
+  portalServer.on("/colmode", HTTP_POST, portalHandleColMode);
+  portalServer.on("/colname", HTTP_POST, portalHandleColName);
+  portalServer.on("/coltargets", HTTP_POST, portalHandleColTargets);
+  portalServer.on("/colpreset", HTTP_POST, portalHandleColPreset);
+  portalServer.on("/thresh", HTTP_POST, portalHandleThresh);
   portalServer.onNotFound(portalHandleNotFound);
   portalServer.begin();
   portalSaved = false; portalStartMs = millis(); portalActive = true;
@@ -2723,6 +3046,7 @@ static void portalStop() {
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   portalActive = false; portalRequested = false; portalCancel = false;
+  portalAdminUnlocked = false;                                // re-lock admin every session
   Serial.println(F("[PORTAL] down"));
 }
 
@@ -3262,17 +3586,26 @@ void handleButtons() {
     static bool unlockLatch = false;
     bool upDown   = (digitalRead(BTN_UP)   == LOW);
     bool downDown = (digitalRead(BTN_DOWN) == LOW);
-    if (upDown && downDown) {
+    if (upDown && downDown) {                                     // unlock = hold UP+DOWN
       if (!unlockLatch) {
         unlockLatch = true;
         lcdLocked = false; saveLock(); wakeBacklight();
         logEvent("ESP1", "STATE", "LCD_UNLOCK");
       }
-    } else {
-      unlockLatch = false;
-      if (upDown || downDown || digitalRead(BTN_ENTER) == LOW) wakeBacklight();  // keep hint visible
+      for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]); // don't replay edges after unlock
+      return;
     }
-    for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]);   // don't replay edges after unlock
+    unlockLatch = false;
+    // Keep the unlock hint readable on a real (DEBOUNCED) press only. A raw level read here spammed
+    // wakeBacklight() every loop on the noisy strapping-pin buttons, so the lock screen never dimmed --
+    // the same reason the main button loop below debounces edges.
+    for (int i = 0; i < 5; i++) {
+      bool cur = digitalRead(pins[i]);
+      if (cur != last[i] && millis() - lastChange[i] > BTN_DEBOUNCE_MS) {
+        lastChange[i] = millis(); last[i] = cur;
+        if (cur == LOW) wakeBacklight();                          // fresh press -> light to read the hint
+      }
+    }
     return;
   }
 
@@ -3967,6 +4300,10 @@ void logFlush(bool force) {
   if (rtcOk && currentDayStamp > 0) snprintf(fname, sizeof(fname), "/%08ld.CSV", currentDayStamp);
   else { strcpy(fname, "/NODATE.CSV"); }
 
+  // Serialize SD access against the core-0 portal (SD admin). If the portal holds sdMux, don't block
+  // the core-1 loop -- keep buffering and flush on a later tick (logBuf tolerates this like !sdOk).
+  if (sdMux && xSemaphoreTake(sdMux, pdMS_TO_TICKS(100)) != pdTRUE) return;
+
   File f = SD.open(fname, FILE_APPEND);
   if (f) { f.print(logBuf); f.close(); logBuf = ""; logLineCount = 0; }
   else {
@@ -3975,4 +4312,5 @@ void logFlush(bool force) {
     if (!SD.begin(SD_CS)) { sdOk = false; Serial.println(F("WARN: microSD lost (write failed, re-init failed)")); }
     logBuf = ""; logLineCount = 0;            // avoid unbounded growth on write failure
   }
+  if (sdMux) xSemaphoreGive(sdMux);
 }

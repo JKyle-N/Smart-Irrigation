@@ -40,6 +40,7 @@ ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS 
 | `MODE,COL_x,AUTO` | `MODE,COL_A,AUTO` | Column decides irrigate-vs-fertigate automatically (by the nutrient gap). | `ACK,MODE,COL_A,AUTO` |
 | `MODE,COL_x,IRRIGATION_ONLY` | `MODE,COL_C,IRRIGATION_ONLY` | Water only for this column — never doses nutrients. | `ACK,MODE,COL_C,IRRIGATION_ONLY` |
 | `NAME,COL_x,<name>` | `NAME,COL_A,Lettuce` | Give a column a name (shown in reports; saved). | `ACK,NAME,COL_A,Lettuce` |
+| `THRESH,<start>,<stop>,<gap>` | `THRESH,35,45,30` | Soil start%/stop% irrigation thresholds + fertigation gap (mg/kg). Also on the LCD (Settings → Thresholds) and the portal. `stop` is bumped above `start` if needed. | `ACK,THRESH,35,45,30` |
 | `STOP,ALL` | `STOP,ALL` | **Emergency stop** — halt all actuators now. | `ACK,STOP,ALL` |
 | `WIFI,<ssid>,<pass>` | `WIFI,MyNet,my pass,word` | Set WiFi credentials (**owner-only**). Password is everything after the 2nd comma, so it may contain commas/spaces; the SSID may not. | `ACK,WIFI,MyNet` |
 | `WIFI,ON` \| `WIFI,OFF` | `WIFI,OFF` | WiFi **master switch** (**owner-only**) — same as Settings → WiFi. OFF stops WiFi + uploads; ON reconnects. Persisted. | `ACK,WIFI,OFF` |
@@ -298,6 +299,29 @@ no SMS or button-typing:
 Cancel any time with the **BACK** button, by texting **`WIFIPORTAL,STOP`**, or just wait — it closes
 itself after **10 minutes** if unused. Irrigation keeps running normally the whole time. *(The AP name
 and password are fixed in firmware; change them there if needed.)*
+
+**Admin area (on the same portal page).** Below the WiFi form is an **Admin** box. Enter the admin **PIN**
+(default **`1234`** — change it at commissioning) and tap **Unlock admin**. Then you can:
+
+- **Owner number** — see the current SMS owner number and change it. The new number is what all SMS
+  commands are gated to (and where alerts/reports go). Saved to memory, survives reboot.
+- **Logs** — every day's `.CSV` is listed with its size. **view** shows the last ~16 KB in your browser
+  (quick check); **get** downloads the whole file to your phone (for the thesis / Excel).
+- **Format SD** — tick the confirm box and tap **Erase SD** to **delete all files** on the card (frees
+  space / clears history; logging resumes into a fresh file). *This is a full erase, not recoverable.*
+- **ThingSpeak keys** — pick a channel (1 Columns / 2 System / 3 Chem) and paste its **Write API key**
+  (shown only as set/unset, never displayed back).
+- **Columns (A/B/C)** — set each column's **mode** (AUTO vs Irrigation-only), **name**, **nutrient
+  targets** (N/P/K/pH), or **apply a crop preset**.
+- **Thresholds** — soil **Start<** / **Stop>** % and the **fertigation gap**.
+- **Change admin PIN** — set a new 4–12-char PIN (saved to memory).
+
+*Config edits show "queued" and take effect within a moment (they don't text you a confirmation). The
+same settings are still available by SMS.*
+
+Admin re-locks itself when the portal closes. Note: the portal AP password and PIN travel over a local
+Wi-Fi link in plain text — fine for setup while you're standing at the unit, but change the default PIN
+and don't leave the portal running unattended.
 
 ### 6.7 Lock screen & emergency stop
 - **Lock:** Settings → Lock Screen ignores all buttons except the unlock combo. **Press UP+DOWN

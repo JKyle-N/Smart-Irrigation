@@ -2048,6 +2048,7 @@ other sender. Internally-generated commands (empty reply target) pass.
 |---------------------------|---------------------------------------------------|
 | MODE,COL_A,AUTO           | Column decides irrigate/fertigate by nutrient gap |
 | MODE,COL_A,IRRIGATION_ONLY| Disable fertigation for this column (water only)  |
+| THRESH,\<start\>,\<stop\>,\<gap\> | Soil start%/stop% irrigation thresholds + fertigation gap mg/kg (also LCD + portal) |
 | STOP,ALL                  | Emergency stop                                    |
 | STOP                      | (while a fault is HELD, sec.19.4.8.2) acknowledge & keep holding — deliver nothing, wait |
 | RELEASE                   | (held) dump the mixing-tank contents to the assigned column as-is (no top-up, no dosing) |
@@ -3936,6 +3937,34 @@ provisioning access point + captive web form so credentials can be entered from 
   (`wifiPersistPending`), preserving the single-core-NVS invariant. Irrigation/fertigation
   (core 1 + ESP2) continue unaffected while the AP is up; only telemetry pauses. `NET` and the
   LCD GSM+WiFi page report `WiFi:PORTAL` during setup.
+
+#### 29.4.1.1. Portal admin area (PIN-gated)
+
+Below the WiFi form the portal exposes an **Admin** section, unlocked with a numeric PIN (NVS `apin`,
+default `1234`, re-locked on every portal close). It provides:
+
+* **SD logs:** list every `/<daystamp>.CSV` with size; `/view?f=` streams the last 16 KB inline (quick
+  check); `/download?f=` streams the whole file as an attachment. File params are sanitized to a
+  root-level `*.CSV` basename (no path traversal).
+* **Format SD:** confirm-gated **delete-all-files** (the installed core 2.0.17 / IDF 4.4 has no true
+  FAT-format API; delete-all empties the card and logging resumes into a fresh file). Refused while a
+  summary report is mid-read.
+* **Owner number / admin PIN:** edit `PHONE_NUMBER` (the SMS owner-gate + alert/report recipient) and
+  the admin PIN.
+* **Config forms:** ThingSpeak write keys (`TSKEY`), per-column nutrient targets / crop preset (`SET`),
+  per-column mode + name (`MODE`/`NAME`), and thresholds (`THRESH`). Each form builds an SMS-format
+  command server-side and enqueues it (6-slot ring); the **core-1 loop** replays it through `handleSms()`
+  with SMS replies muted — no parser duplication and no cross-core config write. `THRESH,<start>,<stop>,
+  <gap>` is a new SMS command (thresholds were previously LCD-only). ThingSpeak keys show set/unset only.
+
+* **SD + owner concurrency:** a FreeRTOS `sdMux` serializes ALL SD access across cores — `logFlush` and
+  the summary parser (core 1) and the portal handlers (core 0). `logFlush` uses a timed take and buffers
+  on contention (never stalls the core-1 loop/WDT); summaries are deferred while the portal is active.
+  The owner number and PIN are **staged to core 1** (`pendingOwner`/`pendingAdminPin`) and applied +
+  persisted there, so `senderIsOwner`/`sendSMS` never race a cross-core write.
+* **Security note:** the AP password and admin PIN travel in clear over the local Wi-Fi link (HTTP), and
+  the unlock is a per-session RAM flag — acceptable for a physically-present operator, not internet-facing.
+  Change the default PIN at commissioning.
 
 ## 29.5. SMS reports — day-selectable SUMMARY and new FULL SUMMARY
 
