@@ -968,7 +968,11 @@ void loop() {
   // Drain one portal config command (TSKEY/SET/MODE/NAME/THRESH) through handleSms with SMS muted.
   // Gated on UI_DATA so it never collides with an open local LCD edit (like the deferred-config path).
   if (cfgHead != cfgTail && uiMode == UI_DATA && !editConfirm) {
+    // Pop under netMux (barrier + mutual exclusion with the core-0 enqueue), then RELEASE before
+    // handleSms -- handleSms/sendSMS take netMux themselves, so holding it across would deadlock.
+    xSemaphoreTake(netMux, portMAX_DELAY);
     String cmd = portalCfgQ[cfgHead]; cfgHead = (uint8_t)((cfgHead + 1) % 6);
+    xSemaphoreGive(netMux);
     logEvent("ESP1", "CFG", "PORTAL|" + cmd);
     smsMute = true; handleSms(cmd); smsMute = false;
   }
@@ -2175,11 +2179,14 @@ static void sdGive()            { if (sdMux) xSemaphoreGive(sdMux); }
 // Enqueue an SMS-format config command from the core-0 portal for the core-1 loop to replay via
 // handleSms (muted). Returns false if the 6-slot ring is full. Producer = core 0, consumer = core 1.
 static bool portalCfgEnq(const String &cmd) {
+  // Publish under netMux so the String content is barriered for the core-1 drain (matches the
+  // WiFi-creds hand-off pattern). The drain reads portalCfgQ under netMux too.
+  xSemaphoreTake(netMux, portMAX_DELAY);
   uint8_t next = (uint8_t)((cfgTail + 1) % 6);
-  if (next == cfgHead) return false;                 // full
-  portalCfgQ[cfgTail] = cmd;
-  cfgTail = next;
-  return true;
+  bool ok = (next != cfgHead);
+  if (ok) { portalCfgQ[cfgTail] = cmd; cfgTail = next; }
+  xSemaphoreGive(netMux);
+  return ok;
 }
 
 void startSummaryJob(SumMode mode, long targetStamp) {
@@ -2743,19 +2750,29 @@ DNSServer     portalDns;
 IPAddress     portalApIpAddr;
 unsigned long portalStartMs = 0;
 bool          portalSaved   = false;
+String        portalScanOpts;                                // cached <option> list (scan once, not per GET /)
 
-static String portalFormHtml() {
+// Scan nearby networks ONCE (blocking ~2 s) and cache the <option> list. Repeating this on every page
+// load would keep taking the STA off-channel in AP_STA mode and bump the phone off the AP.
+static void portalDoScan() {
   int n = WiFi.scanNetworks(false, true);                    // sync scan, include hidden
-  String o = F("<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-               "<title>Irrigation WiFi Setup</title></head>"
-               "<body style='font-family:sans-serif;max-width:420px;margin:16px auto;padding:0 12px'>"
-               "<h2>Irrigation WiFi Setup</h2><form method=POST action=/save>"
-               "<p>Nearby network:<br><select name=ssid style='width:100%;padding:8px'>");
+  String o;
   for (int i = 0; i < n && i < 30; i++) {
     String s = WiFi.SSID(i);
     if (s.length() == 0) continue;
     o += "<option value='" + s + "'>" + s + "  (" + String(WiFi.RSSI(i)) + " dBm)</option>";
   }
+  WiFi.scanDelete();
+  portalScanOpts = o;
+}
+
+static String portalFormHtml() {
+  String o = F("<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+               "<title>Irrigation WiFi Setup</title></head>"
+               "<body style='font-family:sans-serif;max-width:420px;margin:16px auto;padding:0 12px'>"
+               "<h2>Irrigation WiFi Setup</h2><form method=POST action=/save>"
+               "<p>Nearby network (<a href=/rescan>rescan</a>):<br><select name=ssid style='width:100%;padding:8px'>");
+  o += portalScanOpts;                                       // cached at portalStart / /rescan
   o += F("</select></p>"
          "<p>...or type a hidden SSID:<br><input name=ssid_manual style='width:100%;padding:8px'></p>"
          "<p>Password:<br><input name=pass type=password style='width:100%;padding:8px'></p>"
@@ -2765,10 +2782,14 @@ static String portalFormHtml() {
          "<p>Admin PIN:<br><input name=pin type=password style='width:100%;padding:8px'></p>"
          "<p><button type=submit style='width:100%;padding:12px'>Unlock admin</button></p></form>"
          "</body></html>");
-  WiFi.scanDelete();
   return o;
 }
 static void portalHandleRoot() { portalServer.send(200, "text/html", portalFormHtml()); }
+static void portalHandleRescan() {                            // GET /rescan -- refresh the cached SSID list
+  if (portalActive) portalDoScan();
+  portalServer.sendHeader("Location", String("http://") + portalApIpAddr.toString(), true);
+  portalServer.send(302, "text/plain", "");
+}
 static void portalHandleSave() {
   String ss = portalServer.arg("ssid_manual"); ss.trim();
   if (ss.length() == 0) ss = portalServer.arg("ssid");
@@ -2905,14 +2926,16 @@ static void portalHandleOwner() {                             // POST /owner -- 
   String o = portalServer.arg("owner"); o.trim();
   int digits = 0; for (unsigned i = 0; i < o.length(); i++) if (isDigit(o[i])) digits++;
   if (digits < 7 || o.length() > 15) { portalServer.send(200, "text/html", portalAdminHtml("Invalid number (7-15 digits).")); return; }
-  pendingOwner = o; ownerPersistPending = true;               // core-1 loop applies + persists
+  xSemaphoreTake(netMux, portMAX_DELAY); pendingOwner = o; xSemaphoreGive(netMux);  // barrier for core-1 read
+  ownerPersistPending = true;                                 // core-1 loop applies + persists
   portalServer.send(200, "text/html", portalAdminHtml("Owner saved: " + o));
 }
 static void portalHandlePin() {                               // POST /pin -- stage new admin PIN
   if (!portalRequireAdmin()) return;
   String p = portalServer.arg("pin"); p.trim();
   if (p.length() < 4 || p.length() > 12) { portalServer.send(200, "text/html", portalAdminHtml("PIN must be 4-12 chars.")); return; }
-  pendingAdminPin = p; adminPinPersistPending = true;
+  xSemaphoreTake(netMux, portMAX_DELAY); pendingAdminPin = p; xSemaphoreGive(netMux);  // barrier for core-1 read
+  adminPinPersistPending = true;
   portalServer.send(200, "text/html", portalAdminHtml("Admin PIN changed."));
 }
 static void portalHandleView() {                              // GET /view?f= -- inline tail (last 16 KB)
@@ -3021,21 +3044,29 @@ static void portalStart() {
   portalApIpAddr = WiFi.softAPIP();
   portalApIpAddr.toString().toCharArray(portalApIp, sizeof(portalApIp));
   portalDns.start(53, "*", portalApIpAddr);                   // wildcard DNS -> AP IP
-  portalServer.on("/", portalHandleRoot);
-  portalServer.on("/save", HTTP_POST, portalHandleSave);
-  portalServer.on("/admin", HTTP_POST, portalHandleAdmin);   // PIN unlock
-  portalServer.on("/owner", HTTP_POST, portalHandleOwner);
-  portalServer.on("/pin", HTTP_POST, portalHandlePin);
-  portalServer.on("/view", portalHandleView);                // GET ?f=
-  portalServer.on("/download", portalHandleDownload);        // GET ?f=
-  portalServer.on("/format", HTTP_POST, portalHandleFormat);
-  portalServer.on("/tskey", HTTP_POST, portalHandleTskey);   // config forms (staged -> core-1 handleSms)
-  portalServer.on("/colmode", HTTP_POST, portalHandleColMode);
-  portalServer.on("/colname", HTTP_POST, portalHandleColName);
-  portalServer.on("/coltargets", HTTP_POST, portalHandleColTargets);
-  portalServer.on("/colpreset", HTTP_POST, portalHandleColPreset);
-  portalServer.on("/thresh", HTTP_POST, portalHandleThresh);
-  portalServer.onNotFound(portalHandleNotFound);
+  // Register routes ONCE: WebServer::stop() doesn't free handlers, so re-registering each portal
+  // session would grow the handler list unbounded (heap leak). begin()/stop() run per session.
+  static bool routesRegistered = false;
+  if (!routesRegistered) {
+    portalServer.on("/", portalHandleRoot);
+    portalServer.on("/save", HTTP_POST, portalHandleSave);
+    portalServer.on("/rescan", portalHandleRescan);            // GET -> re-scan + redirect
+    portalServer.on("/admin", HTTP_POST, portalHandleAdmin);   // PIN unlock
+    portalServer.on("/owner", HTTP_POST, portalHandleOwner);
+    portalServer.on("/pin", HTTP_POST, portalHandlePin);
+    portalServer.on("/view", portalHandleView);                // GET ?f=
+    portalServer.on("/download", portalHandleDownload);        // GET ?f=
+    portalServer.on("/format", HTTP_POST, portalHandleFormat);
+    portalServer.on("/tskey", HTTP_POST, portalHandleTskey);   // config forms (staged -> core-1 handleSms)
+    portalServer.on("/colmode", HTTP_POST, portalHandleColMode);
+    portalServer.on("/colname", HTTP_POST, portalHandleColName);
+    portalServer.on("/coltargets", HTTP_POST, portalHandleColTargets);
+    portalServer.on("/colpreset", HTTP_POST, portalHandleColPreset);
+    portalServer.on("/thresh", HTTP_POST, portalHandleThresh);
+    portalServer.onNotFound(portalHandleNotFound);
+    routesRegistered = true;
+  }
+  portalDoScan();                                             // cache the SSID list once (not per GET /)
   portalServer.begin();
   portalSaved = false; portalStartMs = millis(); portalActive = true;
   Serial.printf("[PORTAL] up: AP=%s IP=%s\n", AP_SSID, portalApIp);
@@ -3047,6 +3078,7 @@ static void portalStop() {
   WiFi.mode(WIFI_STA);
   portalActive = false; portalRequested = false; portalCancel = false;
   portalAdminUnlocked = false;                                // re-lock admin every session
+  portalScanOpts = "";                                        // free the cached SSID list
   Serial.println(F("[PORTAL] down"));
 }
 
