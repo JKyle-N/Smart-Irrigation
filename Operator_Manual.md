@@ -119,7 +119,7 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | `SENSOR_FAIL` | MAJ | An EC/pH probe read railed (disconnected/shorted) — distinct from out-of-window. | Inspect/replace the probe. |
 | `PCF_FAIL` | MAJ | The actuator relay driver isn't responding (relay-bus fault). | Inspect ESP2 wiring/I²C; other safeties still apply. |
 | `ESP2_DEGRADED` | MAJ | One channel was disabled (a nutrient no-flow or mixer no-load) but the run **continued**. | Note which channel; service it later. |
-| `ESP2_SILENCE` | MAJ | The actuator controller went quiet **and did not answer 5 status probes (~10 s)**; recovery is under way. | Usually self-recovers. Only genuine no-reply raises this (fewer false alarms). ESP2 also auto-reboots after 30 min idle as a self-heal (harmless — returns `READY`). |
+| `ESP2_SILENCE` | MAJ | The actuator controller went quiet **and did not answer 5 status probes (~10 s)**; recovery is under way. | Usually self-recovers. Only genuine no-reply raises this (fewer false alarms). While idle the controller is briefly powered up ~every 10 min (day) / 1 h (night) for a health check — you may hear its relay click — and every power-up now lasts at least 10 s so it can boot and respond. |
 | `ESP2_NO_READY` | MAJ | Actuator controller didn't come up for a run/startup. | Check ESP2 power (GPIO4 relay). |
 | `NPK_FAULT` | MAJ | A column's NPK sensor read invalid; that column won't fertigate this cycle. | Check the RS485/NPK probe. |
 | `RES_LOW` | MAJ | Reservoir below the low threshold — runs blocked until refilled. | Refill the reservoir. |

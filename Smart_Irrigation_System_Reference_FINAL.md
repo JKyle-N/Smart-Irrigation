@@ -2911,6 +2911,18 @@ I2C Devices with adress:
 
 - Because ESP32 #2 and the PCF8575 are power-dependent on GPIO4 relay control, cutting GPIO4 de-energizes the PCF8575 — including P17, the master actuator-power cutoff (Section 19.4.8). So cutting GPIO4 forces all actuators OFF as a hardware backstop. (The Nano hardware-reset pathway no longer exists; P17 was repurposed from Nano RESET to the master cutoff.)
 
+### 18.8.1. Minimum on-time + idle heartbeat poll
+
+- **Minimum on-time (10 s):** every ESP32 #2 power-up stays on at least 10 s. A graceful power-off while
+  it has been on for less is deferred until the 10 s elapses (`esp2SetPower` defer + `esp2PowerTick`), so a
+  too-brief power-up can never cut ESP32 #2 before it boots, ACKs, and heartbeats. Only the emergency stop
+  cuts power immediately (`force`).
+- **Idle heartbeat poll:** while idle (no scheduled irrigation/fertigation), if ESP32 #2 has not been heard
+  for **10 minutes (day) / 1 hour (night)**, ESP32 #1 powers it up briefly for a health heartbeat, logs
+  `IDLE_POLL|ALIVE`, then powers it back off (respecting the 10 s minimum). A poll with no reply runs the
+  recovery ladder (RESET_SELF → power-cycle). This keeps ESP32 #2 proven-alive on a cadence without leaving
+  it powered, and prevents false `ESP2_SILENCE` (which is gated on power state).
+
 ---
 
 ## 18.9. 🔹 System Reliability & Reset Strategy

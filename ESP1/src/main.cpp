@@ -386,6 +386,17 @@ bool esp2Powered = false;
 struct PendingRun { bool active; int colIdx; bool fertigate; };
 PendingRun pendingRun = { false, -1, false };
 unsigned long esp2WarmupMs = 0;
+// Minimum ESP2 on-time + periodic idle heartbeat poll (so a too-brief power-up can't leave ESP2 unable to
+// boot/ACK, and ESP2 is proven alive on a cadence while idle). See esp2SetPower() + esp2PowerTick().
+const unsigned long ESP2_MIN_ON_MS          = 10000;   // min continuous ON per power-up (boot+ACK+heartbeat)
+const unsigned long ESP2_IDLE_POLL_DAY_MS   = 600000;  // idle heartbeat poll cadence, day  (10 min)
+const unsigned long ESP2_IDLE_POLL_NIGHT_MS = 3600000; // idle heartbeat poll cadence, night (1 h)
+const unsigned long ESP2_POLL_TIMEOUT_MS    = 12000;   // boot+reply window for an idle poll (> min-on)
+unsigned long esp2OnMs = 0;                            // when ESP2 was powered on (min-on reference)
+bool          esp2OffPending = false;                 // a graceful off is waiting out the min-on
+unsigned long esp2OffAt = 0;
+bool          esp2PollActive = false;                 // an idle heartbeat poll is in progress
+unsigned long esp2PollStartMs = 0;
 bool testArmPending = false;     // Testing: TEST,ENTER deferred until ESP2 READY (sec.18.10.8.1)
 // Testing arming robustness: ESP2 is cold-booted by the GPIO4 relay on entry, so its single
 // boot READY can be lost. We PRIME (let ESP2 boot) then re-send TEST,ENTER until ESP2 confirms
@@ -587,6 +598,7 @@ bool      backlightOn = true;
 unsigned long backlightMs = 0;
 unsigned long lastLcdMs = 0;
 String    lastFaultMsg = "none";
+String    lastFaultTime = "";        // RTC timestamp of the last fault (shown on the Fault page)
 
 /* ---- Settings / Testing UI (MODE button, spec sec.18.10) ----------------- */
 enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST, UI_CAL };
@@ -737,7 +749,8 @@ void pollESP2();
 void sendWorkOrder(int c, bool fertigate);
 void handleEsp2Response(const String &payload);
 void esp2PowerCycle();
-void esp2SetPower(bool on);
+void esp2SetPower(bool on, bool force = false);
+void esp2PowerTick();
 void dispatchPendingRun();
 void dispatchPendingExercise();
 void exerciseTick();
@@ -945,6 +958,7 @@ void loop() {
   g_lastStage = 'P'; powerTick();          // INA226 I2C read
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
+  g_lastStage = 'p'; esp2PowerTick();      // ESP2 min-on hold + periodic idle heartbeat poll (sec.18.8)
   g_lastStage = 'n'; nanoPaceTick();       // drive Nano ACTIVE/DAY/NIGHT interval (A2)
   g_lastStage = 'd'; deviceHealthTick();   // device-loss watchdog -> daily self-reset (Part C)
   g_lastStage = 'w'; telemetryCollect();   // snapshot for the WiFi/ThingSpeak uplink task (Part A)
@@ -1650,7 +1664,7 @@ void esp2PowerCycle() {
   esp2PowerCycles++;
   logEvent("ESP1", "RESET", "ESP2|HW|POWERCYCLE");
   digitalWrite(ESP2_PWR_PIN, LOW);
-  esp2Powered = false;
+  esp2Powered = false; esp2OffPending = false;   // hard cut ends any deferred graceful off
   esp2OffMs = millis();                  // STARTUP_SYNC holds OFF for POWER_CYCLE_OFF_MS, then powers on
   esp2Available = false;
   // Abandon anything that was warming up against this ESP2 (recovery restarts it clean).
@@ -1659,13 +1673,52 @@ void esp2PowerCycle() {
   setState(STARTUP_SYNC);
 }
 
-// Relay power control for ESP2 (OFF-during-idle model, sec.18.8). When cutting power,
-// also drop esp2Available + any deferred arm so stale flags can't fire against a dead ESP2.
-void esp2SetPower(bool on) {
-  if (on == esp2Powered) return;                 // no redundant relay writes
-  digitalWrite(ESP2_PWR_PIN, on ? HIGH : LOW);
-  esp2Powered = on;
-  if (!on) { esp2Available = false; testArmPending = false; esp2TestArmed = false; testArmTries = 0; }
+// Relay power control for ESP2 (OFF-during-idle model, sec.18.8). MINIMUM ON-TIME: a graceful off
+// (force=false) while ESP2 has been on < ESP2_MIN_ON_MS is DEFERRED (esp2PowerTick services it) so a
+// too-brief power-up can't cut ESP2 before it boots/ACKs/heartbeats. force=true cuts immediately (safety).
+// When cutting power, also drop esp2Available + any deferred arm so stale flags can't fire against a dead ESP2.
+void esp2SetPower(bool on, bool force) {
+  if (on) {
+    esp2OffPending = false;                      // a new power-up cancels a pending graceful off
+    if (esp2Powered) return;
+    digitalWrite(ESP2_PWR_PIN, HIGH);
+    esp2Powered = true; esp2OnMs = millis();
+    return;
+  }
+  if (!esp2Powered) { esp2OffPending = false; return; }
+  if (!force && millis() - esp2OnMs < ESP2_MIN_ON_MS) {    // hold the minimum on-time before turning off
+    esp2OffPending = true; esp2OffAt = esp2OnMs + ESP2_MIN_ON_MS;
+    return;
+  }
+  digitalWrite(ESP2_PWR_PIN, LOW);
+  esp2Powered = false; esp2OffPending = false;
+  esp2Available = false; testArmPending = false; esp2TestArmed = false; testArmTries = 0;
+}
+
+// Serviced each loop: (1) complete a deferred graceful off once min-on elapses; (2) periodic idle
+// heartbeat poll -- when idle and ESP2 hasn't been heard for the day/night interval, power it up briefly
+// to confirm it's alive, then off; a no-reply poll runs the recovery ladder (sec.18.8).
+static bool isNight() {
+  if (!rtcOk) return false;
+  uint16_t mod = minuteOfDay();
+  return (mod >= NIGHT_START_MIN) || (mod < NIGHT_END_MIN);
+}
+void esp2PowerTick() {
+  if (esp2OffPending && esp2Powered && millis() >= esp2OffAt) esp2SetPower(false);   // min-on elapsed -> off
+  if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held) { esp2PollActive = false; return; }
+  unsigned long interval = isNight() ? ESP2_IDLE_POLL_NIGHT_MS : ESP2_IDLE_POLL_DAY_MS;
+  if (!esp2PollActive) {
+    if (millis() - lastEsp2Ms < interval) return;          // heard from ESP2 recently -> no poll needed
+    esp2PollActive = true; esp2PollStartMs = millis();
+    esp2SetPower(true);                                    // power on (or reuse if in a deferred-off window)
+    logEvent("ESP1", "ESP2", "IDLE_POLL|START");
+  } else if (esp2Available) {                              // ESP2 spoke -> alive
+    logEvent("ESP1", "ESP2", "IDLE_POLL|ALIVE");
+    esp2PollActive = false; esp2SetPower(false);           // graceful -> off after the 10 s min-on
+  } else if (millis() - esp2PollStartMs > ESP2_POLL_TIMEOUT_MS) {
+    logEvent("ESP1", "ESP2", "IDLE_POLL|NO_REPLY");
+    esp2PollActive = false; esp2SoftResetTried = false; setState(RECOVERY_STATE);   // recovery ladder
+  }
 }
 
 // Warm-up complete (ESP2 READY): send the queued scheduled run, then clear the pending slot.
@@ -3238,6 +3291,7 @@ void raiseFault(char tier, const char *code, const char *loc) {
   String detail = String(t) + "|" + code + "|" + loc;
   logEvent("ESP1", "FAULT", detail);
   lastFaultMsg = String(code) + " " + loc;
+  lastFaultTime = tsString();
   // Faults preempt the Settings/Testing UI; never leave a manually-held relay ON. Also drop
   // ESP2 power (OFF-during-idle) so the executor doesn't sit powered after a Testing abort.
   if (uiMode == UI_TEST) {
@@ -3263,7 +3317,7 @@ void enterEmergencyStop(bool cutPower) {
   wo.active = false; wo.stage = WO_IDLE;
   pendingRun.active = false; pendingRun.colIdx = -1;
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
-  if (cutPower) esp2SetPower(false);              // (sec.23.1.1) -- mirror kept in sync
+  if (cutPower) esp2SetPower(false, true);        // (sec.23.1.1) -- FORCE immediate cut (bypass min-on hold)
   editConfirm = false; restoreConfirm = false; resetConfirm = false; editDirty = false;   // force-dismiss + auto-discard (§B.3.1)
   // Take over the screen with the recovery prompt (Part B): leave any Settings/Testing UI,
   // default the cursor to "Return to normal".
@@ -3283,6 +3337,7 @@ void enterFaultHold(const char *code, const char *loc) {
   String detail = String("CRIT|") + code + "|" + loc + "|" + op + "|" + colS + "|HELD";
   logEvent("ESP1", "FAULT", detail);
   lastFaultMsg = String(code) + " " + loc + " " + colS;
+  lastFaultTime = tsString();
   // GSM alert WITH operation + column, and the reply menu (sec.12.1.1 + user req).
   sendSMS(String("ALERT,CRIT,") + code + "," + loc + "," + op + "," + colS +
           ",reply STOP/RELEASE/IRRIGATE/NORMAL");
@@ -4237,7 +4292,9 @@ void lcdTick() {
         lcd.setCursor(0, 0); lcd.print("Last Fault:         ");
         lcd.setCursor(0, 1); snprintf(l, 21, "%-20s", lastFaultMsg.substring(0, 20).c_str()); lcd.print(l);
         lcd.setCursor(0, 2); snprintf(l, 21, "C%d M%d m%d today     ", faultsToday[0], faultsToday[1], faultsToday[2]); lcd.print(l);
-        lcd.setCursor(0, 3); lcd.print("                    ");
+        lcd.setCursor(0, 3);
+        if (lastFaultTime.length()) { snprintf(l, 21, "at %-17s", lastFaultTime.substring(5).c_str()); lcd.print(l); }  // MM-DD HH:MM:SS
+        else                        { lcd.print("                    "); }
       }
       break;
   }
