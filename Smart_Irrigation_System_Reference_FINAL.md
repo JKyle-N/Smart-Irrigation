@@ -2969,6 +2969,27 @@ Purpose:
 - Handle communication lockups
 - Improve system robustness
 
+#### 18.9.3.1. Persistent link failure — ESP1-side re-init, cap, slow-retry, self-reset
+
+Power-cycling ESP32 #2 only resets **ESP2's** state; it cannot fix a fault on **ESP32 #1's own UART**
+(a wedged RX peripheral — framing-error/FIFO lockup) or a **broken physical link**. So repeated
+power-cycles can loop indefinitely without restoring comm. The recovery ladder adds three defenses:
+
+1. **ESP1 UART re-init on every attempt** (`esp2ReinitUart`): `esp2Serial.end()` → `begin()` → drain RX,
+   run at the top of each power-cycle and before each `RESET_SELF`. This is the one link element that
+   resetting ESP2 alone never touches.
+2. **Fast-cycle cap → `ESP2_COMM_LOST` → slow-retry.** After **5** fast power-cycles in an episode
+   (`ESP2_MAX_FAST_CYCLES`), ESP32 #1 stops hammering the relay: it latches `ESP2_COMM_LOST` (one Major
+   alert), leaves the fast loop, and falls back to **one gentle re-init + power-cycle every 20 min**
+   (`ESP2_SLOW_RETRY_MS`). A confirmed `READY` / startup validation clears the latch and sends
+   `ESP2_COMM_OK`.
+3. **Final escalation — one ESP1 self-reset/day.** Hitting the cap also triggers a full ESP32 #1
+   `ESP.restart()` (shares the once-per-day RTC-RAM guard with the device-loss self-reset, so no boot
+   loop), reinitializing every peripheral including UART1.
+
+Hardware caveat: none of this fixes a physically broken link. Verify ESP1 TX(GPIO25)→ESP2 RX(GPIO16),
+ESP1 RX(GPIO33)←ESP2 TX(GPIO17), a **common ground**, and 9600 baud.
+
 ---
 
 ### 18.9.4. Watchdog Timer
@@ -3493,24 +3514,31 @@ Upon reset or power-up:
 
 # 21. 🔌 Power Monitoring System
 
-## 21.1. Battery Monitoring (INA226)
+## 21.1. Battery Monitoring (calibrated opto ADC — replaces INA226)
 
-- Measures battery voltage, current, and power
-- Battery voltage is used to estimate remaining charge level
-- Detects:
-  - Charging / Discharging state
-  - Idle vs active consumption
-  - Low and critical battery levels
+- Battery **voltage (GPIO35)** and **current (GPIO34)** are sensed through an optocoupler into the ESP32
+  ADC (ADC1, 12-bit, `ADC_11db`). The optocoupler makes the raw counts NONLINEAR, so each channel is
+  fitted with a **least-squares polynomial** `value = a0 + a1·u + a2·u² + a3·u³`, `u = raw/4095`, capturing
+  the ADC + opto curve end-to-end.
+- **Calibration:** use the bench tool `Test Code/ESP1_ADC_OPTO_CAL` (apply known inputs, capture points,
+  compute) and paste the printed coefficients into the firmware defaults (`calBattV`/`calBattI`), or store
+  them in NVS namespace `adccal` which `loadBattCal()` reads at boot.
+- The INA226 is no longer used for battery. Current is **magnitude only**, so energy is counted purely as
+  consumption (no charge/discharge split).
 
-### 21.1.1. Control Usage: REMOVED (operator request)
-Battery voltage no longer drives any control action. All of the following are **removed**:
-- ~~Low battery → Disable fertigation~~
-- ~~Critical battery → Stop all operations~~ (no emergency-stop)
-- ~~GSM alerts BATTERY_LOW / BATTERY_CRITICAL~~
-- (also: low battery no longer skips the preventive pump exercise, and an INA226 dropout no longer
-  reboots ESP1)
+### 21.1.1. Control Usage: READY, NOT IMPLEMENTED
+Battery voltage drives no control action by default. The protections below are **scaffolded** behind the
+compile-time flag `BATTERY_SAFETY_ENABLED` (default `0`) — the code is present but compiled out; set it to
+`1` to re-enable them (in `powerTick`/`batterySafetyTick`, `controlTick`, `exerciseTick`):
+- Low battery → Disable fertigation (irrigation only)
+- Critical battery → Stop all operations (emergency-stop)
+- GSM alerts BATTERY_LOW / BATTERY_CRITICAL
+- Low battery → skip the preventive pump exercise
 
-INA226 is now **monitoring only**: voltage/current/power to the LCD, `NET`, ThingSpeak (System channel),
+(The old INA226 device-loss auto-reboot is moot — battery is now read from the ADC, not the INA226 — so it
+is not scaffolded.)
+
+Battery is otherwise **monitoring only**: voltage/current/power to the LCD, `NET`, ThingSpeak (System channel),
 and the daily energy Wh in `SUMMARY`/`FULL SUMMARY`.
 
 ## 21.2. AC Monitoring (PZEM-004T)

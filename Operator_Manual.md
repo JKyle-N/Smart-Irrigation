@@ -121,6 +121,7 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | `ESP2_DEGRADED` | MAJ | One channel was disabled (a nutrient no-flow or mixer no-load) but the run **continued**. | Note which channel; service it later. |
 | `ESP2_SILENCE` | MAJ | The actuator controller went quiet **and did not answer 5 status probes (~10 s)**; recovery is under way. | Usually self-recovers. Only genuine no-reply raises this (fewer false alarms). While idle the controller is briefly powered up ~every 10 min (day) / 1 h (night) for a health check — you may hear its relay click — and every power-up now lasts at least 10 s so it can boot and respond. |
 | `ESP2_NO_READY` | MAJ | Actuator controller didn't come up for a run/startup. | Check ESP2 power (GPIO4 relay). |
+| `ESP2_COMM_LOST` | MAJ | Comm still dead after **5 fast power-cycles** — the link, not just ESP2's state, is broken. ESP1 stops hammering the relay, reboots **itself once** (a full reset, may reset once/day), then keeps **retrying gently every 20 min** until it recovers (you'll then get `ESP2_COMM_OK`). | Check the **ESP1↔ESP2 wiring**: ESP1 TX(25)→ESP2 RX(16), ESP1 RX(33)←ESP2 TX(17), a **shared ground**, and 9600 baud — no firmware retry fixes a crossed/loose/ungrounded wire. |
 | `NPK_FAULT` | MAJ | A column's NPK sensor read invalid; that column won't fertigate this cycle. | Check the RS485/NPK probe. |
 | `RES_LOW` | MAJ | Reservoir below the low threshold — runs blocked until refilled. | Refill the reservoir. |
 | ~~`BATTERY_LOW`~~ | — | **Removed** — battery low no longer disables fertigation or alerts. Monitoring only. | Watch the battery voltage yourself. |
@@ -209,7 +210,7 @@ full emergency stop is done at the LCD fault screen.
 **Buttons:** UP, DOWN, ENTER, BACK, MODE.
 
 - **MODE** toggles between the live data pages and the **Settings** menu (and exits Testing/Calibration).
-- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (battery/INA226),
+- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (battery via opto ADC),
   **GSM + WiFi** health, **Fault** (last fault / recovery prompts).
 
 ### 6.1 Settings menu
@@ -358,7 +359,7 @@ serviced. Column-enable reflects **wiring**, so Restore Defaults never changes i
 
 ### Abbreviation glossary
 N, P, K = nutrient mg/kg · M = soil moisture % · W/H2O = water (L) · Nu/NUT = nutrient (mL) ·
-BAT = battery V · CONS/CHG = energy consumed/charged (Wh) · FLT C/M/m = Critical/Major/minor faults ·
+BAT = battery V (from the opto-isolated ADC sensor) · CONS = energy consumed (Wh); CHG stays 0 (the current sensor reads magnitude only) · FLT C/M/m = Critical/Major/minor faults ·
 RST = resets · IRR/FERT/DOSE = irrigation/fertigation/dose counts · EC = conductivity · pH = acidity.
 
 ### Commissioning note

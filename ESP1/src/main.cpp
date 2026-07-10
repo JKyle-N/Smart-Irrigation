@@ -35,7 +35,6 @@
 #include <Preferences.h>
 #include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
-#include <INA226.h>
 #include <SoftwareSerial.h>      // EspSoftwareSerial (plerup) -- Nano link
 #include <esp_task_wdt.h>
 #include <WiFi.h>                // built-in ESP32 WiFi (telemetry uplink, Part A)
@@ -70,6 +69,16 @@
 #define BTN_BACK      15
 #define BTN_MODE       2
 #define ESP2_PWR_PIN   4        // ESP2 power relay (active HIGH)
+#define PIN_BATT_I    34        // battery CURRENT via opto -> ADC1 (nonlinear; polynomial-calibrated)
+#define PIN_BATT_V    35        // battery VOLTAGE via opto -> ADC1 (nonlinear; polynomial-calibrated)
+
+/* ---- Battery safety: READY, NOT IMPLEMENTED ----------------------------------------------------- *
+ * The INA226-tied battery protections (BATTERY_CRITICAL emergency-stop, run-block, low-battery
+ * fertigation disable + alerts, and the pump-exercise gate) were removed by operator request. They are
+ * SCAFFOLDED behind this flag: set to 1 to re-enable all of them (the code is present but compiled out).
+ * BATT_LOW_V / BATT_CRIT_V thresholds are kept. (The old INA226 device-loss auto-reboot is moot -- battery
+ * is now read from the ADC, not the INA226 -- so it is not scaffolded.)                              */
+#define BATTERY_SAFETY_ENABLED 0
 
 /* ---- Bauds --------------------------------------------------------------- */
 #define DEBUG_BAUD   115200
@@ -195,6 +204,11 @@ const unsigned long ESP2_WARMUP_TIMEOUT_MS = 8000;   // ESP2 cold-boot -> READY 
 // Recovery ladder: try a cheap soft reset (RESET_SELF) before the relay power-cycle. This is the
 // RESET_SELF -> READY budget; if ESP2 stays dark past it we escalate to esp2PowerCycle() (sec.18.9).
 const unsigned long ESP2_SOFT_RESET_TIMEOUT_MS = 10000;  // ESP2 cold-boot 8s + margin for frame/stopAll
+// Comm-recovery workaround (sec.18.9): power-cycling ESP2 can't fix a wedged ESP1 UART RX or a broken link,
+// so cap the fast power-cycles, then latch ESP2_COMM_LOST and fall back to a gentle slow-retry (no relay
+// hammering). Every attempt also re-inits ESP1's own UART (esp2ReinitUart), the one side cycling ESP2 misses.
+const uint8_t       ESP2_MAX_FAST_CYCLES = 5;        // fast power-cycles in an episode before giving up
+const unsigned long ESP2_SLOW_RETRY_MS   = 1200000;  // then one gentle cycle every 20 min until it recovers
 
 /* ---- Preventive pump exercise (spec sec.14.9.1 / 19.4.2) ----------------- *
  * MOVED to ESP1: with ESP2 OFF during idle it loses millis() each power-down and
@@ -288,7 +302,6 @@ const char *FRAME_END   = "<END>";
  * ========================================================================== */
 LiquidCrystal_I2C lcd(LCD_ADDR, 20, 4);
 RTC_DS3231        rtc;
-INA226            ina(INA226_ADDR);
 Preferences       prefs;
 Preferences       prefsCal;        // separate calibration namespace (§A.5 / §C: never reset by defaults)
 SoftwareSerial    nanoSerial(NANO_RX_PIN, NANO_TX_PIN);   // EspSoftwareSerial
@@ -376,6 +389,9 @@ const unsigned long POWER_CYCLE_OFF_MS = 1500;   // hold ESP2 relay OFF this lon
 // Recovery escalation ladder: soft reset (RESET_SELF) first, power-cycle as last resort (sec.18.9).
 bool esp2SoftResetTried = false; // soft reset already attempted this recovery episode
 unsigned long esp2RecoverMs = 0; // when RESET_SELF was sent (soft-reset READY-wait timeout reference)
+uint8_t       esp2FastCycles  = 0;      // power-cycles in the current comm-failure episode (cap: sec.18.9)
+bool          esp2CommLost    = false;  // latched after the fast cap; slow-retry owns recovery (not the fast loop)
+unsigned long esp2SlowRetryMs = 0;      // last gentle slow-retry attempt while esp2CommLost
 
 /* ---- ESP2 power lifecycle (OFF-during-idle model) ------------------------- *
  * esp2Powered  : current relay state mirror (avoids redundant digitalWrites + lets
@@ -525,14 +541,23 @@ TelemetrySnapshot telem = {};
 portMUX_TYPE telemMux = portMUX_INITIALIZER_UNLOCKED;
 unsigned long lastTelemCollectMs = 0;
 
-/* ---- Power --------------------------------------------------------------- */
+/* ---- Power (battery via opto-isolated ADC, polynomial-calibrated) --------- *
+ * Battery V/I now come from GPIO35/34 through an optocoupler (nonlinear), fitted with a least-squares
+ * polynomial: value = a0 + a1*u + a2*u^2 + a3*u^3, u = raw/4095. Calibrate with the bench tool
+ * Test Code/ESP1_ADC_OPTO_CAL, then PASTE its printed a0..a3 into the defaults below (or populate NVS
+ * namespace "adccal"). The tool's NVS record layout is mirrored so a matched-partition tool save also works. */
+struct AdcCal { int degree; double coef[4]; };
+// TODO: paste a0..a3 from the bench tool. Defaults are PLACEHOLDERS (raw fraction 0..1) until calibrated.
+AdcCal calBattV = { 1, { 0.0, 1.0, 0.0, 0.0 } };   // voltage channel (GPIO35)
+AdcCal calBattI = { 1, { 0.0, 1.0, 0.0, 0.0 } };   // current channel (GPIO34)
+bool   battCalLoaded = false;                       // true once NVS "adccal" overrode the defaults
 float battV = 0, battI = 0, battP = 0;
 bool  batteryLow = false, batteryCritical = false;
-unsigned long lastInaMs = 0;
-// Energy integration for the daily report (sec.12.1.3: consumption + charge, Wh).
-// battP (W) is integrated over INA read intervals; current sign splits charge/discharge.
-double energyConsumedWh = 0.0;   // discharge energy today (Wh)
-double energyChargedWh  = 0.0;   // charge energy today (Wh)
+unsigned long lastInaMs = 0;                         // ADC read throttle (kept name to avoid churn)
+// Energy integration for the daily report (sec.12.1.3). The opto current is MAGNITUDE only, so all
+// energy is counted as consumption (charge/discharge split removed with the INA226).
+double energyConsumedWh = 0.0;   // energy today (Wh)
+double energyChargedWh  = 0.0;   // kept for the report format (stays 0)
 bool   prevBattStateLow = false, prevBattStateCrit = false;  // PWR-log-on-change (B3)
 
 /* ---- Daily counters (for report) ----------------------------------------- */
@@ -749,6 +774,11 @@ void pollESP2();
 void sendWorkOrder(int c, bool fertigate);
 void handleEsp2Response(const String &payload);
 void esp2PowerCycle();
+void esp2ReinitUart();
+void esp2Escalate();
+void esp2CommRecovered();
+void esp2CommRetryTick();
+void esp1SelfResetOncePerDay(const char *reason);
 void esp2SetPower(bool on, bool force = false);
 void esp2PowerTick();
 void dispatchPendingRun();
@@ -785,6 +815,9 @@ void stateMachineTick();
 void controlTick();
 bool decideFertigate(int c);
 void powerTick();
+void loadBattCal();
+void readBatteryAdc();
+void batterySafetyTick();
 void scheduleTick();
 void heartbeatTick();
 void nanoPaceTick();
@@ -855,27 +888,11 @@ void setup() {
   lcd.setCursor(0, 0); lcd.print("Smart Irrigation");
   lcd.setCursor(0, 1); lcd.print("ESP1 booting...");
 
-  // ---- INA226 init with validation + retry ----
-  inaOk = ina.begin();
-  if (!inaOk) {
-    Serial.println(F("WARN: INA226 init failed; retrying..."));
-    delay(500);
-    inaOk = ina.begin();
-  }
-  if (inaOk) {
-    ina.setMaxCurrentShunt(INA226_MAX_CURRENT_A, INA226_SHUNT_OHMS);
-    // Validate first reading: an implausibly low bus voltage (~0.01V) means the
-    // I2C read is garbage, not a real flat battery. Disable INA so the display/log
-    // don't show a fake ~0 V (battery no longer gates anything; monitoring only).
-    delay(100);
-    float testV = ina.getBusVoltage();
-    if (testV < 0.1f) {
-      Serial.println(F("WARN: INA226 voltage implausible (~0.01V). I2C bus issue; disabling INA until next boot."));
-      inaOk = false;
-    }
-  } else {
-    Serial.println(F("CRIT: INA226 permanently failed"));
-  }
+  // ---- Battery ADC (opto-isolated, polynomial-calibrated) ----
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BATT_I, ADC_11db);   // ~0..3.1 V full scale (clips above)
+  analogSetPinAttenuation(PIN_BATT_V, ADC_11db);
+  loadBattCal();                                   // NVS "adccal" overrides the hardcoded defaults if present
 
   // ---- RTC init ----
   rtcOk = rtc.begin();
@@ -959,6 +976,7 @@ void loop() {
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
   g_lastStage = 'p'; esp2PowerTick();      // ESP2 min-on hold + periodic idle heartbeat poll (sec.18.8)
+  g_lastStage = 'r'; esp2CommRetryTick();  // gentle 20-min retry while ESP2_COMM_LOST is latched (sec.18.9)
   g_lastStage = 'n'; nanoPaceTick();       // drive Nano ACTIVE/DAY/NIGHT interval (A2)
   g_lastStage = 'd'; deviceHealthTick();   // device-loss watchdog -> daily self-reset (Part C)
   g_lastStage = 'w'; telemetryCollect();   // snapshot for the WiFi/ThingSpeak uplink task (Part A)
@@ -1482,6 +1500,7 @@ void handleEsp2Response(const String &payload) {
   if (resp == "READY") {
     // ESP2 finished booting (OFF-during-idle model). Fire whatever was waiting on it.
     logEvent("ESP2", "RESP", payload);
+    esp2CommRecovered();                                         // any READY = link alive -> clear COMM_LOST latch
     // Soft-reset recovery: ESP2 came back after a RESET_SELF -> recovered WITHOUT a power-cycle.
     // (Gated on READY, not esp2Available: ESP2 ACKs RESET_SELF before it reboots, sec.9.7.2.)
     if (esp2SoftResetTried && sysState == RECOVERY_STATE) {
@@ -1657,9 +1676,34 @@ void sendWorkOrder(int c, bool fertigate) {
   sendSMS(String("RUN,COL_") + COL_TAG[c] + "," + (fertigate ? "FERTIGATION" : "IRRIGATION"));
 }
 
+// Re-initialize ESP1's own UART1 to ESP2 (sec.18.9). Power-cycling ESP2 can't clear a wedged RX peripheral
+// (framing-error lockup / stuck FIFO) on THIS side, so every recovery attempt tears the port down and back
+// up and drains any stale bytes -- the one link element that resetting ESP2 alone never touches.
+void esp2ReinitUart() {
+  esp2Serial.end();
+  esp2Serial.begin(ESP2_BAUD, SERIAL_8N1, ESP2_RX_PIN, ESP2_TX_PIN);
+  while (esp2Serial.available()) esp2Serial.read();     // drain partial/garbage frame after re-init
+  logEvent("ESP1", "RESET", "ESP2|UART_REINIT");
+}
+
+// Software self-reset, at most once per calendar day (shared RTC-RAM guard with deviceHealthTick's
+// device-loss reset -> at most one self-reset/day for any reason, no boot loop). The final rung of the
+// comm-recovery ladder: a full ESP1 reboot reinitializes every peripheral incl. UART1.
+void esp1SelfResetOncePerDay(const char *reason) {
+  uint32_t today = (currentDayStamp > 0) ? (uint32_t)currentDayStamp : 0;
+  if (g_lastSelfResetDay == today) return;             // already used today's one reset -> don't loop
+  logEvent("ESP1", "RESET", String("SELF|") + reason);
+  sendSMS(String("ALERT,MAJ,SELF_RESET,") + reason);   // best-effort (may not flush before reboot)
+  logFlush(true);
+  g_lastSelfResetDay = today;
+  delay(60);                                            // let the last UART/SD bytes drain
+  ESP.restart();
+}
+
 void esp2PowerCycle() {
   if (millis() - lastRecoveryMs < RECOVERY_COOLDOWN_MS) return;
   lastRecoveryMs = millis();
+  esp2ReinitUart();                      // reset ESP1's UART too -- cycling ESP2 alone can't clear an ESP1 RX wedge
   esp2SoftResetTried = false;            // power-cycle ends the ladder; a future episode soft-resets first
   esp2PowerCycles++;
   logEvent("ESP1", "RESET", "ESP2|HW|POWERCYCLE");
@@ -1671,6 +1715,47 @@ void esp2PowerCycle() {
   pendingRun.active = false; pendingRun.colIdx = -1;
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
   setState(STARTUP_SYNC);
+}
+
+// Capped escalation to the power-cycle (sec.18.9). Fast power-cycling ESP2 can't recover a broken link or
+// a wedged ESP1 UART, so after ESP2_MAX_FAST_CYCLES we STOP hammering the relay: latch ESP2_COMM_LOST, alert
+// once, and hand off to the 20-min slow-retry (esp2CommRetryTick). Final rung: one ESP1 self-reset/day.
+void esp2Escalate() {
+  if (esp2FastCycles >= ESP2_MAX_FAST_CYCLES) {
+    if (!esp2CommLost) {
+      esp2CommLost = true; esp2SlowRetryMs = millis();
+      raiseFault('M', "ESP2_COMM_LOST", "LINK");       // one-shot SMS + log (check wiring/ground/baud)
+      logEvent("ESP1", "FAULT", "ESP2_COMM_LOST -> slow-retry 20min (relay hammering stopped)");
+    }
+    setState(IDLE_STATE);                              // leave the fast recovery loop
+    esp1SelfResetOncePerDay("ESP2_COMM_LOST");         // final escalation (no-op if already reset today)
+    return;
+  }
+  esp2FastCycles++;
+  esp2PowerCycle();
+}
+
+// ESP2 comm confirmed again (READY / STARTUP_SYNC validate): drop the episode counter and clear the latch.
+void esp2CommRecovered() {
+  esp2FastCycles = 0;
+  if (esp2CommLost) {
+    esp2CommLost = false;
+    logEvent("ESP1", "RESET", "ESP2|COMM_RECOVERED");
+    sendSMS("ALERT,MIN,ESP2_COMM_OK,LINK");
+  }
+}
+
+// Slow-retry while comm is latched-lost: one gentle re-init + power-cycle every ESP2_SLOW_RETRY_MS. Success
+// is validated by STARTUP_SYNC (which calls esp2CommRecovered); failure just waits another 20 min -- the
+// fast loop stays disabled (RECOVERY_STATE bails while esp2CommLost), so no relay/log hammering.
+void esp2CommRetryTick() {
+  if (!esp2CommLost) return;
+  if (millis() - esp2SlowRetryMs < ESP2_SLOW_RETRY_MS) return;
+  esp2SlowRetryMs = millis();
+  logEvent("ESP1", "RESET", "ESP2|SLOW_RETRY");
+  esp2ReinitUart();
+  lastRecoveryMs = 0;                                  // bypass the 30 s cooldown for this one paced attempt
+  esp2PowerCycle();                                    // -> STARTUP_SYNC; validate clears the latch
 }
 
 // Relay power control for ESP2 (OFF-during-idle model, sec.18.8). MINIMUM ON-TIME: a graceful off
@@ -1705,7 +1790,7 @@ static bool isNight() {
 }
 void esp2PowerTick() {
   if (esp2OffPending && esp2Powered && millis() >= esp2OffAt) esp2SetPower(false);   // min-on elapsed -> off
-  if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held) { esp2PollActive = false; return; }
+  if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held || esp2CommLost) { esp2PollActive = false; return; }
   unsigned long interval = isNight() ? ESP2_IDLE_POLL_NIGHT_MS : ESP2_IDLE_POLL_DAY_MS;
   if (!esp2PollActive) {
     if (millis() - lastEsp2Ms < interval) return;          // heard from ESP2 recently -> no poll needed
@@ -1746,7 +1831,9 @@ void exerciseTick() {
   if (sysState != IDLE_STATE) return;
   if (uiMode != UI_DATA) return;
   if (wo.active || pendingRun.active || pendingExercise.active) return;
-  // (low-battery exercise skip removed per user request)
+#if BATTERY_SAFETY_ENABLED
+  if (batteryLow || batteryCritical) return;   // don't exercise on a weak battery (READY, not active)
+#endif
   for (int k = 0; k < 3; k++) {
     if (millis() - lastPumpUseMs[k] > PUMP_EXERCISE_INTERVAL_MS) {
       pendingExercise.active = true; pendingExercise.idx = k; pendingExercise.sent = false;
@@ -2433,6 +2520,7 @@ void stateMachineTick() {
       bool nanoFresh = (millis() - sensor.lastNanoMs < HEARTBEAT_TIMEOUT_MS);
       if (esp2Available && nanoFresh) {
         syncStart = 0;
+        esp2CommRecovered();                         // comm validated -> clear cap counter + any COMM_LOST latch
         pushAllCalToEsp2();                          // baseline calibration after any reset (§A.5.1 #2)
         esp2SetPower(false);                         // validated -> ESP2 OFF for idle (sec.18.8)
         setState(IDLE_STATE);
@@ -2474,25 +2562,29 @@ void stateMachineTick() {
       break;
     }
     case RECOVERY_STATE: {
+      // Fast loop is disabled once ESP2_COMM_LOST is latched -- the 20-min slow-retry owns recovery now,
+      // so any trigger that lands us here just falls back to idle (no relay hammering). (sec.18.9)
+      if (esp2CommLost) { setState(IDLE_STATE); break; }
       // ESP2 recovery escalation ladder (sec.18.9 / CLAUDE.md): try the cheap soft reset
       // (RESET_SELF) first; fall back to the GPIO4 power-cycle only if ESP2 does not come back.
       if (!esp2SoftResetTried) {
         esp2SoftResetTried = true;
+        esp2ReinitUart();                          // reset ESP1's own UART first (RESET_SELF reply lands clean)
         if (esp2Powered) {
           sendEsp2("RESET_SELF");                  // ESP2 ACKs, goes SAFE, reboots, re-emits READY,ESP2
           logEvent("ESP1", "RESET", "ESP2|SOFT|RESET_SELF");
           esp2Available = false;                   // success = READY (handleEsp2Response), not the ACK
           esp2RecoverMs = millis();
         } else {
-          esp2PowerCycle();                        // unpowered: soft reset impossible -> cycle re-powers
+          esp2Escalate();                          // unpowered: soft reset impossible -> capped cycle re-powers
         }
         break;
       }
       // Soft reset issued: success is detected in the READY branch of handleEsp2Response.
-      // If ESP2 never returns within the budget, escalate to the power-cycle (last resort).
+      // If ESP2 never returns within the budget, escalate to the (capped) power-cycle.
       if (millis() - esp2RecoverMs > ESP2_SOFT_RESET_TIMEOUT_MS) {
         logEvent("ESP1", "RESET", "ESP2|SOFT_FAILED|POWERCYCLE");
-        esp2PowerCycle();
+        esp2Escalate();
       }
       break;
     }
@@ -2508,7 +2600,9 @@ void controlTick() {
   if (sysState != IDLE_STATE) return;     // only dispatch new work from IDLE
   if (wo.active) return;                   // ESP2 busy -> sequential (sec.14.2.0.1)
   if (pendingRun.active) return;           // a run is already warming ESP2 up
-  // (battery-critical run-block removed per user request -- battery no longer stops irrigation)
+#if BATTERY_SAFETY_ENABLED
+  if (batteryCritical) return;             // battery-critical -> hold all runs (READY, not active)
+#endif
   if (!rtcOk) return;
   // NOTE: ESP2 is OFF during idle (sec.18.8) -- do NOT gate on esp2Available here; a due
   // column powers ESP2 up on demand below and the work order is sent once it reports READY.
@@ -2530,7 +2624,10 @@ void controlTick() {
       if (!resLowLatched) { resLowLatched = true; raiseFault('M', "RES_LOW", "RESERVOIR"); }
       continue;
     }
-    bool fert = decideFertigate(c);                                // (battery no longer forces irrigation-only)
+    bool fert = decideFertigate(c);
+#if BATTERY_SAFETY_ENABLED
+    if (batteryLow) fert = false;                                  // low battery -> irrigation only (READY, not active)
+#endif
     setState(ACTIVE_STATE);                                        // nanoPaceTick sends ACTIVE on this transition
     // OFF-during-idle (sec.18.8): queue the run, power ESP2 up, and let its READY dispatch the
     // work order (stateMachineTick ACTIVE_STATE is the warm-up timeout safety net).
@@ -2555,41 +2652,77 @@ bool decideFertigate(int c) {
 /* =============================================================================
  *  POWER  (INA226 battery monitoring, spec sec.21.1)
  * ========================================================================== */
-void powerTick() {
-  if (!inaOk) {
-    // INA226 is down (init failed or I2C garbage detected at boot). Do NOT read;
-    // leave battV/battI/battP stale (0) so the display/log don't show garbage.
-    return;
+// Trimmed mean of 64 ADC samples (0..4095) -- rejects spikes. (mirrors the bench tool)
+static double readAdcTrimmed(int pin) {
+  const int N = 64, TRIM = 8;
+  static uint16_t buf[64];
+  for (int i = 0; i < N; i++) { buf[i] = analogRead(pin); delayMicroseconds(150); }
+  for (int i = 1; i < N; i++) { uint16_t k = buf[i]; int j = i - 1; while (j >= 0 && buf[j] > k) { buf[j + 1] = buf[j]; j--; } buf[j + 1] = k; }
+  long sum = 0; int cnt = 0;
+  for (int i = TRIM; i < N - TRIM; i++) { sum += buf[i]; cnt++; }
+  return cnt ? (double)sum / cnt : 0.0;
+}
+// value = a0 + a1*u + ... + aN*u^N,  u = raw/4095 (end-to-end: captures the ADC + optocoupler curve).
+static double applyPoly(const AdcCal &c, double raw) {
+  double u = raw / 4095.0, v = 0, up = 1;
+  for (int k = 0; k <= c.degree && k < 4; k++) { v += c.coef[k] * up; up *= u; }
+  return v;
+}
+// NVS "adccal" (bench-tool layout) overrides the hardcoded defaults if present + valid.
+void loadBattCal() {
+  struct CalRec { uint32_t magic; int32_t degree; double coef[4]; };
+  const uint32_t CAL_MAGIC = 0xADC0CA11;
+  Preferences p; p.begin("adccal", true);
+  CalRec r;
+  if (p.getBytes("v", &r, sizeof(r)) == sizeof(r) && r.magic == CAL_MAGIC && r.degree >= 1 && r.degree <= 3) {
+    calBattV.degree = r.degree; for (int k = 0; k < 4; k++) calBattV.coef[k] = r.coef[k]; battCalLoaded = true;
   }
+  if (p.getBytes("i", &r, sizeof(r)) == sizeof(r) && r.magic == CAL_MAGIC && r.degree >= 1 && r.degree <= 3) {
+    calBattI.degree = r.degree; for (int k = 0; k < 4; k++) calBattI.coef[k] = r.coef[k]; battCalLoaded = true;
+  }
+  p.end();
+  Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS" : "using firmware defaults (calibrate!)");
+}
+void readBatteryAdc() {
+  battV = (float)applyPoly(calBattV, readAdcTrimmed(PIN_BATT_V));
+  battI = (float)fabs(applyPoly(calBattI, readAdcTrimmed(PIN_BATT_I)));   // opto current = magnitude
+  battP = battV * battI;
+}
+
+// Battery protections tied to the (removed) INA226 -- READY, NOT IMPLEMENTED. The real actions live inside
+// BATTERY_SAFETY_ENABLED so flipping that one define re-enables them (see also controlTick / exerciseTick).
+void batterySafetyTick() {
+#if BATTERY_SAFETY_ENABLED
+  static bool wasLow = false, wasCrit = false;
+  if (batteryCritical && !wasCrit) raiseFault('C', "BATTERY_CRITICAL", "BATT");   // -> enterEmergencyStop
+  else if (batteryLow && !wasLow)  raiseFault('M', "BATTERY_LOW", "BATT");
+  wasLow = batteryLow; wasCrit = batteryCritical;
+#endif
+}
+
+void powerTick() {
   if (millis() - lastInaMs < INA_READ_INTERVAL_MS) return;
   unsigned long nowMs = millis();
   float dtH = (lastInaMs == 0) ? 0.0f : (nowMs - lastInaMs) / 3600000.0f;   // hours since last read
   lastInaMs = nowMs;
-  battV = ina.getBusVoltage();
-  battI = ina.getCurrent();
-  battP = ina.getPower();
+  readBatteryAdc();                                    // GPIO35/34 -> polynomial -> battV/battI/battP
 
-  // Energy integration for the daily report (B2, sec.12.1.3). getPower() is magnitude;
-  // current sign splits charge vs discharge. Orientation is wiring-dependent [MEASURE]:
-  // here +I = charging, -I = consuming. Flip the comparison if the shunt is reversed.
-  double wh = (double)battP * dtH;
-  if (battI >= 0) energyChargedWh += wh; else energyConsumedWh += wh;
+  // Energy (B2, sec.12.1.3): opto current is magnitude only, so all energy counts as consumption.
+  energyConsumedWh += (double)battP * dtH;
 
-  // Battery state is DISPLAY/LOG ONLY (per user request): monitoring stays, but battery no longer raises
-  // faults, emergency-stops, blocks runs/fertigation, gates exercise, or reboots. These flags now only
-  // drive the LCD OK/LOW/CRIT line + the PWR-log-on-change below.
-  batteryCritical = inaOk && (battV > 0 && battV < BATT_CRIT_V);
-  batteryLow      = inaOk && (battV > 0 && battV < BATT_LOW_V);
+  // Battery state flags -- DISPLAY/LOG (and, if BATTERY_SAFETY_ENABLED, the protective actions).
+  batteryCritical = (battV > 0 && battV < BATT_CRIT_V);
+  batteryLow      = (battV > 0 && battV < BATT_LOW_V);
+  batterySafetyTick();                                 // ready-but-disabled protections
 
-  // B3: log a PWR snapshot at most ~1/min, OR immediately on a battery-state change
-  // (sec.25.2.1 -- not one row per 5 s read). Energy totals piggyback the snapshot.
+  // B3: log a PWR snapshot at most ~1/min, OR immediately on a battery-state change (sec.25.2.1).
   static unsigned long lastPwrLogMs = 0;
   bool battStateChanged = (batteryLow != prevBattStateLow) || (batteryCritical != prevBattStateCrit);
   if (battStateChanged || lastPwrLogMs == 0 || millis() - lastPwrLogMs >= PWR_LOG_INTERVAL_MS) {
     lastPwrLogMs = millis();
     prevBattStateLow = batteryLow; prevBattStateCrit = batteryCritical;
-    logEvent("ESP1", "PWR", "INA226|V=" + String(battV, 2) + "|I=" + String(battI, 2) + "|P=" + String(battP, 1)
-             + "|CONS=" + String((int)(energyConsumedWh + 0.5)) + "Wh|CHG=" + String((int)(energyChargedWh + 0.5)) + "Wh");
+    logEvent("ESP1", "PWR", "BATT|V=" + String(battV, 2) + "|I=" + String(battI, 2) + "|P=" + String(battP, 1)
+             + "|CONS=" + String((int)(energyConsumedWh + 0.5)) + "Wh");
   }
 }
 
@@ -4250,7 +4383,7 @@ void lcdTick() {
       lcd.setCursor(0, 3); snprintf(l, 21, "ESP2:%s", esp2Available ? "OK" : "--"); lcd.print(l);
       break;
     case PAGE_POWER:
-      lcd.setCursor(0, 0); lcd.print("Power (INA226)");
+      lcd.setCursor(0, 0); lcd.print("Power (ADC)         ");
       lcd.setCursor(0, 1); snprintf(l, 21, "V:%.2f", battV); lcd.print(l);
       lcd.setCursor(0, 2); snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP); lcd.print(l);
       lcd.setCursor(0, 3); snprintf(l, 21, "SD:%s RTC:%s", sdOk ? "OK" : "--", rtcOk ? "OK" : "--"); lcd.print(l);
