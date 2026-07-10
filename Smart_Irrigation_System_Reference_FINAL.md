@@ -317,7 +317,7 @@ RESET_REQ is used both for fault recovery (after 5 consecutive garbage packets, 
 
 Work orders additionally carry job-critical calibration (`KMAIN/KNUT/ECCAL/PHCAL`) so a reset just before a job can never run on stale K-factors / EC-pH cal (companion spec §A.5.1 #3).
 
-ESP32 #2 is the SOLE safety authority in TEST mode (sec.18.10.8.3): it turns the relay OFF if HOLD stops arriving within a short timeout (button released, ESP32 #1 hang, or link loss) and enforces a HARD 10-second cap on continuous ON regardless of ESP32 #1.
+ESP32 #2 is the SOLE safety authority in TEST mode (sec.18.10.8.3): it turns the relay OFF if HOLD stops arriving within a short timeout (button released, ESP32 #1 hang, or link loss) and enforces a HARD **30-second** cap on continuous ON regardless of ESP32 #1. In TEST mode ESP32 #1 raises **no automatic faults and never emergency-stops** (they are logged only; the ESP2/Nano silence recovery and ESP2's PCF health reporting are suppressed) — the operator's MODE+BACK combo remains the manual e-stop.
 
 ### 9.7.3. ESP32 #2 to ESP #1 Responses
 
@@ -1755,7 +1755,7 @@ Entry / behavior:
 * automation disabled; scheduled runs suppressed
 * ESP32 #2 powered ON and aware of testing mode
 * one relay at a time, momentary dead-man control via ENTER button
-* normal protective safeties intentionally bypassed; only dead-man release + ESP32 #2's 10-second hard cap remain
+* normal protective safeties intentionally bypassed; only dead-man release + ESP32 #2's 30-second hard cap remain. No automatic faults/emergency-stop are raised in TEST mode (logged only); MODE+BACK stays as the manual e-stop
 * GSM alerts remain active; all manual actuations logged
 
 Transition:
@@ -2420,11 +2420,16 @@ System behavior adapts according to available power.
 
 ### 14.5.1. Battery Protection Logic
 
-| Battery State | System Action       |
-| ------------- | ------------------- |
-| Normal        | Full operation      |
-| Low           | Disable fertigation |
-| Critical      | Stop all operations |
+**REMOVED (operator request):** battery state no longer triggers any system action — no fertigation
+disable, no stop, no emergency-stop, no alert, no exercise-skip, and INA226 dropout no longer reboots
+ESP1. INA226 is retained for **monitoring only** (voltage/current/power on the LCD, `NET`, ThingSpeak,
+and the daily energy Wh in reports). The table below is the historical behavior, now inactive:
+
+| Battery State | System Action (INACTIVE) |
+| ------------- | ------------------------ |
+| Normal        | Full operation           |
+| Low           | ~~Disable fertigation~~  |
+| Critical      | ~~Stop all operations~~  |
 
 ---
 
@@ -3485,12 +3490,16 @@ Upon reset or power-up:
   - Idle vs active consumption
   - Low and critical battery levels
 
-### 21.1.1. Control Usage:
-- Low battery → Disable fertigation (irrigation only)
-- Critical battery → Stop all operations
-- Sends GSM alerts:
-  - BATTERY_LOW
-  - BATTERY_CRITICAL
+### 21.1.1. Control Usage: REMOVED (operator request)
+Battery voltage no longer drives any control action. All of the following are **removed**:
+- ~~Low battery → Disable fertigation~~
+- ~~Critical battery → Stop all operations~~ (no emergency-stop)
+- ~~GSM alerts BATTERY_LOW / BATTERY_CRITICAL~~
+- (also: low battery no longer skips the preventive pump exercise, and an INA226 dropout no longer
+  reboots ESP1)
+
+INA226 is now **monitoring only**: voltage/current/power to the LCD, `NET`, ThingSpeak (System channel),
+and the daily energy Wh in `SUMMARY`/`FULL SUMMARY`.
 
 ## 21.2. AC Monitoring (PZEM-004T)
 

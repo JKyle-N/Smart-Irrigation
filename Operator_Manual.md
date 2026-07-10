@@ -114,7 +114,7 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | `DOSE_TIMEOUT` | CRIT | A nutrient pump ran past its time ceiling without reaching the target dose — the dosing line is unprimed or its flow sensor is stuck. Run **held**. | Prime that nutrient line (Testing combos / Prime), check the dosing flow sensor, then recover. |
 | `ESP2_ERROR` | CRIT | Actuator controller reported a generic execution failure. Run **held**. | Recover or `STOP,ALL`. |
 | `ESP2_DONE_TIMEOUT` | CRIT | A run didn't finish within the time budget. | Inspect; system has stopped supervising that run. |
-| `BATTERY_CRITICAL` | CRIT | Battery below the critical threshold — everything stops. | Charge / check the solar/battery. |
+| ~~`BATTERY_CRITICAL`~~ | — | **Removed** — battery no longer stops the system. Battery voltage is still shown on the LCD/`NET`/ThingSpeak, but there is no battery emergency-stop. | Watch the battery voltage yourself. |
 | `EC_FAIL` / `PH_FAIL` | MAJ | EC or pH was outside the safe window during dosing (batch still delivered). | Check nutrient mix / probes. |
 | `SENSOR_FAIL` | MAJ | An EC/pH probe read railed (disconnected/shorted) — distinct from out-of-window. | Inspect/replace the probe. |
 | `PCF_FAIL` | MAJ | The actuator relay driver isn't responding (relay-bus fault). | Inspect ESP2 wiring/I²C; other safeties still apply. |
@@ -123,7 +123,7 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | `ESP2_NO_READY` | MAJ | Actuator controller didn't come up for a run/startup. | Check ESP2 power (GPIO4 relay). |
 | `NPK_FAULT` | MAJ | A column's NPK sensor read invalid; that column won't fertigate this cycle. | Check the RS485/NPK probe. |
 | `RES_LOW` | MAJ | Reservoir below the low threshold — runs blocked until refilled. | Refill the reservoir. |
-| `BATTERY_LOW` | MAJ | Battery low — fertigation disabled (irrigation still allowed). | Charge. |
+| ~~`BATTERY_LOW`~~ | — | **Removed** — battery low no longer disables fertigation or alerts. Monitoring only. | Watch the battery voltage yourself. |
 | `NANO_GARBAGE` | MAJ | Sensor hub kept sending garbage after a software reset; running on last-valid data. | Check the Nano / sensor wiring. |
 | `NANO_RESET` | WARN | The sensor hub was told to self-reset (after 5 bad packets, or the daily fresh-start). | Informational. |
 | `NANO_SILENCE` | MIN | The sensor hub went quiet (its own watchdog restarts it). | Informational; check if it persists. |
@@ -256,8 +256,13 @@ actuator controller and confirms it. **No reflashing needed.**
 
 ### 6.4 Testing (Settings → Testing; idle only)
 Manually exercise the actuators. **Hold ENTER** to energize the selected item (dead-man — it drops the
-instant you release, with a hard time cap); UP/DOWN to choose. The **Master Cutoff** entry is reversed
-here (holding it drops bank power) so you can test it without killing the others.
+instant you release, with a **~30 s** hard cap for single relays and combos); UP/DOWN to choose. The
+**Master Cutoff** entry is reversed here (holding it drops bank power) so you can test it without killing
+the others.
+
+**Testing raises no automatic faults and never emergency-stops** — it won't kick you out or reset ESP2 on
+a fault while you're testing (they're logged only). You are the safety here: the dead-man and 30 s cap
+bound relay-on time, and **MODE + BACK** still force-stops everything if you need it.
 
 The list has the 16 single relays, then **priming combos** that run a valve + pump together so water
 actually moves through the pipes (hard cap ~30 s; re-hold to keep going):
@@ -274,6 +279,10 @@ This replaces the idea of a separate "Prime Lines" menu.
 Double-confirm (NO/YES). Resets operational settings (modes, targets, names, schedules, thresholds) to
 factory defaults. **Keeps**: all calibration, which columns are enabled (physical wiring), and WiFi /
 ThingSpeak setup. Does not reboot.
+
+**Reboot ESP1** (Settings → **Reboot ESP1**): software-restarts the controller without the physical
+reset button — a NO/YES confirm, then it flushes logs and restarts. Config is kept (nothing is erased);
+irrigation resumes on boot. Handy if something seems stuck. (Also available on the SoftAP admin page.)
 
 ### 6.6 WiFi controls (Settings menu)
 The MODE-button menu has two live WiFi toggles (each shows `[ON]`/`[OFF]`):
@@ -314,6 +323,8 @@ and password are fixed in firmware; change them there if needed.)*
 - **Columns (A/B/C)** — set each column's **mode** (AUTO vs Irrigation-only), **name**, **nutrient
   targets** (N/P/K/pH), or **apply a crop preset**.
 - **Thresholds** — soil **Start<** / **Stop>** % and the **fertigation gap**.
+- **Reboot ESP1** — tick the box and tap **Reboot ESP1** to software-restart the controller (config is
+  kept; the AP drops — reconnect after ~15 s).
 - **Change admin PIN** — set a new 4–12-char PIN (saved to memory).
 
 *Config edits show "queued" and take effect within a moment (they don't text you a confirmation). The

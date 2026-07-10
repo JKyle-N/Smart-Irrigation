@@ -230,7 +230,7 @@ bool     testCapped    = false;       // 10 s hard cap reached -> stay OFF until
 unsigned long testRelayOnMs = 0;      // when the current relay went ON (for the cap)
 unsigned long testLastHoldMs = 0;     // last TEST,HOLD received (for the release timeout)
 const unsigned long TEST_HOLD_TIMEOUT_MS = 400;     // no HOLD within this -> release (fail-safe)
-const unsigned long TEST_HARD_CAP_MS     = 10000;   // max continuous ON, single relay (sec.18.10.8.3)
+const unsigned long TEST_HARD_CAP_MS     = 30000;   // max continuous ON, single relay (sec.18.10.8.3)
 const unsigned long TEST_COMBO_CAP_MS    = 30000;   // longer cap for valve+pump PRIMING combos
 
 /* ---- Testing valve+pump priming combos (TEST,HOLD idx > 15) --------------- *
@@ -501,6 +501,7 @@ bool pcfPresent() {
   return (Wire.endTransmission() == 0);
 }
 void pcfHealth() {
+  if (testMode) return;                             // no PCF_FAIL/PCF_OK while manually exercising relays (Testing)
   if (millis() - lastPcfProbeMs >= PCF_PROBE_MS) {  // periodic active probe (covers idle)
     lastPcfProbeMs = millis();
     if (pcfPresent()) pcfFailCount = 0;

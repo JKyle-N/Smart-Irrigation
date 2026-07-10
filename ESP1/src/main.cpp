@@ -9,7 +9,8 @@
  *      (supervisor / work-order model, sec.9.8.1.1) -- then monitors.
  *    - Talks to the user over SIM800L SMS (alerts, run notices, daily report).
  *    - Logs every event to microSD (CSV, RTC-stamped, sec.25).
- *    - Monitors battery via INA226; classifies faults (3 tiers, sec.23).
+ *    - Monitors battery via INA226 (display/log/telemetry only -- no battery-triggered
+ *      stops/alerts); classifies OTHER faults (3 tiers, sec.23).
  *    - Drives the LCD UI; owns all recovery escalation (sec.18.9).
  *
  *  AUTHORITY BOUNDARIES: ESP32 #1 decides; ESP32 #2 executes; Nano senses.
@@ -591,9 +592,9 @@ String    lastFaultMsg = "none";
 enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST, UI_CAL };
 UiMode    uiMode = UI_DATA;
 // Top-level Settings menu rows
-enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_CALIB, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_EXIT, SET_COUNT };
+enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_CALIB, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
 // SET_WIFI and SET_SOFTAP show a live [ON]/[OFF] suffix via setRowLabel(); their base names here are placeholders.
-const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Calibration", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Exit" };
+const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Calibration", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
 int  setSel    = 0;          // selected settings row
 int  editItem  = -1;         // SetItem currently being edited
 int  editField = 0;          // field index within the editor
@@ -606,6 +607,10 @@ int  confirmSel  = 0;        // 0 SAVE, 1 DISCARD, 2 CANCEL
 // Restore-Defaults (companion spec §C): destructive, double-confirm.
 bool restoreConfirm = false; // the YES/NO restore dialog is open
 int  restoreSel  = 0;        // 0 NO, 1 YES
+// Manual ESP1 reboot (Settings > Reboot / SoftAP button): double-confirm on the LCD.
+bool resetConfirm = false;   // the YES/NO reboot dialog is open
+int  resetSel    = 0;        // 0 NO, 1 YES
+volatile bool rebootPending = false;   // menu/portal -> core-1 loop: clean logFlush then ESP.restart()
 // Remote SMS config-write deferral while a local edit is open (companion spec §B.3.1).
 String pendingCfgSms = "";   // queued config SMS, applied when the local edit exits
 // Testing submenu: PCF8575 OUT_* bit -> short name (MUST match ESP2 OUT_* numbering)
@@ -847,8 +852,8 @@ void setup() {
   if (inaOk) {
     ina.setMaxCurrentShunt(INA226_MAX_CURRENT_A, INA226_SHUNT_OHMS);
     // Validate first reading: an implausibly low bus voltage (~0.01V) means the
-    // I2C read is garbage, not a real flat battery. Disable INA so it can't raise
-    // a fake BATTERY_CRITICAL that blocks the whole system (see powerTick).
+    // I2C read is garbage, not a real flat battery. Disable INA so the display/log
+    // don't show a fake ~0 V (battery no longer gates anything; monitoring only).
     delay(100);
     float testV = ina.getBusVoltage();
     if (testV < 0.1f) {
@@ -968,6 +973,14 @@ void loop() {
   }
   // Persist ThingSpeak keys set directly on core 0 by the portal (tsKey1-3 already updated under netMux).
   if (tsKeyPersistPending) { tsKeyPersistPending = false; saveTsKey(); logEvent("ESP1", "CFG", "TSKEY|PORTAL"); }
+  // Manual reboot requested (Settings > Reboot or the SoftAP button). Always run on core 1 so logs flush
+  // cleanly (config persists in NVS; ESP2 keeps executing any in-flight run and re-syncs on our return).
+  if (rebootPending) {
+    rebootPending = false;
+    logEvent("ESP1", "RESET", "MANUAL|REBOOT");
+    logFlush(true); delay(60);
+    ESP.restart();
+  }
   // Drain one portal config command (SET/MODE/NAME/THRESH) through handleSms with SMS muted. Allowed in
   // UI_DATA *and* UI_MENU: the portal is often launched from the Settings menu, which leaves uiMode==UI_MENU
   // the whole time it runs -- gating on UI_DATA alone meant those edits never applied. Still never drains
@@ -1164,14 +1177,18 @@ void saveWifiEn() {
 }
 void saveOwner()    { prefs.putString("owner", PHONE_NUMBER); }   // owner number (portal edit)
 void saveAdminPin() { prefs.putString("apin", adminPin); }        // portal admin PIN
+// Copy the cred Strings under netMux (the core-0 portal may write them), then write NVS from the locals
+// so the putString can't torn-read a String mid-write.
 void saveWifi() {
-  prefs.putString("wssid", wifiSsid);
-  prefs.putString("wpass", wifiPass);
+  String ss, pw; xSemaphoreTake(netMux, portMAX_DELAY); ss = wifiSsid; pw = wifiPass; xSemaphoreGive(netMux);
+  prefs.putString("wssid", ss);
+  prefs.putString("wpass", pw);
 }
 void saveTsKey() {
-  prefs.putString("tsk1", tsKey1);
-  prefs.putString("tsk2", tsKey2);
-  prefs.putString("tsk3", tsKey3);
+  String k1, k2, k3; xSemaphoreTake(netMux, portMAX_DELAY); k1 = tsKey1; k2 = tsKey2; k3 = tsKey3; xSemaphoreGive(netMux);
+  prefs.putString("tsk1", k1);
+  prefs.putString("tsk2", k2);
+  prefs.putString("tsk3", k3);
 }
 void saveColumn(int c) {
   char key[8];
@@ -1676,7 +1693,7 @@ void exerciseTick() {
   if (sysState != IDLE_STATE) return;
   if (uiMode != UI_DATA) return;
   if (wo.active || pendingRun.active || pendingExercise.active) return;
-  if (batteryLow || batteryCritical) return;     // don't burn power exercising on a weak battery
+  // (low-battery exercise skip removed per user request)
   for (int k = 0; k < 3; k++) {
     if (millis() - lastPumpUseMs[k] > PUMP_EXERCISE_INTERVAL_MS) {
       pendingExercise.active = true; pendingExercise.idx = k; pendingExercise.sent = false;
@@ -2438,7 +2455,7 @@ void controlTick() {
   if (sysState != IDLE_STATE) return;     // only dispatch new work from IDLE
   if (wo.active) return;                   // ESP2 busy -> sequential (sec.14.2.0.1)
   if (pendingRun.active) return;           // a run is already warming ESP2 up
-  if (batteryCritical) return;            // sec.21.1: stop all
+  // (battery-critical run-block removed per user request -- battery no longer stops irrigation)
   if (!rtcOk) return;
   // NOTE: ESP2 is OFF during idle (sec.18.8) -- do NOT gate on esp2Available here; a due
   // column powers ESP2 up on demand below and the work order is sent once it reports READY.
@@ -2460,7 +2477,7 @@ void controlTick() {
       if (!resLowLatched) { resLowLatched = true; raiseFault('M', "RES_LOW", "RESERVOIR"); }
       continue;
     }
-    bool fert = decideFertigate(c) && !batteryLow;                 // low batt -> irrigation only
+    bool fert = decideFertigate(c);                                // (battery no longer forces irrigation-only)
     setState(ACTIVE_STATE);                                        // nanoPaceTick sends ACTIVE on this transition
     // OFF-during-idle (sec.18.8): queue the run, power ESP2 up, and let its READY dispatch the
     // work order (stateMachineTick ACTIVE_STATE is the warm-up timeout safety net).
@@ -2488,7 +2505,7 @@ bool decideFertigate(int c) {
 void powerTick() {
   if (!inaOk) {
     // INA226 is down (init failed or I2C garbage detected at boot). Do NOT read;
-    // leave battV/battI/battP stale (0) so no fake BATTERY_CRITICAL is raised.
+    // leave battV/battI/battP stale (0) so the display/log don't show garbage.
     return;
   }
   if (millis() - lastInaMs < INA_READ_INTERVAL_MS) return;
@@ -2505,17 +2522,11 @@ void powerTick() {
   double wh = (double)battP * dtH;
   if (battI >= 0) energyChargedWh += wh; else energyConsumedWh += wh;
 
-  bool wasLow = batteryLow, wasCrit = batteryCritical;
-  // Only classify low/critical if INA is working AND the voltage is genuinely low.
-  // If INA failed, battV stays 0 and we skip false faults.
+  // Battery state is DISPLAY/LOG ONLY (per user request): monitoring stays, but battery no longer raises
+  // faults, emergency-stops, blocks runs/fertigation, gates exercise, or reboots. These flags now only
+  // drive the LCD OK/LOW/CRIT line + the PWR-log-on-change below.
   batteryCritical = inaOk && (battV > 0 && battV < BATT_CRIT_V);
   batteryLow      = inaOk && (battV > 0 && battV < BATT_LOW_V);
-
-  if (batteryCritical && !wasCrit) {
-    raiseFault('C', "BATTERY_CRITICAL", "BATT");   // raiseFault('C') already enters EMERGENCY_STOP
-  } else if (batteryLow && !wasLow) {
-    raiseFault('M', "BATTERY_LOW", "BATT");
-  }
 
   // B3: log a PWR snapshot at most ~1/min, OR immediately on a battery-state change
   // (sec.25.2.1 -- not one row per 5 s read). Energy totals piggyback the snapshot.
@@ -2566,6 +2577,9 @@ void scheduleTick() {
  *  HEARTBEAT  (freshness; Nano silence does NOT trigger reset, sec.18.9.5.0.1)
  * ========================================================================== */
 void heartbeatTick() {
+  // No silence alerts / ESP2 recovery while manually Testing -- a heartbeat lapse must not power-cycle
+  // ESP2 or alert mid-test (ESP2 heartbeats continuously in test mode; the Testing header shows link state).
+  if (sysState == TEST_MODE) return;
   // Nano silence: alert/count ONCE per outage (Nano's own WDT self-recovers, sec.18.9.5.0.1).
   // Not a reset trigger; the flag clears when fresh data resumes (pollNano).
   if (!nanoSilent && millis() - sensor.lastNanoMs > HEARTBEAT_TIMEOUT_MS) {
@@ -2645,6 +2659,7 @@ void deviceHealthTick() {
   const char *DEV_NAME[DEV_COUNT] = { "RTC", "LCD", "INA226", "SD" };
   int lost = -1;
   for (int d = 0; d < DEV_COUNT; d++) {
+    if (d == DEV_INA) continue;                                  // INA226 dropout no longer reboots (user request)
     if (bootPresent[d] && !nowPresent[d]) { lost = d; break; }   // dropout transition
   }
   if (lost < 0) return;
@@ -2757,6 +2772,22 @@ unsigned long portalStartMs = 0;
 bool          portalSaved   = false;
 String        portalScanOpts;                                // cached <option> list (scan once, not per GET /)
 
+// Escape a string for safe insertion into portal HTML (attributes + text). Prevents a hostile nearby
+// SSID (or a column name) with quotes/angle-brackets from breaking the markup or injecting script.
+static String htmlEscape(const String &s) {
+  String o; o.reserve(s.length() + 8);
+  for (unsigned i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if      (c == '&') o += "&amp;";
+    else if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else if (c == '"') o += "&quot;";
+    else if (c == '\'') o += "&#39;";
+    else o += c;
+  }
+  return o;
+}
+
 // Scan nearby networks ONCE (blocking ~2 s) and cache the <option> list. Repeating this on every page
 // load would keep taking the STA off-channel in AP_STA mode and bump the phone off the AP.
 static void portalDoScan() {
@@ -2765,7 +2796,8 @@ static void portalDoScan() {
   for (int i = 0; i < n && i < 30; i++) {
     String s = WiFi.SSID(i);
     if (s.length() == 0) continue;
-    o += "<option value='" + s + "'>" + s + "  (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+    String e = htmlEscape(s);                                // SSID is attacker-controlled -> escape
+    o += "<option value='" + e + "'>" + e + "  (" + String(WiFi.RSSI(i)) + " dBm)</option>";
   }
   WiFi.scanDelete();
   portalScanOpts = o;
@@ -2808,7 +2840,7 @@ static void portalHandleSave() {
   wifiEnabled = true;                                          // saving creds implies "connect" -> ensure radio on
   wifiPersistPending = true; portalSaved = true;
   portalServer.send(200, "text/html", "<html><body style='font-family:sans-serif'><h3>Saved.</h3>"
-                    "<p>Connecting to <b>" + ss + "</b>&hellip; you can close this page.</p></body></html>");
+                    "<p>Connecting to <b>" + htmlEscape(ss) + "</b>&hellip; you can close this page.</p></body></html>");
 }
 static void portalHandleNotFound() {                          // captive-portal: redirect probes to the form
   portalServer.sendHeader("Location", String("http://") + portalApIpAddr.toString(), true);
@@ -2867,7 +2899,7 @@ static String portalConfigHtml() {
          "<label><input type=radio name=mode value=IRRIGATION_ONLY " + String(irr ? "checked" : "") + ">Irrig-only</label> "
          "<button type=submit>Set</button></p></form>";
     o += "<form method=POST action=/colname><input type=hidden name=col value=" + tag + ">"
-         "<p>Name: <input name=name value='" + String(col[c].name) + "' style='padding:6px'> <button type=submit>Rename</button></p></form>";
+         "<p>Name: <input name=name value='" + htmlEscape(String(col[c].name)) + "' style='padding:6px'> <button type=submit>Rename</button></p></form>";
     o += "<form method=POST action=/coltargets><input type=hidden name=col value=" + tag + ">"
          "<p>N<input name=n type=number value=" + String((int)col[c].targetN) + " style='width:56px'> "
          "P<input name=p type=number value=" + String((int)col[c].targetP) + " style='width:56px'> "
@@ -2891,7 +2923,7 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
   if (msg.length()) o += "<p style='color:#0a0'><b>" + msg + "</b></p>";
   String owner; xSemaphoreTake(netMux, portMAX_DELAY); owner = PHONE_NUMBER; xSemaphoreGive(netMux);
   o += "<h3>Owner number</h3><form method=POST action=/owner>"
-       "<p>Current: <b>" + owner + "</b><br><input name=owner value='" + owner + "' style='width:100%;padding:8px'></p>"
+       "<p>Current: <b>" + htmlEscape(owner) + "</b><br><input name=owner value='" + htmlEscape(owner) + "' style='width:100%;padding:8px'></p>"
        "<p><button type=submit style='width:100%;padding:10px'>Save owner</button></p></form>";
   o += portalConfigHtml();                                     // ThingSpeak keys + columns + thresholds
   o += "<h3>Logs</h3><table style='width:100%;border-collapse:collapse'>";
@@ -2917,6 +2949,10 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
   o += "<h3>Change admin PIN</h3><form method=POST action=/pin>"
        "<p><input name=pin type=password placeholder='new PIN (4-12)' style='width:100%;padding:8px'></p>"
        "<p><button type=submit style='width:100%;padding:10px'>Change PIN</button></p></form>";
+  o += "<h3 style='color:#c33'>Reboot</h3><form method=POST action=/reboot "
+       "onsubmit=\"return confirm('Reboot the controller now?')\">"
+       "<p><label><input type=checkbox name=confirm value=yes> Yes, reboot ESP1 (config kept).</label></p>"
+       "<p><button type=submit style='width:100%;padding:10px;background:#c33;color:#fff'>Reboot ESP1</button></p></form>";
   o += "<hr><p><a href=/>&larr; WiFi setup</a></p></body></html>";
   return o;
 }
@@ -2933,7 +2969,7 @@ static void portalHandleOwner() {                             // POST /owner -- 
   if (digits < 7 || o.length() > 15) { portalServer.send(200, "text/html", portalAdminHtml("Invalid number (7-15 digits).")); return; }
   xSemaphoreTake(netMux, portMAX_DELAY); pendingOwner = o; xSemaphoreGive(netMux);  // barrier for core-1 read
   ownerPersistPending = true;                                 // core-1 loop applies + persists
-  portalServer.send(200, "text/html", portalAdminHtml("Owner saved: " + o));
+  portalServer.send(200, "text/html", portalAdminHtml("Owner saved: " + htmlEscape(o)));
 }
 static void portalHandlePin() {                               // POST /pin -- stage new admin PIN
   if (!portalRequireAdmin()) return;
@@ -3011,6 +3047,14 @@ static void portalHandleFormat() {                            // POST /format --
   }
   portalServer.send(200, "text/html", portalAdminHtml("Erased " + String(removed) + " file(s). SD ready."));
 }
+static void portalHandleReboot() {                            // POST /reboot -- software-reset ESP1
+  if (!portalRequireAdmin()) return;
+  if (portalServer.arg("confirm") != "yes") { portalServer.send(200, "text/html", portalAdminHtml("Cancelled (box unchecked).")); return; }
+  portalServer.send(200, "text/html", portalHead("Reboot") +
+                    "<h3>Rebooting the controller&hellip;</h3><p>The setup AP will drop. Reconnect to your "
+                    "network (or reopen Setup AP) in ~15 s.</p></body></html>");
+  rebootPending = true;                                       // core-1 loop flushes logs, then ESP.restart()
+}
 // ---- config forms: build an SMS-format command, enqueue for the core-1 handleSms replay -----------
 static void portalCfgReply(const String &cmd, const String &okMsg) {
   portalServer.send(200, "text/html", portalAdminHtml(portalCfgEnq(cmd) ? okMsg : "Busy, retry."));
@@ -3086,6 +3130,7 @@ static void portalStart() {
     portalServer.on("/view", portalHandleView);                // GET ?f=
     portalServer.on("/download", portalHandleDownload);        // GET ?f=
     portalServer.on("/format", HTTP_POST, portalHandleFormat);
+    portalServer.on("/reboot", HTTP_POST, portalHandleReboot); // software-reset ESP1
     portalServer.on("/tskey", HTTP_POST, portalHandleTskey);   // config forms (staged -> core-1 handleSms)
     portalServer.on("/colmode", HTTP_POST, portalHandleColMode);
     portalServer.on("/colname", HTTP_POST, portalHandleColName);
@@ -3180,6 +3225,13 @@ static bool senderIsOwner() {
  *  FAULTS  (3-tier classification + response, spec sec.23)
  * ========================================================================== */
 void raiseFault(char tier, const char *code, const char *loc) {
+  // Testing is a manual, operator-present, dead-man + hard-cap guarded mode: raise NO automatic fault
+  // (no UI-preempt, no SMS, no emergency-stop) -- just record it. The manual MODE+BACK e-stop (which
+  // calls enterEmergencyStop directly) still works.
+  if (sysState == TEST_MODE) {
+    logEvent("ESP1", "FAULT", String("TEST_SUPPRESSED|") + code + "|" + loc);
+    return;
+  }
   const char *t = (tier == 'C') ? "CRIT" : (tier == 'M') ? "MAJ" : (tier == 'W') ? "WARN" : "MIN";
   if (tier == 'C') faultsToday[0]++; else if (tier == 'M') faultsToday[1]++; else if (tier == 'm') faultsToday[2]++;
 
@@ -3212,7 +3264,7 @@ void enterEmergencyStop(bool cutPower) {
   pendingRun.active = false; pendingRun.colIdx = -1;
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
   if (cutPower) esp2SetPower(false);              // (sec.23.1.1) -- mirror kept in sync
-  editConfirm = false; restoreConfirm = false; editDirty = false;   // force-dismiss + auto-discard (§B.3.1)
+  editConfirm = false; restoreConfirm = false; resetConfirm = false; editDirty = false;   // force-dismiss + auto-discard (§B.3.1)
   // Take over the screen with the recovery prompt (Part B): leave any Settings/Testing UI,
   // default the cursor to "Return to normal".
   uiMode = UI_DATA; lcdPage = PAGE_FAULT; estopSel = 0; wakeBacklight();
@@ -3235,7 +3287,7 @@ void enterFaultHold(const char *code, const char *loc) {
   sendSMS(String("ALERT,CRIT,") + code + "," + loc + "," + op + "," + colS +
           ",reply STOP/RELEASE/IRRIGATE/NORMAL");
   esp2Held = true; faultRecovSel = 0;                  // default cursor = Hold (safe; pushes no water)
-  editConfirm = false; restoreConfirm = false; editDirty = false;   // force-dismiss any open dialog (§B.3.1)
+  editConfirm = false; restoreConfirm = false; resetConfirm = false; editDirty = false;   // force-dismiss any open dialog (§B.3.1)
   // ESP2 STAYS POWERED (it holds the tank) -- do NOT esp2SetPower(false) here.
   uiMode = UI_DATA; lcdPage = PAGE_FAULT; wakeBacklight();
   setState(EMERGENCY_STOP);                            // halted; the held UI/buttons branch on esp2Held
@@ -3858,6 +3910,17 @@ void settingsButton(int i) {
     return;
   }
 
+  // ---- Reboot ESP1 double-confirm ----
+  if (resetConfirm) {
+    if (i == 0 || i == 1) resetSel ^= 1;                   // toggle NO / YES
+    else if (i == 3) resetConfirm = false;                 // BACK = abort
+    else if (i == 2) {
+      if (resetSel == 1) rebootPending = true;             // YES -> core-1 loop reboots (clean logFlush)
+      resetConfirm = false; uiMode = UI_DATA;
+    }
+    return;
+  }
+
   if (uiMode == UI_MENU) {
     if (i == 0) setSel = (setSel + SET_COUNT - 1) % SET_COUNT;
     else if (i == 1) setSel = (setSel + 1) % SET_COUNT;
@@ -3894,6 +3957,9 @@ void settingsButton(int i) {
       else if (setSel == SET_RESTORE) {                          // Restore Defaults (§C): idle-only, double-confirm
         if (sysState != IDLE_STATE) return;
         restoreConfirm = true; restoreSel = 0;                  // default cursor = NO
+      }
+      else if (setSel == SET_RESET) {                            // manual ESP1 reboot: double-confirm (anytime)
+        resetConfirm = true; resetSel = 0;                       // default cursor = NO
       }
       else enterEditor(setSel);
     }
@@ -4210,6 +4276,14 @@ void lcdRenderSettings() {
     lcd.setCursor(0, 1); lcd.print("Keeps cal+col setup ");
     lcd.setCursor(0, 2); snprintf(l, 21, "%cNO                 ", restoreSel == 0 ? '>' : ' '); lcd.print(l);
     lcd.setCursor(0, 3); snprintf(l, 21, "%cYES, RESET         ", restoreSel == 1 ? '>' : ' '); lcd.print(l);
+    return;
+  }
+  // ---- Reboot ESP1 double-confirm ----
+  if (resetConfirm) {
+    lcd.setCursor(0, 0); lcd.print("Reboot controller?  ");
+    lcd.setCursor(0, 1); lcd.print("Config is kept      ");
+    lcd.setCursor(0, 2); snprintf(l, 21, "%cNO                 ", resetSel == 0 ? '>' : ' '); lcd.print(l);
+    lcd.setCursor(0, 3); snprintf(l, 21, "%cYES, REBOOT        ", resetSel == 1 ? '>' : ' '); lcd.print(l);
     return;
   }
   // ---- Edit "unsaved changes" three-way dialog (companion spec §B.3) ----
