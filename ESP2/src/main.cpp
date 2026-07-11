@@ -314,6 +314,7 @@ String rxLine;
 /* ---- Forward declarations ------------------------------------------------ */
 void wdtSetup();
 void feedWDT();
+void i2cBusRecover();
 bool pcfWrite(uint16_t s);
 void pcfOn(uint8_t bit);
 void pcfOff(uint8_t bit);
@@ -363,13 +364,20 @@ void setup() {
   delay(50);
   Serial.println(F("\n=== ESP32 #2 Actuator Controller boot ==="));
 
+  // WDT FIRST: arm the 8 s panic-reboot before touching any peripheral, so a stalled cold-boot init
+  // (PCF8575/PZEM not yet ready when the GPIO4 relay applies power) auto-recovers instead of hanging
+  // silent until a manual EN reset (sec.18.9 / boot-hang fix).
+  wdtSetup();
+
+  // I2C: recover a stuck bus, cap the clock, and give endTransmission a short timeout so the first
+  // PCF8575 write can never block boot.
+  i2cBusRecover();
   Wire.begin(I2C_SDA, I2C_SCL);
-  pcfWrite(0xFFFF);                         // ALL actuators OFF + master cutoff de-energized (SAFE)
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);                       // ms; bounds a not-ready/stuck-bus transaction
+  pcfWrite(0xFFFF);                          // ALL actuators OFF + master cutoff de-energized (SAFE) -- must be first
 
   esp1Serial.begin(ESP1_BAUD, SERIAL_8N1, ESP1_RX_PIN, ESP1_TX_PIN);
-  pzem.setAddress(0x01);                    // default PZEM Modbus address (begins Serial1)
-
-  analogReadResolution(12);                 // 0..4095
 
   wo.active = false;
   lastHeartbeat = millis();
@@ -378,8 +386,14 @@ void setup() {
   tankLoad();                               // restore persisted mixing-tank volume (overfill guard)
   Serial.printf("Restored mixing-tank volume: %.2f L\n", mixTankL);
 
-  wdtSetup();
+  // Announce READY as early as possible -- BEFORE the (non-critical) PZEM Modbus probe, which is only
+  // used during a run and could otherwise slow/block the boot handshake if the meter is absent/slow.
+  feedWDT();
   reply("READY,ESP2");                      // tell ESP32 #1 we are up & SAFE (sec.10.7.4)
+
+  analogReadResolution(12);                 // 0..4095
+  pzem.setAddress(0x01);                    // default PZEM Modbus address (begins Serial1) -- deferred, post-READY
+
   Serial.println(F("Setup complete -> SAFE/IDLE, sent READY"));
 }
 
@@ -427,6 +441,28 @@ void feedWDT() { esp_task_wdt_reset(); }
 /* =============================================================================
  *  PCF8575  (raw I2C, active-LOW -- proven pattern)
  * ========================================================================== */
+// Clear a stuck I2C bus (a slave -- e.g. the PCF8575 half-powered at a cold relay boot -- holding SDA low):
+// clock SCL up to 9 times then issue a STOP, so the very first Wire transaction in setup() can't hang.
+void i2cBusRecover() {
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  pinMode(I2C_SCL, INPUT_PULLUP);
+  delay(5);
+  if (digitalRead(I2C_SDA) == LOW) {              // a slave is holding the bus
+    pinMode(I2C_SCL, OUTPUT);
+    for (int i = 0; i < 9 && digitalRead(I2C_SDA) == LOW; i++) {
+      digitalWrite(I2C_SCL, LOW);  delayMicroseconds(5);
+      digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);   // clock out one bit
+    }
+    pinMode(I2C_SDA, OUTPUT);                     // generate a STOP: SDA low->high while SCL high
+    digitalWrite(I2C_SDA, LOW);  delayMicroseconds(5);
+    digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);
+    digitalWrite(I2C_SDA, HIGH); delayMicroseconds(5);
+  }
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  pinMode(I2C_SCL, INPUT_PULLUP);
+  delay(5);
+}
+
 bool pcfWrite(uint16_t s) {
   Wire.beginTransmission(PCF_ADDR);
   Wire.write(lowByte(s));

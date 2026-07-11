@@ -190,6 +190,7 @@ const uint8_t       SILENCE_PROBE_MAX          = 5;     // unanswered probes bef
 const unsigned long INA_READ_INTERVAL_MS  = 5000;
 const unsigned long LCD_REFRESH_MS        = 500;
 const unsigned long LCD_BACKLIGHT_MS      = 10000;   // button backlight timeout
+const unsigned long LCD_FAULT_BACKLIGHT_MS = 60000;  // fault page stays lit 1 min, then dims
 const unsigned long BTN_DEBOUNCE_MS       = 40;      // per-button debounce window
 const unsigned long LOG_FLUSH_INTERVAL_MS = 5000;    // batched SD flush
 const uint16_t      LOG_FLUSH_LINES       = 20;
@@ -385,7 +386,9 @@ unsigned long silenceProbeMs = 0;    // last silence-probe send time
 uint8_t esp2PowerCycles = 0;
 unsigned long lastRecoveryMs = 0;
 unsigned long esp2OffMs = 0;     // timestamp ESP2 power was cut, for the power-cycle OFF hold
-const unsigned long POWER_CYCLE_OFF_MS = 1500;   // hold ESP2 relay OFF this long for a real cycle
+const unsigned long POWER_CYCLE_OFF_MS = 3500;   // hold ESP2 relay OFF long enough for its rail to fully
+                                                 // discharge -> clean power-on-reset (a short off can leave a
+                                                 // half-reset ESP2 that only a manual EN clears; boot-hang fix)
 // Recovery escalation ladder: soft reset (RESET_SELF) first, power-cycle as last resort (sec.18.9).
 bool esp2SoftResetTried = false; // soft reset already attempted this recovery episode
 unsigned long esp2RecoverMs = 0; // when RESET_SELF was sent (soft-reset READY-wait timeout reference)
@@ -1453,6 +1456,11 @@ void pollESP2() {
         lastEsp2Ms = millis();
         esp2Available = true;
         silenceProbes = 0;                       // any frame clears an in-progress silence probe
+        // ESP1 heard from ESP2 -> any prior comm fault is resolved; stop showing it as the Last Fault
+        // (it otherwise latches and keeps displaying even while ESP2 is idle/unpowered).
+        if (lastFaultMsg.startsWith("ESP2_SILENCE") || lastFaultMsg.startsWith("ESP2_NO_READY")) {
+          lastFaultMsg = "none"; lastFaultTime = "";
+        }
         int s = raw.indexOf(FRAME_START), e = raw.indexOf(FRAME_END);
         String payload = (s >= 0 && e > s) ? raw.substring(s + 7, e) : raw;
         payload.trim();
@@ -4315,9 +4323,12 @@ void lcdTick() {
   if (!lcdPresent) { lcdWasPresent = false; return; }
   if (!lcdWasPresent) { lcd.init(); lcd.backlight(); lcdWasPresent = true; }   // recovered
 
-  if (backlightOn && millis() - backlightMs > LCD_BACKLIGHT_MS
-      && uiMode == UI_DATA && !portalActive
-      && sysState != ACTIVE_STATE && sysState != EMERGENCY_STOP && lcdPage != PAGE_FAULT) {
+  // Fault display stays lit a full minute (vs the 10 s button window) so a fault is noticed, then dims
+  // to save battery/LCD. Any button press or fresh fault relights it (wakeBacklight resets backlightMs).
+  unsigned long blWindow = (lcdPage == PAGE_FAULT || sysState == EMERGENCY_STOP)
+                             ? LCD_FAULT_BACKLIGHT_MS : LCD_BACKLIGHT_MS;
+  if (backlightOn && millis() - backlightMs > blWindow
+      && uiMode == UI_DATA && !portalActive && sysState != ACTIVE_STATE) {
     backlightOn = false; lcd.noBacklight();
   }
 
