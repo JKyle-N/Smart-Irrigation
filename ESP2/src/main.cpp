@@ -69,6 +69,7 @@
 #include <Wire.h>
 #include <PZEM004Tv30.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>        // esp_reset_reason() -- clean-reboot-once on cold power-on
 #include <Preferences.h>       // NVS: persist mixing-tank volume across reboot/power-down
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
@@ -359,10 +360,37 @@ void primeSafety();
 /* =============================================================================
  *  SETUP  --  SAFE boot: all outputs OFF before anything else (sec.19.5.4)
  * ========================================================================== */
+// Power-on hard-reset one-shot guard: RTC-RAM survives a SW reset but is garbage on a true power loss, so
+// this guarantees the clean-boot reset below fires at most once per power-up and can never loop.
+RTC_NOINIT_ATTR uint32_t g_porResetMagic;
+const uint32_t POR_RESET_DONE = 0xB007CE11;     // marker: already did the one clean power-on reset
+
 void setup() {
   Serial.begin(DEBUG_BAUD);
   delay(50);
   Serial.println(F("\n=== ESP32 #2 Actuator Controller boot ==="));
+
+  // HARD RESET ON EVERY POWER-ON (user req): a relay power-up can leave the ESP32 in a marginal
+  // power-on-reset state (the "silent until a manual EN press" boot). So on a genuine power-on we let
+  // VCC settle briefly then do ONE clean software reset -- this mimics pressing EN after the rails are
+  // stable and gives a reliable boot. The forced reset reports ESP_RST_SW, so the 2nd boot skips this
+  // (no reboot loop); brownout/other reset reasons also skip it.
+  esp_reset_reason_t rr = esp_reset_reason();
+  if (rr == ESP_RST_POWERON) {
+    if (g_porResetMagic == POR_RESET_DONE) {
+      // We already forced our one clean reset this power cycle but still see POWERON (marginal-power
+      // misreport) -> do NOT restart again; break any loop and just boot normally.
+      g_porResetMagic = 0;
+    } else {
+      g_porResetMagic = POR_RESET_DONE;      // mark before the forced restart (survives the SW reset)
+      Serial.println(F("Power-on detected -> one clean hard reset for a reliable boot"));
+      Serial.flush();
+      delay(200);                            // let VCC settle before the clean restart
+      ESP.restart();                         // returns as ESP_RST_SW -> the else branch clears the mark
+    }
+  } else {
+    g_porResetMagic = 0;                     // any non-POR reset (SW/WDT/brownout/RESET_SELF/idle) clears it
+  }
 
   // WDT FIRST: arm the 8 s panic-reboot before touching any peripheral, so a stalled cold-boot init
   // (PCF8575/PZEM not yet ready when the GPIO4 relay applies power) auto-recovers instead of hanging
