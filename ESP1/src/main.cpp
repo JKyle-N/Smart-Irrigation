@@ -361,7 +361,7 @@ struct SensorData {
   // --- RAW signals retained for the Sensor Diag screen (pre-conversion, honest -1 on fault) ---
   float rawTemp, rawHum, rawLux;         // ENV / LIGHT raw (Nano sends engineering, no offset)
   float rawResCm, rawMixCm, rawFlow;     // TANK: raw ultrasonic distances (cm) + raw flow L/min
-  int   rawSoil[NUM_COLUMNS];            // raw averaged soil ADC (0..1023)
+  int   rawSoil[NUM_COLUMNS][2];         // raw per-probe soil ADC (0..1023); [c][0]=probe1 [c][1]=probe2
   float rawNpk[NUM_COLUMNS][7];          // raw Modbus registers per column
   // Per-branch last-seen so a single dead Nano sensor is detectable (lastNanoMs is whole-link).
   unsigned long msEnv, msTank, msSoil, msLight, msNpk[NUM_COLUMNS];
@@ -726,10 +726,11 @@ String calMsg = "";                        // transient calibration message (e.g
  * NOT streamed in normal operation, so the ESP2 pages power ESP2 up and CAL-stream each sensor's
  * raw value in turn (one at a time), reusing the calibration transport. Purely diagnostic.      */
 uint8_t diagPage = 0;
-const uint8_t DIAG_PAGES = 8;              // 0 Env,1 Tank,2 Soil,3 NPK,4 ESP1,5 ESP2 chem,6 ESP2 flow1,7 ESP2 flow2
-const uint8_t DIAG_SOIL_PAGE = 2;          // the Soil page CAL-streams the Nano per-channel raw
+const uint8_t DIAG_PAGES = 9;              // 0 Env,1 Tank,2 Soil,3 NPK,4 ESP1,5 ESP2 chem,6 ESP2 pwr,7 flow1,8 flow2
 const unsigned long NANO_STALE_MS = 90000; // a Nano sensor is "stale" after this (~2x the active TX interval)
-const char *DIAG_ESP2_ID[] = { "PH", "EC", "ACS712", "FLOW_RESMIX", "FLOW_MIXIRR", "FLOW_NUTA", "FLOW_NUTB", "FLOW_NUTC" };
+// ESP2 sensors are pulled live one-at-a-time via a CAL round-robin (not streamed in normal operation).
+const char *DIAG_ESP2_ID[] = { "PH", "EC", "ACS712", "PZEM_V", "PZEM_I", "PZEM_P",
+                               "FLOW_RESMIX", "FLOW_MIXIRR", "FLOW_NUTA", "FLOW_NUTB", "FLOW_NUTC" };
 const uint8_t DIAG_ESP2_N = sizeof(DIAG_ESP2_ID) / sizeof(DIAG_ESP2_ID[0]);
 float         diagEsp2Raw[DIAG_ESP2_N];
 bool          diagEsp2Valid[DIAG_ESP2_N];
@@ -738,24 +739,20 @@ int           diagEsp2Idx = -1;            // index currently CAL-streaming (-1 
 unsigned long diagEsp2DwellMs = 0;         // when the current id started streaming
 bool          diagEsp2Streaming = false;   // sweep active (idle + ESP2 powered)
 const unsigned long DIAG_ESP2_DWELL_MS = 900;    // per-id dwell before advancing the round-robin
-const unsigned long DIAG_ESP2_STALE_MS = 12000;  // full sweep ~7 s; mark a value stale a bit beyond
-// Nano per-channel soil sweep (Soil page): the Nano already streams SOIL_<col><ch> raw over CAL,
-// so ESP1 round-robins the individual sensors A1/A2/B1/B2(/C1/C2) to expose a dead/uncal channel.
-struct DiagSoilCh { const char *id; uint8_t col; };
-const DiagSoilCh DIAG_SOIL[] = { {"SOIL_A1",0},{"SOIL_A2",0},{"SOIL_B1",1},{"SOIL_B2",1},{"SOIL_C1",2},{"SOIL_C2",2} };
-const uint8_t DIAG_SOIL_N = sizeof(DIAG_SOIL) / sizeof(DIAG_SOIL[0]);
-float         diagSoilRaw[DIAG_SOIL_N];
-bool          diagSoilValid[DIAG_SOIL_N];
-unsigned long diagSoilMs[DIAG_SOIL_N];
-int           diagSoilIdx = -1;
-unsigned long diagSoilDwellMs = 0;
-bool          diagSoilStreaming = false;
+const unsigned long DIAG_ESP2_STALE_MS = 16000;  // full sweep ~10 s; mark a value stale a bit beyond
+// Per-probe soil raw for the Soil page comes straight from sensor.rawSoil[][] (the Nano now sends both
+// probes in the normal SOIL packet) -- no CAL sweep needed for soil.
 
 /* ---- Heartbeat ----------------------------------------------------------- */
 bool nanoSilent = false;        // one-shot latch so silence alerts/counts fire once per outage
 
 /* ---- Reservoir-low latch (A1: one-shot, prevents fault/SMS storm) --------- */
 bool resLowLatched = false;     // raised once per low-reservoir episode; cleared on recovery
+
+/* ---- Control-decision trace: log WHY a column is/ isn't serviced (debug the "never irrigates") --- *
+ * Logged on change (or re-emitted every 10 min) so the SD log explains itself without spamming.      */
+String        ctrlReason[NUM_COLUMNS];
+unsigned long ctrlReasonMs[NUM_COLUMNS] = { 0 };
 
 /* ---- Nano interval pacing (A2: ACTIVE / DAY / NIGHT, sent only on change) -- */
 enum NanoPace { PACE_NONE, PACE_ACTIVE, PACE_DAY, PACE_NIGHT };
@@ -823,6 +820,7 @@ void esp2Escalate();
 void esp2CommRecovered();
 void esp2CommRetryTick();
 void esp1SelfResetOncePerDay(const char *reason);
+void rtcDeadRebootTick();
 void esp2SetPower(bool on, bool force = false);
 void esp2PowerTick();
 void dispatchPendingRun();
@@ -845,6 +843,7 @@ void handleButtons();
 void settingsButton(int i);
 void settingsLeaveToData();
 void uiIdleTick();
+void healthTick();
 void enterEditor(int item);
 void commitEditor();
 void restoreDefaults();
@@ -856,10 +855,7 @@ void lcdRenderCal();
 void enterDiag();
 void exitDiag();
 void diagTick();
-void diagEsp2Tick();
-void diagSoilTick();
 void diagStopStream();
-void diagStopSoil();
 void diagButton(int i);
 void lcdRenderDiag();
 void sendEsp2(const String &body);
@@ -1042,6 +1038,8 @@ void loop() {
   g_lastStage = 'C'; calHoldTick();        // flow-cal dead-man (prime pump while ENTER held)
   g_lastStage = 'D'; diagTick();           // Sensor Diag: round-robin CAL sweep of ESP2 sensors
   g_lastStage = 'U'; uiIdleTick();         // fail-safe: auto-return to data screen after 5 min idle in a menu
+  g_lastStage = 'M'; healthTick();         // module-health logging: edge changes + periodic HEALTH snapshot
+  g_lastStage = 'Z'; rtcDeadRebootTick();  // dead-RTC (all-zero timestamp): daily idle-only reboot to recover
   // Apply a config SMS that was deferred during a local edit, once the edit has closed (§B.3.1).
   if (pendingCfgSms.length() && uiMode != UI_EDIT && !editConfirm) {
     String s = pendingCfgSms; pendingCfgSms = ""; handleSms(s);
@@ -1408,28 +1406,35 @@ bool classifyAndApply(const String &payload, const String &raw) {
     return true;
   }
   if (cmd == "SOIL") {
-    // Tag-based, variable-length: SOIL,<tag>,<val>,... (enabled columns only; disabled omitted)
-    if (n < 3 || ((n - 1) & 1)) return false;          // need >=1 pair, even token count (Tier 1)
-    int tmp[NUM_COLUMNS], rawTmp[NUM_COLUMNS];
-    for (int c = 0; c < NUM_COLUMNS; c++) { tmp[c] = -1; rawTmp[c] = -1; }  // columns absent from packet stay -1
-    for (int i = 1; i + 1 < n; i += 2) {
+    // Tag-based, variable-length: SOIL,<tag>,<probe1>,<probe2>,... (enabled columns only; disabled omitted).
+    // Both raw capacitive probes per column; ESP1 averages them for control + maps to %, and logs each raw.
+    if (n < 4 || ((n - 1) % 3) != 0) return false;     // need >=1 triplet, (tag,p1,p2) groups (Tier 1)
+    int tmp[NUM_COLUMNS], rawTmp[NUM_COLUMNS][2];
+    for (int c = 0; c < NUM_COLUMNS; c++) { tmp[c] = -1; rawTmp[c][0] = -1; rawTmp[c][1] = -1; }  // absent stay -1
+    for (int i = 1; i + 2 < n; i += 3) {
       int c = -1;
       for (int j = 0; j < NUM_COLUMNS; j++) if (tok[i] == String(COL_TAG[j])) c = j;
       if (c < 0) return false;                          // unknown tag = Tier 1 garbage
-      int v = tok[i + 1].toInt();                        // RAW averaged ADC (companion spec §A)
-      if (v < 0 || v > 1023) return false;               // Tier 2: 10-bit ADC range
-      rawTmp[c] = v;                                      // Sensor Diag: keep the raw ADC
-      tmp[c] = soilPct(c, v);                            // map to % with the stored endpoints
+      int v1 = tok[i + 1].toInt(), v2 = tok[i + 2].toInt();   // RAW per-probe ADC (companion spec §A)
+      if (v1 < 0 || v1 > 1023 || v2 < 0 || v2 > 1023) return false;   // Tier 2: 10-bit ADC range
+      rawTmp[c][0] = v1; rawTmp[c][1] = v2;              // keep each raw probe (log + Sensor Diag)
+      tmp[c] = soilPct(c, (v1 + v2) / 2);               // control value = 2-probe average -> % (endpoints)
     }
-    for (int c = 0; c < NUM_COLUMNS; c++) { sensor.soil[c] = tmp[c]; sensor.rawSoil[c] = rawTmp[c]; }
+    for (int c = 0; c < NUM_COLUMNS; c++) {
+      sensor.soil[c] = tmp[c];
+      sensor.rawSoil[c][0] = rawTmp[c][0]; sensor.rawSoil[c][1] = rawTmp[c][1];
+    }
     sensor.msSoil = millis();
     sensor.lastNanoMs = millis();
-    // Log all columns, pipe-delimited (CSV-safe, sec.25.2.1); disabled columns -> DISABLED
-    // token (Nano omits them, but ESP1 knows from COLUMN_ENABLED) to distinguish off vs 0/fault.
+    // Log the column % (X=<pct>, read by the summary parser) PLUS each raw probe (X1/X2) for debugging;
+    // pipe-delimited/CSV-safe (sec.25.2.1). Disabled columns -> DISABLED (distinguishes off vs 0/fault).
     String d = "SOIL";
     for (int c = 0; c < NUM_COLUMNS; c++) {
       d += "|" + String(COL_TAG[c]) + "=";
-      d += COLUMN_ENABLED[c] ? String(tmp[c]) : String("DISABLED");
+      if (!COLUMN_ENABLED[c]) { d += "DISABLED"; continue; }
+      d += String(tmp[c]);
+      d += "|" + String(COL_TAG[c]) + "1=" + String(rawTmp[c][0]);
+      d += "|" + String(COL_TAG[c]) + "2=" + String(rawTmp[c][1]);
     }
     logEvent("NANO", "SENSOR", d);
     return true;
@@ -1565,6 +1570,12 @@ void handleEsp2Response(const String &payload) {
     int c2 = arg.indexOf(',');
     if (c2 > 0) { calRxId = arg.substring(0, c2); calRxRaw = arg.substring(c2 + 1).toFloat();
                   calRxValid = (calRxRaw != -1); calRxMs = millis(); }
+    return;
+  }
+  if (resp == "TELE") {                                   // power telemetry during a run: PZEM,<v>,<i>,<p>,ACS,<a>
+    // arg = "PZEM,228.0,1.40,319.0,ACS,0.80" -> log verbatim as pipe-delimited for the SD log / SUMMARY.
+    String d = arg; d.replace(",", "|");                  // CSV-safe (sec.25.2: no commas in detail)
+    logEvent("ESP2", "SENSOR", d);
     return;
   }
   if (resp == "READY") {
@@ -1766,6 +1777,29 @@ void esp1SelfResetOncePerDay(const char *reason) {
   sendSMS(String("ALERT,MAJ,SELF_RESET,") + reason);   // best-effort (may not flush before reboot)
   logFlush(true);
   g_lastSelfResetDay = today;
+  delay(60);                                            // let the last UART/SD bytes drain
+  ESP.restart();
+}
+
+/* ---- Dead-RTC daily reboot ------------------------------------------------ *
+ * When the RTC is unreadable, tsString() stamps every row "0000-00-00 00:00:00" and logs land in
+ * NODATE.CSV -- scheduling is dead too (controlTick bails on !rtcOk), so the rig silently does nothing.
+ * A reboot re-runs the I2C/RTC init and often clears a wedged bus. Reboot at most once every 24 h of
+ * uptime while the timestamp stays all-zero, and ONLY when truly idle with nothing pending -- never
+ * mid-run, mid-fault-hold, or while the operator is in a menu / the WiFi portal.
+ * The 24 h clock is uptime-based on purpose: with a dead RTC there is no calendar day to key off, and
+ * millis() resets on reboot, so the next attempt is naturally ~24 h later (no boot loop).            */
+const unsigned long RTC_DEAD_REBOOT_MS = 86400000UL;   // 24 h of continuous all-zero timestamp
+unsigned long rtcDeadSinceMs = 0;                       // 0 = timestamp currently valid
+void rtcDeadRebootTick() {
+  if (rtcOk) { rtcDeadSinceMs = 0; return; }            // timestamp valid -> reset the clock
+  if (rtcDeadSinceMs == 0) { rtcDeadSinceMs = millis(); return; }   // start the 24 h clock
+  if (millis() - rtcDeadSinceMs < RTC_DEAD_REBOOT_MS) return;
+  // Idle-only, nothing pending, operator not busy -> otherwise wait and retry on a later tick.
+  if (sysState != IDLE_STATE || wo.active || pendingRun.active || pendingExercise.active
+      || esp2Held || uiMode != UI_DATA || portalActive) return;
+  logEvent("ESP1", "RESET", "SELF|RTC_TS_ZERO|24h_idle");
+  logFlush(true);
   delay(60);                                            // let the last UART/SD bytes drain
   ESP.restart();
 }
@@ -2665,6 +2699,18 @@ void stateMachineTick() {
 /* =============================================================================
  *  CONTROL LOGIC  --  windowed schedule + soil threshold + NPK gap
  * ========================================================================== */
+// Format minutes-of-day as HH:MM for the control-decision log.
+static String hhmm(uint16_t m) {
+  char b[6]; snprintf(b, sizeof(b), "%02u:%02u", (unsigned)(m / 60), (unsigned)(m % 60)); return String(b);
+}
+// Log a per-column control decision, but only when it CHANGES (or every 10 min) so the SD log
+// explains WHY a column is/ isn't serviced without flooding (answers "why it never irrigates").
+static void ctrlNote(int c, const String &r) {
+  if (ctrlReason[c] == r && millis() - ctrlReasonMs[c] < 600000UL) return;
+  ctrlReason[c] = r; ctrlReasonMs[c] = millis();
+  logEvent("ESP1", "CTRL", String("COL_") + COL_TAG[c] + "|" + r);
+}
+
 void controlTick() {
   if (uiMode != UI_DATA) return;          // operator in Settings/Testing -> pause automation
   if (sysState != IDLE_STATE) return;     // only dispatch new work from IDLE
@@ -2680,21 +2726,29 @@ void controlTick() {
   uint16_t mod = minuteOfDay();
 
   for (int c = 0; c < NUM_COLUMNS; c++) {
-    if (!COLUMN_ENABLED[c]) continue;
-    if (col[c].lastServicedStamp == currentDayStamp) continue;     // once/day per window
+    if (!COLUMN_ENABLED[c]) continue;                              // config, not a fault -> no CTRL log spam
+    if (col[c].lastServicedStamp == currentDayStamp) { ctrlNote(c, "SERVICED_TODAY"); continue; }
     // schedule axis: AUTO uses the default window, MANUAL uses the operator-set one (sec.18.10.7.2)
     uint16_t ws = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_START[c] : DEF_WIN_START[c];
     uint16_t we = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_END[c]   : DEF_WIN_END[c];
-    if (mod < ws || mod > we) continue;                            // outside service window
-    if (sensor.soil[c] < 0) continue;                              // invalid soil (faulted elsewhere)
-    if (sensor.soil[c] >= soilStartPct) continue;                 // not dry enough
+    if (mod < ws || mod > we) {                                    // outside service window
+      ctrlNote(c, "OUTSIDE_WINDOW|now=" + hhmm(mod) + "|win=" + hhmm(ws) + "-" + hhmm(we));
+      continue;
+    }
+    if (sensor.soil[c] < 0) { ctrlNote(c, "SOIL_INVALID"); continue; }   // invalid soil (faulted elsewhere)
+    if (sensor.soil[c] >= soilStartPct) {                          // not dry enough
+      ctrlNote(c, "NOT_DRY|soil=" + String(sensor.soil[c]) + ">=" + String(soilStartPct));
+      continue;
+    }
     if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT) {        // reservoir guard (sec.14.4.1)
       // A1: latch so the fault/SMS fires ONCE per low episode (cleared on recovery in powerTick-
       // style check below), not every loop while a column sits due over a low reservoir.
+      ctrlNote(c, "RES_LOW|res=" + String((int)sensor.resLevel));
       if (!resLowLatched) { resLowLatched = true; raiseFault('M', "RES_LOW", "RESERVOIR"); }
       continue;
     }
     bool fert = decideFertigate(c);
+    ctrlNote(c, fert ? "DUE->FERTIGATE" : "DUE->IRRIGATE");        // column is being serviced now
 #if BATTERY_SAFETY_ENABLED
     if (batteryLow) fert = false;                                  // low battery -> irrigation only (READY, not active)
 #endif
@@ -2717,6 +2771,65 @@ bool decideFertigate(int c) {
   if ((col[c].targetP - p) >= fertGap) return true;
   if ((col[c].targetK - k) >= fertGap) return true;
   return false;
+}
+
+/* =============================================================================
+ *  MODULE HEALTH LOGGING  --  edge (state change) + periodic HEALTH snapshot so the SD log
+ *  shows WHEN each module/link/sensor failed (GSM, WiFi/ThingSpeak, RTC/LCD/SD, Nano/ESP2
+ *  links, per-column NPK). All logging is on core 1 (SD is core-1-only); netTask snapshot
+ *  flags (wifiConnected / lastTsOk) are just read here.
+ * ========================================================================== */
+const unsigned long NANO_LINK_STALE_MS = 180000;   // Nano considered stale if no packet in 3 min
+void healthTick() {
+  static unsigned long lastCheckMs = 0, lastSnapMs = 0;
+  if (millis() - lastCheckMs < 5000) return;       // edge scan every 5 s
+  lastCheckMs = millis();
+
+  // GSM registration
+  static int lastReg = -1;
+  int reg = netRegistered ? 1 : 0;
+  if (reg != lastReg) { lastReg = reg; logEvent("ESP1", "NET", reg ? ("GSM|REG|rssi=" + String(lastRssi)) : "GSM|NOREG"); }
+
+  // WiFi (off / up / down) + ThingSpeak upload result
+  static int lastWifi = -1;
+  int wf = !wifiEnabled ? 2 : (wifiConnected ? 1 : 0);
+  if (wf != lastWifi) { lastWifi = wf; logEvent("ESP1", "NET", wf == 2 ? "WIFI|OFF" : wf == 1 ? ("WIFI|UP|rssi=" + String(wifiRssiVal)) : "WIFI|DOWN"); }
+  static int lastTs = -1;
+  if (wifiEnabled && wifiConnected) { int ts = lastTsOk ? 1 : 0; if (ts != lastTs) { lastTs = ts; logEvent("ESP1", "NET", ts ? "TS|OK" : "TS|FAIL"); } }
+
+  // I2C/SD device presence (probe at this cadence)
+  static int8_t dprev[3] = { -1, -1, -1 };
+  bool dnow[3] = { i2cPresent(0x68), i2cPresent(LCD_ADDR), sdOk };
+  const char *dname[3] = { "RTC", "LCD", "SD" };
+  for (int k = 0; k < 3; k++) { int v = dnow[k] ? 1 : 0; if (v != dprev[k]) { dprev[k] = v; logEvent("ESP1", "DEV", String(dname[k]) + "|" + (v ? "OK" : "ABSENT")); } }
+
+  // Nano link + ESP2 availability
+  static int lastNano = -1;
+  int nano = (sensor.lastNanoMs && millis() - sensor.lastNanoMs < NANO_LINK_STALE_MS) ? 1 : 0;
+  if (nano != lastNano) { lastNano = nano; logEvent("ESP1", "LINK", nano ? "NANO|OK" : "NANO|STALE"); }
+  static int lastE2 = -1;
+  int e2 = esp2Available ? 1 : 0;
+  if (e2 != lastE2) { lastE2 = e2; logEvent("ESP1", "LINK", e2 ? "ESP2|OK" : "ESP2|SILENT"); }
+
+  // Per-column NPK sensor validity (flaps on -1) -- the one sensor most prone to intermittent failure
+  static int8_t npkPrev[NUM_COLUMNS] = { -1, -1, -1 };
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    if (!COLUMN_ENABLED[c]) continue;
+    int v = sensor.npkValid[c] ? 1 : 0;
+    if (v != npkPrev[c]) { npkPrev[c] = v; logEvent("ESP1", "SENSOR", String("NPK_") + COL_TAG[c] + "|" + (v ? "OK" : "FAIL")); }
+  }
+
+  // Periodic snapshot every 5 min: one greppable line with every module state.
+  if (millis() - lastSnapMs >= 300000) {
+    lastSnapMs = millis();
+    String s  = "GSM:" + String(netRegistered ? "reg" : "no");
+    s += "|WIFI:" + String(!wifiEnabled ? "off" : wifiConnected ? "up" : "dn");
+    s += "|RTC:" + String(rtcOk ? "ok" : "x") + "|SD:" + String(sdOk ? "ok" : "x");
+    s += "|NANO:" + String((sensor.lastNanoMs && millis() - sensor.lastNanoMs < NANO_LINK_STALE_MS) ? "ok" : "stale");
+    s += "|ESP2:" + String(esp2Powered ? (esp2Available ? "on" : "boot") : "off");
+    s += "|SOILA:" + String(sensor.soil[0]) + "|SOILB:" + String(sensor.soil[1]);
+    logEvent("ESP1", "HEALTH", s);
+  }
 }
 
 /* =============================================================================
@@ -3502,7 +3615,7 @@ void raiseFault(char tier, const char *code, const char *loc) {
     if (sysState == TEST_MODE) setState(IDLE_STATE);
   }
   if (uiMode == UI_DIAG) {                          // fault while in Sensor Diag: stop streams + power ESP2 off
-    diagStopStream(); diagStopSoil(); esp2SetPower(false);
+    diagStopStream(); esp2SetPower(false);
   }
   // Non-critical faults wait BEHIND an open confirm dialog (companion spec §B.3.1); Critical
   // force-dismisses (handled in enterEmergencyStop below).
@@ -3917,10 +4030,10 @@ void lcdRenderCal() {
 
 /* =============================================================================
  *  SENSOR DIAG  (Settings > Sensor Diag)  --  read-only RAW viewer, all 3 controllers.
- *  Nano + ESP1 raw are already on hand; the Soil page and the ESP2 pages pull live per-sensor
- *  raw via a one-at-a-time CAL round-robin (Nano soil A1/A2/B1/B2..., ESP2 pH/EC/ACS/flow --
- *  not streamed in normal operation). Only one sweep runs at a time (they share calRxId), chosen
- *  by page. Purely diagnostic: no actuators are driven, ESP2 is powered only while open.
+ *  Nano + ESP1 raw are already on hand (SensorData raw fields incl. per-probe soil, battery ADC).
+ *  ESP2's sensors are NOT streamed in normal operation, so the ESP2 pages power ESP2 up and
+ *  CAL-stream each sensor's raw value one-at-a-time (pH/EC/ACS/PZEM/flow), reusing the calibration
+ *  transport. Purely diagnostic: no actuators driven, ESP2 powered only while the screen is open.
  * ========================================================================== */
 // Stop the ESP2 CAL sweep (close the open id) without touching power / uiMode.
 void diagStopStream() {
@@ -3928,36 +4041,28 @@ void diagStopStream() {
     sendEsp2(String("CAL_STOP,") + DIAG_ESP2_ID[diagEsp2Idx]);
   diagEsp2Streaming = false; diagEsp2Idx = -1; diagEsp2DwellMs = 0;
 }
-// Stop the Nano per-channel soil CAL sweep (close the open channel).
-void diagStopSoil() {
-  if (diagSoilStreaming && diagSoilIdx >= 0 && diagSoilDwellMs != 0)
-    sendNanoCommand((String("CAL_STOP,") + DIAG_SOIL[diagSoilIdx].id).c_str());
-  diagSoilStreaming = false; diagSoilIdx = -1; diagSoilDwellMs = 0;
-}
 
 void enterDiag() {
   uiMode = UI_DIAG; diagPage = 0;
   for (int k = 0; k < DIAG_ESP2_N; k++) { diagEsp2Raw[k] = 0; diagEsp2Valid[k] = false; diagEsp2Ms[k] = 0; }
-  for (int k = 0; k < DIAG_SOIL_N; k++) { diagSoilRaw[k] = 0; diagSoilValid[k] = false; diagSoilMs[k] = 0; }
   diagEsp2Idx = -1; diagEsp2DwellMs = 0; diagEsp2Streaming = false;
-  diagSoilIdx = -1; diagSoilDwellMs = 0; diagSoilStreaming = false;
   // ESP2 sensors aren't sent normally -> power ESP2 so its pages can CAL-stream (idle-only; a run /
-  // held fault makes it reply BUSY). Automation is already paused in any Settings mode. The sweeps
-  // themselves are page-aware and self-start in diagTick.
+  // held fault makes it reply BUSY). Automation is already paused in any Settings mode. The sweep
+  // self-starts in diagTick. (Soil is per-probe in the normal packet -- no sweep needed.)
   if (sysState == IDLE_STATE && !wo.active && !esp2Held) esp2SetPower(true);
   logEvent("ESP1", "DIAG", "ENTER");
 }
 
 void exitDiag() {
   diagStopStream();
-  diagStopSoil();
   esp2SetPower(false);                        // respects the min-on / deferred-off logic
   uiMode = UI_MENU;
   logEvent("ESP1", "DIAG", "EXIT");
 }
 
 // Round-robin the ESP2 CAL stream (self-starting): arm one id, dwell, record raw, stop, advance.
-void diagEsp2Tick() {
+void diagTick() {
+  if (uiMode != UI_DIAG) return;
   if (sysState != IDLE_STATE || wo.active || esp2Held) { diagStopStream(); return; }   // ESP2 busy
   if (!diagEsp2Streaming) { diagEsp2Streaming = true; diagEsp2Idx = 0; diagEsp2DwellMs = 0; }
 
@@ -3976,43 +4081,6 @@ void diagEsp2Tick() {
   sendEsp2(String("CAL_STOP,") + DIAG_ESP2_ID[k]);
   diagEsp2Idx = (diagEsp2Idx + 1) % DIAG_ESP2_N;
   diagEsp2DwellMs = 0;                                          // next loop arms the new id
-}
-
-// Round-robin the Nano per-channel soil CAL stream over ENABLED columns (self-starting).
-void diagSoilTick() {
-  if (!diagSoilStreaming) { diagSoilStreaming = true; diagSoilIdx = -1; diagSoilDwellMs = 0; }
-
-  if (diagSoilDwellMs == 0) {                                   // advance to the next enabled channel + arm it
-    int start = diagSoilIdx;
-    do { diagSoilIdx = (diagSoilIdx + 1) % DIAG_SOIL_N; }
-    while (!COLUMN_ENABLED[DIAG_SOIL[diagSoilIdx].col] && diagSoilIdx != start);
-    if (!COLUMN_ENABLED[DIAG_SOIL[diagSoilIdx].col]) return;    // no enabled soil channel at all
-    calRxId = "";
-    sendNanoCommand((String("CAL_START,") + DIAG_SOIL[diagSoilIdx].id).c_str());
-    diagSoilDwellMs = millis();
-    return;
-  }
-  if (millis() - diagSoilDwellMs < DIAG_ESP2_DWELL_MS) return;
-
-  int k = diagSoilIdx;
-  if (calRxId == DIAG_SOIL[k].id && millis() - calRxMs < DIAG_ESP2_DWELL_MS + 500) {
-    diagSoilRaw[k] = calRxRaw; diagSoilValid[k] = calRxValid; diagSoilMs[k] = millis();
-  }
-  sendNanoCommand((String("CAL_STOP,") + DIAG_SOIL[k].id).c_str());
-  diagSoilDwellMs = 0;
-}
-
-// Page-aware dispatch: only one CAL sweep runs at a time (both share calRxId). The Soil page
-// streams the Nano's per-channel soil; every other page streams ESP2.
-void diagTick() {
-  if (uiMode != UI_DIAG) return;
-  static uint8_t lastPage = 255;
-  bool onSoil = (diagPage == DIAG_SOIL_PAGE);
-  if (diagPage != lastPage) {                  // page changed -> stop the sweep that isn't for this page
-    if (onSoil) diagStopStream(); else diagStopSoil();
-    lastPage = diagPage;
-  }
-  if (onSoil) diagSoilTick(); else diagEsp2Tick();
 }
 
 void diagButton(int i) {
@@ -4034,13 +4102,6 @@ static const char *diagEsp2Flag(int k) {
   if (millis() - diagEsp2Ms[k] > DIAG_ESP2_STALE_MS) return "OLD";
   return diagEsp2Valid[k] ? "ok" : "BAD";
 }
-// Column-level flag for the two soil channels (BAD if either is a -1 sentinel).
-static const char *diagSoilColFlag(int c) {
-  int k1 = 2 * c, k2 = 2 * c + 1;
-  if (!diagSoilStreaming || diagSoilMs[k1] == 0 || diagSoilMs[k2] == 0) return "..";
-  if (millis() - diagSoilMs[k1] > DIAG_ESP2_STALE_MS || millis() - diagSoilMs[k2] > DIAG_ESP2_STALE_MS) return "--";
-  return (diagSoilValid[k1] && diagSoilValid[k2]) ? "ok" : "BAD";
-}
 
 void lcdRenderDiag() {
   char l[21];
@@ -4060,12 +4121,12 @@ void lcdRenderDiag() {
       snprintf(l, 21, "%-7scm:%-6s%4s", "Mix", String(sensor.rawMixCm, 0).c_str(), diagNanoFlag(sensor.msTank, sensor.tankValid)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-7sLpm:%-5s%4s", "Flow", String(sensor.rawFlow, 1).c_str(), diagNanoFlag(sensor.msTank, true));            lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 2: {  // Nano: per-channel capacitive soil raw ADC (A1/A2 B1/B2 C1/C2), live CAL stream
+    case 2: {  // Nano: per-probe capacitive soil raw ADC (A1/A2 B1/B2 C1/C2) from the normal SOIL packet
       snprintf(l, 21, "%-8s Soil ch", hdr);                               lcd.setCursor(0, 0); lcd.print(l);
       for (int c = 0; c < NUM_COLUMNS && c < 3; c++) {
         if (!COLUMN_ENABLED[c]) { snprintf(l, 21, "%c: disabled", COL_TAG[c]); lcd.setCursor(0, c + 1); lcd.print(l); continue; }
-        int k1 = 2 * c, k2 = 2 * c + 1;
-        snprintf(l, 21, "%c1:%-4d %c2:%-4d %3s", COL_TAG[c], (int)diagSoilRaw[k1], COL_TAG[c], (int)diagSoilRaw[k2], diagSoilColFlag(c));
+        const char *fl = diagNanoFlag(sensor.msSoil, sensor.rawSoil[c][0] >= 0 && sensor.rawSoil[c][1] >= 0);
+        snprintf(l, 21, "%c1:%-4d %c2:%-4d %3s", COL_TAG[c], sensor.rawSoil[c][0], COL_TAG[c], sensor.rawSoil[c][1], fl);
         lcd.setCursor(0, c + 1); lcd.print(l);
       }
       break;
@@ -4094,16 +4155,22 @@ void lcdRenderDiag() {
       snprintf(l, 21, "%-4sraw%-8ld%5s", "EC",  (long)diagEsp2Raw[1], diagEsp2Flag(1)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "ACS", (long)diagEsp2Raw[2], diagEsp2Flag(2)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 6:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
-      snprintf(l, 21, "%-8s ESP2 Flw1", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "RESMIX", (long)diagEsp2Raw[3], diagEsp2Flag(3)); lcd.setCursor(0, 1); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "MIXIRR", (long)diagEsp2Raw[4], diagEsp2Flag(4)); lcd.setCursor(0, 2); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT A",  (long)diagEsp2Raw[5], diagEsp2Flag(5)); lcd.setCursor(0, 3); lcd.print(l);
+    case 6:   // ESP2: PZEM AC power (V/I/P, engineering values from the CAL stream)
+      snprintf(l, 21, "%-8s ESP2 Pwr", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
+      snprintf(l, 21, "Vac:%-8s%5s", String(diagEsp2Raw[3], 0).c_str(), diagEsp2Flag(3)); lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "Iac:%-8s%5s", String(diagEsp2Raw[4], 2).c_str(), diagEsp2Flag(4)); lcd.setCursor(0, 2); lcd.print(l);
+      snprintf(l, 21, "Pw :%-8s%5s", String(diagEsp2Raw[5], 0).c_str(), diagEsp2Flag(5)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    default:  // case 7: ESP2 flow (2/2): NUT B / NUT C
+    case 7:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
+      snprintf(l, 21, "%-8s ESP2 Flw1", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "RESMIX", (long)diagEsp2Raw[6], diagEsp2Flag(6)); lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "MIXIRR", (long)diagEsp2Raw[7], diagEsp2Flag(7)); lcd.setCursor(0, 2); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT A",  (long)diagEsp2Raw[8], diagEsp2Flag(8)); lcd.setCursor(0, 3); lcd.print(l);
+      break;
+    default:  // case 8: ESP2 flow (2/2): NUT B / NUT C
       snprintf(l, 21, "%-8s ESP2 Flw2", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT B", (long)diagEsp2Raw[6], diagEsp2Flag(6)); lcd.setCursor(0, 1); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT C", (long)diagEsp2Raw[7], diagEsp2Flag(7)); lcd.setCursor(0, 2); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT B", (long)diagEsp2Raw[9],  diagEsp2Flag(9));  lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT C", (long)diagEsp2Raw[10], diagEsp2Flag(10)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "UP/DN=page BACK=out"); lcd.setCursor(0, 3); lcd.print(l);
       break;
   }
@@ -4234,7 +4301,7 @@ void settingsLeaveToData() {
     if (calOpen) calCloseTarget();
     esp2SetPower(false); logEvent("ESP1", "CAL", "EXIT");
   } else if (uiMode == UI_DIAG) {              // leaving Sensor Diag: stop streams + power ESP2 off
-    diagStopStream(); diagStopSoil(); esp2SetPower(false); logEvent("ESP1", "DIAG", "EXIT");
+    diagStopStream(); esp2SetPower(false); logEvent("ESP1", "DIAG", "EXIT");
   }
   // Cancel any open dialog / discard an in-progress edit (nothing is committed on a fail-safe exit).
   editConfirm = false; restoreConfirm = false; resetConfirm = false;

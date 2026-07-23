@@ -354,6 +354,7 @@ void testSafety();
 void testComboOn(int idx);
 void testOff();
 void calStreamTick();
+void teleTick();
 int  flowPinForId(const String &id);
 bool applySetCal(const String &id, const String *tok, int n, int i);
 void setupPrime(const String &line, const String &col);
@@ -438,6 +439,7 @@ void loop() {
   safetyMonitor();
   testSafety();
   calStreamTick();             // Calibration Mode: stream the selected sensor's raw value (§A.3)
+  teleTick();                  // power telemetry (PZEM V/I/P + ACS) while a run executes -> ESP1 logs it
   primeSafety();               // Prime dead-man + generous cap (§A.4.2)
   pcfHealth();                 // PCF8575 bus watchdog -> PCF_FAIL / PCF_OK
   heartbeat();
@@ -1157,11 +1159,18 @@ int flowPinForId(const String &id) {
   return -1;
 }
 
-// Stream the selected sensor's RAW value (~1.6 Hz) for interactive calibration (§A.3).
+// Stream the selected sensor's RAW value (~1.6 Hz) for interactive calibration / Sensor Diag (§A.3).
 void calStreamTick() {
   if (calId == "") return;
   if (millis() - lastCalMs < CAL_STREAM_MS) return;
   lastCalMs = millis();
+  // PZEM is factory-calibrated -> stream the ENGINEERING value (V/I/P), not a raw ADC.
+  if (calId == "PZEM_V" || calId == "PZEM_I" || calId == "PZEM_P") {
+    float v = (calId == "PZEM_V") ? pzem.voltage() : (calId == "PZEM_I") ? pzem.current() : pzem.power();
+    if (isnan(v)) v = -1;                       // no PZEM / no reply -> -1 sentinel
+    reply("CAL," + calId + "," + String(v, 2));
+    return;
+  }
   long raw;
   if      (calId == "PH")     raw = analogRead(PIN_PH);
   else if (calId == "EC")     raw = analogRead(PIN_EC);
@@ -1169,6 +1178,19 @@ void calStreamTick() {
   else if (calId.startsWith("FLOW_")) { noInterrupts(); raw = (long)flowPulses; interrupts(); }
   else return;
   reply("CAL," + calId + "," + String(raw));
+}
+
+// Periodic power telemetry WHILE a work order runs (PZEM V/I/P + ACS712 mixer current). ESP1 logs it
+// so the operator can see actual power draw during irrigation/fertigation. Idle = ESP2 off = nothing.
+const unsigned long TELE_MS = 5000;
+unsigned long lastTeleMs = 0;
+void teleTick() {
+  if (step == SEQ_NONE && !wo.active) { lastTeleMs = 0; return; }   // only during an active run
+  if (millis() - lastTeleMs < TELE_MS) return;
+  lastTeleMs = millis();
+  float v = pzem.voltage(), i = pzem.current(), p = pzem.power();
+  if (isnan(v)) v = -1; if (isnan(i)) i = -1; if (isnan(p)) p = -1;
+  reply("TELE,PZEM," + String(v, 1) + "," + String(i, 2) + "," + String(p, 1) + ",ACS," + String(readMixerCurrent(), 2));
 }
 
 // Apply one pushed calibration constant to the matching runtime variable. pH/EC carry two

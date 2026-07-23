@@ -13,7 +13,7 @@
  *      Outbound (Nano -> ESP32 #1):
  *        <START>,ENV,<temp>,<hum>,<END>
  *        <START>,TANK,<res%>,<mix%>,<flowLpm>,<END>
- *        <START>,SOIL,<COL>,<val>,...,<END>         (tag,value per enabled column; disabled omitted)
+ *        <START>,SOIL,<COL>,<p1>,<p2>,...,<END>      (tag + 2 raw probes per enabled column; disabled omitted)
  *        <START>,LIGHT,<lux>,<END>
  *        <START>,NPK,<COL>,<moist>,<temp>,<EC>,<pH>,<N>,<P>,<K>,<END>  (one per enabled column)
  *        <START>,STATUS,NANO,OK,<END>                (heartbeat, spec sec.10.8.2)
@@ -396,10 +396,12 @@ void sendTank() {
   endPkt();
 }
 
-// Tag-based, variable-length: one <tag>,<val> pair per ENABLED column; disabled
-// columns are omitted entirely (no field, no -1) -- their pins are never read.
+// Tag-based, variable-length: one <tag>,<probe1>,<probe2> TRIPLET per ENABLED column; disabled
+// columns are omitted entirely (their pins are never read). Both raw capacitive probes are sent
+// individually (NOT pre-averaged) so ESP32 #1 can log/diagnose each probe; ESP32 #1 averages the
+// two for the control value and maps to % with the stored air/water endpoints (companion spec §A).
 void sendSoil() {
-  // If every column is disabled there are no pairs to send; an empty <START>,SOIL,<END>
+  // If every column is disabled there are no triplets to send; an empty <START>,SOIL,<END>
   // would be rejected as garbage by ESP32 #1, so skip the packet entirely.
   bool anyEnabled = false;
   for (uint8_t c = 0; c < NUM_COLUMNS; c++) if (COLUMN_ENABLED[c]) { anyEnabled = true; break; }
@@ -411,9 +413,8 @@ void sendSoil() {
     if (!COLUMN_ENABLED[c]) continue;               // omit disabled column entirely
     tag[0] = COLUMN_TAG[c];
     pktAddRaw(tag);                                  // column tag
-    // RAW averaged ADC (companion spec §A): ESP32 #1 maps to % using the stored air/water endpoints.
-    int raw = (analogRead(SOIL_PINS[c][0]) + analogRead(SOIL_PINS[c][1])) / 2;
-    pktAddIntOrInvalid(raw, true);
+    pktAddIntOrInvalid(analogRead(SOIL_PINS[c][0]), true);   // probe 1 raw ADC
+    pktAddIntOrInvalid(analogRead(SOIL_PINS[c][1]), true);   // probe 2 raw ADC
   }
   endPkt();
 }
