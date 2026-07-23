@@ -71,7 +71,6 @@ void loop() {
     Serial.print(resPercent, 1);
     Serial.println(" %");
   }
-
   if (mixPercent < 0)
     Serial.println("Mix Tank: SENSOR ERROR");
   else {
