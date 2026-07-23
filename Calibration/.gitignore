@@ -1,0 +1,3 @@
+# PlatformIO build output & downloaded libs (per repo convention)
+.pio/
+.vscode/

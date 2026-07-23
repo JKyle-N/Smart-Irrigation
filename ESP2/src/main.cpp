@@ -116,14 +116,17 @@
 const uint8_t COL_VALVE_BIT[3] = { OUT_COL_A, OUT_COL_B, OUT_COL_C };
 const uint8_t NUT_PUMP_BIT[3]  = { OUT_NUT_A, OUT_NUT_B, OUT_NUT_C };
 
-/* ---- Flow sensors (interrupt, stage-based; spec sec.19.4.5) --------------- */
-#define FLOW_RES_MIX  4
+/* ---- Flow sensors (interrupt, stage-based; spec sec.19.4.5) --------------- *
+ * Pins CORRECTED to the actual wiring (identified with Calibration/ESP2/FlowPinFinder).  */
+#define FLOW_RES_MIX 26
 #define FLOW_MIX_IRR  5
-#define FLOW_NUT_A   18
+#define FLOW_NUT_A   23
 #define FLOW_NUT_B   19
-#define FLOW_NUT_C   23
+#define FLOW_NUT_C   18
+#define FLOW_NUT_D   27      // wired but not metered in normal operation
+#define FLOW_PH_UP    4      // wired but not metered in normal operation
+#define FLOW_PH_DN   25      // wired but not metered in normal operation
 const uint8_t NUT_FLOW_PIN[3] = { FLOW_NUT_A, FLOW_NUT_B, FLOW_NUT_C };
-// (NutD 25, pHUp 26, pHDn 27 flow pins exist in hardware but are not metered here.)
 
 /* ---- Analog sensors (ADC1; spec sec.19.4.6) ------------------------------ */
 #define PIN_PH        32
@@ -1148,9 +1151,9 @@ int flowPinForId(const String &id) {
   if (id == "FLOW_NUTA")   return FLOW_NUT_A;
   if (id == "FLOW_NUTB")   return FLOW_NUT_B;
   if (id == "FLOW_NUTC")   return FLOW_NUT_C;
-  if (id == "FLOW_NUTD")   return 25;   // wired but not metered in normal operation
-  if (id == "FLOW_PHUP")   return 26;
-  if (id == "FLOW_PHDN")   return 27;
+  if (id == "FLOW_NUTD")   return FLOW_NUT_D;   // wired but not metered in normal operation
+  if (id == "FLOW_PHUP")   return FLOW_PH_UP;
+  if (id == "FLOW_PHDN")   return FLOW_PH_DN;
   return -1;
 }
 

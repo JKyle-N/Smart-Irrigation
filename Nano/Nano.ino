@@ -149,7 +149,7 @@ const float FLOW_K_PULSES_PER_LITER = 450.0f;   // [MEASURE]
  *  ESP32 #1 applies the per-element scale + offset (the scale lives there now). On ANY failure
  *  every field is reported as -1.
  * ========================================================================== */
-const uint8_t  NPK_ADDR[NUM_COLUMNS] = { 0x01, 0x02, 0x03 };  // per-column slave addr [CONFIRM]
+const uint8_t  NPK_ADDR[NUM_COLUMNS] = { 0x03, 0x01, 0x02 };  // A=NPK1(0x03) B=NPK2(0x01) C=NPK3(0x02) -- from FINALTESTCODEWITHNPK
 const unsigned long NPK_BAUD = 4800;            // proven working baud (bench test code) [CONFIRM]
 const uint8_t  NPK_FUNCTION  = 0x03;            // 0x03 read-holding (some use 0x04) [CONFIRM]
 const uint16_t NPK_REG_START = 0x0000;          // first register               [CONFIRM]
