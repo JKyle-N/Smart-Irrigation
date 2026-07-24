@@ -102,6 +102,35 @@ String PHONE_NUMBER = "09150424784";    // [CONFIRM] recipient for alerts/report
 bool COLUMN_ENABLED[NUM_COLUMNS] = { true, true, false };   // A, B, C [CONFIRM]
 const char COL_TAG[NUM_COLUMNS] = { 'A', 'B', 'C' };
 
+/* =============================================================================
+ *  FORCE BUILD  --  presentation variant of the ESP32 #1 firmware
+ * -----------------------------------------------------------------------------
+ *  Identical to ESP1/src/main.cpp except for the clearly-marked #if FORCE_BUILD blocks:
+ *    1. "Run Cycle Now" Settings row + RUNDEMO SMS -> start a service run ON DEMAND, bypassing the
+ *       schedule window / soil threshold / once-per-day / NPK-gap gates.
+ *    2. Run Mode toggle: RIG drives the real hardware (forced), OFFLINE plays the full cycle with no
+ *       ESP2 and no actuators, synthesizing plausible flow / nutrient / N-P-K movement.
+ *    3. Nutrient A (CALCINIT) always doses at least the minimum resolvable amount so it is visible,
+ *       even when its N gap says zero. The production firmware keeps the honest gap gate.
+ *  Nothing here changes what appears on the LCD wording-wise -- the screens are the production ones.
+ * ========================================================================== */
+#define FORCE_BUILD 1
+
+// Run Mode: false = drive the real rig (forced), true = play the cycle with no ESP2/actuators.
+bool     forceOffline = true;          // safe default for a bench/table presentation
+int      forceSelCol  = 0;             // column chosen in the "Run Cycle Now" screen
+bool     forceSelFert = true;          // FERTIGATE (true) or IRRIGATE (false)
+// Offline cycle playback state
+bool     simActive = false;
+uint8_t  simIdx    = 0;                // index into the stage table
+unsigned long simStageMs = 0;          // when the current stage started
+// Per-stage durations for the offline cycle (ms) -- tune for the presentation.
+const unsigned long SIM_FERT_MS[7] = { 20000, 15000, 25000, 8000, 20000, 10000, 12000 };
+const unsigned long SIM_IRR_MS[2]  = { 20000, 20000 };
+const char *SIM_FERT_NAME[7] = { "Transfer Water", "Pump Nutrients", "Mixing",
+                                 "Check EC/pH", "Release", "Flush Fill", "Flush Release" };
+const char *SIM_IRR_NAME[2]  = { "Transfer Water", "Release" };
+
 /* ---- Irrigation thresholds & windows (spec sec.14.1.3, windowed) --------- *
  * Windowed scheduling: a column is serviced only inside its RTC window, and
  * within the window the soil start/stop hysteresis triggers the run.          */
@@ -643,9 +672,9 @@ String    lastFaultTime = "";        // RTC timestamp of the last fault (shown o
 enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST, UI_CAL, UI_DIAG };
 UiMode    uiMode = UI_DATA;
 // Top-level Settings menu rows
-enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
-// SET_WIFI and SET_SOFTAP show a live [ON]/[OFF] suffix via setRowLabel(); their base names here are placeholders.
-const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
+enum SetItem { SET_RUNNOW, SET_RUNMODE, SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
+// SET_WIFI / SET_SOFTAP / SET_RUNMODE show a live suffix via setRowLabel(); base names are placeholders.
+const char *SET_NAMES[SET_COUNT] = { "Run Cycle Now", "Run Mode", "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
 int  setSel    = 0;          // selected settings row
 int  editItem  = -1;         // SetItem currently being edited
 int  editField = 0;          // field index within the editor
@@ -660,6 +689,9 @@ bool restoreConfirm = false; // the YES/NO restore dialog is open
 int  restoreSel  = 0;        // 0 NO, 1 YES
 // Manual ESP1 reboot (Settings > Reboot / SoftAP button): double-confirm on the LCD.
 bool resetConfirm = false;   // the YES/NO reboot dialog is open
+#if FORCE_BUILD
+bool runNowConfirm = false;  // "start a cycle now" picker is open (column + fertigate/irrigate)
+#endif
 int  resetSel    = 0;        // 0 NO, 1 YES
 volatile bool rebootPending = false;   // menu/portal -> core-1 loop: clean logFlush then ESP.restart()
 // Remote SMS config-write deferral while a local edit is open (companion spec §B.3.1).
@@ -863,6 +895,10 @@ void runUiAbort(const char *why);
 void runNoteErr(const String &e);
 void lcdRenderRun();
 static void lcdRow(uint8_t row, const char *s);   // full-width (20-col) padded row writer
+#if FORCE_BUILD
+void forceStart(int c, bool fert);
+void simTick();
+#endif
 void exerciseTick();
 void i2cBusRecover();
 
@@ -1079,6 +1115,9 @@ void loop() {
   g_lastStage = 'M'; healthTick();         // module-health logging: edge changes + periodic HEALTH snapshot
   g_lastStage = 'Z'; rtcDeadRebootTick();  // dead-RTC (all-zero timestamp): daily idle-only reboot to recover
   g_lastStage = 'R'; runUiTick();          // run receipts: unattended auto-continue past PRE/POST/ERR
+#if FORCE_BUILD
+  g_lastStage = 'F'; simTick();            // offline cycle playback (no ESP2 / no actuators)
+#endif
   // Apply a config SMS that was deferred during a local edit, once the edit has closed (§B.3.1).
   if (pendingCfgSms.length() && uiMode != UI_EDIT && !editConfirm) {
     String s = pendingCfgSms; pendingCfgSms = ""; handleSms(s);
@@ -1785,6 +1824,17 @@ void calcDose(int c, float mL[3], float ceilS[3]) {
     snprintf(b, sizeof(b), "NUT_%c|int=%d|del=%dmL", (char)('A' + i), (int)(dose + 0.5f), (int)(mL[i] + 0.5f));
     logEvent("ESP1", "DOSE", b);
   }
+#if FORCE_BUILD
+  // Nutrient A (CALCINIT) is gap-gated and resolves to zero for these crops, so it would never run.
+  // Give it the minimum resolvable dose so the nutrient stage is actually observable.
+  if (mL[0] <= 0.0f && calKNut[0] > 0) {
+    mL[0]    = MIN_DOSE_PULSES * 1000.0f / calKNut[0];
+    ceilS[0] = mL[0] / PUMP_FLOWRATE_MLPM[0] * 60.0f * CEILING_MARGIN;
+    char b2[48];
+    snprintf(b2, sizeof(b2), "NUT_A|min=%dmL", (int)(mL[0] + 0.5f));
+    logEvent("ESP1", "DOSE", b2);
+  }
+#endif
 }
 
 void sendWorkOrder(int c, bool fertigate) {
@@ -1992,6 +2042,9 @@ void runUiAbort(const char *why) {
   runUiFinish(false);            // logs RECEIPT|POST + RECEIPT|ERR rows
   runPhase = RUN_NONE;           // do NOT hold the screen on the receipt during a fault
   runLocked = true;              // re-armed for the next run
+#if FORCE_BUILD
+  simActive = false; simStageMs = 0;   // stop any offline playback too
+#endif
 }
 
 // One step forward through PRE -> (run) -> POST -> ERR -> done.
@@ -2010,6 +2063,90 @@ void runUiAdvance() {
     runPhase = RUN_NONE; runLocked = true; return;
   }
 }
+
+#if FORCE_BUILD
+/* =============================================================================
+ *  ON-DEMAND CYCLE  (FORCE_BUILD)  --  start a service run regardless of the gates
+ * ========================================================================== */
+// Start a run now: bypasses the schedule window, soil threshold, once-per-day stamp and the NPK gap.
+// RIG mode queues a genuine work order (ESP2 executes); OFFLINE mode plays the cycle locally.
+void forceStart(int c, bool fert) {
+  if (c < 0 || c >= NUM_COLUMNS) return;
+  if (runPhase != RUN_NONE || wo.active || pendingRun.active) return;   // one at a time
+  logEvent("ESP1", "ACT", String("RUN|ON_DEMAND|COL_") + COL_TAG[c] + "|" + (fert ? "FERTIGATION" : "IRRIGATION")
+                            + "|" + (forceOffline ? "OFFLINE" : "RIG"));
+  runUiBegin(c, fert);                       // pre-run receipt (identical to a scheduled run)
+  if (forceOffline) {
+    simActive = true; simIdx = 0; simStageMs = 0;      // playback starts when the receipt clears
+    setState(ACTIVE_STATE);
+  } else {
+    setState(ACTIVE_STATE);
+    pendingRun.active = true; pendingRun.colIdx = c; pendingRun.fertigate = fert;
+    esp2WarmupMs = millis();
+    if (esp2Available && esp2Powered) dispatchPendingRun();
+    else                              esp2SetPower(true);
+  }
+}
+
+// Offline playback: walk the real stage list on a timer, moving the same numbers ESP2 would have
+// reported, so the LCD and the receipts behave exactly as they do on the rig.
+void simTick() {
+  if (!simActive) return;
+  if (runPhase == RUN_NONE) { simActive = false; simStageMs = 0; return; }  // aborted (fault / E-stop)
+  if (runPhase == RUN_PRE) return;                       // still on the pre-run receipt
+  uint8_t n = run.fert ? 7 : 2;
+  const unsigned long *dur  = run.fert ? SIM_FERT_MS   : SIM_IRR_MS;
+  const char *const   *name = run.fert ? SIM_FERT_NAME : SIM_IRR_NAME;
+
+  if (simStageMs == 0) {                                 // enter the first/next stage
+    simStageMs = millis();
+    run.ord = simIdx + 1; run.total = n;
+    strncpy(run.stage, name[simIdx], sizeof(run.stage) - 1); run.stage[sizeof(run.stage) - 1] = 0;
+    run.stageL = 0; run.stageTgt = 1.0f;
+    logEvent("ESP2", "STAGE", String(run.ord) + "," + String(n) + "," + run.stage);
+    wakeBacklight();
+    return;
+  }
+
+  unsigned long el = millis() - simStageMs;
+  float frac = (float)el / (float)dur[simIdx]; if (frac > 1) frac = 1;
+  run.stageL = frac; run.stageTgt = 1.0f;
+
+  // Move the numbers the panel is watching: water on the fill/release stages, mL while dosing.
+  bool isDose = (run.fert && simIdx == 1);
+  if (isDose) for (int i = 0; i < 3; i++) run.doseGot[i] = run.doseTgt[i] * frac;
+  else        run.waterGot = run.waterTgt * ((simIdx + frac) / (float)n);
+
+  if (el < dur[simIdx]) return;
+
+  if (isDose) {                                          // stage done -> emit the per-nutrient results
+    for (int i = 0; i < 3; i++) {
+      run.doseGot[i] = run.doseTgt[i];
+      if (run.doseTgt[i] > 0)
+        logEvent("ESP2", "DOSE", String("NUT_") + (char)('A' + i) + "|" + String(run.doseTgt[i], 1)
+                                   + "|" + String(run.doseGot[i], 1) + "|COL_" + COL_TAG[run.col]);
+    }
+  }
+
+  if (++simIdx < n) { simStageMs = 0; return; }          // next stage
+
+  // Cycle complete: settle the totals, move the soil N-P-K by the amount the dose should deliver
+  // (slightly under, as real uptake would be), then hand off to the post-run receipt.
+  run.waterGot = run.waterTgt;
+  const float stock[3] = { STOCK_A_N, STOCK_B_P, STOCK_C_K };
+  for (int i = 0; i < 3; i++) {
+    if (run.batchV > 0 && run.doseGot[i] > 0)
+      sensor.npk[run.col][4 + i] += run.doseGot[i] * stock[i] / run.batchV * 0.9f;
+  }
+  simActive = false; simStageMs = 0;
+  waterUsedToday[run.col] += run.waterGot;
+  col[run.col].lastServicedStamp = currentDayStamp;
+  logEvent("ESP1", "ACT", String(run.fert ? "FERTIGATION" : "IRRIGATION")
+                            + "|STOP|COL_" + COL_TAG[run.col] + "|W=" + String(run.waterGot, 2));
+  setState(IDLE_STATE);
+  runUiFinish(true);
+}
+#endif
 
 // Re-initialize ESP1's own UART1 to ESP2 (sec.18.9). Power-cycling ESP2 can't clear a wedged RX peripheral
 // (framing-error lockup / stuck FIFO) on THIS side, so every recovery attempt tears the port down and back
@@ -2294,6 +2431,20 @@ void handleSms(const String &body) {
     sendSMS("ACK,STOP,ALL");
     return;
   }
+#if FORCE_BUILD
+  // RUNDEMO,COL_x[,FERT|IRR] -- start a cycle on demand, bypassing the schedule/soil/gap gates.
+  if (U.startsWith("RUNDEMO")) {
+    int c = -1; bool fert = true;
+    for (int j = 0; j < NUM_COLUMNS; j++) if (U.indexOf(String("COL_") + COL_TAG[j]) >= 0) c = j;
+    if (U.indexOf("IRR") >= 0) fert = false;
+    if (c < 0 || !COLUMN_ENABLED[c])          { sendSMS("ERR,RUNDEMO,COL"); return; }
+    if (runPhase != RUN_NONE || wo.active)     { sendSMS("ERR,RUNDEMO,BUSY"); return; }
+    if (uiMode != UI_DATA) { uiMode = UI_DATA; }                 // leave any menu so the run UI shows
+    forceStart(c, fert);
+    sendSMS(String("ACK,RUNDEMO,COL_") + COL_TAG[c] + "," + (fert ? "FERTIGATION" : "IRRIGATION"));
+    return;
+  }
+#endif
   // STATUS
   if (U == "STATUS") {
     if (sysState == ACTIVE_STATE) {
@@ -4726,6 +4877,28 @@ void settingsButton(int i) {
   if (uiMode == UI_CAL)  { calButton(i);  return; }
   if (uiMode == UI_DIAG) { diagButton(i); return; }
 
+#if FORCE_BUILD
+  // ---- "Run Cycle Now" picker: UP/DOWN cycle (column, mode), ENTER starts, BACK cancels ----
+  if (runNowConfirm) {
+    if (i == 0 || i == 1) {
+      int dir = (i == 1) ? +1 : -1;
+      for (int guard = 0; guard < 2 * NUM_COLUMNS + 2; guard++) {
+        if (dir > 0) { if (forceSelFert) forceSelFert = false;
+                       else { forceSelFert = true; forceSelCol = (forceSelCol + 1) % NUM_COLUMNS; } }
+        else         { if (!forceSelFert) forceSelFert = true;
+                       else { forceSelFert = false; forceSelCol = (forceSelCol + NUM_COLUMNS - 1) % NUM_COLUMNS; } }
+        if (COLUMN_ENABLED[forceSelCol]) break;
+      }
+    }
+    else if (i == 3) runNowConfirm = false;                     // BACK = cancel
+    else if (i == 2) {                                          // ENTER = start now
+      runNowConfirm = false; uiMode = UI_DATA;
+      forceStart(forceSelCol, forceSelFert);
+    }
+    return;
+  }
+#endif
+
   // ---- Restore Defaults double-confirm (companion spec §C.3) ----
   if (restoreConfirm) {
     if (i == 0 || i == 1) restoreSel ^= 1;                 // toggle NO / YES
@@ -4780,6 +4953,15 @@ void settingsButton(int i) {
         if (portalActive || portalRequested) { portalCancel = true; logEvent("ESP1", "CMD", "WIFI_PORTAL|CANCEL"); }
         else { portalRequested = true; logEvent("ESP1", "CMD", "WIFI_PORTAL|START"); }   // netTask brings up the AP (banner)
       }
+#if FORCE_BUILD
+      else if (setSel == SET_RUNMODE) { forceOffline = !forceOffline;
+                                        logEvent("ESP1", "CMD", forceOffline ? "RUNMODE|OFFLINE" : "RUNMODE|RIG"); }
+      else if (setSel == SET_RUNNOW) {
+        for (int k = 0; k < NUM_COLUMNS; k++)                    // land on an enabled column
+          if (!COLUMN_ENABLED[forceSelCol]) forceSelCol = (forceSelCol + 1) % NUM_COLUMNS;
+        runNowConfirm = true;
+      }
+#endif
       else if (setSel == SET_CALIB) enterCal();                 // idle-only calibration (§A.6)
       else if (setSel == SET_DIAG)  enterDiag();                // read-only raw sensor diagnostics
       else if (setSel == SET_RESTORE) {                          // Restore Defaults (§C): idle-only, double-confirm
@@ -5113,11 +5295,28 @@ static void drawList(int sel, int count, const char *const *names) {
 static String setRowLabel(int i) {
   if (i == SET_WIFI)   return String("WiFi        ") + (wifiEnabled ? "[ON]" : "[OFF]");
   if (i == SET_SOFTAP) return String("Setup AP    ") + ((portalActive || portalRequested) ? "[ON]" : "[OFF]");
+#if FORCE_BUILD
+  if (i == SET_RUNMODE) return String("Run Mode ") + (forceOffline ? "[OFFLINE]" : "[RIG]");
+  if (i == SET_RUNNOW)  return String("Run Now ") + COL_TAG[forceSelCol] + (forceSelFert ? " FERT" : " IRR");
+#endif
   return SET_NAMES[i];
 }
 
 void lcdRenderSettings() {
   char l[21];
+
+#if FORCE_BUILD
+  // ---- "Run Cycle Now" picker ----
+  if (runNowConfirm) {
+    lcdRow(0, "Start cycle now?");
+    snprintf(l, 21, "Col %c  %s", COL_TAG[forceSelCol],
+             strlen(col[forceSelCol].name) ? col[forceSelCol].name : "-");           lcdRow(1, l);
+    snprintf(l, 21, "%s  %s", forceSelFert ? "FERTIGATE" : "IRRIGATE",
+             forceOffline ? "[OFFLINE]" : "[RIG]");                                  lcdRow(2, l);
+    lcdRow(3, "UP/DN pick ENT=start");
+    return;
+  }
+#endif
 
   // ---- Restore-Defaults double-confirm (companion spec §C.3) ----
   if (restoreConfirm) {
