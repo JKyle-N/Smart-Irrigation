@@ -4114,8 +4114,11 @@ Storage bucket**; the developer generates time-limited signed URLs from the dash
   is never deleted, so a failed upload only defers — no data loss. Every attempt is logged as its own
   **`UPLOAD`** event_type: `UPLOAD|OK|<day>.CSV` or `UPLOAD|FAIL|<day>.CSV|http=<code>|try=<n>`.
 * **Credentials:** the project URL + service_role key live **only in NVS** (like the WiFi/ThingSpeak
-  creds) — set at runtime by owner-gated SMS `SUPA,<projectUrl>,<serviceKey>` (`SUPA,CLEAR` to wipe)
-  or the SoftAP admin form. **Nothing secret is compiled into tracked source.** TLS currently uses
+  creds). Set them at runtime via the **SoftAP admin form** (the PIN-gated admin page has a "Supabase
+  cloud logs" URL+key form — the reliable path, since a service_role JWT (~220 chars) exceeds one SMS),
+  or the owner-gated SMS `SUPA,<projectUrl>,<serviceKey>` (`SUPA,CLEAR` to wipe) for a short key. The key
+  is never echoed back to the browser or written to the log. **Nothing secret is compiled into tracked
+  source.** TLS currently uses
   `setInsecure()` (encrypted, no certificate pinning) — adequate for the deployment; pinning the
   Supabase CA is a future hardening step. Rotate any key that was exposed during manual testing.
 

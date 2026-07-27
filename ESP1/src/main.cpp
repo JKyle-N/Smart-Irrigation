@@ -529,6 +529,19 @@ const char *SUPA_BUCKET = "CSV-Logs";
 String   supaUrl = "", supaKey = "";               // e.g. "https://<ref>.supabase.co" + service_role key
 long     supaLast = 0;                             // yyyymmdd of the last CSV successfully uploaded (NVS)
 volatile bool supaPersistPending = false;          // core0 admin form -> core1: persist supaUrl/supaKey
+// Reduce whatever the user pastes to the project ORIGIN (https://<host>). The firmware appends
+// /storage/v1/object/CSV-Logs/<file> itself, so a pasted endpoint/signed path (e.g. .../storage/v1/
+// object/sign/CSV-logs/) must not double up -- strip any path after the host + trailing slashes.
+static String supaNormalizeUrl(String u) {
+  u.trim();
+  int scheme = u.indexOf("://");
+  if (scheme >= 0) {
+    int slash = u.indexOf('/', scheme + 3);        // first '/' after the host -> cut the path
+    if (slash >= 0) u = u.substring(0, slash);
+  }
+  while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+  return u;
+}
 // Cross-core upload hand-off: core 1 chooses the day, netTask (core 0) does the HTTPS PUT.
 volatile long uploadReqStamp = 0;                  // core1 -> netTask: yyyymmdd to upload (0 = idle)
 volatile bool uploadBusy     = false;              // netTask: an upload is in flight
@@ -1154,6 +1167,8 @@ void loop() {
   }
   // Persist ThingSpeak keys set directly on core 0 by the portal (tsKey1-3 already updated under netMux).
   if (tsKeyPersistPending) { tsKeyPersistPending = false; saveTsKey(); logEvent("ESP1", "CFG", "TSKEY|PORTAL"); }
+  // Persist Supabase URL+key set by the SoftAP admin form (already updated under netMux). Never logs the key.
+  if (supaPersistPending) { supaPersistPending = false; saveSupa(); logEvent("ESP1", "CFG", "SUPA|PORTAL"); }
   // Manual reboot requested (Settings > Reboot or the SoftAP button). Always run on core 1 so logs flush
   // cleanly (config persists in NVS; ESP2 keeps executing any in-flight run and re-syncs on our return).
   if (rebootPending) {
@@ -2376,7 +2391,7 @@ void handleSms(const String &body) {
     if (c2 <= 0) { sendSMS("ERR,SUPA,FORMAT"); return; }
     String u = rest.substring(0, c2); u.trim();
     String k = rest.substring(c2 + 1); k.trim();
-    if (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+    u = supaNormalizeUrl(u);                        // collapse any pasted path down to the origin
     if (!u.startsWith("http") || k.length() < 20) { sendSMS("ERR,SUPA,FORMAT"); return; }
     xSemaphoreTake(netMux, portMAX_DELAY); supaUrl = u; supaKey = k; xSemaphoreGive(netMux);
     saveSupa();
@@ -3798,8 +3813,12 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
   o += "<h3>Change admin PIN</h3><form method=POST action=/pin>"
        "<p><input name=pin type=password placeholder='new PIN (4-12)' style='width:100%;padding:8px'></p>"
        "<p><button type=submit style='width:100%;padding:10px'>Change PIN</button></p></form>";
-  o += "<h3>Upload logs</h3><form method=POST action=/upload>"
-       "<p>Push yesterday's CSV to cloud storage" + String(supaUrl.length() ? "" : " (set SUPA creds first)") + ".</p>"
+  o += "<h3>Supabase cloud logs</h3><form method=POST action=/supa>"
+       "<p>Project URL<br><input name=url style='width:100%' placeholder='https://<ref>.supabase.co' value='" + htmlEscape(supaUrl) + "'></p>"
+       "<p>Service key (service_role JWT)<br><textarea name=key rows=3 style='width:100%' placeholder='" + String(supaKey.length() ? "(set - leave blank to keep)" : "paste the full key") + "'></textarea></p>"
+       "<p><button type=submit style='width:100%;padding:10px'>Save Supabase creds</button></p></form>";
+  o += "<form method=POST action=/upload>"
+       "<p>Push yesterday's CSV to cloud storage" + String(supaUrl.length() ? "" : " (set the URL + key above first)") + ".</p>"
        "<p><button type=submit style='width:100%;padding:10px'>Upload logs now</button></p></form>";
   o += "<h3 style='color:#c33'>Reboot</h3><form method=POST action=/reboot "
        "onsubmit=\"return confirm('Reboot the controller now?')\">"
@@ -3916,6 +3935,30 @@ static void portalHandleReboot() {                            // POST /reboot --
 static void portalCfgReply(const String &cmd, const String &okMsg) {
   portalServer.send(200, "text/html", portalAdminHtml(portalCfgEnq(cmd) ? okMsg : "Busy, retry."));
 }
+static void portalHandleSupa() {                              // POST /supa -- set Supabase URL + service key
+  if (!portalRequireAdmin()) return;
+  String url = portalServer.arg("url"); url.trim();
+  String key = portalServer.arg("key"); key.trim();
+  if (url.equalsIgnoreCase("CLEAR")) {
+    xSemaphoreTake(netMux, portMAX_DELAY); supaUrl = ""; supaKey = ""; xSemaphoreGive(netMux);
+    supaPersistPending = true;
+    portalServer.send(200, "text/html", portalAdminHtml("Supabase creds cleared."));
+    return;
+  }
+  url = supaNormalizeUrl(url);                                 // collapse any pasted path down to the origin
+  if (!url.startsWith("http")) {
+    portalServer.send(200, "text/html", portalAdminHtml("URL must start with https://")); return;
+  }
+  bool keepKey = (key.length() == 0 && supaKey.length() > 0);  // blank key + one already stored -> URL-only edit
+  if (!keepKey && key.length() < 20) {                          // a service_role JWT is ~200+ chars
+    portalServer.send(200, "text/html", portalAdminHtml("Paste the full service key (or leave blank to keep the current one).")); return;
+  }
+  // Set directly under netMux (like the WiFi/TSKEY creds); core-1 loop persists to NVS (supaPersistPending).
+  // The key is never echoed back to the browser or written to the log.
+  xSemaphoreTake(netMux, portMAX_DELAY); supaUrl = url; if (!keepKey) supaKey = key; xSemaphoreGive(netMux);
+  supaPersistPending = true;
+  portalServer.send(200, "text/html", portalAdminHtml(keepKey ? "Supabase URL saved (key kept)." : "Supabase URL + key saved."));
+}
 static void portalHandleTskey() {                             // POST /tskey
   if (!portalRequireAdmin()) return;
   int ch = portalServer.arg("ch").toInt();
@@ -3989,6 +4032,7 @@ static void portalStart() {
     portalServer.on("/format", HTTP_POST, portalHandleFormat);
     portalServer.on("/reboot", HTTP_POST, portalHandleReboot); // software-reset ESP1
     portalServer.on("/upload", HTTP_POST, portalHandleUpload); // queue a Supabase CSV push
+    portalServer.on("/supa", HTTP_POST, portalHandleSupa);     // set Supabase URL + service key (NVS)
     portalServer.on("/tskey", HTTP_POST, portalHandleTskey);   // config forms (staged -> core-1 handleSms)
     portalServer.on("/colmode", HTTP_POST, portalHandleColMode);
     portalServer.on("/colname", HTTP_POST, portalHandleColName);
