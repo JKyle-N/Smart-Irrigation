@@ -163,8 +163,18 @@ const float PH_MIN = 5.0f,  PH_MAX = 7.0f;    // [TBD]
  *  interpreting packets; ESP2-owned consts (flow K, EC/pH, ACS712 zero) are the authoritative
  *  copy ESP1 pushes to ESP2 (SET_CAL + startup sync + work order, §A.5.1). Defaults = bench.   */
 // Nano-applied:
-int   calSoilAir[NUM_COLUMNS]   = { 800, 800, 800 };   // raw ADC dry (per column avg) [MEASURE]
-int   calSoilWater[NUM_COLUMNS] = { 300, 300, 300 };   // raw ADC saturated            [MEASURE]
+// Per-column soil endpoints (raw ADC), applied to the 2-probe average. Measured on the deployed rig
+// (dry = HIGH ADC, wet = LOW). The probes were found CROSS-WIRED: column A's two ADC channels are
+// physically {B2, A2} and column B's are {B1, A1}. Per-probe endpoints (dry/wet):
+//   A1 748/392  A2 661/518  B1 666/390  B2 650/529
+// Column endpoint = average of its two (corrected) probes:
+//   A = {B2,A2} -> dry (650+661)/2=656, wet (529+518)/2=524
+//   B = {B1,A1} -> dry (666+748)/2=707, wet (390+392)/2=391
+//   C: disabled -> defaults          [MEASURE per rig]
+int   calSoilAir[NUM_COLUMNS]   = { 656, 707, 800 };   // raw ADC when DRY  (maps to 0%)
+int   calSoilWater[NUM_COLUMNS] = { 524, 391, 300 };   // raw ADC when WET  (maps to 100%)
+// A capacitive probe reading <=LO or >=HI is treated as disconnected/shorted and dropped from the combine.
+const int SOIL_ADC_RAIL_LO = 8, SOIL_ADC_RAIL_HI = 1015;
 float calResEmptyCm = 53.0f, calResFullCm = 3.0f;      // ultrasonic geometry (moved from Nano)
 float calMixEmptyCm = 50.0f, calMixFullCm = 4.0f;
 float calFlowResScale = 1.0f;                          // reservoir flow correction factor
@@ -182,10 +192,24 @@ String calRxId = "";                    // sensor id of the last CAL sample rece
 float  calRxRaw = 0; bool calRxValid = false; unsigned long calRxMs = 0;
 
 // Map a raw soil ADC to 0..100 % using the per-column endpoints (dry=high ADC, wet=low ADC).
+// Column moisture is CAPACITIVE-ONLY: the NPK 7-in-1 moisture field is never blended in here (it reads
+// unreliably in unsaturated soil) -- the NPK parser writes only sensor.npk[c][*], never sensor.soil[c].
 static int soilPct(int col, int raw) {
   long p = map(raw, calSoilAir[col], calSoilWater[col], 0, 100);
   if (p < 0) p = 0; if (p > 100) p = 100;
   return (int)p;
+}
+// Combine the two capacitive probes of a column, dropping one that reads a rail (disconnected/shorted)
+// so a single dead probe can't peg the column. Returns 0..100 %, or -1 if BOTH probes look dead.
+static int soilCombine(int col, int v1, int v2) {
+  bool ok1 = (v1 > SOIL_ADC_RAIL_LO && v1 < SOIL_ADC_RAIL_HI);
+  bool ok2 = (v2 > SOIL_ADC_RAIL_LO && v2 < SOIL_ADC_RAIL_HI);
+  int raw;
+  if      (ok1 && ok2) raw = (v1 + v2) / 2;   // both good -> average
+  else if (ok1)        raw = v1;              // one railed -> use the good probe
+  else if (ok2)        raw = v2;
+  else                 return -1;             // both look disconnected -> honest invalid
+  return soilPct(col, raw);
 }
 // Map a raw ultrasonic distance (cm) to 0..100 % using empty/full geometry.
 static float levelPct(float distCm, float emptyCm, float fullCm) {
@@ -1287,8 +1311,10 @@ void loadCal() {
   prefsCal.begin("calib", false);                 // separate namespace; Restore-Defaults never touches it
   for (int c = 0; c < NUM_COLUMNS; c++) {
     String k = "s" + String(c);
-    calSoilAir[c]   = prefsCal.getInt((k + "a").c_str(), calSoilAir[c]);
-    calSoilWater[c] = prefsCal.getInt((k + "w").c_str(), calSoilWater[c]);
+    // "a2"/"w2" keys (bumped from "a"/"w"): a stale pre-remap on-device soil cal no longer overrides the
+    // measured compiled defaults -- the correct endpoints apply on flash until a fresh cal is saved.
+    calSoilAir[c]   = prefsCal.getInt((k + "a2").c_str(), calSoilAir[c]);
+    calSoilWater[c] = prefsCal.getInt((k + "w2").c_str(), calSoilWater[c]);
     calNpkOff[c][0] = prefsCal.getFloat((k + "N").c_str(), 0);
     calNpkOff[c][1] = prefsCal.getFloat((k + "P").c_str(), 0);
     calNpkOff[c][2] = prefsCal.getFloat((k + "K").c_str(), 0);
@@ -1502,7 +1528,8 @@ bool classifyAndApply(const String &payload, const String &raw) {
       int v1 = tok[i + 1].toInt(), v2 = tok[i + 2].toInt();   // RAW per-probe ADC (companion spec §A)
       if (v1 < 0 || v1 > 1023 || v2 < 0 || v2 > 1023) return false;   // Tier 2: 10-bit ADC range
       rawTmp[c][0] = v1; rawTmp[c][1] = v2;              // keep each raw probe (log + Sensor Diag)
-      tmp[c] = soilPct(c, (v1 + v2) / 2);               // control value = 2-probe average -> % (endpoints)
+      tmp[c] = soilCombine(c, v1, v2);                  // 2-probe combine (drops a railed probe) -> %
+      if (abs(v1 - v2) > 400) logEvent("NANO", "SOIL_DIVERGE", String(COL_TAG[c]) + "|" + v1 + "|" + v2);
     }
     for (int c = 0; c < NUM_COLUMNS; c++) {
       sensor.soil[c] = tmp[c];
@@ -4166,7 +4193,7 @@ static bool calCommit() {
     case CK_SOIL: {
       int air = (int)calCap[0], wat = (int)calCap[1];
       String k = "s" + String(t.col);
-      prefsCal.putInt((k + "a").c_str(), air); prefsCal.putInt((k + "w").c_str(), wat);
+      prefsCal.putInt((k + "a2").c_str(), air); prefsCal.putInt((k + "w2").c_str(), wat);
       snprintf(buf, sizeof(buf), "SAVE|SOIL_%c|%d/%d", COL_TAG[t.col], air, wat);
       calSoilAir[t.col] = air; calSoilWater[t.col] = wat;
       logEvent("ESP1", "CAL", buf);
@@ -4547,8 +4574,8 @@ void lcdRenderDiag() {
       snprintf(l, 21, "%-8s Soil ch", hdr);                               lcd.setCursor(0, 0); lcd.print(l);
       for (int c = 0; c < NUM_COLUMNS && c < 3; c++) {
         if (!COLUMN_ENABLED[c]) { snprintf(l, 21, "%c: disabled", COL_TAG[c]); lcd.setCursor(0, c + 1); lcd.print(l); continue; }
-        const char *fl = diagNanoFlag(sensor.msSoil, sensor.rawSoil[c][0] >= 0 && sensor.rawSoil[c][1] >= 0);
-        snprintf(l, 21, "%c1:%-4d %c2:%-4d %3s", COL_TAG[c], sensor.rawSoil[c][0], COL_TAG[c], sensor.rawSoil[c][1], fl);
+        // mapped % (robust combine) next to the two raw probes, so raw-vs-% is visible at a glance.
+        snprintf(l, 21, "%c %3d%% %4d/%-4d", COL_TAG[c], sensor.soil[c], sensor.rawSoil[c][0], sensor.rawSoil[c][1]);
         lcd.setCursor(0, c + 1); lcd.print(l);
       }
       break;
