@@ -838,6 +838,12 @@ int  estopSel = 0;              // recovery cursor: 0 = Return to normal, 1 = St
 bool esp2Held = false;          // an ESP2 hard fault is held, awaiting user recovery
 int  faultRecovSel = 0;         // LCD recovery cursor: 0 Hold, 1 Release, 2 OnlyIrr, 3 Normal
 const char *RECOV_NAMES[4] = { "Hold (wait)", "Release tank", "Only irrigate", "Resume normal" };
+// Re-hold loop guard: a flow-metered resume of a dead flow sensor keeps re-holding FLOW_FAIL. After a
+// few identical holds, steer the operator to the flow-independent Release/Irrigate options (ESP2 runs
+// those on a timer for a flow fault) so the recovery can't loop forever.
+String lastHoldCode = "";
+int    sameHoldN    = 0;
+bool   steerRelease = false;    // set after repeated FLOW_FAIL holds -> default cursor to Release + warn
 
 /* ---- Device health / daily self-reset (Part C) --------------------------- *
  * bootPresent[] = devices seen at boot; a present->absent transition at runtime
@@ -1753,6 +1759,7 @@ void handleEsp2Response(const String &payload) {
       wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
       if (sysState == ACTIVE_STATE) setState(IDLE_STATE);
       esp2SetPower(false);             // run complete -> ESP2 off (idle power-saving, sec.18.8)
+      lastHoldCode = ""; sameHoldN = 0; steerRelease = false;   // run completed -> clear the re-hold guard
       runUiFinish(true);               // -> post-run receipt (+ error table if the run logged problems)
     }
   } else if (resp == "BUSY") {
@@ -4071,7 +4078,10 @@ void enterFaultHold(const char *code, const char *loc) {
   // GSM alert WITH operation + column, and the reply menu (sec.12.1.1 + user req).
   sendSMS(String("ALERT,CRIT,") + code + "," + loc + "," + op + "," + colS +
           ",reply STOP/RELEASE/IRRIGATE/NORMAL");
-  esp2Held = true; faultRecovSel = 0;                  // default cursor = Hold (safe; pushes no water)
+  // Count consecutive identical holds; after 3 FLOW_FAILs steer to Release (flow-independent on ESP2).
+  if (lastHoldCode == code) sameHoldN++; else { lastHoldCode = code; sameHoldN = 1; }
+  steerRelease = (sameHoldN >= 3 && String(code) == "FLOW_FAIL");
+  esp2Held = true; faultRecovSel = steerRelease ? 1 : 0;   // default cursor: Release when steering, else Hold
   runUiAbort(code);                                    // close the run UI so the recovery menu is reachable
   editConfirm = false; restoreConfirm = false; resetConfirm = false; editDirty = false;   // force-dismiss any open dialog (§B.3.1)
   // ESP2 STAYS POWERED (it holds the tank) -- do NOT esp2SetPower(false) here.
@@ -5252,7 +5262,9 @@ void lcdTick() {
     default: // PAGE_FAULT  (doubles as the E-stop / fault-hold recovery prompt)
       if (esp2Held) {
         // ESP2 fault HELD: 4-way recovery in a 3-row window over rows 1..3 (sec.19.4.8.2).
-        snprintf(l, 21, "HELD:%-15s", lastFaultMsg.substring(0, 15).c_str()); lcdRow(0, l);
+        // After repeated flow re-holds, the header steers to Release (the flow-independent escape).
+        if (steerRelease) lcdRow(0, "FLOWx3: use RELEASE");
+        else { snprintf(l, 21, "HELD:%-15s", lastFaultMsg.substring(0, 15).c_str()); lcdRow(0, l); }
         int top = faultRecovSel - 1; if (top < 0) top = 0; if (top > 1) top = 1;
         for (int r = 0; r < 3; r++) {
           int idx = top + r;

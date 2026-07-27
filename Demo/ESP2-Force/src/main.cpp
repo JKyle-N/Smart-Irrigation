@@ -151,6 +151,16 @@ const unsigned long FLOW_TIMEOUT_MS   = 10000;  // no-flow after pump start -> F
 const unsigned long STAGE_MAX_MS      = 180000; // hard safety cap per metered stage
 const unsigned long MIX_DEFAULT_MS    = 30000;  // used if work order omits MIX
 
+/* ---- Flow-independent (timed) recovery -- escape hatch when the FLOW SENSOR is dead -------- *
+ * A held FLOW_FAIL can never clear via a flow-metered resume (the stage re-detects no-flow and
+ * re-holds -> lockout). On RESUME,IRRIGATE / RESUME,RELEASE after a flow fault, the FILL/DELIVER
+ * stages run the pump on a TIMER instead, sized from the known volume and pump rate. The PZEM
+ * power check still runs, so this is flow-blind, not power-blind. Rates are [MEASURE] at commissioning. */
+const float TRANSFER_LPM = 8.0f;                // reservoir->mix transfer pump flow rate [MEASURE]
+const float BOOSTER_LPM  = 6.0f;                // mix->column booster pump flow rate     [MEASURE]
+const float TIMED_MARGIN = 1.3f;                // run a bit longer than the estimate to fully move the volume
+const unsigned long TIMED_STAGE_CAP_MS = 120000; // hard cap on any single timed stage (safety)
+
 /* ---- PZEM AC validation (spec sec.23.1.2.1) ------------------------------ */
 const float PZEM_MIN_CURRENT_A = 0.5f;    // pump ON but below this = no draw
 const float PZEM_OVERCURRENT_A = 3.0f;
@@ -302,6 +312,10 @@ int   sgTankSign = 0;          // +1 = this stage FILLS the mix tank, -1 = DRAIN
 unsigned long sgCapMs = STAGE_MAX_MS;   // per-stage hard cap (dose stages override with the 2x ceiling)
 bool  sgIsAC = false, sgPumpOn = false, sgSawFlow = false;
 unsigned long sgT0 = 0;
+bool  sgTimed = false;                   // flow-independent stage: complete on a timer, ignore the flow sensor
+unsigned long sgTimedMs = 0;             // computed run time for a timed stage
+bool  lastHoldFlow = false;              // the most recent hold was a FLOW_FAIL (enables timed recovery)
+bool  resumeTimed  = false;              // this RESUME should run FILL/DELIVER timed (flow-blind)
 unsigned long acNoCurrentSince = 0;
 unsigned long lastPzemMs = 0;     // PZEM read throttle (see PZEM_POLL_MS)
 
@@ -654,6 +668,7 @@ void dispatch(const String &payload) {
   // ---- always-honored commands ----
   if (cmd == "STOP_ALL") {
     stopAll(); step = SEQ_NONE; wo.active = false; faultHeld = false; detachFlow();
+    resumeTimed = false; lastHoldFlow = false;           // clear the timed-recovery latch
     testMode = false; testHeldBit = -1; testCapped = false;
     if (primeLine != "") stopPrime(); calId = "";        // drop any calibration stream / prime
 
@@ -864,6 +879,7 @@ void stageBegin(int pumpBit, bool isAC, int flowPin, float k, float targetL) {
   sgTankSign = 0;                // default: stage does not move tank water (set by caller for fill/deliver)
   sgCapMs = STAGE_MAX_MS;        // default cap (dose stages override with the per-dose ceiling)
   sgPumpOn = false; sgSawFlow = false; sgT0 = millis();
+  sgTimed = false; sgTimedMs = 0;   // default: flow-metered; a timed-recovery stage sets these after this call
   acNoCurrentSince = 0;
   if (isAC) pcfOn(OUT_INVERTER);
 }
@@ -872,7 +888,9 @@ void stageBegin(int pumpBit, bool isAC, int flowPin, float k, float targetL) {
 // volume (and, for a DELIVER, to the per-order water-to-column tally). Reads before stageEnd
 // so it works for both normal completion and a mid-stage fault (partial liters still count).
 float endMeteredStage() {
-  float liters = litersSoFar(sgK);
+  // A timed (flow-blind) stage has no usable pulse count, so credit the ESTIMATED target volume it was
+  // sized to move -- otherwise the tank bookkeeping would think nothing moved and never empty/fill.
+  float liters = sgTimed ? sgTarget : litersSoFar(sgK);
   if      (sgTankSign > 0) tankApply(+liters);                 // reservoir -> mix
   else if (sgTankSign < 0) { tankApply(-liters); woWaterL += liters; }  // mix -> column
   stageEnd();
@@ -883,6 +901,14 @@ int stagePoll() {
     if (millis() - sgT0 >= (sgIsAC ? INVERTER_WARMUP_MS : VALVE_SWITCH_MS)) {
       attachFlow(sgFlow); pcfOn(sgPump); sgPumpOn = true; sgT0 = millis();
     }
+    return 0;
+  }
+  // Timed (flow-blind) recovery stage: the flow sensor is dead, so complete on the clock and NEVER
+  // raise the no-flow fault. PZEM power validation (pwrValidate) still runs -> not power-blind.
+  if (sgTimed) {
+    unsigned long el = millis() - sgT0;
+    if (el >= sgTimedMs) return 1;
+    if (el > TIMED_STAGE_CAP_MS) return 1;              // absolute safety cap -> stop (do not re-fault)
     return 0;
   }
   float L = litersSoFar(sgK);
@@ -905,6 +931,7 @@ void finishOk() {
   String name = wo.cmdName;
   float water = woWaterL;
   wo.active = false; faultHeld = false; step = SEQ_NONE;
+  resumeTimed = false; lastHoldFlow = false;   // run finished -> clear the timed-recovery latch
   // Append measured water so ESP1 can tally per-column daily usage (sec.12.1.3 / B1).
   reply("DONE," + name + ",WATER," + String(water, 2));
 }
@@ -918,6 +945,7 @@ void holdFault(const char *resp, const char *loc) {
   stopAll();                         // all OFF, master cutoff de-energized
   faultHeld = true;
   stepInit  = false;                 // on RESUME the paused step re-inits with the updated tank volume
+  lastHoldFlow = (strcmp(resp, "FLOW_FAIL") == 0);   // a dead flow sensor enables timed IRRIGATE/RELEASE recovery
   reply(String(resp) + "," + loc);
 }
 
@@ -927,6 +955,9 @@ void holdFault(const char *resp, const char *loc) {
 void resumeWork(const String &mode) {
   faultHeld = false;
   cutoffEnergize();
+  // Flow sensor dead + user chose a deliver/top-up recovery -> run those stages on a timer (flow-blind),
+  // otherwise they would re-detect no-flow and re-hold forever. Metered recovery stays for other faults.
+  resumeTimed = (lastHoldFlow && (mode == "IRRIGATE" || mode == "RELEASE"));
   if (mode == "IRRIGATE") {
     wo.fertigate = false; wo.flushPct = 0;     // top-up FILL to budget, then DELIVER, no flush/dosing
     goStep(SEQ_FILL);
@@ -961,6 +992,11 @@ void runSequence() {
         pcfOn(OUT_RES_VALVE);
         stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
         sgTankSign = +1;                              // this stage adds water to the mix tank
+        if (resumeTimed) {                            // flow sensor dead -> run the transfer pump on a timer
+          sgTimed = true;
+          sgTimedMs = (unsigned long)(remaining / TRANSFER_LPM * 60000.0f * TIMED_MARGIN);
+          if (sgTimedMs > TIMED_STAGE_CAP_MS) sgTimedMs = TIMED_STAGE_CAP_MS;
+        }
         stepInit = true;
       }
       int r = stagePoll();
@@ -1043,6 +1079,11 @@ void runSequence() {
         pcfOn(OUT_MIX_VALVE); pcfOn(COL_VALVE_BIT[c]);
         stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
         sgTankSign = -1;                                     // this stage drains the mix tank
+        if (resumeTimed) {                                   // flow sensor dead -> run the booster on a timer
+          sgTimed = true;
+          sgTimedMs = (unsigned long)(mixTankL / BOOSTER_LPM * 60000.0f * TIMED_MARGIN);
+          if (sgTimedMs > TIMED_STAGE_CAP_MS) sgTimedMs = TIMED_STAGE_CAP_MS;
+        }
         stepInit = true;
       }
       int r = stagePoll();
