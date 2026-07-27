@@ -4087,6 +4087,38 @@ Extends the manual TEST mode (Section 18.10.8).
   ESP32 #1↔#2 link: if relays click here but Testing still fails, the fault is the link, not the
   hardware.
 
+## 29.9. Remote log retrieval — Supabase Storage upload
+
+The site is ~50 km away with **outbound-only** internet (no port forwarding), so logs are pushed to
+the cloud rather than pulled. ESP32 #1 uploads each completed daily CSV to a **private Supabase
+Storage bucket**; the developer generates time-limited signed URLs from the dashboard to download.
+
+* **What is uploaded:** the completed daily log files exactly as written to SD — `/<YYYYMMDD>.CSV`
+  (4-column schema `timestamp,source,event_type,detail`). The **currently-open day and `/NODATE.CSV`
+  are never uploaded** (no read/write conflict with the active SD writer).
+* **Endpoint:** `POST <projectUrl>/storage/v1/object/CSV-Logs/<YYYYMMDD>.CSV`. Bucket name is
+  **case-sensitive** — exactly `CSV-Logs` (capital C, capital L, hyphen); a mismatch returns 404.
+  Headers: `Authorization: Bearer <service_role>`, `apikey: <service_role>`, `Content-Type: text/csv`,
+  `x-upsert: true` (so a retry or re-send overwrites instead of failing "already exists").
+* **Streamed, not buffered:** the body is streamed straight from the SD `File` via
+  `HTTPClient::sendRequest("POST", &file, size)`, which pulls ~1.4 KB at a time with a fixed
+  Content-Length. Heap stays flat regardless of file size (multi-MB day files upload safely).
+  Runs on the **core-0 `netTask`** over `WiFiClientSecure` (TLS); SD access is held under `sdMux`
+  while streaming, and the core-1 logger's buffered `logFlush` just defers meanwhile.
+* **Triggers:** at the midnight day-rollover, yesterday's now-completed file becomes a candidate; on
+  every WiFi (re)connect the firmware also **catches up** any completed day-file on the SD newer than
+  the last success (NVS `supalast`), oldest-first, one per cycle — so nights missed due to the site's
+  flaky WiFi drain automatically. Manual re-send: SMS **`UPLOAD`** (yesterday) / **`UPLOAD,YYYYMMDD`**
+  (a specific day), or the **"Upload logs"** button in the SoftAP admin page.
+* **Reliability:** failures retry with exponential backoff (30 s → 2 m → 8 m → cap 30 m). The SD file
+  is never deleted, so a failed upload only defers — no data loss. Every attempt is logged as its own
+  **`UPLOAD`** event_type: `UPLOAD|OK|<day>.CSV` or `UPLOAD|FAIL|<day>.CSV|http=<code>|try=<n>`.
+* **Credentials:** the project URL + service_role key live **only in NVS** (like the WiFi/ThingSpeak
+  creds) — set at runtime by owner-gated SMS `SUPA,<projectUrl>,<serviceKey>` (`SUPA,CLEAR` to wipe)
+  or the SoftAP admin form. **Nothing secret is compiled into tracked source.** TLS currently uses
+  `setInsecure()` (encrypted, no certificate pinning) — adequate for the deployment; pinning the
+  Supabase CA is a future hardening step. Rotate any key that was exposed during manual testing.
+
 
 ---
 

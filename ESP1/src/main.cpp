@@ -38,7 +38,8 @@
 #include <SoftwareSerial.h>      // EspSoftwareSerial (plerup) -- Nano link
 #include <esp_task_wdt.h>
 #include <WiFi.h>                // built-in ESP32 WiFi (telemetry uplink, Part A)
-#include <HTTPClient.h>          // ThingSpeak HTTP upload
+#include <HTTPClient.h>          // ThingSpeak HTTP upload + Supabase CSV upload
+#include <WiFiClientSecure.h>    // TLS client for the Supabase Storage HTTPS upload
 #include <WebServer.h>           // SoftAP provisioning portal (WiFi setup form)
 #include <DNSServer.h>           // captive-portal DNS for the provisioning AP
 
@@ -495,6 +496,23 @@ const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
 String wifiSsid = "", wifiPass = "";
 String tsKey1 = "", tsKey2 = "", tsKey3 = "";      // ThingSpeak write keys (ch1 cols, ch2 system, ch3 EC/pH)
 SemaphoreHandle_t netMux = NULL;                   // guards the cred/key Strings across cores
+
+// ---- Supabase Storage upload (daily CSV push; outbound HTTPS, private bucket) ----
+// Bucket name is CASE-SENSITIVE and hyphenated -- exactly "CSV-Logs". A case mismatch = 404.
+const char *SUPA_BUCKET = "CSV-Logs";
+// URL + service_role key are NVS-only (set by SMS SUPA,... or the SoftAP admin form) -- NEVER hardcoded
+// in tracked source (see the WiFi/ThingSpeak cred pattern). Guarded by netMux like the other secrets.
+String   supaUrl = "", supaKey = "";               // e.g. "https://<ref>.supabase.co" + service_role key
+long     supaLast = 0;                             // yyyymmdd of the last CSV successfully uploaded (NVS)
+volatile bool supaPersistPending = false;          // core0 admin form -> core1: persist supaUrl/supaKey
+// Cross-core upload hand-off: core 1 chooses the day, netTask (core 0) does the HTTPS PUT.
+volatile long uploadReqStamp = 0;                  // core1 -> netTask: yyyymmdd to upload (0 = idle)
+volatile bool uploadBusy     = false;              // netTask: an upload is in flight
+volatile int  uploadResult   = 0;                  // netTask -> core1: 0 none / 1 ok / 2 fail
+volatile long uploadResStamp = 0;                  // which day the result is for
+volatile int  uploadHttp     = 0;                  // last HTTP status (for the FAIL log)
+volatile long manualUploadStamp = 0;               // SMS/admin one-shot request (core 1), prioritized
+volatile bool adminUploadReq    = false;           // SoftAP admin "Upload logs" button (core0 -> core1)
 volatile bool wifiEnabled   = true;                // Settings > WiFi master switch (STA + telemetry); NVS-kept
 volatile bool wifiConnected = false;
 volatile int  wifiRssiVal   = 0;
@@ -918,6 +936,12 @@ void saveOwner();
 void saveAdminPin();
 void saveWifi();
 void saveTsKey();
+void saveSupa();
+void saveSupaLast();
+bool supaUploadFile(const char *path, const char *objName);
+void uploadTick();
+static bool sdTake(uint32_t ms);
+static void sdGive();
 void telemetryCollect();
 void netTask(void *pv);
 static bool senderIsOwner();
@@ -1079,6 +1103,7 @@ void loop() {
   g_lastStage = 'M'; healthTick();         // module-health logging: edge changes + periodic HEALTH snapshot
   g_lastStage = 'Z'; rtcDeadRebootTick();  // dead-RTC (all-zero timestamp): daily idle-only reboot to recover
   g_lastStage = 'R'; runUiTick();          // run receipts: unattended auto-continue past PRE/POST/ERR
+  g_lastStage = 'X'; uploadTick();         // Supabase CSV push scheduling (rollover + reconnect catch-up)
   // Apply a config SMS that was deferred during a local edit, once the edit has closed (§B.3.1).
   if (pendingCfgSms.length() && uiMode != UI_EDIT && !editConfirm) {
     String s = pendingCfgSms; pendingCfgSms = ""; handleSms(s);
@@ -1234,6 +1259,9 @@ void loadConfig() {
   tsKey1   = prefs.getString("tsk1", "");
   tsKey2   = prefs.getString("tsk2", "");
   tsKey3   = prefs.getString("tsk3", "");
+  supaUrl  = prefs.getString("supaurl", "");        // Supabase project URL + service_role key (NVS-only)
+  supaKey  = prefs.getString("supakey", "");
+  supaLast = prefs.getLong("supalast", 0);          // last day (yyyymmdd) successfully uploaded
 }
 /* =============================================================================
  *  CALIBRATION NVS + DISTRIBUTION  (companion spec §A.5.1)
@@ -1303,6 +1331,12 @@ void saveWifiEn() {
 }
 void saveOwner()    { prefs.putString("owner", PHONE_NUMBER); }   // owner number (portal edit)
 void saveAdminPin() { prefs.putString("apin", adminPin); }        // portal admin PIN
+void saveSupaLast() { prefs.putLong("supalast", supaLast); }      // last uploaded day (yyyymmdd)
+// Supabase creds under netMux (the core-0 admin form may write them), NVS write from locals.
+void saveSupa() {
+  String u, k; xSemaphoreTake(netMux, portMAX_DELAY); u = supaUrl; k = supaKey; xSemaphoreGive(netMux);
+  prefs.putString("supaurl", u); prefs.putString("supakey", k);
+}
 // Copy the cred Strings under netMux (the core-0 portal may write them), then write NVS from the locals
 // so the putString can't torn-read a String mid-write.
 void saveWifi() {
@@ -2294,6 +2328,48 @@ void handleSms(const String &body) {
     sendSMS("ACK,STOP,ALL");
     return;
   }
+  // SUPA,<projectUrl>,<serviceKey>  -- set Supabase creds (case-sensitive; use raw body, not U).
+  // SUPA,CLEAR wipes them. Stored in NVS only -- never committed. Owner-gated by senderIsOwner() above.
+  if (U.startsWith("SUPA")) {
+    int c1 = b.indexOf(',');
+    String rest = (c1 >= 0) ? b.substring(c1 + 1) : "";
+    rest.trim();
+    if (rest.equalsIgnoreCase("CLEAR")) {
+      xSemaphoreTake(netMux, portMAX_DELAY); supaUrl = ""; supaKey = ""; xSemaphoreGive(netMux);
+      saveSupa(); sendSMS("ACK,SUPA,CLEAR"); return;
+    }
+    int c2 = rest.indexOf(',');                          // URL , KEY (key may not contain a comma; JWTs don't)
+    if (c2 <= 0) { sendSMS("ERR,SUPA,FORMAT"); return; }
+    String u = rest.substring(0, c2); u.trim();
+    String k = rest.substring(c2 + 1); k.trim();
+    if (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+    if (!u.startsWith("http") || k.length() < 20) { sendSMS("ERR,SUPA,FORMAT"); return; }
+    xSemaphoreTake(netMux, portMAX_DELAY); supaUrl = u; supaKey = k; xSemaphoreGive(netMux);
+    saveSupa();
+    logEvent("ESP1", "CFG", "SUPA|SET");                 // note: NO url/key in the log
+    sendSMS("ACK,SUPA,SET");
+    return;
+  }
+  // UPLOAD             -> queue yesterday's CSV.  UPLOAD,YYYYMMDD -> queue that specific day.
+  if (U.startsWith("UPLOAD")) {
+    long stamp = 0;
+    int c1 = b.indexOf(',');
+    if (c1 >= 0) { String d = b.substring(c1 + 1); d.trim(); if (d.length() == 8) stamp = d.toInt(); }
+    else if (rtcOk && currentDayStamp > 0) {             // no arg -> yesterday
+      DateTime y = rtc.now() - TimeSpan(1, 0, 0, 0);
+      stamp = dayStamp(y);
+    }
+    if (supaUrl.length() == 0) { sendSMS("ERR,UPLOAD,NOCREDS"); return; }
+    if (stamp <= 0)                    { sendSMS("ERR,UPLOAD,DAY"); return; }
+    if (rtcOk && stamp == currentDayStamp) { sendSMS("ERR,UPLOAD,TODAY"); return; }  // never the open file
+    char path[16]; snprintf(path, sizeof(path), "/%08ld.CSV", stamp);
+    bool exists;
+    { bool got = sdTake(200); exists = got && SD.exists(path); if (got) sdGive(); }
+    if (!exists) { sendSMS(String("ERR,UPLOAD,NOFILE,") + stamp); return; }
+    manualUploadStamp = stamp;                           // uploadTick prioritizes this
+    sendSMS(String("ACK,UPLOAD,") + stamp);
+    return;
+  }
   // STATUS
   if (U == "STATUS") {
     if (sysState == ACTIVE_STATE) {
@@ -3199,6 +3275,79 @@ void scheduleTick() {
 }
 
 /* =============================================================================
+ *  SUPABASE UPLOAD SCHEDULING  (core 1 owns "which day"; netTask does the network)
+ * ========================================================================== */
+// Oldest completed daily CSV on the SD with supaLast < stamp < today (skips NODATE + today's open file).
+// 0 = nothing to send. Requires a valid clock so "today" is known -- no auto catch-up on a dead RTC.
+static long uploadNextCatchupDay() {
+  if (!rtcOk || currentDayStamp <= 0) return 0;
+  if (!sdTake(200)) return 0;                          // SD busy -> try next cycle
+  long best = 0;
+  File root = SD.open("/");
+  if (root) {
+    for (File e = root.openNextFile(); e; e = root.openNextFile()) {
+      String n = e.name(); e.close();
+      int sl = n.lastIndexOf('/'); if (sl >= 0) n = n.substring(sl + 1);
+      if (n.length() != 12 || !n.endsWith(".CSV")) continue;     // want exactly NNNNNNNN.CSV
+      bool digits = true; for (int i = 0; i < 8; i++) if (!isDigit(n[i])) digits = false;
+      if (!digits) continue;                                     // skips NODATE.CSV and other names
+      long stamp = n.substring(0, 8).toInt();
+      if (stamp > supaLast && stamp < currentDayStamp && (best == 0 || stamp < best)) best = stamp;
+    }
+    root.close();
+  }
+  sdGive();
+  return best;
+}
+
+// Drain a finished upload result, then queue the next day (manual request first, else catch-up).
+// Exponential backoff on failure; the SD file is never deleted, so a failed upload only defers -- no data loss.
+void uploadTick() {
+  static unsigned long lastAttemptMs = 0;
+  static int attempts = 0;
+  static const unsigned long BACKOFF[4] = { 30000UL, 120000UL, 480000UL, 1800000UL };  // 30s,2m,8m,30m
+
+  // SoftAP admin "Upload logs" button: resolve yesterday HERE (RTC lives on core 1) into a manual request.
+  if (adminUploadReq) {
+    adminUploadReq = false;
+    if (rtcOk && currentDayStamp > 0) {
+      long y = dayStamp(rtc.now() - TimeSpan(1, 0, 0, 0));
+      char path[16]; snprintf(path, sizeof(path), "/%08ld.CSV", y);
+      bool got = sdTake(200), exists = got && SD.exists(path); if (got) sdGive();
+      if (exists) { manualUploadStamp = y; attempts = 0; }
+    }
+  }
+
+  // 1) publish a finished result (netTask -> here)
+  if (uploadResult != 0) {
+    long s = uploadResStamp; int r = uploadResult, code = uploadHttp;
+    uploadResult = 0; lastAttemptMs = millis();
+    if (r == 1) {
+      logEvent("ESP1", "UPLOAD", "OK|" + String(s) + ".CSV");
+      if (s > supaLast) { supaLast = s; saveSupaLast(); }
+      if (manualUploadStamp == s) manualUploadStamp = 0;
+      attempts = 0;
+    } else {
+      attempts++;
+      logEvent("ESP1", "UPLOAD", "FAIL|" + String(s) + ".CSV|http=" + String(code) + "|try=" + String(attempts));
+      if (manualUploadStamp == s && attempts >= 5) { manualUploadStamp = 0; attempts = 0; }  // give up a stuck manual send
+    }
+    return;
+  }
+
+  if (uploadReqStamp != 0 || uploadBusy) return;                 // an attempt is in flight
+  if (supaUrl.length() == 0 || supaKey.length() == 0) return;    // not configured
+  if (!wifiConnected) return;
+  unsigned long wait = (attempts > 0) ? BACKOFF[attempts < 4 ? attempts - 1 : 3] : 5000UL;
+  if (millis() - lastAttemptMs < wait) return;                   // backoff / gentle SD-scan throttle
+
+  long target = (manualUploadStamp != 0) ? manualUploadStamp : uploadNextCatchupDay();
+  if (target == 0) return;
+  uploadReqStamp = target;                                       // hand to netTask
+  lastAttemptMs = millis();
+}
+
+/* =============================================================================
  *  HEARTBEAT  (freshness; Nano silence does NOT trigger reset, sec.18.9.5.0.1)
  * ========================================================================== */
 void heartbeatTick() {
@@ -3384,6 +3533,47 @@ static void tsUpload() {
     ok = tsGet(url) || ok;
   }
   lastTsOk = ok; lastTsUploadMs = millis();
+}
+
+/* =============================================================================
+ *  SUPABASE STORAGE UPLOAD  (core 0 / netTask)  --  stream a completed daily CSV to a private bucket.
+ *  Endpoint: POST <supaUrl>/storage/v1/object/CSV-Logs/<objName>  (x-upsert:true = idempotent retries).
+ *  The body is STREAMED straight from the SD File (HTTPClient pulls ~1.4 KB at a time with a fixed
+ *  Content-Length), so heap stays flat no matter how big the file is. sdMux is held for the transfer;
+ *  the core-1 logger's logFlush uses a timed take and just buffers meanwhile (never blocks the WDT).
+ * ========================================================================== */
+bool supaUploadFile(const char *path, const char *objName) {
+  String base, key;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = supaUrl; key = supaKey; xSemaphoreGive(netMux);
+  if (base.length() == 0 || key.length() == 0) { uploadHttp = 0; return false; }   // not configured
+  if (!wifiConnected) { uploadHttp = 0; return false; }
+
+  if (!sdTake(4000)) { uploadHttp = -1; return false; }            // SD busy (portal/summary) -> retry later
+  File f = SD.open(path, FILE_READ);
+  if (!f || f.isDirectory()) { if (f) f.close(); sdGive(); uploadHttp = -2; return false; }
+  size_t len = f.size();
+
+  WiFiClientSecure client;
+  client.setInsecure();                                            // encrypted; no cert pinning (thesis) [HARDENING TODO]
+  client.setTimeout(15000);
+  HTTPClient http;
+  String url = base + "/storage/v1/object/" + SUPA_BUCKET + "/" + objName;
+  bool ok = false; int code = 0;
+  if (http.begin(client, url)) {
+    http.setConnectTimeout(8000);
+    http.setTimeout(20000);
+    http.addHeader("Authorization", "Bearer " + key);
+    http.addHeader("apikey", key);
+    http.addHeader("Content-Type", "text/csv");
+    http.addHeader("x-upsert", "true");                            // overwrite if it already exists
+    code = http.sendRequest("POST", &f, len);                      // streams from SD, no full-file buffer
+    http.end();
+    ok = (code == 200 || code == 201);
+  }
+  f.close();
+  sdGive();
+  uploadHttp = code;
+  return ok;
 }
 
 /* ---- WiFi provisioning portal (SoftAP + captive web form) -------------------
@@ -3574,12 +3764,20 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
   o += "<h3>Change admin PIN</h3><form method=POST action=/pin>"
        "<p><input name=pin type=password placeholder='new PIN (4-12)' style='width:100%;padding:8px'></p>"
        "<p><button type=submit style='width:100%;padding:10px'>Change PIN</button></p></form>";
+  o += "<h3>Upload logs</h3><form method=POST action=/upload>"
+       "<p>Push yesterday's CSV to cloud storage" + String(supaUrl.length() ? "" : " (set SUPA creds first)") + ".</p>"
+       "<p><button type=submit style='width:100%;padding:10px'>Upload logs now</button></p></form>";
   o += "<h3 style='color:#c33'>Reboot</h3><form method=POST action=/reboot "
        "onsubmit=\"return confirm('Reboot the controller now?')\">"
        "<p><label><input type=checkbox name=confirm value=yes> Yes, reboot ESP1 (config kept).</label></p>"
        "<p><button type=submit style='width:100%;padding:10px;background:#c33;color:#fff'>Reboot ESP1</button></p></form>";
   o += "<hr><p><a href=/>&larr; WiFi setup</a></p></body></html>";
   return o;
+}
+static void portalHandleUpload() {                            // POST /upload -- queue the log push (core-1 resolves the day)
+  if (!portalAdminUnlocked) { portalServer.send(403, "text/html", "locked"); return; }
+  adminUploadReq = true;                                      // core-1 uploadTick resolves yesterday + queues it
+  portalServer.send(200, "text/html", portalAdminHtml("Upload queued (sends when WiFi is up)."));
 }
 static void portalHandleAdmin() {                             // POST /admin -- verify PIN
   String pin = portalServer.arg("pin");
@@ -3756,6 +3954,7 @@ static void portalStart() {
     portalServer.on("/download", portalHandleDownload);        // GET ?f=
     portalServer.on("/format", HTTP_POST, portalHandleFormat);
     portalServer.on("/reboot", HTTP_POST, portalHandleReboot); // software-reset ESP1
+    portalServer.on("/upload", HTTP_POST, portalHandleUpload); // queue a Supabase CSV push
     portalServer.on("/tskey", HTTP_POST, portalHandleTskey);   // config forms (staged -> core-1 handleSms)
     portalServer.on("/colmode", HTTP_POST, portalHandleColMode);
     portalServer.on("/colname", HTTP_POST, portalHandleColName);
@@ -3833,6 +4032,18 @@ void netTask(void *pv) {
 
     unsigned long interval = (sysState == ACTIVE_STATE) ? TS_UPLOAD_ACTIVE_MS : TS_UPLOAD_IDLE_MS;
     if (millis() - lastUpload >= interval) { lastUpload = millis(); tsUpload(); }
+
+    // Supabase CSV push: core 1 sets uploadReqStamp; do one attempt here and publish the result.
+    if (uploadReqStamp != 0 && !uploadBusy) {
+      uploadBusy = true;
+      long stamp = uploadReqStamp;
+      char path[16], obj[13];
+      snprintf(path, sizeof(path), "/%08ld.CSV", stamp);
+      snprintf(obj,  sizeof(obj),  "%08ld.CSV", stamp);
+      bool ok = supaUploadFile(path, obj);
+      uploadResStamp = stamp; uploadResult = ok ? 1 : 2;
+      uploadReqStamp = 0; uploadBusy = false;
+    }
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
