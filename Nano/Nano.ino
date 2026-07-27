@@ -87,7 +87,8 @@ const uint8_t PIN_RS485_TX  = 10;   // D10 RS485 TX (Nano -> NPK)
 const uint8_t PIN_DHT       = 11;   // D11 DHT22 data
 // D12 reserved
 const uint8_t PIN_LED       = 13;   // D13 status LED
-// Soil capacitive sensors (2 per column, averaged). A6/A7 are analog-input only.
+// Soil capacitive sensors: 2 per column, sent to ESP32 #1 individually (ESP1 averages + maps to %).
+// A6/A7 are analog-input only.
 const uint8_t SOIL_PINS[NUM_COLUMNS][2] = {
   { A0, A1 },   // Column A
   { A2, A3 },   // Column B
@@ -483,7 +484,7 @@ bool calReadRaw(float &raw) {
   if (!strncmp(calId, "SOIL_", 5)) {
     int col = calId[5] - 'A';                      // A/B/C
     if (col < 0 || col >= NUM_COLUMNS) return false;
-    if (calId[6] == '\0') {                         // "SOIL_A" -> column AVERAGE (matches normal packet)
+    if (calId[6] == '\0') {                         // "SOIL_A" -> column AVERAGE (ESP1 calibrates the 2-probe avg)
       raw = (float)((analogRead(SOIL_PINS[col][0]) + analogRead(SOIL_PINS[col][1])) / 2);
       return true;
     }
