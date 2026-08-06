@@ -207,7 +207,12 @@ const unsigned long UART_DONE_TIMEOUT_MS  = 600000;  // ESP2 sequence completion
 const uint8_t       MAX_UART_RETRY        = 3;
 const unsigned long RECOVERY_COOLDOWN_MS  = 30000;
 const unsigned long STARTUP_SYNC_TIMEOUT_MS = 15000;
-const unsigned long HEARTBEAT_TIMEOUT_MS  = 120000;  // subsystem freshness
+const unsigned long HEARTBEAT_TIMEOUT_MS  = 120000;  // subsystem freshness (ESP2 silence, startup sync)
+// Nano silence needs its OWN, wider window: the Nano's NIGHT heartbeat is 120s (HB_INTERVAL_NIGHT_MS),
+// exactly equal to HEARTBEAT_TIMEOUT_MS -> zero margin, so any jitter or one dropped frame (~10% UART
+// corruption) trips a false NANO_SILENCE + SMS every ~5 min at night. 2.5x the slowest heartbeat gives
+// real margin; a genuine Nano outage still self-recovers via the Nano's own WDT (sec.18.9.5.0.1).
+const unsigned long NANO_SILENCE_TIMEOUT_MS = 300000;  // 5 min = 2.5x Nano night heartbeat (120s)
 // ESP2 silence is CONFIRMED, not assumed: after the freshness gap, actively probe with STATUS_REQ a few
 // times before declaring ESP2_SILENCE, so a dropped-frame / starved-loop glitch doesn't force a needless reset.
 const unsigned long SILENCE_PROBE_INTERVAL_MS = 2000;  // spacing between confirm probes
@@ -3146,7 +3151,14 @@ void controlTick() {
 
 bool decideFertigate(int c) {
   if (col[c].mode == MODE_IRRIGATION_ONLY) return false;
-  if (!sensor.npkValid[c]) { raiseFault('M', "NPK_FAULT", c == 0 ? "COL_A" : c == 1 ? "COL_B" : "COL_C"); return false; }
+  if (!sensor.npkValid[c]) {
+    raiseFault('M', "NPK_FAULT", c == 0 ? "COL_A" : c == 1 ? "COL_B" : "COL_C");
+    // Fertigation-capable column falls back to irrigation-only because NPK is invalid. Log the DOWNGRADE
+    // as its own event so the thesis dataset can tell "fertigated" from "watered only" (sec.M-3); the
+    // NPK_FAULT above marks the sensor, this marks the decision consequence.
+    logEvent("ESP1", "CTRL", String("COL_") + COL_TAG[c] + "|FERT_DOWNGRADE|reason=NPK_INVALID");
+    return false;
+  }
   float n = sensor.npk[c][4], p = sensor.npk[c][5], k = sensor.npk[c][6];
   if ((col[c].targetN - n) >= fertGap) return true;
   if ((col[c].targetP - p) >= fertGap) return true;
@@ -3405,7 +3417,7 @@ void heartbeatTick() {
   if (sysState == TEST_MODE) return;
   // Nano silence: alert/count ONCE per outage (Nano's own WDT self-recovers, sec.18.9.5.0.1).
   // Not a reset trigger; the flag clears when fresh data resumes (pollNano).
-  if (!nanoSilent && millis() - sensor.lastNanoMs > HEARTBEAT_TIMEOUT_MS) {
+  if (!nanoSilent && millis() - sensor.lastNanoMs > NANO_SILENCE_TIMEOUT_MS) {
     nanoSilent = true;
     faultsToday[2]++;                                          // minor (now actually tallied)
     logEvent("ESP1", "FAULT", "MIN|NANO_SILENCE|NANO");
