@@ -84,6 +84,32 @@ This multi-layer approach ensures:
 - pH and EC sensors require periodic calibration
 - Sensor drift should be considered in long-term use
 
+### 5.3.1. Capacitive Soil-Probe Calibration (measured)
+
+Raw ADC readings per probe (normal polarity — **dry = high, wet = low**), captured on-site:
+
+| Probe | 100% Wet | Dry |
+| ----- | -------- | --- |
+| A1    | 392      | 748 |
+| A2    | 518      | 661 |
+| B1    | 390      | 666 |
+| B2    | 529      | 650 |
+
+**Cross-wiring correction:** the two ADC channels per column were found physically swapped, so the
+real grouping is **Column A = {B2, A2}** and **Column B = {B1, A1}**.
+
+Averaging within each corrected column gives the baked per-column endpoints (in
+`ESP1/src/main.cpp` → `calSoilAir` / `calSoilWater`, commit `ea9e280`):
+
+| Column        | Dry (air, high ADC) | Wet (water, low ADC) |
+| ------------- | ------------------- | -------------------- |
+| A = {B2, A2}  | 656                 | 524                  |
+| B = {B1, A1}  | 707                 | 391                  |
+| C            | 800 (default)       | 300 (default)        |
+
+The **NPK moisture field** reads 0 in unsaturated soil (hardware limitation) and is intentionally
+kept **out** of the column moisture average — column moisture is **capacitive-only**.
+
 ---
 
 ## 5.4. 🔷 Microcontroller Responsibility Boundaries
