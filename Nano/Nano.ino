@@ -15,7 +15,8 @@
  *        <START>,TANK,<res%>,<mix%>,<flowLpm>,<END>
  *        <START>,SOIL,<COL>,<p1>,<p2>,...,<END>      (tag + 2 raw probes per enabled column; disabled omitted)
  *        <START>,LIGHT,<lux>,<END>
- *        <START>,NPK,<COL>,<moist>,<temp>,<EC>,<pH>,<N>,<P>,<K>,<END>  (one per enabled column)
+ *        <START>,NPK,<COL>,<moist>,<temp>,<EC>,<pH>,<N>,<P>,<K>,<reason>,<END>  (one per enabled column;
+ *              reason = OK|TIMEOUT|BADADDR|BADLEN|BADCRC -- OK carries values, the rest carry -1s)
  *        <START>,STATUS,NANO,OK,<END>                (heartbeat, spec sec.10.8.2)
  *      Inbound (ESP32 #1 -> Nano, spec sec.9.7.1.1):
  *        <START>,ACTIVE,<END>     fast interval (10 s)
@@ -211,7 +212,11 @@ void  calStreamTick();
 bool  calReadRaw(float &raw);
 float readLux();
 float computeFlowLpm();
-bool  readNpkColumn(uint8_t addr, float out[7]);
+// NPK read outcome (companion spec §A): OK carries values, the rest identify WHY the read failed so
+// ESP1 can tell "no response" (TIMEOUT/BADADDR -> dead device/wiring) from "corrupted" (BADCRC -> bus EMI).
+enum NpkResult { NPK_OK = 0, NPK_TIMEOUT, NPK_BADADDR, NPK_BADLEN, NPK_BADCRC };
+uint8_t  readNpkColumn(uint8_t addr, float out[7]);   // returns an NpkResult code
+const char *npkReasonStr(uint8_t rc);
 uint16_t modbusCRC(const uint8_t *buf, uint8_t len);
 void startPkt(const char *cmd);
 void pktAddRaw(const char *s);
@@ -433,13 +438,15 @@ void sendNpk() {
     if (!COLUMN_ENABLED[c]) continue;               // skip disabled columns entirely
     wdt_reset();                                    // longest read -- keep WDT happy
     float vals[7];
-    bool ok = readNpkColumn(NPK_ADDR[c], vals);
+    uint8_t rc = readNpkColumn(NPK_ADDR[c], vals);
+    bool ok = (rc == NPK_OK);
     startPkt("NPK");
     tag[0] = COLUMN_TAG[c];
     pktAddRaw(tag);
     for (uint8_t i = 0; i < 7; i++) {
       pktAddFloatOrInvalid(vals[i], NPK_PREC[i], ok);
     }
+    pktAddRaw(npkReasonStr(rc));                     // trailing reason token (OK on success, else why it failed)
     endPkt();
   }
 }
@@ -497,7 +504,7 @@ bool calReadRaw(float &raw) {
     int col = calId[4] - 'A';
     if (col < 0 || col >= NUM_COLUMNS) return false;
     float vals[7];
-    if (!readNpkColumn(NPK_ADDR[col], vals)) return false;
+    if (readNpkColumn(NPK_ADDR[col], vals) != NPK_OK) return false;
     raw = vals[4];                                  // N (index 4) raw register
     return true;
   }
@@ -550,7 +557,17 @@ float computeFlowLpm() {
  *  NPK RS485 MODBUS  (hand-rolled so the proven config can be pasted above)
  * ========================================================================== */
 // Returns true and fills out[0..6] on a valid CRC-checked reply; false otherwise.
-bool readNpkColumn(uint8_t addr, float out[7]) {
+const char *npkReasonStr(uint8_t rc) {
+  switch (rc) {
+    case NPK_OK:      return "OK";
+    case NPK_TIMEOUT: return "TIMEOUT";
+    case NPK_BADADDR: return "BADADDR";
+    case NPK_BADLEN:  return "BADLEN";
+    default:          return "BADCRC";
+  }
+}
+
+uint8_t readNpkColumn(uint8_t addr, float out[7]) {
   for (uint8_t i = 0; i < 7; i++) out[i] = -1.0f;
 
   uint8_t q[8];
@@ -583,20 +600,20 @@ bool readNpkColumn(uint8_t addr, float out[7]) {
     if (npkSerial.available()) resp[idx++] = (uint8_t)npkSerial.read();
   }
 
-  if (idx < expected)                       return false;
-  if (resp[0] != addr || resp[1] != NPK_FUNCTION) return false;
-  if (resp[2] != 2 * NPK_REG_COUNT)         return false;
+  if (idx < expected)                             return NPK_TIMEOUT;   // no / short response
+  if (resp[0] != addr || resp[1] != NPK_FUNCTION) return NPK_BADADDR;    // wrong responder / function
+  if (resp[2] != 2 * NPK_REG_COUNT)               return NPK_BADLEN;     // unexpected byte count
 
   uint16_t rcrc = modbusCRC(resp, expected - 2);
   if (lowByte(rcrc) != resp[expected - 2] ||
-      highByte(rcrc) != resp[expected - 1]) return false;
+      highByte(rcrc) != resp[expected - 1])       return NPK_BADCRC;     // corrupted (bus noise/EMI)
 
   // RAW 16-bit registers (companion spec §A): ESP32 #1 applies NPK_SCALE + per-element offset.
   for (uint8_t i = 0; i < 7; i++) {
     uint16_t raw = ((uint16_t)resp[3 + 2 * i] << 8) | resp[4 + 2 * i];
     out[i] = (float)raw;
   }
-  return true;
+  return NPK_OK;
 }
 
 uint16_t modbusCRC(const uint8_t *buf, uint8_t len) {

@@ -386,6 +386,7 @@ struct SensorData {
   float lux;                       // LIGHT
   float npk[NUM_COLUMNS][7];       // NPK per column: moist,temp,EC,pH,N,P,K
   bool  npkValid[NUM_COLUMNS];
+  String npkReason[NUM_COLUMNS];   // last NPK read outcome from the Nano (OK/TIMEOUT/BADADDR/BADLEN/BADCRC)
   bool  envValid, tankValid, lightValid;
   unsigned long lastNanoMs;
   // --- RAW signals retained for the Sensor Diag screen (pre-conversion, honest -1 on fault) ---
@@ -471,7 +472,7 @@ const uint8_t       TEST_ARM_MAX_TRIES  = 20;  // stop re-sending after this (li
  * exactly like pendingRun (power up -> READY -> EXERCISE,<pump> -> DONE -> power off). */
 const char *EX_NAME[3] = { "TRANSFER", "BOOSTER", "MIXER" };
 unsigned long lastPumpUseMs[3] = { 0, 0, 0 };
-struct PendingExercise { bool active; int idx; bool sent; };
+struct PendingExercise { bool active; int idx; bool sent; bool acked; };  // acked: ESP2 confirmed receipt (ACK,EXERCISE)
 PendingExercise pendingExercise = { false, -1, false };
 
 /* ---- GSM ----------------------------------------------------------------- */
@@ -483,6 +484,7 @@ bool summaryPending = false;    // deferred SUMMARY/FULL report (same pattern as
 /* ---- GSM live health (LCD PAGE_GSM) -------------------------------------- */
 int  lastRssi      = -1;        // AT+CSQ RSSI 0..31 (99/-1 = no signal)
 bool netRegistered = false;     // AT+CREG stat 1 (home) or 5 (roaming)
+int  lastCreg      = -1;        // AT+CREG raw stat (2=searching, 3=denied, etc.) -- logged, not just the bool
 bool simReady      = false;     // AT+CPIN? == READY
 unsigned long lastGsmHealthMs = 0;
 uint8_t gsmHealthStep = 0;      // round-robin: 0=CSQ 1=CREG 2=CPIN
@@ -503,9 +505,11 @@ GsmTx    gtx = GTX_IDLE;
 unsigned long gtxMs = 0;
 String   gtxMsg;
 String   gtxTo;                        // recipient of the in-flight outbound message
+bool     gtxResultSeen = false;        // saw +CMGS/+CMS ERROR for the in-flight send (else -> TX_UNKNOWN)
 const unsigned long GSM_CMGF_SETTLE_MS    = 300;
 const unsigned long GSM_PROMPT_TIMEOUT_MS = 5000;
 const unsigned long GSM_BODY_SETTLE_MS    = 1500;
+const unsigned long GSM_SEND_RESULT_TIMEOUT_MS = 6000;  // hard cap waiting for +CMGS/+CMS ERROR after CTRL+Z
 
 /* ---- WiFi + ThingSpeak telemetry (Part A) -------------------------------- *
  * ESP32 #1 joins the nearby WiFi and uploads a numeric snapshot to ThingSpeak,
@@ -1575,7 +1579,7 @@ bool classifyAndApply(const String &payload, const String &raw) {
     logEvent("NANO", "SENSOR", "LIGHT|" + tok[1]);
     return true;
   }
-  if (cmd == "NPK" && n == 9) {
+  if (cmd == "NPK" && n == 10) {          // tag + 7 values + trailing reason token (companion spec §A)
     int c = -1;
     for (int i = 0; i < NUM_COLUMNS; i++) if (tok[1] == String(COL_TAG[i])) c = i;
     if (c < 0) return false;
@@ -1587,6 +1591,7 @@ bool classifyAndApply(const String &payload, const String &raw) {
       if (i >= 4) val += calNpkOff[c][i - 4];     // N/P/K offset trim (i=4/5/6)
       sensor.npk[c][i] = val;
     }
+    sensor.npkReason[c] = tok[9];         // WHY the read failed (or OK) -- surfaced on the FAIL health line
     sensor.npkValid[c] = !anyInvalid;     // -1 sentinel is honest, NOT garbage
     sensor.msNpk[c] = millis();
     sensor.lastNanoMs = millis();
@@ -1774,6 +1779,10 @@ void handleEsp2Response(const String &payload) {
   if (resp == "ACK") {
     if (arg.startsWith("TEST")) esp2TestArmed = true;          // ESP2 confirmed TEST mode -> stop retrying
     if (arg.startsWith("SET_CAL")) lastSetCalAck = arg;        // block-until-ACK on calibration save (§A.5.1)
+    if (arg.startsWith("EXERCISE") && pendingExercise.active && !pendingExercise.acked) {
+      pendingExercise.acked = true;                            // ESP2 confirmed receipt -> log START now (not at dispatch)
+      logEvent("ESP1", "ACT", String("EXERCISE|START|") + (pendingExercise.idx >= 0 ? EX_NAME[pendingExercise.idx] : "?"));
+    }
     if (wo.active) { wo.stage = WO_ACKED; wo.sentMs = millis(); }
   } else if (resp == "DONE") {
     if (arg.startsWith("EXERCISE")) {                          // preventive exercise finished
@@ -2267,8 +2276,9 @@ void dispatchPendingExercise() {
   if (!pendingExercise.active || pendingExercise.sent) return;
   pendingExercise.sent = true;
   esp2WarmupMs = millis();                       // now timing the 5 s run -> DONE,EXERCISE
+  // sendEsp2 logs the CMD,ESP2|EXERCISE intent line. START is logged only once ESP2 confirms receipt
+  // (ACK,EXERCISE, handleEsp2Response), so the log reflects a genuine command reception, not just dispatch.
   sendEsp2(String("EXERCISE,") + EX_NAME[pendingExercise.idx]);
-  logEvent("ESP1", "ACT", String("EXERCISE|START|") + EX_NAME[pendingExercise.idx]);
 }
 
 // Preventive pump exercise (sec.14.9.1): when fully idle, if a pump has not run for
@@ -2283,7 +2293,7 @@ void exerciseTick() {
 #endif
   for (int k = 0; k < 3; k++) {
     if (millis() - lastPumpUseMs[k] > PUMP_EXERCISE_INTERVAL_MS) {
-      pendingExercise.active = true; pendingExercise.idx = k; pendingExercise.sent = false;
+      pendingExercise.active = true; pendingExercise.idx = k; pendingExercise.sent = false; pendingExercise.acked = false;
       esp2WarmupMs = millis();
       setState(ACTIVE_STATE);
       if (esp2Available && esp2Powered) dispatchPendingExercise();   // already up
@@ -2319,9 +2329,19 @@ void gsmFeedInbound(char c) {
     } else if (line.indexOf("+CREG:") >= 0) {       // network registration: stat after the comma
       int cm = line.indexOf(',');
       int stat = (cm >= 0) ? line.substring(cm + 1).toInt() : -1;
+      lastCreg = stat;                              // keep the raw stat (2=searching,3=denied) for logging
       netRegistered = (stat == 1 || stat == 5);
     } else if (line.indexOf("+CPIN:") >= 0) {       // SIM ready?
       simReady = (line.indexOf("READY") >= 0);
+    } else if (line.startsWith("+CMGS:")) {          // send ACCEPTED by the network -> message reference
+      gtxResultSeen = true;
+      logEvent("GSM", "GSM", "TX_OK|" + line.substring(6));
+    } else if (line.startsWith("+CMS ERROR:")) {     // send REJECTED -> numeric code (no credit / no reg / bad recipient)
+      gtxResultSeen = true;
+      logEvent("GSM", "GSM", "TX_ERR|" + line.substring(11));
+    } else if (line == "ERROR" && gtx == GTX_BODY_SETTLE) {   // bare ERROR during a send = rejection w/o a code
+      gtxResultSeen = true;
+      logEvent("GSM", "GSM", "TX_ERR|GENERIC");
     } else if (expectBody && line.length() > 0) {
       logEvent("GSM", "GSM", "RX|" + line);
       handleSms(line);                              // replies enqueue with replyTarget (the sender)
@@ -2648,6 +2668,7 @@ void gsmTxTick() {
           simSerial.print(gtxMsg);
           simSerial.write(26);                          // CTRL+Z -> send
           logEvent("GSM", "GSM", "TX|" + gtxMsg);
+          gtxResultSeen = false;                        // arm result capture for this send (+CMGS / +CMS ERROR)
           gtxMs = millis();
           gtx = GTX_BODY_SETTLE;
           return;
@@ -2660,9 +2681,13 @@ void gsmTxTick() {
       }
       break;
 
-    case GTX_BODY_SETTLE:                                // let the module finish before next send
-      while (simSerial.available()) gsmFeedInbound((char)simSerial.read());  // drain inbound (B5)
-      if (millis() - gtxMs >= GSM_BODY_SETTLE_MS) gtx = GTX_IDLE;
+    case GTX_BODY_SETTLE:                                // wait for the network's send result, then next send
+      while (simSerial.available()) gsmFeedInbound((char)simSerial.read());  // parse +CMGS/+CMS ERROR (B5)
+      if (gtxResultSeen) { gtx = GTX_IDLE; break; }     // +CMGS / +CMS ERROR already logged the outcome
+      if (millis() - gtxMs >= GSM_SEND_RESULT_TIMEOUT_MS) {   // hard cap: silent modem can't stall the queue
+        logEvent("GSM", "GSM", "TX_UNKNOWN");
+        gtx = GTX_IDLE;
+      }
       break;
   }
 }
@@ -3039,12 +3064,15 @@ void stateMachineTick() {
           if (esp2Available) dispatchPendingExercise();
           else if (millis() - esp2WarmupMs > ESP2_WARMUP_TIMEOUT_MS) {  // never booted: skip, defer 2 days
             int k = pendingExercise.idx; if (k >= 0 && k < 3) lastPumpUseMs[k] = millis();
-            pendingExercise.active = false; pendingExercise.idx = -1;
+            logEvent("ESP1", "ACT", String("EXERCISE|NOBOOT|") + (k >= 0 ? EX_NAME[k] : "?"));  // ESP2 never powered up
+            pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.acked = false;
             esp2SetPower(false); setState(IDLE_STATE);
           }
         } else if (millis() - esp2WarmupMs > PUMP_EXERCISE_TIMEOUT_MS) {  // no DONE,EXERCISE in time
           int k = pendingExercise.idx; if (k >= 0 && k < 3) lastPumpUseMs[k] = millis();
-          pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
+          // Distinguish "ESP2 never confirmed receipt" (NOACK) from "acked but never finished" (NODONE).
+          logEvent("ESP1", "ACT", String("EXERCISE|") + (pendingExercise.acked ? "NODONE|" : "NOACK|") + (k >= 0 ? EX_NAME[k] : "?"));
+          pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false; pendingExercise.acked = false;
           esp2SetPower(false); setState(IDLE_STATE);
         }
       }
@@ -3160,10 +3188,13 @@ bool decideFertigate(int c) {
     return false;
   }
   float n = sensor.npk[c][4], p = sensor.npk[c][5], k = sensor.npk[c][6];
-  if ((col[c].targetN - n) >= fertGap) return true;
-  if ((col[c].targetP - p) >= fertGap) return true;
-  if ((col[c].targetK - k) >= fertGap) return true;
-  return false;
+  float gapN = col[c].targetN - n, gapP = col[c].targetP - p, gapK = col[c].targetK - k;
+  bool fert = (gapN >= fertGap) || (gapP >= fertGap) || (gapK >= fertGap);
+  // Log the affirmative decision with the per-nutrient gaps so every fertigation choice is traceable
+  // (the DOWNGRADE path above logs the other branch). Low-frequency: only at the start of a serviced run.
+  logEvent("ESP1", "CTRL", String("COL_") + COL_TAG[c] + "|FERT_DECIDE|fert=" + String(fert ? 1 : 0) +
+           "|gapN=" + String(gapN, 1) + "|gapP=" + String(gapP, 1) + "|gapK=" + String(gapK, 1));
+  return fert;
 }
 
 /* =============================================================================
@@ -3209,13 +3240,18 @@ void healthTick() {
   for (int c = 0; c < NUM_COLUMNS; c++) {
     if (!COLUMN_ENABLED[c]) continue;
     int v = sensor.npkValid[c] ? 1 : 0;
-    if (v != npkPrev[c]) { npkPrev[c] = v; logEvent("ESP1", "SENSOR", String("NPK_") + COL_TAG[c] + "|" + (v ? "OK" : "FAIL")); }
+    if (v != npkPrev[c]) { npkPrev[c] = v; logEvent("ESP1", "SENSOR", String("NPK_") + COL_TAG[c] + "|" + (v ? String("OK") : ("FAIL|reason=" + sensor.npkReason[c]))); }
   }
 
   // Periodic snapshot every 5 min: one greppable line with every module state.
   if (millis() - lastSnapMs >= 300000) {
     lastSnapMs = millis();
-    String s  = "GSM:" + String(netRegistered ? "reg" : "no");
+    // Bounded (every 5 min) GSM link telemetry: raw CSQ rssi (0-31, 99=unknown), raw CREG stat
+    // (2=searching, 3=denied -- not just the reg bool), SIM state. Mirrors the WIFI|UP|rssi pattern so
+    // "GSM failing" can be told apart from "no signal" / "not registered" in the logs.
+    logEvent("ESP1", "NET", "GSM|rssi=" + String(lastRssi) + "|creg=" + String(lastCreg) +
+                            "|cpin=" + String(simReady ? "READY" : "NOTREADY"));
+    String s  = "GSM:" + String(netRegistered ? "reg" : "no") + "(rssi=" + String(lastRssi) + ")";
     s += "|WIFI:" + String(!wifiEnabled ? "off" : wifiConnected ? "up" : "dn");
     s += "|RTC:" + String(rtcOk ? "ok" : "x") + "|SD:" + String(sdOk ? "ok" : "x");
     s += "|NANO:" + String((sensor.lastNanoMs && millis() - sensor.lastNanoMs < NANO_LINK_STALE_MS) ? "ok" : "stale");
