@@ -1101,7 +1101,7 @@ void setup() {
 
   // ---- sensor snapshot defaults (invalid until first packet) ----
   sensor.envValid = sensor.tankValid = sensor.lightValid = false;
-  for (int i = 0; i < NUM_COLUMNS; i++) { sensor.soil[i] = -1; sensor.npkValid[i] = false; }
+  for (int i = 0; i < NUM_COLUMNS; i++) { sensor.soil[i] = -1; sensor.npkValid[i] = false; sensor.npkReason[i] = "INIT"; }
   sensor.lastNanoMs = millis();
   lastEsp2Ms = millis();
   lastPumpUseMs[0] = lastPumpUseMs[1] = lastPumpUseMs[2] = millis();   // exercise clock starts at boot
@@ -2335,10 +2335,12 @@ void gsmFeedInbound(char c) {
       simReady = (line.indexOf("READY") >= 0);
     } else if (line.startsWith("+CMGS:")) {          // send ACCEPTED by the network -> message reference
       gtxResultSeen = true;
-      logEvent("GSM", "GSM", "TX_OK|" + line.substring(6));
+      String ref = line.substring(6); ref.trim();    // strip the space after the colon
+      logEvent("GSM", "GSM", "TX_OK|" + ref);
     } else if (line.startsWith("+CMS ERROR:")) {     // send REJECTED -> numeric code (no credit / no reg / bad recipient)
       gtxResultSeen = true;
-      logEvent("GSM", "GSM", "TX_ERR|" + line.substring(11));
+      String code = line.substring(11); code.trim();
+      logEvent("GSM", "GSM", "TX_ERR|" + code);
     } else if (line == "ERROR" && gtx == GTX_BODY_SETTLE) {   // bare ERROR during a send = rejection w/o a code
       gtxResultSeen = true;
       logEvent("GSM", "GSM", "TX_ERR|GENERIC");

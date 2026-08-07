@@ -941,12 +941,19 @@ void finishOk() {
 // user-gated RESUME,<mode>. ESP2 does NOT power itself off -- that would forget the water and
 // overfill on resume; ESP1 keeps it powered while held.
 void holdFault(const char *resp, const char *loc) {
+  bool isFlow = (strcmp(resp, "FLOW_FAIL") == 0);
+  unsigned long fp = 0;
+  if (isFlow) { noInterrupts(); fp = flowPulses; interrupts(); }   // snapshot pulses seen this stage BEFORE detach
   stageEnd();                        // pump off + flow detached (partial liters already credited by caller)
   stopAll();                         // all OFF, master cutoff de-energized
   faultHeld = true;
   stepInit  = false;                 // on RESUME the paused step re-inits with the updated tank volume
-  lastHoldFlow = (strcmp(resp, "FLOW_FAIL") == 0);   // a dead flow sensor enables timed IRRIGATE/RELEASE recovery
-  reply(String(resp) + "," + loc);
+  lastHoldFlow = isFlow;             // a dead flow sensor enables timed IRRIGATE/RELEASE recovery
+  // For FLOW_FAIL, append the pulse count: pulses=0 means the pump/sensor produced NOTHING (dead pump,
+  // dead sensor, or no water); pulses>0 means flow started then stalled (air, weak pump, sensor half in
+  // path). That single number tells the field team which hardware to inspect (diagnostic C-3).
+  if (isFlow) reply(String(resp) + "," + loc + "|pulses=" + String(fp));
+  else        reply(String(resp) + "," + loc);
 }
 
 // User-gated recovery (sec.19.4.8.2). NORMAL resumes the paused step; IRRIGATE finishes as
