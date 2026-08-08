@@ -39,7 +39,8 @@
 #include <esp_task_wdt.h>
 #include <WiFi.h>                // built-in ESP32 WiFi (telemetry uplink, Part A)
 #include <HTTPClient.h>          // ThingSpeak HTTP upload + Supabase CSV upload
-#include <WiFiClientSecure.h>    // TLS client for the Supabase Storage HTTPS upload
+#include <WiFiClientSecure.h>    // TLS client for the Supabase Storage + Firebase RTDB HTTPS uploads
+#include <ArduinoJson.h>         // Firebase live-snapshot JSON payload
 #include <WebServer.h>           // SoftAP provisioning portal (WiFi setup form)
 #include <DNSServer.h>           // captive-portal DNS for the provisioning AP
 
@@ -525,6 +526,38 @@ const unsigned long TS_UPLOAD_ACTIVE_MS = 20000;   // faster during ACTIVE_STATE
 const unsigned long WIFI_RETRY_MS       = 15000;   // reconnect backoff
 const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
 
+/* ---- Firebase Realtime Database bridge (live dashboard snapshot) ---------- *
+ * Phase 1 of Web_Dashboard_Firebase_Plan.md: ESP32 #1 PUTs the latest verified
+ * snapshot to <db>/irrigation/live.json so the website can render "now". PUT
+ * replaces the node, so RTDB storage stays flat (~1 KB) no matter how long it runs.
+ * History is NOT duplicated here -- ThingSpeak keeps the graphs and Supabase keeps
+ * the daily CSV archive. The three are complementary, not redundant.
+ *
+ * Remote COMMANDS are deliberately not executed here: ESP32 #1 stays the single
+ * decision-making authority, and STOP/RELEASE/IRRIGATE/NORMAL stay SMS/LCD-only.
+ *
+ * SECURITY (commissioning posture, matches the Supabase TLS stance below):
+ *   - RTDB is in TEST MODE and this PUT carries NO auth token, so anyone with the
+ *     URL can read/overwrite /irrigation/live. Acceptable for bench work ONLY.
+ *   - Before deployment: lock the rules to a device UID and sign in as a device
+ *     account (ID token, ~55 min refresh) -- see the plan doc. fbBuildUrl() is the
+ *     single seam where the "?auth=<token>" query gets added.                     */
+const unsigned long FIREBASE_UPLOAD_IDLE_MS   = 60000;  // ~1 min dashboard refresh when idle
+const unsigned long FIREBASE_UPLOAD_ACTIVE_MS = 20000;  // faster during ACTIVE_STATE
+// Skip an upload below this much free heap: an mbedTLS session needs ~40-50 KB and a
+// failed alloc mid-handshake is far worse than a skipped dashboard tick.
+const uint32_t FIREBASE_MIN_HEAP = 60000;
+// URL is NVS-backed (SoftAP admin form / FBASE SMS) -- never hardcoded in tracked source,
+// same rule as the Supabase creds. Empty URL or firebaseEnabled=false disables the feature.
+String   fbUrl = "";                               // e.g. "https://<ref>-default-rtdb.<region>.firebasedatabase.app"
+bool     firebaseEnabled = true;                   // master switch (NVS "fben")
+volatile bool fbPersistPending = false;            // core0 admin form -> core1: persist fbUrl/firebaseEnabled
+volatile bool fbLastOk = false;                    // last PUT result (diagnostics page)
+volatile unsigned long fbLastUploadMs = 0;         // cadence gate + "last seen" age
+volatile uint32_t fbLastHeap = 0;                  // free heap observed at the last attempt
+volatile int  fbLastHttp = 0;                      // last HTTP status (0 = never attempted / skipped)
+volatile uint32_t fbAttempts = 0, fbFailures = 0;  // lifetime counters (logged on transition)
+
 // Creds/keys live in RAM (loaded from NVS); guarded by netMux between the two cores.
 String wifiSsid = "", wifiPass = "";
 String tsKey1 = "", tsKey2 = "", tsKey3 = "";      // ThingSpeak write keys (ch1 cols, ch2 system, ch3 EC/pH)
@@ -609,6 +642,11 @@ struct TelemetrySnapshot {
   float npkEC[NUM_COLUMNS], npkPH[NUM_COLUMNS];
   bool  npkValid[NUM_COLUMNS];
   float battV, battP;
+  // Validity/state mirrored here so the core-0 uploaders never touch core-1's `sensor`/`wo`/`sysState`
+  // directly (a torn read there publishes e.g. tankValid against a half-updated level).
+  bool  envValid, tankValid, lightValid, inaValid;
+  SystemState state;
+  bool  woActive;
   bool  valid;
 };
 TelemetrySnapshot telem = {};
@@ -989,6 +1027,7 @@ void saveAdminPin();
 void saveWifi();
 void saveTsKey();
 void saveSupa();
+void saveFb();
 void saveSupaLast();
 bool supaUploadFile(const char *path, const char *objName);
 void uploadTick();
@@ -996,6 +1035,8 @@ static bool sdTake(uint32_t ms);
 static void sdGive();
 void telemetryCollect();
 void netTask(void *pv);
+static bool firebaseUploadLive();
+void firebaseLogTick();
 static bool senderIsOwner();
 
 void raiseFault(char tier, const char *code, const char *loc);
@@ -1113,7 +1154,9 @@ void setup() {
   // Started after NVS load so creds are ready. Runs network I/O off the core-1 loop.
   netMux = xSemaphoreCreateMutex();
   sdMux  = xSemaphoreCreateMutex();          // serialize SD across cores (must exist before netTask/logFlush)
-  xTaskCreatePinnedToCore(netTask, "netTask", 20480, NULL, 1, &netTaskHandle, 0);  // +stack for WebServer/scan/SD stream (portal)
+  // 28 KB: WebServer/scan/SD stream (portal) + mbedTLS handshake frames. Two TLS consumers now share
+  // this task (Supabase daily CSV, Firebase every ~60 s) -- they serialize, but the deepest frame wins.
+  xTaskCreatePinnedToCore(netTask, "netTask", 28672, NULL, 1, &netTaskHandle, 0);
 
   wdtSetup();                               // arm task watchdog (core-1 loop only)
   setState(STARTUP_SYNC);
@@ -1156,6 +1199,7 @@ void loop() {
   g_lastStage = 'Z'; rtcDeadRebootTick();  // dead-RTC (all-zero timestamp): daily idle-only reboot to recover
   g_lastStage = 'R'; runUiTick();          // run receipts: unattended auto-continue past PRE/POST/ERR
   g_lastStage = 'X'; uploadTick();         // Supabase CSV push scheduling (rollover + reconnect catch-up)
+  g_lastStage = 'F'; firebaseLogTick();    // Firebase health: log ok<->fail transitions (core-0 does the PUT)
   // Apply a config SMS that was deferred during a local edit, once the edit has closed (§B.3.1).
   if (pendingCfgSms.length() && uiMode != UI_EDIT && !editConfirm) {
     String s = pendingCfgSms; pendingCfgSms = ""; handleSms(s);
@@ -1178,6 +1222,8 @@ void loop() {
   if (tsKeyPersistPending) { tsKeyPersistPending = false; saveTsKey(); logEvent("ESP1", "CFG", "TSKEY|PORTAL"); }
   // Persist Supabase URL+key set by the SoftAP admin form (already updated under netMux). Never logs the key.
   if (supaPersistPending) { supaPersistPending = false; saveSupa(); logEvent("ESP1", "CFG", "SUPA|PORTAL"); }
+  // Persist Firebase URL + enable flag set by the SoftAP admin form (already updated under netMux).
+  if (fbPersistPending) { fbPersistPending = false; saveFb(); logEvent("ESP1", "CFG", "FBASE|PORTAL"); }
   // Manual reboot requested (Settings > Reboot or the SoftAP button). Always run on core 1 so logs flush
   // cleanly (config persists in NVS; ESP2 keeps executing any in-flight run and re-syncs on our return).
   if (rebootPending) {
@@ -1316,6 +1362,8 @@ void loadConfig() {
   supaUrl  = prefs.getString("supaurl", "");        // Supabase project URL + service_role key (NVS-only)
   supaKey  = prefs.getString("supakey", "");
   supaLast = prefs.getLong("supalast", 0);          // last day (yyyymmdd) successfully uploaded
+  fbUrl    = prefs.getString("fburl", "");          // Firebase RTDB base URL (NVS-only, like the Supabase creds)
+  firebaseEnabled = prefs.getBool("fben", true);    // master switch; URL still has to be set for it to run
 }
 /* =============================================================================
  *  CALIBRATION NVS + DISTRIBUTION  (companion spec §A.5.1)
@@ -1392,6 +1440,12 @@ void saveSupaLast() { prefs.putLong("supalast", supaLast); }      // last upload
 void saveSupa() {
   String u, k; xSemaphoreTake(netMux, portMAX_DELAY); u = supaUrl; k = supaKey; xSemaphoreGive(netMux);
   prefs.putString("supaurl", u); prefs.putString("supakey", k);
+}
+// Firebase RTDB URL + enable flag under netMux (the core-0 admin form may write them), NVS write from locals.
+void saveFb() {
+  String u; bool en;
+  xSemaphoreTake(netMux, portMAX_DELAY); u = fbUrl; en = firebaseEnabled; xSemaphoreGive(netMux);
+  prefs.putString("fburl", u); prefs.putBool("fben", en);
 }
 // Copy the cred Strings under netMux (the core-0 portal may write them), then write NVS from the locals
 // so the putString can't torn-read a String mid-write.
@@ -2424,6 +2478,32 @@ void handleSms(const String &body) {
     saveSupa();
     logEvent("ESP1", "CFG", "SUPA|SET");                 // note: NO url/key in the log
     sendSMS("ACK,SUPA,SET");
+    return;
+  }
+  // FBASE,<rtdbUrl>  -- set the Firebase RTDB base URL (raw body, not U: the URL is case-sensitive).
+  // FBASE,CLEAR wipes it; FBASE,ON / FBASE,OFF toggle without touching the URL. NVS only, owner-gated.
+  if (U.startsWith("FBASE")) {
+    int c1 = b.indexOf(',');
+    String rest = (c1 >= 0) ? b.substring(c1 + 1) : "";
+    rest.trim();
+    if (rest.equalsIgnoreCase("CLEAR")) {
+      xSemaphoreTake(netMux, portMAX_DELAY); fbUrl = ""; xSemaphoreGive(netMux);
+      saveFb(); sendSMS("ACK,FBASE,CLEAR"); return;
+    }
+    if (rest.equalsIgnoreCase("ON") || rest.equalsIgnoreCase("OFF")) {
+      bool en = rest.equalsIgnoreCase("ON");
+      xSemaphoreTake(netMux, portMAX_DELAY); firebaseEnabled = en; xSemaphoreGive(netMux);
+      saveFb();
+      logEvent("ESP1", "CFG", String("FBASE|") + (en ? "ON" : "OFF"));
+      sendSMS(en ? "ACK,FBASE,ON" : "ACK,FBASE,OFF");
+      return;
+    }
+    String u = supaNormalizeUrl(rest);                   // same origin-only reduction as SUPA
+    if (!u.startsWith("http")) { sendSMS("ERR,FBASE,FORMAT"); return; }
+    xSemaphoreTake(netMux, portMAX_DELAY); fbUrl = u; firebaseEnabled = true; xSemaphoreGive(netMux);
+    saveFb();
+    logEvent("ESP1", "CFG", "FBASE|SET");                // note: NO url in the log
+    sendSMS("ACK,FBASE,SET");
     return;
   }
   // UPLOAD             -> queue yesterday's CSV.  UPLOAD,YYYYMMDD -> queue that specific day.
@@ -3568,6 +3648,10 @@ void telemetryCollect() {
     telem.npkEC[c] = sensor.npk[c][2]; telem.npkPH[c] = sensor.npk[c][3];
   }
   telem.battV = battV; telem.battP = battP;
+  // Mirror the per-group validity + coarse system state so core-0 uploaders read only from the snapshot.
+  telem.envValid = sensor.envValid; telem.tankValid = sensor.tankValid; telem.lightValid = sensor.lightValid;
+  telem.inaValid = inaOk;
+  telem.state = sysState; telem.woActive = wo.active;
   telem.valid = true;
   portEXIT_CRITICAL(&telemMux);
 }
@@ -3632,6 +3716,110 @@ static void tsUpload() {
     ok = tsGet(url) || ok;
   }
   lastTsOk = ok; lastTsUploadMs = millis();
+}
+
+/* =============================================================================
+ *  FIREBASE RTDB LIVE SNAPSHOT  (core 0 / netTask)
+ *  PUT <fbUrl>/irrigation/live.json -- replaces the node, so storage stays flat.
+ * ========================================================================== */
+// Single seam for the RTDB path + (future) auth. When the test-mode rules are replaced by a device
+// account, append "?auth=" + idToken here and nothing else in this file needs to change.
+static String fbBuildUrl(const String &base) {
+  return base + "/irrigation/live.json";
+}
+
+// Core 0: publish the latest verified snapshot. Reads ONLY from the telem snapshot (never core-1's
+// `sensor`/`wo`/`sysState`) so the dashboard can't show a torn mix of old and new readings.
+static bool firebaseUploadLive() {
+  // Stamp the attempt FIRST, unconditionally: every early return below still consumes this tick.
+  // Stamping only on success would leave the netTask cadence gate permanently open and retry the
+  // whole path every 500 ms loop iteration (worst at boot, before the first telemetryCollect()).
+  fbLastUploadMs = millis();
+
+  String base;
+  bool enabled;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
+  if (!enabled || base.length() < 8) { fbLastOk = false; return false; }
+
+  TelemetrySnapshot t;
+  portENTER_CRITICAL(&telemMux); t = telem; portEXIT_CRITICAL(&telemMux);
+  if (!t.valid || WiFi.status() != WL_CONNECTED) { fbLastOk = false; return false; }
+
+  // An mbedTLS session needs ~40-50 KB. Skipping a dashboard tick is much cheaper than a failed
+  // alloc mid-handshake, and fbLastHeap makes the long-run fragmentation trend visible on PAGE_GSM.
+  uint32_t heap = ESP.getFreeHeap();
+  fbLastHeap = heap;
+  if (heap < FIREBASE_MIN_HEAP) { fbLastOk = false; return false; }
+
+  // 1536 B covers all NUM_COLUMNS zones with headroom. Overflow is CHECKED below, not assumed: an
+  // over-capacity document serializes silently truncated, which would PUT malformed JSON.
+  StaticJsonDocument<1536> doc;
+  JsonObject meta = doc.createNestedObject("meta");
+  meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
+  meta["deviceOnline"] = true;
+
+  JsonObject system = doc.createNestedObject("system");
+  system["state"] = stateName(t.state);
+  system["masterWorkOrderActive"] = t.woActive;
+
+  JsonObject sensors = doc.createNestedObject("sensors");
+  if (t.tankValid)  { sensors["reservoirLevel"] = t.resLevel; sensors["mixingLevel"] = t.mixLevel; sensors["flowRate"] = t.flow; }
+  if (t.envValid)   { sensors["temperature"] = t.temp; sensors["humidity"] = t.hum; }
+  if (t.lightValid) sensors["lightLevel"] = t.lux;
+  if (t.inaValid)   sensors["batteryVoltage"] = t.battV;
+
+  JsonObject zones = sensors.createNestedObject("zones");
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    if (!COLUMN_ENABLED[c]) continue;
+    JsonObject z = zones.createNestedObject(String(COL_TAG[c]));
+    if (t.soil[c] >= 0) z["moisture"] = t.soil[c];
+    if (t.npkValid[c]) {
+      z["nitrogen"] = t.npkN[c]; z["phosphorus"] = t.npkP[c]; z["potassium"] = t.npkK[c];
+      z["ec"] = t.npkEC[c]; z["ph"] = t.npkPH[c];
+    }
+  }
+
+  // Past every skip condition -- this tick is a real attempt, so count it before anything that can fail.
+  fbAttempts++;
+  if (doc.overflowed()) { fbLastOk = false; fbLastHttp = -100; fbFailures++; return false; }  // never PUT truncated JSON
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClientSecure client;
+  client.setInsecure();                                    // encrypted; no cert pinning (thesis) [HARDENING TODO]
+  HTTPClient http;
+  http.setConnectTimeout(6000); http.setTimeout(6000);
+  if (!http.begin(client, fbBuildUrl(base))) { fbLastOk = false; fbLastHttp = 0; fbFailures++; return false; }
+  http.addHeader("Content-Type", "application/json");
+  int code = http.PUT(payload);
+  http.end();
+  fbLastHttp = code;
+  fbLastOk = (code >= 200 && code < 300);
+  if (!fbLastOk) fbFailures++;
+  return fbLastOk;
+}
+
+// Core 1: publish Firebase health to the SD log. Logs only on an ok<->fail TRANSITION (same
+// log-on-change discipline as the battery PWR logs) -- a per-upload line would be ~1440 rows/day.
+// Carries free heap and netTask stack headroom, which is how the long-run TLS fragmentation risk
+// (a fresh mbedTLS session every ~60 s) becomes visible in the CSV instead of only on the LCD.
+void firebaseLogTick() {
+  static int  lastState = -1;                       // -1 unknown, 0 fail, 1 ok
+  static unsigned long lastSeenUploadMs = 0;
+  if (fbLastUploadMs == lastSeenUploadMs) return;   // no new attempt since the last check
+  lastSeenUploadMs = fbLastUploadMs;
+  // netMux: the core-0 admin form may be rewriting these while this core-1 tick reads them.
+  // Unconfigured/disabled is not a failure -- don't log a FAIL line for a feature that is simply off.
+  bool configured;
+  xSemaphoreTake(netMux, portMAX_DELAY); configured = (firebaseEnabled && fbUrl.length() >= 8); xSemaphoreGive(netMux);
+  if (!configured) { lastState = -1; return; }      // re-arm so the first real result still logs
+  int now = fbLastOk ? 1 : 0;
+  if (now == lastState) return;
+  lastState = now;
+  uint32_t stackFree = netTaskHandle ? uxTaskGetStackHighWaterMark(netTaskHandle) : 0;
+  logEvent("ESP1", "FBASE", String(now ? "OK" : "FAIL") + "|http=" + String(fbLastHttp) +
+                            "|heap=" + String(fbLastHeap) + "|netstk=" + String(stackFree) +
+                            "|n=" + String(fbAttempts) + "|fail=" + String(fbFailures));
 }
 
 /* =============================================================================
@@ -3870,6 +4058,13 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
   o += "<form method=POST action=/upload>"
        "<p>Push yesterday's CSV to cloud storage" + String(supaUrl.length() ? "" : " (set the URL + key above first)") + ".</p>"
        "<p><button type=submit style='width:100%;padding:10px'>Upload logs now</button></p></form>";
+  o += "<h3>Firebase live dashboard</h3><form method=POST action=/fbase>"
+       "<p>RTDB URL<br><input name=url style='width:100%' placeholder='https://<ref>-default-rtdb.<region>.firebasedatabase.app' value='" + htmlEscape(fbUrl) + "'></p>"
+       "<p><label><input type=checkbox name=en value=yes" + String(firebaseEnabled ? " checked" : "") + "> Enabled (publishes a live snapshot every ~60 s)</label></p>"
+       "<p>Last upload: " + String(fbUrl.length() == 0 ? "not configured"
+                                   : (fbLastUploadMs == 0 ? "none yet"
+                                      : String((millis() - fbLastUploadMs) / 1000) + " s ago, " + (fbLastOk ? "OK" : "FAILED"))) + "</p>"
+       "<p><button type=submit style='width:100%;padding:10px'>Save Firebase settings</button></p></form>";
   o += "<h3 style='color:#c33'>Reboot</h3><form method=POST action=/reboot "
        "onsubmit=\"return confirm('Reboot the controller now?')\">"
        "<p><label><input type=checkbox name=confirm value=yes> Yes, reboot ESP1 (config kept).</label></p>"
@@ -3985,6 +4180,27 @@ static void portalHandleReboot() {                            // POST /reboot --
 static void portalCfgReply(const String &cmd, const String &okMsg) {
   portalServer.send(200, "text/html", portalAdminHtml(portalCfgEnq(cmd) ? okMsg : "Busy, retry."));
 }
+static void portalHandleFbase() {                             // POST /fbase -- set Firebase RTDB URL + enable
+  if (!portalRequireAdmin()) return;
+  String url = portalServer.arg("url"); url.trim();
+  bool   en  = (portalServer.arg("en") == "yes");             // unchecked box = arg absent = disabled
+  if (url.equalsIgnoreCase("CLEAR")) {
+    xSemaphoreTake(netMux, portMAX_DELAY); fbUrl = ""; xSemaphoreGive(netMux);
+    fbPersistPending = true;
+    portalServer.send(200, "text/html", portalAdminHtml("Firebase URL cleared (feature off)."));
+    return;
+  }
+  if (url.length()) {
+    url = supaNormalizeUrl(url);                              // same origin-only reduction as the Supabase form
+    if (!url.startsWith("http")) {
+      portalServer.send(200, "text/html", portalAdminHtml("URL must start with https://")); return;
+    }
+  }
+  // Set directly under netMux (like the WiFi/TSKEY/SUPA creds); core-1 loop persists to NVS (fbPersistPending).
+  xSemaphoreTake(netMux, portMAX_DELAY); fbUrl = url; firebaseEnabled = en; xSemaphoreGive(netMux);
+  fbPersistPending = true;
+  portalServer.send(200, "text/html", portalAdminHtml(String("Firebase settings saved (") + (en ? "enabled" : "disabled") + ")."));
+}
 static void portalHandleSupa() {                              // POST /supa -- set Supabase URL + service key
   if (!portalRequireAdmin()) return;
   String url = portalServer.arg("url"); url.trim();
@@ -4083,6 +4299,7 @@ static void portalStart() {
     portalServer.on("/reboot", HTTP_POST, portalHandleReboot); // software-reset ESP1
     portalServer.on("/upload", HTTP_POST, portalHandleUpload); // queue a Supabase CSV push
     portalServer.on("/supa", HTTP_POST, portalHandleSupa);     // set Supabase URL + service key (NVS)
+    portalServer.on("/fbase", HTTP_POST, portalHandleFbase);   // set Firebase RTDB URL + enable flag (NVS)
     portalServer.on("/tskey", HTTP_POST, portalHandleTskey);   // config forms (staged -> core-1 handleSms)
     portalServer.on("/colmode", HTTP_POST, portalHandleColMode);
     portalServer.on("/colname", HTTP_POST, portalHandleColName);
@@ -4160,6 +4377,13 @@ void netTask(void *pv) {
 
     unsigned long interval = (sysState == ACTIVE_STATE) ? TS_UPLOAD_ACTIVE_MS : TS_UPLOAD_IDLE_MS;
     if (millis() - lastUpload >= interval) { lastUpload = millis(); tsUpload(); }
+
+    // Firebase live snapshot for the web dashboard. Same core-0 cadence discipline as tsUpload above:
+    // it may block on the network, but never touches the core-1 control loop. Additive -- ThingSpeak
+    // (graphs) and the Supabase daily CSV (archive) are unaffected and all three serialize here, so
+    // only one TLS session is ever open at a time.
+    unsigned long fbInterval = (sysState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
+    if (millis() - fbLastUploadMs >= fbInterval) firebaseUploadLive();
 
     // Supabase CSV push: core 1 sets uploadReqStamp; do one attempt here and publish the result.
     if (uploadReqStamp != 0 && !uploadBusy) {
@@ -5405,9 +5629,17 @@ void lcdTick() {
       else if (wifiConnected) snprintf(l, 21, "WiFi:OK %ddBm", wifiRssiVal);
       else                    snprintf(l, 21, "WiFi:DOWN");
       lcdRow(2, l);
-      snprintf(l, 21, "TS:%s %lus ago", lastTsOk ? "ok" : "--",
-               lastTsUploadMs ? (millis() - lastTsUploadMs) / 1000 : 0);
-      lcdRow(3, l);
+      {
+        // Row 3 carries both uplinks: ThingSpeak (graphs) and Firebase (live dashboard). Ages are
+        // clamped to 999 s so a long outage can't overflow the 20-char row.
+        unsigned long tsAge = lastTsUploadMs ? (millis() - lastTsUploadMs) / 1000 : 0;
+        unsigned long fbAge = fbLastUploadMs ? (millis() - fbLastUploadMs) / 1000 : 0;
+        if (tsAge > 999) tsAge = 999;
+        if (fbAge > 999) fbAge = 999;
+        const char *fbTag = (fbUrl.length() == 0 || !firebaseEnabled) ? "--" : (fbLastOk ? "ok" : "!!");
+        snprintf(l, 21, "TS:%s%3lus FB:%s%3lus", lastTsOk ? "ok" : "--", tsAge, fbTag, fbAge);
+        lcdRow(3, l);
+      }
       break;
     default: // PAGE_FAULT  (doubles as the E-stop / fault-hold recovery prompt)
       if (esp2Held) {
