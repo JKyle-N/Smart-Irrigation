@@ -573,6 +573,11 @@ volatile uint32_t fbAttempts = 0, fbFailures = 0;  // lifetime counters (logged 
  * erased. All NVS-backed, all netMux-guarded, never logged.                          */
 String   fbEmail = "", fbPassword = "", fbApiKey = "", fbRefresh = "";
 String   fbIdToken = "";                           // RAM only -- short-lived, never persisted
+String   fbUid = "";                               // localId from the sign-in: THIS is what RTDB rules
+                                                   // match as auth.uid. Shown in the portal so you can
+                                                   // paste it into the rules; the firmware never needs it.
+String   fbAuthErr = "";                           // Google's reason string on the last failure (not a secret)
+bool     fbPinCa = true;                           // validate the server cert against FB_ROOT_CA (NVS "fbpin")
 unsigned long fbTokenExpiryMs = 0;                 // millis() deadline for the current ID token
 volatile bool fbAuthOk = false;                    // last token operation succeeded (diagnostics)
 volatile int  fbAuthHttp = 0;                      // last auth HTTP status
@@ -1116,6 +1121,7 @@ void firebaseCommandTick();
 void firebaseQueueStatus(const char *id, const char *status, const char *detail);
 void firebaseRemoteExerciseDone(const char *status, const char *detail);
 void saveFbAuth();
+static void fbResetTls();
 static bool senderIsOwner();
 
 void raiseFault(char tier, const char *code, const char *loc);
@@ -1456,6 +1462,7 @@ void loadConfig() {
   fbPassword = prefs.getString("fbpass", "");       // wiped once a refresh token exists
   fbApiKey   = prefs.getString("fbkey",  "");       // Firebase Web API key
   fbRefresh  = prefs.getString("fbref",  "");       // long-lived; this is what keeps us signed in
+  fbPinCa    = prefs.getBool("fbpin", true);        // cert validation on by default
 }
 /* =============================================================================
  *  CALIBRATION NVS + DISTRIBUTION  (companion spec §A.5.1)
@@ -1549,6 +1556,7 @@ void saveFbAuth() {
   xSemaphoreGive(netMux);
   prefs.putString("fbmail", e); prefs.putString("fbpass", p);
   prefs.putString("fbkey",  k); prefs.putString("fbref",  r);
+  prefs.putBool("fbpin", fbPinCa);
 }
 // Copy the cred Strings under netMux (the core-0 portal may write them), then write NVS from the locals
 // so the putString can't torn-read a String mid-write.
@@ -2610,10 +2618,41 @@ void handleSms(const String &body) {
       xSemaphoreTake(netMux, portMAX_DELAY);
       fbPassword = ""; fbRefresh = ""; fbIdToken = "";
       xSemaphoreGive(netMux);
-      fbTokenExpiryMs = 0; fbAuthOk = false;
+      fbTokenExpiryMs = 0; fbAuthOk = false; fbUid = ""; fbAuthErr = "";
       saveFbAuth();
       logEvent("ESP1", "CFG", "FBASE|SIGNOUT");
       sendSMS("ACK,FBASE,SIGNOUT");
+      return;
+    }
+    // FBASE,STATUS -- why is it not connecting? Reports the blocking precondition, the last
+    // Google error, and the UID. Safe to send: no secret is ever echoed.
+    if (rest.equalsIgnoreCase("STATUS")) {
+      String m = "FB,";
+      m += fbAuthOk ? "SIGNEDIN" : "NOAUTH";
+      m += ",http=" + String(fbAuthHttp);
+      if (!firebaseEnabled)                                 m += ",OFF";
+      else if (fbApiKey.length() < 8)                       m += ",NOKEY";
+      else if (!fbEmail.length())                           m += ",NOMAIL";
+      else if (!fbRefresh.length() && !fbPassword.length()) m += ",NOPASS";
+      else if (!wifiConnected)                              m += ",NOWIFI";
+      else if (fbUrl.length() < 8)                          m += ",NOURL";
+      m += fbPinCa ? ",TLS=pin" : ",TLS=insecure";
+      if (fbUid.length())     m += ",uid=" + fbUid;
+      if (fbAuthErr.length()) m += "," + fbAuthErr.substring(0, 60);
+      sendSMS(m);
+      return;
+    }
+    // FBASE,TLS,ON|OFF -- toggle certificate validation. OFF is a DIAGNOSTIC: if sign-in only
+    // works with it off, the CA pin is the problem, not your credentials. Put it back on.
+    if (rest.startsWith("TLS,") || rest.startsWith("tls,")) {
+      String v = rest.substring(4); v.trim();
+      if (!v.equalsIgnoreCase("ON") && !v.equalsIgnoreCase("OFF")) { sendSMS("ERR,FBASE,FORMAT"); return; }
+      xSemaphoreTake(netMux, portMAX_DELAY); fbPinCa = v.equalsIgnoreCase("ON"); xSemaphoreGive(netMux);
+      fbResetTls();
+      fbSignInPending = true; fbAuthFails = 0; fbAuthNextTryMs = 0;
+      saveFbAuth();
+      logEvent("ESP1", "CFG", String("FBASE|TLS|") + (fbPinCa ? "PIN" : "INSECURE"));
+      sendSMS(fbPinCa ? "ACK,FBASE,TLS,ON" : "ACK,FBASE,TLS,OFF");
       return;
     }
     // FBASE,APIKEY,<webApiKey>
@@ -3887,10 +3926,17 @@ bool             fbTlsReady = false;                // TLS options applied once
 // and say so, rather than silently pretending the connection is verified.
 static void fbApplyTls() {
   if (fbTlsReady) return;
-  if (FB_ROOT_CA[0]) fbClient.setCACert(FB_ROOT_CA);
-  else               fbClient.setInsecure();        // [HARDENING TODO] no cert validation
+  if (fbPinCa && FB_ROOT_CA[0]) fbClient.setCACert(FB_ROOT_CA);
+  else                          fbClient.setInsecure();   // [HARDENING TODO] no cert validation
   fbHttp.setReuse(true);                            // <-- the whole point: keep the socket alive
   fbTlsReady = true;
+}
+// Force the next request to re-apply the trust policy (and drop any open socket), so toggling
+// pinning takes effect immediately instead of at the next reboot.
+static void fbResetTls() {
+  fbHttp.end();
+  fbClient.stop();
+  fbTlsReady = false;
 }
 
 // Every Firebase HTTP call goes through here so the handshake counter and timeouts stay honest.
@@ -3915,6 +3961,36 @@ static String fbBuildUrl(const String &base, const char *path) {
  * Once a refresh token exists the password is dead weight and can be wiped, so a stolen
  * device yields a revocable token instead of reusable account credentials.               */
 
+// Turn a failed auth response into something a human can act on. Google returns
+// {"error":{"message":"REASON"}}; the bare HTTP number alone is not diagnosable.
+// A negative code is an HTTPClient transport error (no TLS/TCP), not an API rejection.
+static void fbNoteAuthError(int code, const String &resp) {
+  String reason;
+  if (code < 0) {
+    reason = "transport error (TLS/TCP) code " + String(code);
+  } else {
+    StaticJsonDocument<512> e;
+    if (!deserializeJson(e, resp)) reason = String(e["error"]["message"] | "");
+    if (!reason.length()) reason = "HTTP " + String(code);
+  }
+  // The handful of reasons that actually happen, translated into the fix.
+  String hint;
+  if      (reason.startsWith("OPERATION_NOT_ALLOWED"))   hint = " -> enable Email/Password in Firebase Console > Authentication > Sign-in method";
+  else if (reason.startsWith("EMAIL_NOT_FOUND"))         hint = " -> that user does not exist in THIS project; create it under Authentication > Users";
+  else if (reason.startsWith("INVALID_LOGIN_CREDENTIALS")
+        || reason.startsWith("INVALID_PASSWORD"))        hint = " -> wrong password (or wrong project's API key)";
+  else if (reason.startsWith("API_KEY_INVALID")
+        || reason.startsWith("INVALID_API_KEY"))         hint = " -> Web API key is wrong; copy it from Project settings > General";
+  else if (reason.startsWith("INVALID_EMAIL"))           hint = " -> email is malformed";
+  else if (reason.startsWith("USER_DISABLED"))           hint = " -> the device account is disabled";
+  else if (reason.startsWith("TOO_MANY_ATTEMPTS"))       hint = " -> rate-limited by Google; wait, then retry";
+  else if (reason.startsWith("TOKEN_EXPIRED")
+        || reason.startsWith("USER_NOT_FOUND"))          hint = " -> refresh token no longer valid; re-enter the password to re-provision";
+  else if (code < 0)                                     hint = " -> no TLS/TCP to Google: check WiFi, DNS, and try FBASE,TLS,OFF to rule out cert pinning";
+  fbAuthErr = reason + hint;
+  Serial.print(F("[FIREBASE] auth failed: ")); Serial.println(fbAuthErr);
+}
+
 // Shared tail: parse a token response, store it, reset the backoff. Returns true on success.
 static bool fbStoreToken(const String &idToken, const String &refresh, unsigned long expSec) {
   if (!idToken.length()) return false;
@@ -3922,6 +3998,7 @@ static bool fbStoreToken(const String &idToken, const String &refresh, unsigned 
   fbIdToken = idToken;
   if (refresh.length()) fbRefresh = refresh;
   xSemaphoreGive(netMux);
+  fbAuthErr = "";
   // Renew 5 min early so a slow link never uses an expired token mid-request.
   fbTokenExpiryMs = millis() + ((expSec > 300 ? expSec - 300 : 60) * 1000UL);
   fbAuthFails = 0; fbAuthNextTryMs = 0; fbAuthOk = true;
@@ -3931,15 +4008,21 @@ static bool fbStoreToken(const String &idToken, const String &refresh, unsigned 
 // Exchange the stored refresh token for a fresh ID token. No password involved.
 static bool fbRefreshToken(const String &apiKey, const String &refresh) {
   String body = "grant_type=refresh_token&refresh_token=" + refresh;
-  if (!fbBegin("https://securetoken.googleapis.com/v1/token?key=" + apiKey)) return false;
+  if (!fbBegin("https://securetoken.googleapis.com/v1/token?key=" + apiKey)) {
+    fbAuthHttp = -1; fbNoteAuthError(-1, ""); return false;
+  }
   fbHttp.addHeader("Content-Type", "application/x-www-form-urlencoded");
   int code = fbHttp.POST(body);
-  String resp = (code == 200) ? fbHttp.getString() : "";
+  // ALWAYS drain the body: it carries the reason on failure, and an unread body would
+  // leave the kept-alive socket dirty for the next request.
+  String resp = fbHttp.getString();
   fbHttp.end();
   fbAuthHttp = code;
-  if (code != 200) return false;
+  if (code != 200) { fbNoteAuthError(code, resp); return false; }
   StaticJsonDocument<1536> r;
-  if (deserializeJson(r, resp)) return false;
+  if (deserializeJson(r, resp)) { fbAuthErr = "malformed refresh response"; return false; }
+  String uid = r["user_id"] | "";
+  if (uid.length()) fbUid = uid;
   return fbStoreToken(r["id_token"] | "", r["refresh_token"] | "", (r["expires_in"] | String("3600")).toInt());
 }
 
@@ -3948,15 +4031,21 @@ static bool fbPasswordSignIn(const String &apiKey, const String &email, const St
   StaticJsonDocument<384> req;
   req["email"] = email; req["password"] = pass; req["returnSecureToken"] = true;
   String body; serializeJson(req, body);
-  if (!fbBegin("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + apiKey)) return false;
+  if (!fbBegin("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + apiKey)) {
+    fbAuthHttp = -1; fbNoteAuthError(-1, ""); return false;
+  }
   fbHttp.addHeader("Content-Type", "application/json");
   int code = fbHttp.POST(body);
-  String resp = (code == 200) ? fbHttp.getString() : "";
+  String resp = fbHttp.getString();                       // always drain -- see fbRefreshToken
   fbHttp.end();
   fbAuthHttp = code;
-  if (code != 200) return false;
+  if (code != 200) { fbNoteAuthError(code, resp); return false; }
   StaticJsonDocument<1536> r;
-  if (deserializeJson(r, resp)) return false;
+  if (deserializeJson(r, resp)) { fbAuthErr = "malformed sign-in response"; return false; }
+  // localId is the account's UID. The firmware never needs it (the token carries it, and rules
+  // compare auth.uid server-side) but you need it to WRITE those rules -- so surface it.
+  String uid = r["localId"] | "";
+  if (uid.length()) fbUid = uid;
   return fbStoreToken(r["idToken"] | "", r["refreshToken"] | "", (r["expiresIn"] | String("3600")).toInt());
 }
 
@@ -4488,10 +4577,28 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
        "<p>Device email<br><input name=email style='width:100%' value='" + htmlEscape(fbEmail) + "'></p>"
        "<p>Device password<br><input name=pass type=password style='width:100%' placeholder='" +
          String(fbPassword.length() ? "(set - leave blank to keep)" : "used once, then discardable") + "'></p>"
-       "<p>Token: " + String(fbAuthOk ? "signed in" : "not signed in") +
+       "<p>Token: <b>" + String(fbAuthOk ? "signed in" : "NOT signed in") + "</b>" +
          String(fbAuthHttp ? " (HTTP " + String(fbAuthHttp) + ")" : "") +
          " &middot; refresh token " + String(fbRefresh.length() ? "stored" : "none") +
-         " &middot; TLS handshakes " + String(fbHandshakes) + "</p>"
+         " &middot; TLS handshakes " + String(fbHandshakes) + "</p>";
+  // Blocked-reason readout. Without this the page just says "not signed in" and gives you
+  // nothing to act on -- which is exactly the state that makes provisioning feel broken.
+  {
+    String why;
+    if (!firebaseEnabled)           why = "Firebase is disabled (tick Enabled above)";
+    else if (fbApiKey.length() < 8) why = "no Web API key set";
+    else if (!fbEmail.length())     why = "no device email set";
+    else if (!fbRefresh.length() && !fbPassword.length()) why = "no password and no refresh token";
+    else if (!wifiConnected)        why = "WiFi is not connected";
+    if (why.length())      o += "<p style='color:#c33'>Blocked: " + htmlEscape(why) + "</p>";
+    if (fbAuthErr.length()) o += "<p style='color:#c33'>Last error: " + htmlEscape(fbAuthErr) + "</p>";
+    if (fbUid.length())
+      o += "<p>Device UID: <code>" + htmlEscape(fbUid) + "</code><br>"
+           "<small>Use this in your RTDB rules, e.g. <code>\".write\": \"auth.uid === '" + htmlEscape(fbUid) + "'\"</code>. "
+           "The firmware itself never needs the UID.</small></p>";
+  }
+  o += "<p><label><input type=checkbox name=pin value=yes" + String(fbPinCa ? " checked" : "") + "> "
+       "Validate server certificate (uncheck ONLY to test whether pinning is the problem)</label></p>"
        "<p><label><input type=checkbox name=signin value=yes> Sign in now (uses the password)</label></p>"
        "<p><button type=submit style='width:100%;padding:10px'>Save device account</button></p></form>";
   o += "<form method=POST action=/fbauth>"
@@ -4648,11 +4755,13 @@ static void portalHandleFbauth() {                            // POST /fbauth --
   String email = portalServer.arg("email"); email.trim();
   String pass  = portalServer.arg("pass");                    // NOT trimmed: spaces can be legitimate
   bool   signin = (portalServer.arg("signin") == "yes");
+  bool   pin    = (portalServer.arg("pin") == "yes");
   // Blank means "keep what's stored" for the two secrets, mirroring the Supabase service-key form.
   xSemaphoreTake(netMux, portMAX_DELAY);
   if (key.length())  fbApiKey = key;
   if (pass.length()) fbPassword = pass;
   if (email != fbEmail) { fbEmail = email; fbRefresh = ""; }  // new identity -> old refresh token is void
+  if (pin != fbPinCa) { fbPinCa = pin; fbResetTls(); }        // drop the socket so it re-handshakes
   xSemaphoreGive(netMux);
   fbCredsPersistPending = true;
   if (signin) { fbSignInPending = true; fbAuthFails = 0; fbAuthNextTryMs = 0; }  // clear backoff, retry now
@@ -4841,6 +4950,17 @@ void netTask(void *pv) {
     // it may block on the network, but never touches the core-1 control loop. Additive -- ThingSpeak
     // (graphs) and the Supabase daily CSV (archive) are unaffected and all three serialize here, so
     // only one TLS session is ever open at a time.
+    // Sign in / refresh INDEPENDENTLY of whether an RTDB URL is configured. Signing in needs
+    // only the API key + creds, so gating it behind the URL (as the upload/poll paths must be)
+    // would make provisioning impossible: "Sign in now" would silently do nothing and the portal
+    // would sit at "not signed in" forever. fbEnsureToken() self-gates on a valid token, the
+    // backoff timer, and a missing API key, so calling it every loop is cheap.
+    {
+      bool fbOn;
+      xSemaphoreTake(netMux, portMAX_DELAY); fbOn = firebaseEnabled; xSemaphoreGive(netMux);
+      if (fbOn) fbEnsureToken();
+    }
+
     unsigned long fbInterval = (sysState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
     if (millis() - fbLastUploadMs >= fbInterval) firebaseUploadLive();
     // Remote-command transport, both directions. Cheap: they ride the SAME keep-alive TLS
