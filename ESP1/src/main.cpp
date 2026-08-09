@@ -225,6 +225,10 @@ const unsigned long LCD_FAULT_BACKLIGHT_MS = 60000;  // fault page stays lit 1 m
 const unsigned long BTN_DEBOUNCE_MS       = 40;      // per-button debounce window
 const unsigned long LOG_FLUSH_INTERVAL_MS = 5000;    // batched SD flush
 const uint16_t      LOG_FLUSH_LINES       = 20;
+// Hard ceiling on the RAM buffer. logFlush() returns WITHOUT clearing when it cannot take sdMux
+// (the core-0 portal holds it for the whole of a /download), so a long transfer would otherwise let
+// logBuf grow unbounded on the heap. Every other failure path already drops the buffer.
+const size_t        LOG_BUF_MAX           = 8192;
 const uint8_t       GARBAGE_LIMIT         = 5;       // consecutive (spec sec.18.9.5)
 // (Nano hardware-reset layer removed -- P17 is now the master cutoff; ladder is 2 layers, sec.18.9.5.1)
 
@@ -1006,6 +1010,11 @@ const char *RECOV_NAMES[RECOV_N] = { "Hold (wait)", "Release tank", "Only irriga
 String lastHoldCode = "";
 int    sameHoldN    = 0;
 bool   steerRelease = false;    // set after repeated FLOW_FAIL holds -> default cursor to Release + warn
+// One-shot per column: the Nano's COLUMN_ENABLED is compile-time and is NOT distributed from ESP1
+// (spec sec.9.7.1.1 has no such command), so enabling a column here that the Nano does not report
+// used to make controlTick log SOIL_INVALID forever and never irrigate -- silently. Latch like
+// resLowLatched so the fault alerts once per outage, not once per packet.
+bool   soilMissingLatched[NUM_COLUMNS] = { false };
 // Hard circuit breaker: steerRelease only moves the cursor, so an operator who keeps choosing
 // "Resume normal" against dead hardware loops forever. At this many identical holds the run
 // self-cancels instead of presenting the menu again.
@@ -1748,6 +1757,15 @@ bool classifyAndApply(const String &payload, const String &raw) {
     for (int c = 0; c < NUM_COLUMNS; c++) {
       sensor.soil[c] = tmp[c];
       sensor.rawSoil[c][0] = rawTmp[c][0]; sensor.rawSoil[c][1] = rawTmp[c][1];
+      // A column ESP1 has ENABLED but the Nano did not report. Without this the column just logs
+      // SOIL_INVALID in controlTick and never irrigates, with nothing raised to the operator --
+      // the failure mode when the two COLUMN_ENABLED tables disagree (see the latch declaration).
+      if (COLUMN_ENABLED[c] && tmp[c] < 0) {
+        if (!soilMissingLatched[c]) {
+          soilMissingLatched[c] = true;
+          raiseFault('M', "SOIL_MISSING", c == 0 ? "COL_A" : c == 1 ? "COL_B" : "COL_C");
+        }
+      } else if (tmp[c] >= 0) soilMissingLatched[c] = false;      // reporting again -> re-arm
     }
     sensor.msSoil = millis();
     sensor.lastNanoMs = millis();
@@ -6630,6 +6648,13 @@ void logEvent(const char *source, const char *type, const String &detail) {
   Serial.print(row);                          // mirror to USB debug
   bool critical = (strcmp(type, "FAULT") == 0 && detail.startsWith("CRIT"));
   if (logLineCount >= LOG_FLUSH_LINES || critical) logFlush(critical);
+  // The flush above can legitimately decline (sdMux held by a core-0 portal download) and leave the
+  // buffer intact. Cap it so that can never become unbounded heap growth, and leave a marker so the
+  // gap is visible in the CSV instead of silently missing rows.
+  if (logBuf.length() > LOG_BUF_MAX) {
+    logBuf = tsString() + ",ESP1,LOG,OVERFLOW|buffer_dropped\n";
+    logLineCount = 1;
+  }
 }
 
 void logFlush(bool force) {

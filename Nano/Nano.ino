@@ -352,7 +352,15 @@ void handleLine(char *line) {
       noInterrupts(); flowPulseCount = 0; interrupts();
     }
   }
-  else if (strcmp(cmd, "CAL_STOP")  == 0) { calActive = false; calId[0] = '\0'; }
+  else if (strcmp(cmd, "CAL_STOP")  == 0) {
+    // A FLOW calibration accumulates pulses without consuming them, and computeFlowLpm() has been
+    // returning 0 (not touching lastFlowCalcMs) for the whole run. Zero both here, or the first
+    // normal TANK packet afterwards divides a full calibration's pulses by a stale interval and
+    // reports one spurious flow value.
+    noInterrupts(); flowPulseCount = 0; interrupts();
+    lastFlowCalcMs = millis();
+    calActive = false; calId[0] = '\0';
+  }
   // else: ignore
 }
 
@@ -592,7 +600,10 @@ uint8_t readNpkColumn(uint8_t addr, float out[7]) {
   digitalWrite(PIN_RS485_DE, LOW);                  // back to receive
 
   const uint8_t expected = 3 + 2 * NPK_REG_COUNT + 2;   // addr+func+bytecount + data + crc
-  uint8_t resp[40];
+  // Sized FROM the register count, not a fixed 40: NPK_REG_COUNT is an editable [CONFIRM] constant,
+  // and the fill loop below is bounded by `expected`. A fixed 40 would overrun this global on a
+  // 2 KB-SRAM part the moment someone set NPK_REG_COUNT >= 18 for a different sensor.
+  uint8_t resp[3 + 2 * NPK_REG_COUNT + 2];
   uint8_t idx = 0;
   unsigned long start = millis();
   while (idx < expected &&

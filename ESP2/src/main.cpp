@@ -33,7 +33,8 @@
  *                 relay test, sec.18.10.8): ESP1 streams HOLD while ENTER held; ESP2
  *                 keeps ONE relay ON only while HOLD arrives (timeout), with a 10s
  *                 hard cap. bit = PCF8575 OUT_* index 0..15.
- *    OUT: ACK,<cmd> -> DONE,<cmd>[,WATER,<L>];  DOSE,NUT_x,<target>,<measured>,COL_y
+ *    OUT: ACK,<cmd> -> DONE,<cmd>[,WATER,<L>[,EST]];  DOSE,NUT_x,<target>,<measured>,COL_y
+ *         (,EST = this water total includes a flow-blind timed stage: estimated, not metered)
  *         (per-nutrient result, sec.25.2.1); FLOW_FAIL/PWR_FAIL/EC_FAIL/PH_FAIL/
  *         SAFE_STOP/ERROR; DOSE_TIMEOUT,NUT_x (dosing pump past its ceiling -> ESP1 fault-hold);
  *         DEGRADED,<chan> (channel disabled, sequence continues ->
@@ -291,9 +292,12 @@ enum SeqStep {
 SeqStep step = SEQ_NONE;
 bool    stepInit = false;
 int     doseIdx = 0;
-bool    ecphFailed = false;
 unsigned long stepStart = 0;
 float   woWaterL = 0.0f;        // metered water delivered to the column this work order (for DONE,WATER)
+// Set if ANY stage in this work order ran flow-blind (timed recovery), so woWaterL is partly an
+// ESTIMATE from the pump rate rather than a metered figure. DONE then carries an ,EST tag --
+// otherwise the thesis dataset cannot tell a measured litre from a computed one.
+bool    woEstimated = false;
 
 /* ---- Mixing-tank volume + fault hold (sec.19.4.8) ------------------------- *
  * mixTankL is the authoritative liters currently in the mixing tank, metered from
@@ -517,14 +521,21 @@ bool pcfWrite(uint16_t s) {
   Wire.write(lowByte(s));
   Wire.write(highByte(s));
   bool ok = (Wire.endTransmission() == 0);          // 0 = ACKed; non-zero = bus/device fault
-  pcfShadow = s;
+  // Only track the shadow when the write actually landed. A NAKed write leaves the hardware in its
+  // OLD state, so recording the new one would desync shadow from reality and every later pcfOn/pcfOff
+  // (which derive their mask FROM the shadow) would compute against a lie.
+  if (ok) pcfShadow = s;
   if (!ok) { if (pcfFailCount < 250) pcfFailCount++; }   // consecutive-failure counter (debounce)
   else     { pcfFailCount = 0; }
   return ok;
 }
 void pcfOn(uint8_t bit)  { pcfWrite(pcfShadow & ~(1 << bit)); }   // clear bit = ON
 void pcfOff(uint8_t bit) { pcfWrite(pcfShadow |  (1 << bit)); }   // set bit  = OFF
-void stopAll()           { pcfWrite(0xFFFF); }                    // all OFF incl. cutoff de-energized
+// Retry the two SAFE-ing writes. Every caller discards pcfWrite's status, so a single NAK here used
+// to mean "emergency stop issued, relays still energized, nobody the wiser". No delay(): the I2C
+// transaction is already bounded by Wire.setTimeOut(50), so 3 tries is <=150 ms -- far inside the 8 s
+// WDT and still non-blocking per spec sec.10.6.5.
+void stopAll()           { for (uint8_t a = 0; a < 3; a++) if (pcfWrite(0xFFFF)) return; }
 // All actuators OFF but the master cutoff kept ENERGIZED (bank stays powered). One atomic write
 // (bit15=0 -> P17 on), so switching Testing components never pulses P17 off->on (sec.19.4.8.4).
 void stopKeepBank()      { pcfWrite(0x7FFF); }
@@ -534,7 +545,8 @@ void stopKeepBank()      { pcfWrite(0x7FFF); }
  * DE-energizes (whole P0-P16 bank goes hardware-dead, fail-safe). Energize before any
  * actuation; de-energize on fault / completion / idle.                                */
 void cutoffEnergize()    { pcfOn(OUT_MASTER_CUTOFF); }
-void cutoffDeenergize()  { pcfOff(OUT_MASTER_CUTOFF); }
+// De-energizing is the fail-safe direction -- retry it like stopAll() (see note above).
+void cutoffDeenergize()  { for (uint8_t a = 0; a < 3; a++) if (pcfWrite(pcfShadow | (1 << OUT_MASTER_CUTOFF))) return; }
 
 // Energize all PCF bits of a Testing priming combo (idx 16=Fill, 17/18/19=Push>Col A/B/C).
 void testComboOn(int idx) {
@@ -658,7 +670,13 @@ void pollEsp1() {
 
 void dispatch(const String &payload) {
   // tokenize
-  const int MAXT = 24; String tok[MAXT]; int n = 0, start = 0;
+  // 40, not 24: a full FERTIGATION work order is 34 tokens
+  // (SEQ_x,FLUSH,p,DOSE,a,b,c,DCEIL,a,b,c,BATCHV,v,EC,lo,hi,PH,lo,hi,MIX,ms,KMAIN,k,k,
+  //  KNUT,a,b,c,ECCAL,m,b,PHCAL,m,b). At 24 the frame still arrived whole (207B < 256) but the
+  // tokenizer dropped KNUT/ECCAL/PHCAL, so every fertigation ran on stale nutrient K-factors and
+  // stale EC/pH calibration -- silently defeating the self-contained job cal of §A.5.1 #3.
+  // Do NOT shrink this below the largest work order.
+  const int MAXT = 40; String tok[MAXT]; int n = 0, start = 0;
   for (int i = 0; i <= payload.length() && n < MAXT; i++) {
     if (i == payload.length() || payload[i] == ',') { tok[n++] = payload.substring(start, i); start = i + 1; }
   }
@@ -832,9 +850,9 @@ void dispatch(const String &payload) {
 void startWorkOrder() {
   wo.active = true;
   faultHeld = false;
-  ecphFailed = false;
   doseIdx = 0;
   woWaterL = 0.0f;
+  woEstimated = false;
   cutoffEnergize();              // power the actuator bank (sec.19.4.8); individual relays still gate each load
   Serial.printf("Work order: %s fert=%d flush=%.0f%% tank=%.2fL\n",
                 wo.cmdName.c_str(), wo.fertigate, wo.flushPct, mixTankL);
@@ -891,6 +909,7 @@ float endMeteredStage() {
   // A timed (flow-blind) stage has no usable pulse count, so credit the ESTIMATED target volume it was
   // sized to move -- otherwise the tank bookkeeping would think nothing moved and never empty/fill.
   float liters = sgTimed ? sgTarget : litersSoFar(sgK);
+  if (sgTimed) woEstimated = true;            // this order's water total is no longer purely metered
   if      (sgTankSign > 0) tankApply(+liters);                 // reservoir -> mix
   else if (sgTankSign < 0) { tankApply(-liters); woWaterL += liters; }  // mix -> column
   stageEnd();
@@ -930,10 +949,14 @@ void finishOk() {
   mixTankL = 0.0f; tankSave();       // tank emptied to the column -> clear the persisted volume
   String name = wo.cmdName;
   float water = woWaterL;
+  bool est = woEstimated;
   wo.active = false; faultHeld = false; step = SEQ_NONE;
   resumeTimed = false; lastHoldFlow = false;   // run finished -> clear the timed-recovery latch
-  // Append measured water so ESP1 can tally per-column daily usage (sec.12.1.3 / B1).
-  reply("DONE," + name + ",WATER," + String(water, 2));
+  woEstimated = false;
+  // Append measured water so ESP1 can tally per-column daily usage (sec.12.1.3 / B1). ,EST marks a
+  // total that includes a flow-blind (timed) stage. ESP1 reads this with indexOf("WATER,")+toFloat(),
+  // which stops at the comma, so the extra token is backward-compatible.
+  reply("DONE," + name + ",WATER," + String(water, 2) + (est ? ",EST" : ""));
 }
 
 // Hard fault (sec.19.4.8.1): drop the master cutoff (bank hardware-dead), PAUSE the sequence
@@ -1021,13 +1044,15 @@ void runSequence() {
         if (doseIdx >= 3) { goStep(SEQ_MIX); break; }
         float targetL = wo.dose[doseIdx] / 1000.0f;     // mL -> L
         stageBegin(NUT_PUMP_BIT[doseIdx], false, NUT_FLOW_PIN[doseIdx], K_NUT[doseIdx], targetL);
+        // Dosed liquid physically enters the mixing tank, so it must count toward mixTankL -- otherwise
+        // a dose interrupted mid-pour leaves the tank bookkeeping short and a resumed FILL overfills.
+        sgTankSign = +1;
         sgCapMs = wo.doseCeilMs[doseIdx] ? wo.doseCeilMs[doseIdx] : STAGE_MAX_MS;   // per-dose 2x ceiling (spec §2.4)
         stepInit = true;
       }
       int r = stagePoll();
       if (r == 1) {
-        float measuredML = litersSoFar(K_NUT[doseIdx]) * 1000.0f;   // read before stageEnd
-        stageEnd();
+        float measuredML = endMeteredStage() * 1000.0f;   // credits the tank, then ends the stage
         Serial.printf("Dosed nutrient %d: %.1f mL\n", doseIdx, measuredML);
         // Report dose to ESP1 (target + measured) for the daily report / thesis data (sec.25.2.1).
         reply(String("DOSE,NUT_") + (char)('A' + doseIdx) + "," +
@@ -1038,7 +1063,7 @@ void runSequence() {
       } else if (r == -1) {
         // Dosing pump ran past its timed ceiling (or never flowed) -> DOSE_TIMEOUT, NOT a fallback
         // (dosing spec §2.3/§5): stuck-low flow sensor or unprimed line. Stop and HOLD for the user.
-        stageEnd();
+        endMeteredStage();                   // credit whatever partial volume did make it into the tank
         String nut = String("NUT_") + (char)('A' + doseIdx);
         holdFault("DOSE_TIMEOUT", nut.c_str());
       }
@@ -1068,10 +1093,10 @@ void runSequence() {
       // HARDWARE fault first (railed ADC = probe disconnected/shorted) -> SENSOR_FAIL, distinct
       // from an in-range value that is merely outside the safe window (EC_FAIL/PH_FAIL). Both
       // are Major on ESP1; check EC and pH independently so a double-fault reports both.
-      if (phRaw <= PH_ADC_FAULT_LO || phRaw >= PH_ADC_FAULT_HI) { ecphFailed = true; reply("SENSOR_FAIL,PH"); }
-      else if (ph < wo.phLo || ph > wo.phHi)                    { ecphFailed = true; reply(String("PH_FAIL,") + colLoc); }
-      if (ecRaw <= EC_ADC_FAULT_LO || ecRaw >= EC_ADC_FAULT_HI) { ecphFailed = true; reply("SENSOR_FAIL,EC"); }
-      else if (ec < wo.ecLo || ec > wo.ecHi)                    { ecphFailed = true; reply(String("EC_FAIL,") + colLoc); }
+      if (phRaw <= PH_ADC_FAULT_LO || phRaw >= PH_ADC_FAULT_HI) { reply("SENSOR_FAIL,PH"); }
+      else if (ph < wo.phLo || ph > wo.phHi)                    { reply(String("PH_FAIL,") + colLoc); }
+      if (ecRaw <= EC_ADC_FAULT_LO || ecRaw >= EC_ADC_FAULT_HI) { reply("SENSOR_FAIL,EC"); }
+      else if (ec < wo.ecLo || ec > wo.ecHi)                    { reply(String("EC_FAIL,") + colLoc); }
       // Plumbing has no drain: deliver the mixed batch regardless, fault already reported.
       goStep(SEQ_DELIVER);
       break;
@@ -1210,7 +1235,7 @@ void idleResetTick() {
 void testSafety() {
   if (!testMode || testHeldBit < 0) return;
   unsigned long now = millis();
-  // HARD CAP: force OFF regardless of ESP1. Combos get the longer priming cap; single relays 10 s.
+  // HARD CAP: force OFF regardless of ESP1. Both are 30 s (sec.18.10.8.3 / CLAUDE.md).
   unsigned long cap = (testHeldBit > 15) ? TEST_COMBO_CAP_MS : TEST_HARD_CAP_MS;
   if (!testCapped && now - testRelayOnMs >= cap) {
     testOff(); testCapped = true;                  // back to resting (bank powered)
