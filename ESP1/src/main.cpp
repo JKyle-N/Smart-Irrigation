@@ -993,14 +993,36 @@ int  estopSel = 0;              // recovery cursor: 0 = Return to normal, 1 = St
  *   STOP (hold/ack) | RELEASE (dump tank to its column) | IRRIGATE (water-only finish)
  *   | NORMAL (resume the paused sequence). Sent over SMS or chosen on the LCD.        */
 bool esp2Held = false;          // an ESP2 hard fault is held, awaiting user recovery
-int  faultRecovSel = 0;         // LCD recovery cursor: 0 Hold, 1 Release, 2 OnlyIrr, 3 Normal
-const char *RECOV_NAMES[4] = { "Hold (wait)", "Release tank", "Only irrigate", "Resume normal" };
+int  faultRecovSel = 0;         // LCD recovery cursor: 0 Hold, 1 Release, 2 OnlyIrr, 3 Normal, 4 Cancel
+// "Cancel run" is the ABORT this menu previously lacked: Hold/Release/Irrigate/Normal all try to
+// CONTINUE the run, so a fault the rig cannot recover from (dead flow sensor) had no exit but a
+// physical reset with the pumps still live.
+const int RECOV_N = 5;
+const char *RECOV_NAMES[RECOV_N] = { "Hold (wait)", "Release tank", "Only irrigate",
+                                     "Resume normal", "Cancel run..." };
 // Re-hold loop guard: a flow-metered resume of a dead flow sensor keeps re-holding FLOW_FAIL. After a
 // few identical holds, steer the operator to the flow-independent Release/Irrigate options (ESP2 runs
 // those on a timer for a flow fault) so the recovery can't loop forever.
 String lastHoldCode = "";
 int    sameHoldN    = 0;
 bool   steerRelease = false;    // set after repeated FLOW_FAIL holds -> default cursor to Release + warn
+// Hard circuit breaker: steerRelease only moves the cursor, so an operator who keeps choosing
+// "Resume normal" against dead hardware loops forever. At this many identical holds the run
+// self-cancels instead of presenting the menu again.
+const int HOLD_AUTOCANCEL_N = 4;
+
+/* ---- Cancel run (operator abort) ------------------------------------------ *
+ * Reachable from the held-fault menu AND from a live run. Confirms with three choices,
+ * because "stop this run" almost always means one of: the column is broken (turn it off),
+ * or come back shortly (snooze).                                                        */
+bool cancelPrompt = false;      // the 3-way confirm is open (over the fault menu or the run UI)
+int  cancelSel    = 0;          // 0 Off column, 1 Snooze 30m, 2 Snooze 10m
+const char *CANCEL_NAMES[3] = { "Turn OFF column", "Snooze 30 min", "Snooze 10 min" };
+// Per-column suppression window. RAM-only and millis-based on purpose: a snooze is transient and a
+// reboot legitimately clears it. The persistent choice is "Turn OFF column" (COLUMN_ENABLED + NVS).
+unsigned long colSnoozeUntil[NUM_COLUMNS] = { 0 };
+const unsigned long SNOOZE_LONG_MS  = 30UL * 60UL * 1000UL;
+const unsigned long SNOOZE_SHORT_MS = 10UL * 60UL * 1000UL;
 
 /* ---- Device health / daily self-reset (Part C) --------------------------- *
  * bootPresent[] = devices seen at boot; a present->absent transition at runtime
@@ -1135,6 +1157,7 @@ void raiseFault(char tier, const char *code, const char *loc);
 void enterEmergencyStop(bool cutPower);
 void enterFaultHold(const char *code, const char *loc);
 void issueRecovery(int sel);
+void cancelRun(int mode, const char *why);
 
 void logEvent(const char *source, const char *type, const String &detail);
 void logFlush(bool force);
@@ -2573,6 +2596,22 @@ void handleSms(const String &body) {
     if (U == "NORMAL")   { issueRecovery(3); return; }   // resume the paused sequence
   }
 
+  // CANCEL,OFF | CANCEL,30 | CANCEL,10  -- abort the run and suppress the column. Works whether or
+  // not a fault is held, so it also stops a healthy-but-unwanted run without the global e-stop.
+  if (U.startsWith("CANCEL")) {
+    int c1 = U.indexOf(',');
+    String a = (c1 >= 0) ? U.substring(c1 + 1) : "30";
+    a.trim();
+    int mode;
+    if      (a == "OFF") mode = 0;
+    else if (a == "30")  mode = 1;
+    else if (a == "10")  mode = 2;
+    else { sendSMS("ERR,CANCEL,FORMAT (use CANCEL,OFF | CANCEL,30 | CANCEL,10)"); return; }
+    if (!wo.active && !pendingRun.active && !esp2Held) { sendSMS("ERR,CANCEL,NO_RUN"); return; }
+    cancelRun(mode, "SMS");
+    return;
+  }
+
   // STOP,ALL  (global emergency stop when nothing is held)
   if (U.startsWith("STOP")) {
     enterEmergencyStop(false);
@@ -3416,6 +3455,12 @@ void controlTick() {
 
   for (int c = 0; c < NUM_COLUMNS; c++) {
     if (!COLUMN_ENABLED[c]) continue;                              // config, not a fault -> no CTRL log spam
+    // Operator (or the auto-cancel breaker) suppressed this column for a while. Logged like every
+    // other skip reason so the CSV shows why a due column was passed over.
+    if (colSnoozeUntil[c] && (long)(millis() - colSnoozeUntil[c]) < 0) {
+      ctrlNote(c, "SNOOZED|" + String((colSnoozeUntil[c] - millis()) / 60000 + 1) + "min");
+      continue;
+    }
     if (col[c].lastServicedStamp == currentDayStamp) { ctrlNote(c, "SERVICED_TODAY"); continue; }
     // schedule axis: AUTO uses the default window, MANUAL uses the operator-set one (sec.18.10.7.2)
     uint16_t ws = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_START[c] : DEF_WIN_START[c];
@@ -5123,6 +5168,15 @@ void enterFaultHold(const char *code, const char *loc) {
           ",reply STOP/RELEASE/IRRIGATE/NORMAL");
   // Count consecutive identical holds; after 3 FLOW_FAILs steer to Release (flow-independent on ESP2).
   if (lastHoldCode == code) sameHoldN++; else { lastHoldCode = code; sameHoldN = 1; }
+  // Circuit breaker. Steering only moves the cursor -- an operator who keeps picking "Resume normal"
+  // against dead hardware re-holds forever, which is exactly the state that forced a physical reset
+  // with the pumps still live. Give up on our own and snooze the column instead.
+  if (sameHoldN >= HOLD_AUTOCANCEL_N) {
+    logEvent("ESP1", "FAULT", String("CRIT|") + code + "|" + loc + "|AUTOCANCEL|after=" + String(sameHoldN));
+    sendSMS(String("ALERT,CANCEL,") + code + "," + colS + ",repeated holds - run cancelled, column snoozed 30m");
+    cancelRun(1, code);                                // 30-min snooze; clears the hold + stops ESP2
+    return;
+  }
   steerRelease = (sameHoldN >= 3 && String(code) == "FLOW_FAIL");
   esp2Held = true; faultRecovSel = steerRelease ? 1 : 0;   // default cursor: Release when steering, else Hold
   runUiAbort(code);                                    // close the run UI so the recovery menu is reachable
@@ -5132,11 +5186,50 @@ void enterFaultHold(const char *code, const char *loc) {
   setState(EMERGENCY_STOP);                            // halted; the held UI/buttons branch on esp2Held
 }
 
+/* Operator abort. This is the exit the recovery menu never had: Hold/Release/Irrigate/Normal all
+ * try to CONTINUE the run, so an unrecoverable fault (dead flow sensor) left a physical reset as
+ * the only way to stop the pumps.
+ *   mode 0 = turn the column OFF (persistent)   1 = snooze 30 min   2 = snooze 10 min
+ * Safe to call whether or not ESP2 is currently held. */
+void cancelRun(int mode, const char *why) {
+  int c = (wo.colIdx >= 0) ? wo.colIdx : pendingRun.colIdx;      // whichever run we are aborting
+
+  // STOP_ALL is what actually kills the pumps: on ESP2 it clears faultHeld, the work order, the
+  // step and the timed-recovery latch, so nothing can resume behind our back.
+  sendEsp2("STOP_ALL");
+
+  wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
+  pendingRun.active = false; pendingRun.colIdx = -1;
+  esp2Held = false;
+  lastHoldCode = ""; sameHoldN = 0; steerRelease = false;        // a cancel resolves the re-hold loop
+  cancelPrompt = false; cancelSel = 0;
+
+  String scope;
+  if (c >= 0 && c < NUM_COLUMNS) {
+    if (mode == 0)      { COLUMN_ENABLED[c] = false; saveColEnable(c); scope = "OFF"; }
+    else if (mode == 1) { colSnoozeUntil[c] = millis() + SNOOZE_LONG_MS;  scope = "SNOOZE30"; }
+    else                { colSnoozeUntil[c] = millis() + SNOOZE_SHORT_MS; scope = "SNOOZE10"; }
+  } else scope = "NOCOL";                                        // nothing was running -- still a clean stop
+
+  String colS = (c >= 0 && c < NUM_COLUMNS) ? String("COL_") + COL_TAG[c] : String("COL_?");
+  logEvent("ESP1", "ACT", String("CANCEL|") + scope + "|" + colS + "|" + why);
+  sendSMS(String("ACK,CANCEL,") + scope + "," + colS);
+
+  runUiAbort("CANCELLED");                                       // release the run screen
+  esp2SetPower(false);                                           // OFF-during-idle
+  setState(IDLE_STATE);
+  uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
+}
+
 // Apply a recovery choice (from LCD ENTER or an SMS reply): 0 Hold, 1 Release, 2 OnlyIrr, 3 Normal.
 void issueRecovery(int sel) {
   if (!esp2Held) return;
   if (sel == 0) {                                      // Hold / acknowledge: stay held, push nothing
     sendSMS("ACK,STOP,HELD");
+    // Visible acknowledgement. Staying held is correct behaviour, but with no feedback at all this
+    // button was indistinguishable from a dead one.
+    lastFaultMsg = String("HELD - waiting");
+    wakeBacklight();
     return;
   }
   const char *mode = (sel == 1) ? "RELEASE" : (sel == 2) ? "IRRIGATE" : "NORMAL";
@@ -5715,18 +5808,38 @@ void handleButtons() {
   // wander into a menu mid-run. The MODE+BACK emergency stop is handled above and always works.
   // (never swallows buttons during a held fault / E-stop -- the recovery selectors live below)
   if (runPhase != RUN_NONE && runLocked && !esp2Held && sysState != EMERGENCY_STOP) {
-    static bool runUnlockLatch = false, runEnterLatch = false;
+    static bool runUnlockLatch = false, runEnterLatch = false, runBackLatch = false;
     bool up = (digitalRead(BTN_UP) == LOW), dn = (digitalRead(BTN_DOWN) == LOW);
+    bool ent = (digitalRead(BTN_ENTER) == LOW), bk = (digitalRead(BTN_BACK) == LOW);
+
+    // Cancel confirm open: UP/DOWN pick, ENTER commits, BACK backs out. Takes priority over the
+    // normal run-screen bindings so the prompt cannot be dismissed by accident.
+    if (cancelPrompt) {
+      if (up && !dn)      { if (!runUnlockLatch) { runUnlockLatch = true; cancelSel = (cancelSel + 2) % 3; wakeBacklight(); } }
+      else if (dn && !up) { if (!runUnlockLatch) { runUnlockLatch = true; cancelSel = (cancelSel + 1) % 3; wakeBacklight(); } }
+      else runUnlockLatch = false;
+      if (ent) { if (!runEnterLatch) { runEnterLatch = true; cancelRun(cancelSel, "OPERATOR"); } }
+      else runEnterLatch = false;
+      if (bk)  { if (!runBackLatch)  { runBackLatch = true; cancelPrompt = false; wakeBacklight(); } }
+      else runBackLatch = false;
+      for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]);
+      return;
+    }
+
     if (up && dn) {
       if (!runUnlockLatch) {
         runUnlockLatch = true; runLocked = false; wakeBacklight();
         logEvent("ESP1", "ACT", "RUN|SCREEN_RELEASED");
       }
     } else runUnlockLatch = false;
-    bool ent = (digitalRead(BTN_ENTER) == LOW);
     if (ent && !up && !dn) {
       if (!runEnterLatch) { runEnterLatch = true; wakeBacklight(); runUiAdvance(); }
     } else runEnterLatch = false;
+    // BACK during a live run opens the cancel confirm. ENTER is already the receipt-advance, and
+    // BACK was simply swallowed here, so this adds a stop without taking a binding away.
+    if (bk && !up && !dn && !ent) {
+      if (!runBackLatch) { runBackLatch = true; cancelPrompt = true; cancelSel = 1; wakeBacklight(); }
+    } else runBackLatch = false;
     for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]);   // swallow every other edge
     return;
   }
@@ -5753,9 +5866,19 @@ void handleButtons() {
         // ESP2 fault-hold recovery selector (sec.19.4.8.2): UP/DOWN choose one of the 4
         // options, ENTER issues it (mirror of the GSM STOP/RELEASE/IRRIGATE/NORMAL reply).
         if (esp2Held && uiMode == UI_DATA) {
-          if      (i == 0) faultRecovSel = (faultRecovSel + 3) % 4;   // UP
-          else if (i == 1) faultRecovSel = (faultRecovSel + 1) % 4;   // DOWN
-          else if (i == 2) issueRecovery(faultRecovSel);             // ENTER -> act
+          if (cancelPrompt) {                                         // 3-way confirm is open
+            if      (i == 0) cancelSel = (cancelSel + 2) % 3;         // UP
+            else if (i == 1) cancelSel = (cancelSel + 1) % 3;         // DOWN
+            else if (i == 2) cancelRun(cancelSel, lastHoldCode.length() ? lastHoldCode.c_str() : "OPERATOR");
+            else if (i == 3) cancelPrompt = false;                    // BACK -> back to the recovery menu
+            continue;
+          }
+          if      (i == 0) faultRecovSel = (faultRecovSel + RECOV_N - 1) % RECOV_N;   // UP
+          else if (i == 1) faultRecovSel = (faultRecovSel + 1) % RECOV_N;             // DOWN
+          else if (i == 2) {                                          // ENTER -> act
+            if (faultRecovSel == 4) { cancelPrompt = true; cancelSel = 1; }  // open the confirm
+            else                     issueRecovery(faultRecovSel);
+          }
           continue;
         }
 
@@ -6211,9 +6334,21 @@ void lcdTick() {
   // Never mask a held fault / E-stop: those screens carry the recovery choices the operator must answer.
   if (runPhase != RUN_NONE && runLocked && !esp2Held && sysState != EMERGENCY_STOP) {
     if (lastRunPhase != (uint8_t)runPhase) { lcd.clear(); lastRunPhase = (uint8_t)runPhase; }
+    // BACK opened the cancel confirm over the live run screen.
+    if (cancelPrompt) {
+      char cl[21];
+      lcdRow(0, "CANCEL THIS RUN?");
+      for (int r = 0; r < 3; r++) {
+        snprintf(cl, 21, "%c%-19s", r == cancelSel ? '>' : ' ', CANCEL_NAMES[r]); lcdRow(r + 1, cl);
+      }
+      return;
+    }
     lcdRenderRun();
     return;
   }
+  // Drop an orphaned confirm: only the held-fault menu and the locked run screen service it, so if
+  // neither is showing (run ended, screen released, fault resolved) nothing could dismiss it.
+  if (cancelPrompt && !esp2Held && !(runPhase != RUN_NONE && runLocked)) cancelPrompt = false;
   if (lastRunPhase != 255) { lcd.clear(); lastRunPhase = 255; }   // left the run UI -> clean redraw
 
   // Settings / Testing UI takes over the screen when active (spec sec.18.10).
@@ -6280,12 +6415,21 @@ void lcdTick() {
       }
       break;
     default: // PAGE_FAULT  (doubles as the E-stop / fault-hold recovery prompt)
-      if (esp2Held) {
-        // ESP2 fault HELD: 4-way recovery in a 3-row window over rows 1..3 (sec.19.4.8.2).
+      if (esp2Held && cancelPrompt) {
+        // Cancel confirm, over the recovery menu: three ways to stop, BACK returns.
+        lcdRow(0, "CANCEL RUN?");
+        for (int r = 0; r < 3; r++) {
+          snprintf(l, 21, "%c%-19s", r == cancelSel ? '>' : ' ', CANCEL_NAMES[r]); lcdRow(r + 1, l);
+        }
+      } else if (esp2Held) {
+        // ESP2 fault HELD: 5-way recovery in a 3-row window over rows 1..3 (sec.19.4.8.2).
         // After repeated flow re-holds, the header steers to Release (the flow-independent escape).
-        if (steerRelease) lcdRow(0, "FLOWx3: use RELEASE");
+        if (steerRelease) lcdRow(0, "FLOWx3: RELEASE/Cxl");
         else { snprintf(l, 21, "HELD:%-15s", lastFaultMsg.substring(0, 15).c_str()); lcdRow(0, l); }
-        int top = faultRecovSel - 1; if (top < 0) top = 0; if (top > 1) top = 1;
+        // Window follows the cursor across all RECOV_N entries (was hard-capped at 4).
+        int top = faultRecovSel - 1;
+        if (top < 0) top = 0;
+        if (top > RECOV_N - 3) top = RECOV_N - 3;
         for (int r = 0; r < 3; r++) {
           int idx = top + r;
           snprintf(l, 21, "%c%-19s", idx == faultRecovSel ? '>' : ' ', RECOV_NAMES[idx]); lcdRow(r + 1, l);
