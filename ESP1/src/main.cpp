@@ -1686,8 +1686,28 @@ void pollNano() {
   }
 }
 
+// A field must actually be a number before we believe it. Guards against a spliced frame handing
+// the parser a token like "ENV" or "<START>", which String::toFloat() silently turns into 0.0.
+static bool isNumericToken(const String &s) {
+  if (s.length() == 0) return false;
+  int i = 0, digits = 0, dots = 0;
+  if (s[0] == '-' || s[0] == '+') i = 1;
+  for (; i < (int)s.length(); i++) {
+    if (isDigit(s[i])) digits++;
+    else if (s[i] == '.') { if (++dots > 1) return false; }
+    else return false;
+  }
+  return digits > 0;
+}
+
 // Returns true if packet is clean+plausible (and applies it); false = garbage.
 bool classifyAndApply(const String &payload, const String &raw) {
+  // STRUCTURAL (Tier 1): the payload is taken from BETWEEN the frame markers, so a marker inside it
+  // means two packets were spliced -- ESP1's SoftwareSerial RX dropped the bytes that separated them.
+  // Such a line can still present the right comma count and a valid column tag, so it must be
+  // rejected here or it is indistinguishable from real data downstream (spec sec.9.9.5/9.9.6).
+  if (payload.indexOf(FRAME_START) >= 0 || payload.indexOf(FRAME_END) >= 0) return false;
+
   // tokenize by comma
   const int MAXT = 12;
   String tok[MAXT];
@@ -1796,6 +1816,17 @@ bool classifyAndApply(const String &payload, const String &raw) {
     int c = -1;
     for (int i = 0; i < NUM_COLUMNS; i++) if (tok[1] == String(COL_TAG[i])) c = i;
     if (c < 0) return false;
+    // SEMANTIC (Tier 2): NPK was the only packet with no value validation -- ENV/TANK/SOIL/LIGHT all
+    // range-check. A corrupted field therefore became plausible-looking nutrient data (e.g. a spliced
+    // ENV packet logging temperature as phosphorus), which then drove decideFertigate(). Registers are
+    // unsigned 16-bit, so anything outside 0..65535 (or non-numeric) is impossible.
+    for (int i = 0; i < 7; i++) {
+      const String &v = tok[i + 2];
+      if (v == "-1") continue;                    // honest invalid-read sentinel, NOT garbage
+      if (!isNumericToken(v)) return false;
+      float f = v.toFloat();
+      if (f < 0.0f || f > 65535.0f) return false;
+    }
     bool anyInvalid = false;
     for (int i = 0; i < 7; i++) {                 // RAW registers (companion spec §A): apply scale + offset
       if (tok[i + 2] == "-1") { anyInvalid = true; sensor.npk[c][i] = -1; sensor.rawNpk[c][i] = -1; continue; }
@@ -6642,7 +6673,14 @@ void lcdRenderSettings() {
  *  LOGGING  (buffered CSV to microSD, spec sec.25)
  * ========================================================================== */
 void logEvent(const char *source, const char *type, const String &detail) {
-  String row = tsString() + "," + source + "," + type + "," + detail + "\n";
+  // The schema is timestamp,source,event_type,detail with '|' as the secondary delimiter and NO
+  // commas inside detail (sec.25.2 / CLAUDE.md). Several callers pass through raw framed payloads or
+  // SMS text that legitimately contain commas -- GARBAGE RAW=, ESP2 RESP, ESP1 CMD, GSM TX -- which
+  // silently split into extra CSV columns (~10% of rows). Our own summary parser tolerates it
+  // (substring past the 3rd comma), but any external reader of the thesis CSV does not.
+  String d = detail;
+  d.replace(',', ';');
+  String row = tsString() + "," + source + "," + type + "," + d + "\n";
   logBuf += row;
   logLineCount++;
   Serial.print(row);                          // mirror to USB debug
