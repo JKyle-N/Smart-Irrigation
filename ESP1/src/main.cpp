@@ -577,6 +577,13 @@ String   fbUid = "";                               // localId from the sign-in: 
                                                    // match as auth.uid. Shown in the portal so you can
                                                    // paste it into the rules; the firmware never needs it.
 String   fbAuthErr = "";                           // Google's reason string on the last failure (not a secret)
+unsigned long fbAuthErrMs = 0;                     // when it happened -- the portal shows the age, because
+                                                   // opening the portal SUSPENDS all Firebase work, so what
+                                                   // you read there is always from the previous STA session
+// Core0 -> core1 handoff so auth failures reach the SD log. logEvent() is core-1 only, and
+// fbNoteAuthError runs on netTask, so it cannot log directly. Fixed buffer: no String across cores.
+char     fbAuthErrLog[96] = "";
+volatile bool fbAuthErrLogPending = false;
 bool     fbPinCa = true;                           // validate the server cert against FB_ROOT_CA (NVS "fbpin")
 unsigned long fbTokenExpiryMs = 0;                 // millis() deadline for the current ID token
 volatile bool fbAuthOk = false;                    // last token operation succeeded (diagnostics)
@@ -3988,7 +3995,13 @@ static void fbNoteAuthError(int code, const String &resp) {
         || reason.startsWith("USER_NOT_FOUND"))          hint = " -> refresh token no longer valid; re-enter the password to re-provision";
   else if (code < 0)                                     hint = " -> no TLS/TCP to Google: check WiFi, DNS, and try FBASE,TLS,OFF to rule out cert pinning";
   fbAuthErr = reason + hint;
+  fbAuthErrMs = millis();
   Serial.print(F("[FIREBASE] auth failed: ")); Serial.println(fbAuthErr);
+  // Hand the reason to core 1 for the SD log. Without this the only witness is the serial
+  // monitor -- and you cannot read the portal's copy without suspending the very connection
+  // attempt that produces it.
+  strlcpy(fbAuthErrLog, fbAuthErr.c_str(), sizeof(fbAuthErrLog));
+  fbAuthErrLogPending = true;
 }
 
 // Shared tail: parse a token response, store it, reset the backoff. Returns true on success.
@@ -4308,6 +4321,12 @@ void firebaseCommandTick() {
 // Carries free heap and netTask stack headroom, which is how the long-run TLS fragmentation risk
 // (a fresh mbedTLS session every ~60 s) becomes visible in the CSV instead of only on the LCD.
 void firebaseLogTick() {
+  // Auth failures land in the CSV so you can reproduce the fault with the portal CLOSED
+  // (the only state in which Firebase is actually attempted) and read the reason afterwards.
+  if (fbAuthErrLogPending) {
+    fbAuthErrLogPending = false;
+    logEvent("ESP1", "FBASE", String("AUTH|") + fbAuthErrLog);
+  }
   static int  lastState = -1;                       // -1 unknown, 0 fail, 1 ok
   static unsigned long lastSeenUploadMs = 0;
   if (fbLastUploadMs == lastSeenUploadMs) return;   // no new attempt since the last check
@@ -4584,14 +4603,24 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
   // Blocked-reason readout. Without this the page just says "not signed in" and gives you
   // nothing to act on -- which is exactly the state that makes provisioning feel broken.
   {
+    // NOTE: while this page is open the setup AP owns netTask, so NO Firebase request is being
+    // made right now. Everything below is the state from before the portal opened -- say so,
+    // instead of reporting "WiFi is not connected", which is trivially true of every portal session.
+    o += "<p><small><b>This page suspends Firebase.</b> The setup AP takes over the network task, so "
+         "nothing is being attempted while you read this. The status below is from before you opened it. "
+         "For a live view use the USB serial monitor at 115200, or send the SMS <code>FBASE,STATUS</code>. "
+         "Auth failures are also written to the SD log as <code>FBASE,AUTH|...</code>.</small></p>";
     String why;
     if (!firebaseEnabled)           why = "Firebase is disabled (tick Enabled above)";
     else if (fbApiKey.length() < 8) why = "no Web API key set";
     else if (!fbEmail.length())     why = "no device email set";
     else if (!fbRefresh.length() && !fbPassword.length()) why = "no password and no refresh token";
-    else if (!wifiConnected)        why = "WiFi is not connected";
+    else if (fbUrl.length() < 8)    why = "no RTDB URL set -- sign-in will work, but nothing will publish";
     if (why.length())      o += "<p style='color:#c33'>Blocked: " + htmlEscape(why) + "</p>";
-    if (fbAuthErr.length()) o += "<p style='color:#c33'>Last error: " + htmlEscape(fbAuthErr) + "</p>";
+    if (fbAuthErr.length()) {
+      o += "<p style='color:#c33'>Last error (" + String((millis() - fbAuthErrMs) / 1000) + " s ago): "
+           + htmlEscape(fbAuthErr) + "</p>";
+    }
     if (fbUid.length())
       o += "<p>Device UID: <code>" + htmlEscape(fbUid) + "</code><br>"
            "<small>Use this in your RTDB rules, e.g. <code>\".write\": \"auth.uid === '" + htmlEscape(fbUid) + "'\"</code>. "
