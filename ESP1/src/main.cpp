@@ -533,17 +533,25 @@ const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
  * History is NOT duplicated here -- ThingSpeak keeps the graphs and Supabase keeps
  * the daily CSV archive. The three are complementary, not redundant.
  *
- * Remote COMMANDS are deliberately not executed here: ESP32 #1 stays the single
- * decision-making authority, and STOP/RELEASE/IRRIGATE/NORMAL stay SMS/LCD-only.
+ * Remote COMMANDS: the dashboard may request an EMERGENCY_STOP or a bounded 5 s pump
+ * test. ESP32 #1 remains the single decision-making authority -- core 0 only TRANSPORTS
+ * a request; core 1 validates it against the same idle gate the local UI uses and
+ * dispatches through the existing pendingExercise flow. There is no remote direct
+ * relay/valve/nutrient control. SMS/LCD stay the authoritative stop path, because a
+ * remote e-stop silently does nothing when WiFi is down.
  *
- * SECURITY (commissioning posture, matches the Supabase TLS stance below):
- *   - RTDB is in TEST MODE and this PUT carries NO auth token, so anyone with the
- *     URL can read/overwrite /irrigation/live. Acceptable for bench work ONLY.
- *   - Before deployment: lock the rules to a device UID and sign in as a device
- *     account (ID token, ~55 min refresh) -- see the plan doc. fbBuildUrl() is the
- *     single seam where the "?auth=<token>" query gets added.                     */
+ * SECURITY:
+ *   - Every RTDB request carries "?auth=<idToken>" from a dedicated device account.
+ *     Lock the RTDB rules to that device UID; test-mode rules make the token pointless.
+ *   - Credentials are NVS-only (SoftAP admin form / FBASE SMS) -- never hardcoded in
+ *     tracked source, same rule as the Supabase creds. The password is used ONCE at
+ *     provisioning; steady state refreshes with the stored refresh token, so the
+ *     password can be wiped afterwards (FBASE,SIGNOUT or the portal's Forget button). */
 const unsigned long FIREBASE_UPLOAD_IDLE_MS   = 60000;  // ~1 min dashboard refresh when idle
 const unsigned long FIREBASE_UPLOAD_ACTIVE_MS = 20000;  // faster during ACTIVE_STATE
+// Command poll cadence. The TLS connection is REUSED between polls (fbClient/fbHttp below),
+// so this is one small GET on an open socket -- not a handshake every 3 s.
+const unsigned long FIREBASE_COMMAND_POLL_MS  = 3000;
 // Skip an upload below this much free heap: an mbedTLS session needs ~40-50 KB and a
 // failed alloc mid-handshake is far worse than a skipped dashboard tick.
 const uint32_t FIREBASE_MIN_HEAP = 60000;
@@ -557,6 +565,73 @@ volatile unsigned long fbLastUploadMs = 0;         // cadence gate + "last seen"
 volatile uint32_t fbLastHeap = 0;                  // free heap observed at the last attempt
 volatile int  fbLastHttp = 0;                      // last HTTP status (0 = never attempted / skipped)
 volatile uint32_t fbAttempts = 0, fbFailures = 0;  // lifetime counters (logged on transition)
+
+/* ---- Firebase Auth (device account) --------------------------------------- *
+ * Provision once with email+password -> signInWithPassword returns an ID token AND a
+ * refresh token. Only the refresh token is kept long-term: steady-state renewal hits
+ * securetoken.googleapis.com, so the password never goes on the wire again and can be
+ * erased. All NVS-backed, all netMux-guarded, never logged.                          */
+String   fbEmail = "", fbPassword = "", fbApiKey = "", fbRefresh = "";
+String   fbIdToken = "";                           // RAM only -- short-lived, never persisted
+unsigned long fbTokenExpiryMs = 0;                 // millis() deadline for the current ID token
+volatile bool fbAuthOk = false;                    // last token operation succeeded (diagnostics)
+volatile int  fbAuthHttp = 0;                      // last auth HTTP status
+volatile bool fbSignInPending = false;             // portal/SMS -> netTask: force a password sign-in now
+volatile bool fbCredsPersistPending = false;       // core0 admin form -> core1: persist auth creds
+// Auth backoff: a wrong password must NOT be retried every poll (that is credential
+// hammering and Google will rate-limit the account). Same ladder shape as uploadTick().
+const unsigned long FB_AUTH_BACKOFF[4] = { 30000UL, 120000UL, 480000UL, 1800000UL };
+uint8_t  fbAuthFails = 0;
+unsigned long fbAuthNextTryMs = 0;
+
+/* ---- Firebase remote commands --------------------------------------------- *
+ * Core 0 (netTask) only transports; core 1 validates and dispatches. FreeRTOS queues
+ * carry POD structs across the core boundary -- no Strings, no shared mutable state.  */
+struct FirebaseCommand       { char id[48]; char type[32]; char pump[16]; };
+struct FirebaseCommandStatus { char id[48]; char status[16]; char detail[48]; };
+QueueHandle_t fbCommandQueue = NULL;                // core0 -> core1: requests awaiting validation
+QueueHandle_t fbStatusQueue  = NULL;                // core1 -> core0: results to PATCH back
+char     fbRemoteExerciseId[48] = "";               // command id owning the in-flight pump test ("" = none)
+unsigned long fbLastCommandPollMs = 0;
+volatile uint32_t fbHandshakes = 0;                 // TLS connects; the keep-alive health metric (H-1)
+
+/* Google Trust Services Root R1 (https://pki.goog/repo/certs/gtsr1.pem, valid to 2036-06-22)
+ * -- the CA behind *.googleapis.com and *.firebasedatabase.app. With this set, the Firebase
+ * client VALIDATES the server certificate, so the provisioning sign-in cannot be MITM'd for
+ * the device password. Blank it to fall back to setInsecure() (encrypted but unauthenticated).
+ * If Google ever re-roots, TLS starts failing and PAGE_GSM shows FB:!! -- replace this PEM.  */
+const char FB_ROOT_CA[] = R"EOF(-----BEGIN CERTIFICATE-----
+MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
+CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+MBIGA1UEAxMLR1RTIFJvb3QgUjEwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw
+MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp
+Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwggIiMA0GCSqGSIb3DQEBAQUA
+A4ICDwAwggIKAoICAQC2EQKLHuOhd5s73L+UPreVp0A8of2C+X0yBoJx9vaMf/vo
+27xqLpeXo4xL+Sv2sfnOhB2x+cWX3u+58qPpvBKJXqeqUqv4IyfLpLGcY9vXmX7w
+Cl7raKb0xlpHDU0QM+NOsROjyBhsS+z8CZDfnWQpJSMHobTSPS5g4M/SCYe7zUjw
+TcLCeoiKu7rPWRnWr4+wB7CeMfGCwcDfLqZtbBkOtdh+JhpFAz2weaSUKK0Pfybl
+qAj+lug8aJRT7oM6iCsVlgmy4HqMLnXWnOunVmSPlk9orj2XwoSPwLxAwAtcvfaH
+szVsrBhQf4TgTM2S0yDpM7xSma8ytSmzJSq0SPly4cpk9+aCEI3oncKKiPo4Zor8
+Y/kB+Xj9e1x3+naH+uzfsQ55lVe0vSbv1gHR6xYKu44LtcXFilWr06zqkUspzBmk
+MiVOKvFlRNACzqrOSbTqn3yDsEB750Orp2yjj32JgfpMpf/VjsPOS+C12LOORc92
+wO1AK/1TD7Cn1TsNsYqiA94xrcx36m97PtbfkSIS5r762DL8EGMUUXLeXdYWk70p
+aDPvOmbsB4om3xPXV2V4J95eSRQAogB/mqghtqmxlbCluQ0WEdrHbEg8QOB+DVrN
+VjzRlwW5y0vtOUucxD/SVRNuJLDWcfr0wbrM7Rv1/oFB2ACYPTrIrnqYNxgFlQID
+AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQU5K8rJnEaK0gnhS9SZizv8IkTcT4wDQYJKoZIhvcNAQEMBQADggIBAJ+qQibb
+C5u+/x6Wki4+omVKapi6Ist9wTrYggoGxval3sBOh2Z5ofmmWJyq+bXmYOfg6LEe
+QkEzCzc9zolwFcq1JKjPa7XSQCGYzyI0zzvFIoTgxQ6KfF2I5DUkzps+GlQebtuy
+h6f88/qBVRRiClmpIgUxPoLW7ttXNLwzldMXG+gnoot7TiYaelpkttGsN/H9oPM4
+7HLwEXWdyzRSjeZ2axfG34arJ45JK3VmgRAhpuo+9K4l/3wV3s6MJT/KYnAK9y8J
+ZgfIPxz88NtFMN9iiMG1D53Dn0reWVlHxYciNuaCp+0KueIHoI17eko8cdLiA6Ef
+MgfdG+RCzgwARWGAtQsgWSl4vflVy2PFPEz0tv/bal8xa5meLMFrUKTX5hgUvYU/
+Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT
+6u9AWpQKXCBfTkBdYiJ23//OYb2MI3jSNwLgjt7RETeJ9r/tSQdirpLsQBqvFAnZ
+0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm
+2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb
+bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c
+-----END CERTIFICATE-----
+)EOF";
 
 // Creds/keys live in RAM (loaded from NVS); guarded by netMux between the two cores.
 String wifiSsid = "", wifiPass = "";
@@ -1037,6 +1112,10 @@ void telemetryCollect();
 void netTask(void *pv);
 static bool firebaseUploadLive();
 void firebaseLogTick();
+void firebaseCommandTick();
+void firebaseQueueStatus(const char *id, const char *status, const char *detail);
+void firebaseRemoteExerciseDone(const char *status, const char *detail);
+void saveFbAuth();
 static bool senderIsOwner();
 
 void raiseFault(char tier, const char *code, const char *loc);
@@ -1154,6 +1233,11 @@ void setup() {
   // Started after NVS load so creds are ready. Runs network I/O off the core-1 loop.
   netMux = xSemaphoreCreateMutex();
   sdMux  = xSemaphoreCreateMutex();          // serialize SD across cores (must exist before netTask/logFlush)
+  // Firebase remote-command transport. Created BEFORE netTask so the first poll can never
+  // touch a null queue. Depth 4/8: one command is in flight at a time, statuses can burst.
+  fbCommandQueue = xQueueCreate(4, sizeof(FirebaseCommand));
+  fbStatusQueue  = xQueueCreate(8, sizeof(FirebaseCommandStatus));
+  if (!fbCommandQueue || !fbStatusQueue) Serial.println(F("[FIREBASE] command queues unavailable"));
   // 28 KB: WebServer/scan/SD stream (portal) + mbedTLS handshake frames. Two TLS consumers now share
   // this task (Supabase daily CSV, Firebase every ~60 s) -- they serialize, but the deepest frame wins.
   xTaskCreatePinnedToCore(netTask, "netTask", 28672, NULL, 1, &netTaskHandle, 0);
@@ -1200,6 +1284,7 @@ void loop() {
   g_lastStage = 'R'; runUiTick();          // run receipts: unattended auto-continue past PRE/POST/ERR
   g_lastStage = 'X'; uploadTick();         // Supabase CSV push scheduling (rollover + reconnect catch-up)
   g_lastStage = 'F'; firebaseLogTick();    // Firebase health: log ok<->fail transitions (core-0 does the PUT)
+  g_lastStage = 'k'; firebaseCommandTick();// remote commands: validated + dispatched HERE, on the control core
   // Apply a config SMS that was deferred during a local edit, once the edit has closed (§B.3.1).
   if (pendingCfgSms.length() && uiMode != UI_EDIT && !editConfirm) {
     String s = pendingCfgSms; pendingCfgSms = ""; handleSms(s);
@@ -1224,6 +1309,9 @@ void loop() {
   if (supaPersistPending) { supaPersistPending = false; saveSupa(); logEvent("ESP1", "CFG", "SUPA|PORTAL"); }
   // Persist Firebase URL + enable flag set by the SoftAP admin form (already updated under netMux).
   if (fbPersistPending) { fbPersistPending = false; saveFb(); logEvent("ESP1", "CFG", "FBASE|PORTAL"); }
+  // Persist Firebase auth creds. Also fires after netTask mints a refresh token on core 0, so the
+  // device survives a reboot without needing the password again. Never logs the creds themselves.
+  if (fbCredsPersistPending) { fbCredsPersistPending = false; saveFbAuth(); logEvent("ESP1", "CFG", "FBASE|AUTH"); }
   // Manual reboot requested (Settings > Reboot or the SoftAP button). Always run on core 1 so logs flush
   // cleanly (config persists in NVS; ESP2 keeps executing any in-flight run and re-syncs on our return).
   if (rebootPending) {
@@ -1364,6 +1452,10 @@ void loadConfig() {
   supaLast = prefs.getLong("supalast", 0);          // last day (yyyymmdd) successfully uploaded
   fbUrl    = prefs.getString("fburl", "");          // Firebase RTDB base URL (NVS-only, like the Supabase creds)
   firebaseEnabled = prefs.getBool("fben", true);    // master switch; URL still has to be set for it to run
+  fbEmail    = prefs.getString("fbmail", "");       // device-account creds (NVS-only, never in tracked source)
+  fbPassword = prefs.getString("fbpass", "");       // wiped once a refresh token exists
+  fbApiKey   = prefs.getString("fbkey",  "");       // Firebase Web API key
+  fbRefresh  = prefs.getString("fbref",  "");       // long-lived; this is what keeps us signed in
 }
 /* =============================================================================
  *  CALIBRATION NVS + DISTRIBUTION  (companion spec §A.5.1)
@@ -1446,6 +1538,17 @@ void saveFb() {
   String u; bool en;
   xSemaphoreTake(netMux, portMAX_DELAY); u = fbUrl; en = firebaseEnabled; xSemaphoreGive(netMux);
   prefs.putString("fburl", u); prefs.putBool("fben", en);
+}
+// Firebase device-account creds. The refresh token is the long-lived secret; the password is only
+// needed until the first successful sign-in and can then be wiped (FBASE,SIGNOUT / portal Forget).
+// The ID token is deliberately NOT persisted -- it expires in an hour and is cheap to re-mint.
+void saveFbAuth() {
+  String e, p, k, r;
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  e = fbEmail; p = fbPassword; k = fbApiKey; r = fbRefresh;
+  xSemaphoreGive(netMux);
+  prefs.putString("fbmail", e); prefs.putString("fbpass", p);
+  prefs.putString("fbkey",  k); prefs.putString("fbref",  r);
 }
 // Copy the cred Strings under netMux (the core-0 portal may write them), then write NVS from the locals
 // so the putString can't torn-read a String mid-write.
@@ -1774,6 +1877,7 @@ void handleEsp2Response(const String &payload) {
       esp2SoftResetTried = false;
       pendingRun.active = false; pendingRun.colIdx = -1;          // drop anything abandoned at failure
       pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
+      firebaseRemoteExerciseDone("failed", "aborted by ESP2 recovery");
       setState(STARTUP_SYNC);                                     // re-validate before resuming (sec.10.7.7)
       return;
     }
@@ -1844,6 +1948,7 @@ void handleEsp2Response(const String &payload) {
       if (k >= 0 && k < 3) lastPumpUseMs[k] = millis();        // reset that pump's 2-day clock
       logEvent("ESP1", "ACT", String("EXERCISE|STOP|") + (k >= 0 ? EX_NAME[k] : "?"));
       pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
+      firebaseRemoteExerciseDone("completed", "5 second pump test finished");   // no-op if locally initiated
       if (sysState == ACTIVE_STATE) setState(IDLE_STATE);
       esp2SetPower(false);
     } else if (wo.active) {
@@ -2223,6 +2328,7 @@ void esp2PowerCycle() {
   // Abandon anything that was warming up against this ESP2 (recovery restarts it clean).
   pendingRun.active = false; pendingRun.colIdx = -1;
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
+  firebaseRemoteExerciseDone("failed", "aborted by ESP2 power cycle");
   setState(STARTUP_SYNC);
 }
 
@@ -2496,6 +2602,46 @@ void handleSms(const String &body) {
       saveFb();
       logEvent("ESP1", "CFG", String("FBASE|") + (en ? "ON" : "OFF"));
       sendSMS(en ? "ACK,FBASE,ON" : "ACK,FBASE,OFF");
+      return;
+    }
+    // FBASE,SIGNOUT -- wipe every credential and the live token. The dashboard goes read-dead
+    // until re-provisioned; use this if the device is lost or the account is rotated.
+    if (rest.equalsIgnoreCase("SIGNOUT")) {
+      xSemaphoreTake(netMux, portMAX_DELAY);
+      fbPassword = ""; fbRefresh = ""; fbIdToken = "";
+      xSemaphoreGive(netMux);
+      fbTokenExpiryMs = 0; fbAuthOk = false;
+      saveFbAuth();
+      logEvent("ESP1", "CFG", "FBASE|SIGNOUT");
+      sendSMS("ACK,FBASE,SIGNOUT");
+      return;
+    }
+    // FBASE,APIKEY,<webApiKey>
+    if (rest.startsWith("APIKEY,") || rest.startsWith("apikey,")) {
+      String k = rest.substring(7); k.trim();
+      if (k.length() < 8) { sendSMS("ERR,FBASE,FORMAT"); return; }
+      xSemaphoreTake(netMux, portMAX_DELAY); fbApiKey = k; xSemaphoreGive(netMux);
+      saveFbAuth();
+      logEvent("ESP1", "CFG", "FBASE|APIKEY");          // note: NO key in the log
+      sendSMS("ACK,FBASE,APIKEY");
+      return;
+    }
+    // FBASE,AUTH,<email>,<password> -- provisioning. Password is used once to mint a refresh
+    // token, then FBASE,SIGNOUT or the portal's Forget button can remove it.
+    if (rest.startsWith("AUTH,") || rest.startsWith("auth,")) {
+      String rem = rest.substring(5);
+      int c2 = rem.indexOf(',');
+      if (c2 <= 0) { sendSMS("ERR,FBASE,FORMAT"); return; }
+      String em = rem.substring(0, c2); em.trim();
+      String pw = rem.substring(c2 + 1); pw.trim();
+      if (em.indexOf('@') < 0 || pw.length() < 6) { sendSMS("ERR,FBASE,FORMAT"); return; }
+      xSemaphoreTake(netMux, portMAX_DELAY);
+      fbEmail = em; fbPassword = pw; fbRefresh = "";   // new creds void any stored refresh token
+      xSemaphoreGive(netMux);
+      saveFbAuth();
+      fbSignInPending = true; fbAuthFails = 0; fbAuthNextTryMs = 0;
+      logEvent("ESP1", "CFG", "FBASE|AUTH");           // note: NO email/password in the log
+      sendSMS("ACK,FBASE,AUTH");
       return;
     }
     String u = supaNormalizeUrl(rest);                   // same origin-only reduction as SUPA
@@ -3148,12 +3294,14 @@ void stateMachineTick() {
             int k = pendingExercise.idx; if (k >= 0 && k < 3) lastPumpUseMs[k] = millis();
             logEvent("ESP1", "ACT", String("EXERCISE|NOBOOT|") + (k >= 0 ? EX_NAME[k] : "?"));  // ESP2 never powered up
             pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.acked = false;
+            firebaseRemoteExerciseDone("failed", "ESP2 never powered up");   // releases the remote slot
             esp2SetPower(false); setState(IDLE_STATE);
           }
         } else if (millis() - esp2WarmupMs > PUMP_EXERCISE_TIMEOUT_MS) {  // no DONE,EXERCISE in time
           int k = pendingExercise.idx; if (k >= 0 && k < 3) lastPumpUseMs[k] = millis();
           // Distinguish "ESP2 never confirmed receipt" (NOACK) from "acked but never finished" (NODONE).
           logEvent("ESP1", "ACT", String("EXERCISE|") + (pendingExercise.acked ? "NODONE|" : "NOACK|") + (k >= 0 ? EX_NAME[k] : "?"));
+          firebaseRemoteExerciseDone("failed", pendingExercise.acked ? "ESP2 never reported done" : "ESP2 never acknowledged");
           pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false; pendingExercise.acked = false;
           esp2SetPower(false); setState(IDLE_STATE);
         }
@@ -3722,10 +3870,126 @@ static void tsUpload() {
  *  FIREBASE RTDB LIVE SNAPSHOT  (core 0 / netTask)
  *  PUT <fbUrl>/irrigation/live.json -- replaces the node, so storage stays flat.
  * ========================================================================== */
-// Single seam for the RTDB path + (future) auth. When the test-mode rules are replaced by a device
-// account, append "?auth=" + idToken here and nothing else in this file needs to change.
-static String fbBuildUrl(const String &base) {
-  return base + "/irrigation/live.json";
+/* ---- Shared TLS client (keep-alive) ---------------------------------------
+ * ONE WiFiClientSecure + HTTPClient reused by every Firebase request. Without this, the
+ * 3 s command poll would open a fresh mbedTLS session ~28,800 times a day: ~1-2 s and
+ * ~40-50 KB of heap churn each, which would saturate netTask and starve the ThingSpeak
+ * and Supabase uploads. setReuse(true) keeps the socket open, so handshakes happen only
+ * on first use and after the server drops us -- fbHandshakes is the metric that proves it.
+ * Only netTask touches these; they are never used from core 1.                          */
+WiFiClientSecure fbClient;
+HTTPClient       fbHttp;
+bool             fbTlsReady = false;                // TLS options applied once
+
+// Apply the TLS trust policy. Pinning matters more here than for the Supabase CSV push
+// because the provisioning sign-in carries the device PASSWORD. FB_ROOT_CA is the Google
+// GTS Root R1 PEM; when it is empty we fall back to setInsecure() (encrypted, unauthenticated)
+// and say so, rather than silently pretending the connection is verified.
+static void fbApplyTls() {
+  if (fbTlsReady) return;
+  if (FB_ROOT_CA[0]) fbClient.setCACert(FB_ROOT_CA);
+  else               fbClient.setInsecure();        // [HARDENING TODO] no cert validation
+  fbHttp.setReuse(true);                            // <-- the whole point: keep the socket alive
+  fbTlsReady = true;
+}
+
+// Every Firebase HTTP call goes through here so the handshake counter and timeouts stay honest.
+static bool fbBegin(const String &url) {
+  fbApplyTls();
+  if (!fbClient.connected()) fbHandshakes++;        // a fresh TCP+TLS session is about to happen
+  fbHttp.setConnectTimeout(6000);
+  fbHttp.setTimeout(6000);
+  return fbHttp.begin(fbClient, url);
+}
+
+// Single seam for the RTDB path + auth. Every request carries the device account's ID token;
+// lock the RTDB rules to that UID or the token buys you nothing.
+static String fbBuildUrl(const String &base, const char *path) {
+  return base + path + "?auth=" + fbIdToken;
+}
+
+/* ---- Token lifecycle -------------------------------------------------------
+ * Two paths, deliberately asymmetric:
+ *   PROVISIONING (rare)  signInWithPassword -> idToken + refreshToken. Needs the password.
+ *   STEADY STATE (hourly) securetoken refresh -> idToken. Needs only the refresh token.
+ * Once a refresh token exists the password is dead weight and can be wiped, so a stolen
+ * device yields a revocable token instead of reusable account credentials.               */
+
+// Shared tail: parse a token response, store it, reset the backoff. Returns true on success.
+static bool fbStoreToken(const String &idToken, const String &refresh, unsigned long expSec) {
+  if (!idToken.length()) return false;
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  fbIdToken = idToken;
+  if (refresh.length()) fbRefresh = refresh;
+  xSemaphoreGive(netMux);
+  // Renew 5 min early so a slow link never uses an expired token mid-request.
+  fbTokenExpiryMs = millis() + ((expSec > 300 ? expSec - 300 : 60) * 1000UL);
+  fbAuthFails = 0; fbAuthNextTryMs = 0; fbAuthOk = true;
+  return true;
+}
+
+// Exchange the stored refresh token for a fresh ID token. No password involved.
+static bool fbRefreshToken(const String &apiKey, const String &refresh) {
+  String body = "grant_type=refresh_token&refresh_token=" + refresh;
+  if (!fbBegin("https://securetoken.googleapis.com/v1/token?key=" + apiKey)) return false;
+  fbHttp.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int code = fbHttp.POST(body);
+  String resp = (code == 200) ? fbHttp.getString() : "";
+  fbHttp.end();
+  fbAuthHttp = code;
+  if (code != 200) return false;
+  StaticJsonDocument<1536> r;
+  if (deserializeJson(r, resp)) return false;
+  return fbStoreToken(r["id_token"] | "", r["refresh_token"] | "", (r["expires_in"] | String("3600")).toInt());
+}
+
+// Provisioning sign-in. This is the only request that carries the device password.
+static bool fbPasswordSignIn(const String &apiKey, const String &email, const String &pass) {
+  StaticJsonDocument<384> req;
+  req["email"] = email; req["password"] = pass; req["returnSecureToken"] = true;
+  String body; serializeJson(req, body);
+  if (!fbBegin("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + apiKey)) return false;
+  fbHttp.addHeader("Content-Type", "application/json");
+  int code = fbHttp.POST(body);
+  String resp = (code == 200) ? fbHttp.getString() : "";
+  fbHttp.end();
+  fbAuthHttp = code;
+  if (code != 200) return false;
+  StaticJsonDocument<1536> r;
+  if (deserializeJson(r, resp)) return false;
+  return fbStoreToken(r["idToken"] | "", r["refreshToken"] | "", (r["expiresIn"] | String("3600")).toInt());
+}
+
+// Core 0: guarantee a usable ID token, or fail fast under backoff. Called before every request.
+static bool fbEnsureToken() {
+  if (fbIdToken.length() && (long)(millis() - fbTokenExpiryMs) < 0) return true;   // still valid
+  if (fbAuthNextTryMs && (long)(millis() - fbAuthNextTryMs) < 0) return false;     // backing off
+
+  String apiKey, email, pass, refresh;
+  bool force;
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  apiKey = fbApiKey; email = fbEmail; pass = fbPassword; refresh = fbRefresh;
+  xSemaphoreGive(netMux);
+  force = fbSignInPending; fbSignInPending = false;
+  if (apiKey.length() < 8) { fbAuthOk = false; return false; }                     // not provisioned yet
+
+  bool ok = false;
+  // Prefer the refresh token; only fall back to the password when provisioning or when the
+  // refresh token has been revoked/expired (a forced sign-in from the portal also lands here).
+  if (!force && refresh.length()) ok = fbRefreshToken(apiKey, refresh);
+  if (!ok && email.length() && pass.length()) {
+    ok = fbPasswordSignIn(apiKey, email, pass);
+    if (ok) fbCredsPersistPending = true;                                          // persist the new refresh token
+  }
+  if (!ok) {
+    fbAuthOk = false;
+    fbIdToken = "";                                                                // don't reuse a dead token
+    // Escalate: 30 s -> 2 m -> 8 m -> 30 m. Retrying a wrong password every poll is
+    // credential hammering and Google will rate-limit or lock the account.
+    fbAuthNextTryMs = millis() + FB_AUTH_BACKOFF[fbAuthFails < 4 ? fbAuthFails : 3];
+    if (fbAuthFails < 4) fbAuthFails++;
+  }
+  return ok;
 }
 
 // Core 0: publish the latest verified snapshot. Reads ONLY from the telem snapshot (never core-1's
@@ -3751,12 +4015,18 @@ static bool firebaseUploadLive() {
   fbLastHeap = heap;
   if (heap < FIREBASE_MIN_HEAP) { fbLastOk = false; return false; }
 
+  if (!fbEnsureToken()) { fbLastOk = false; return false; }   // no token -> no request (respects backoff)
+
   // 1536 B covers all NUM_COLUMNS zones with headroom. Overflow is CHECKED below, not assumed: an
   // over-capacity document serializes silently truncated, which would PUT malformed JSON.
   StaticJsonDocument<1536> doc;
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
   meta["deviceOnline"] = true;
+  // Publish the cadence so the dashboard can compute its own staleness threshold and grey out the
+  // control buttons when this snapshot goes cold. With remote e-stop in scope, a page that cannot
+  // tell "idle" from "device offline" is the dangerous failure mode.
+  meta["refreshMs"] = (sysState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
 
   JsonObject system = doc.createNestedObject("system");
   system["state"] = stateName(t.state);
@@ -3785,18 +4055,163 @@ static bool firebaseUploadLive() {
   String payload;
   serializeJson(doc, payload);
 
-  WiFiClientSecure client;
-  client.setInsecure();                                    // encrypted; no cert pinning (thesis) [HARDENING TODO]
-  HTTPClient http;
-  http.setConnectTimeout(6000); http.setTimeout(6000);
-  if (!http.begin(client, fbBuildUrl(base))) { fbLastOk = false; fbLastHttp = 0; fbFailures++; return false; }
-  http.addHeader("Content-Type", "application/json");
-  int code = http.PUT(payload);
-  http.end();
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/live.json"))) { fbLastOk = false; fbLastHttp = 0; fbFailures++; return false; }
+  fbHttp.addHeader("Content-Type", "application/json");
+  int code = fbHttp.PUT(payload);
+  fbHttp.end();                                            // setReuse(true): keeps the socket, frees the request
   fbLastHttp = code;
   fbLastOk = (code >= 200 && code < 300);
   if (!fbLastOk) fbFailures++;
+  if (code == 401) { fbIdToken = ""; fbTokenExpiryMs = 0; }  // token rejected -> force a renew next tick
   return fbLastOk;
+}
+
+/* =============================================================================
+ *  FIREBASE REMOTE COMMANDS  (core 0 transports, core 1 decides)
+ * ========================================================================== */
+// Core 1 -> core 0: queue a result for the dashboard. Safe to call from any control path.
+void firebaseQueueStatus(const char *id, const char *status, const char *detail) {
+  if (!fbStatusQueue || !id || !*id) return;
+  FirebaseCommandStatus u = {};
+  strlcpy(u.id, id, sizeof(u.id));
+  strlcpy(u.status, status, sizeof(u.status));
+  strlcpy(u.detail, detail, sizeof(u.detail));
+  xQueueSend(fbStatusQueue, &u, 0);                        // never block the control loop
+}
+
+// Core 1: a remote pump test reached a terminal state. Report it and release the slot.
+// EVERY terminal path must call this: fbRemoteExerciseId is part of the idle gate, so leaving
+// it set after a failure would reject all future remote commands as "not safely idle".
+void firebaseRemoteExerciseDone(const char *status, const char *detail) {
+  if (!fbRemoteExerciseId[0]) return;
+  firebaseQueueStatus(fbRemoteExerciseId, status, detail);
+  fbRemoteExerciseId[0] = 0;
+}
+
+// Core 0: fetch at most one queued command. One per poll keeps operation strictly sequential.
+static void firebasePollCommands() {
+  if (millis() - fbLastCommandPollMs < FIREBASE_COMMAND_POLL_MS) return;
+  fbLastCommandPollMs = millis();
+
+  String base; bool enabled;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
+  if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
+  if (!fbCommandQueue || !fbEnsureToken()) return;
+
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json"))) return;
+  int code = fbHttp.GET();
+  String resp = (code == 200) ? fbHttp.getString() : "";
+  fbHttp.end();
+  if (code == 401) { fbIdToken = ""; fbTokenExpiryMs = 0; return; }
+  if (code != 200 || resp.length() == 0 || resp == "null") return;
+
+  // Filter: we only ever read these four fields, so ArduinoJson can skip the rest of the
+  // document instead of allocating it. Keeps this off the netTask stack (was 6 KB in the fork).
+  StaticJsonDocument<128> filter;
+  JsonObject any = filter.createNestedObject("*");
+  any["status"] = true; any["type"] = true;
+  any.createNestedObject("payload")["pump"] = true;
+
+  StaticJsonDocument<1024> doc;
+  if (deserializeJson(doc, resp, DeserializationOption::Filter(filter)) || !doc.is<JsonObject>()) return;
+
+  for (JsonPair item : doc.as<JsonObject>()) {
+    JsonObject req = item.value().as<JsonObject>();
+    if (String(req["status"] | "") != "queued") continue;
+    FirebaseCommand c = {};
+    strlcpy(c.id,   item.key().c_str(),          sizeof(c.id));
+    strlcpy(c.type, req["type"] | "",            sizeof(c.type));
+    strlcpy(c.pump, req["payload"]["pump"] | "", sizeof(c.pump));
+    FirebaseCommandStatus ack = {};
+    strlcpy(ack.id, c.id, sizeof(ack.id));
+    // Mark it non-"queued" immediately, so the next poll cannot hand the same request to
+    // core 1 twice and start two pump tests from one dashboard click.
+    if (xQueueSend(fbCommandQueue, &c, 0) == pdTRUE) {
+      strlcpy(ack.status, "received", sizeof(ack.status));
+      strlcpy(ack.detail, "master validating", sizeof(ack.detail));
+    } else {
+      strlcpy(ack.status, "rejected", sizeof(ack.status));
+      strlcpy(ack.detail, "master busy", sizeof(ack.detail));
+    }
+    xQueueSend(fbStatusQueue, &ack, 0);
+    break;                                                 // exactly one command per poll
+  }
+}
+
+// Core 0: PATCH queued results back. Separated from control work so a dead link never
+// stalls the actuator side -- the queue simply drains when connectivity returns.
+static void firebaseFlushStatus() {
+  if (!fbStatusQueue) return;
+  String base; bool enabled;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
+  if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
+
+  FirebaseCommandStatus u;
+  while (xQueuePeek(fbStatusQueue, &u, 0) == pdTRUE) {
+    if (!fbEnsureToken()) return;                          // leave it queued; retry next tick
+    StaticJsonDocument<192> body;
+    body["status"] = u.status; body["detail"] = u.detail;
+    body.createNestedObject("updatedAt")[".sv"] = "timestamp";
+    String json; serializeJson(body, json);
+    String path = String("/irrigation/commands/") + u.id + ".json";
+    if (!fbBegin(fbBuildUrl(base, path.c_str()))) return;
+    fbHttp.addHeader("Content-Type", "application/json");
+    int code = fbHttp.PATCH(json);
+    fbHttp.end();
+    if (code == 401) { fbIdToken = ""; fbTokenExpiryMs = 0; return; }
+    if (code < 200 || code >= 300) return;                 // keep it queued and retry later
+    xQueueReceive(fbStatusQueue, &u, 0);                   // confirmed delivered -> drop it
+  }
+}
+
+// Core 1: validate and dispatch. This is the ONLY place a remote request can touch the rig,
+// and it goes through the same gates and the same bounded flows the local UI uses.
+void firebaseCommandTick() {
+  if (!fbCommandQueue) return;
+  FirebaseCommand c;
+  while (xQueueReceive(fbCommandQueue, &c, 0) == pdTRUE) {
+    if (!strcmp(c.type, "EMERGENCY_STOP")) {
+      enterEmergencyStop(true);                            // existing system-wide physical stop
+      logEvent("FIREBASE", "CMD", "ESTOP");
+      firebaseQueueStatus(c.id, "completed", "emergency stop executed");
+      continue;
+    }
+
+    // START_PUMP is accepted for dashboard compatibility but is deliberately interpreted as the
+    // firmware's existing 5 s preventive exercise -- never an open-ended remote run.
+    int pump = -1;
+    if (!strcmp(c.type, "RUN_PUMP_TEST") || !strcmp(c.type, "START_PUMP")) {
+      if      (!strcmp(c.pump, "transfer")) pump = 0;
+      else if (!strcmp(c.pump, "booster"))  pump = 1;
+      else if (!strcmp(c.pump, "mixer"))    pump = 2;
+    } else if (!strcmp(c.type, "TOGGLE_MIXER")) pump = 2;
+
+    if (pump < 0) {
+      firebaseQueueStatus(c.id, "rejected", "not a remotely safe control");
+      logEvent("FIREBASE", "REJECT", String(c.type));
+      continue;
+    }
+    // Same gate the local exerciseTick() honours, plus the UI modes: never preempt a run,
+    // a held fault, Testing/Calibration, or another in-flight remote test.
+    if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
+        pendingExercise.active || esp2Held || fbRemoteExerciseId[0]) {
+      firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
+      logEvent("FIREBASE", "REJECT", "NOT_IDLE");
+      continue;
+    }
+
+    // Arm exactly as exerciseTick() does -- including acked=false, which the ACK/START log and
+    // the NOACK-vs-NODONE timeout distinction both depend on.
+    pendingExercise.active = true; pendingExercise.idx = pump;
+    pendingExercise.sent = false;  pendingExercise.acked = false;
+    strlcpy(fbRemoteExerciseId, c.id, sizeof(fbRemoteExerciseId));
+    esp2WarmupMs = millis();
+    setState(ACTIVE_STATE);
+    if (esp2Available && esp2Powered) dispatchPendingExercise();   // already up
+    else                              esp2SetPower(true);          // warm up; READY dispatches
+    firebaseQueueStatus(c.id, "accepted", "5 second pump test started");
+    logEvent("FIREBASE", "CMD", String("PUMP_TEST|") + EX_NAME[pump]);
+  }
 }
 
 // Core 1: publish Firebase health to the SD log. Logs only on an ok<->fail TRANSITION (same
@@ -4060,11 +4475,29 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
        "<p><button type=submit style='width:100%;padding:10px'>Upload logs now</button></p></form>";
   o += "<h3>Firebase live dashboard</h3><form method=POST action=/fbase>"
        "<p>RTDB URL<br><input name=url style='width:100%' placeholder='https://<ref>-default-rtdb.<region>.firebasedatabase.app' value='" + htmlEscape(fbUrl) + "'></p>"
-       "<p><label><input type=checkbox name=en value=yes" + String(firebaseEnabled ? " checked" : "") + "> Enabled (publishes a live snapshot every ~60 s)</label></p>"
+       "<p><label><input type=checkbox name=en value=yes" + String(firebaseEnabled ? " checked" : "") + "> Enabled (live snapshot + remote commands)</label></p>"
        "<p>Last upload: " + String(fbUrl.length() == 0 ? "not configured"
                                    : (fbLastUploadMs == 0 ? "none yet"
                                       : String((millis() - fbLastUploadMs) / 1000) + " s ago, " + (fbLastOk ? "OK" : "FAILED"))) + "</p>"
        "<p><button type=submit style='width:100%;padding:10px'>Save Firebase settings</button></p></form>";
+  // Device account. The password is write-only from here: it is never rendered back, and once a
+  // refresh token exists it is no longer needed at all (Forget password below).
+  o += "<h3>Firebase device account</h3><form method=POST action=/fbauth>"
+       "<p>Web API key<br><input name=key style='width:100%' placeholder='" +
+         String(fbApiKey.length() ? "(set - leave blank to keep)" : "AIza...") + "'></p>"
+       "<p>Device email<br><input name=email style='width:100%' value='" + htmlEscape(fbEmail) + "'></p>"
+       "<p>Device password<br><input name=pass type=password style='width:100%' placeholder='" +
+         String(fbPassword.length() ? "(set - leave blank to keep)" : "used once, then discardable") + "'></p>"
+       "<p>Token: " + String(fbAuthOk ? "signed in" : "not signed in") +
+         String(fbAuthHttp ? " (HTTP " + String(fbAuthHttp) + ")" : "") +
+         " &middot; refresh token " + String(fbRefresh.length() ? "stored" : "none") +
+         " &middot; TLS handshakes " + String(fbHandshakes) + "</p>"
+       "<p><label><input type=checkbox name=signin value=yes> Sign in now (uses the password)</label></p>"
+       "<p><button type=submit style='width:100%;padding:10px'>Save device account</button></p></form>";
+  o += "<form method=POST action=/fbauth>"
+       "<input type=hidden name=forget value=pass>"
+       "<p>Once \"refresh token: stored\" appears, the password is no longer needed.</p>"
+       "<p><button type=submit style='width:100%;padding:10px'>Forget password (keep signed in)</button></p></form>";
   o += "<h3 style='color:#c33'>Reboot</h3><form method=POST action=/reboot "
        "onsubmit=\"return confirm('Reboot the controller now?')\">"
        "<p><label><input type=checkbox name=confirm value=yes> Yes, reboot ESP1 (config kept).</label></p>"
@@ -4201,6 +4634,31 @@ static void portalHandleFbase() {                             // POST /fbase -- 
   fbPersistPending = true;
   portalServer.send(200, "text/html", portalAdminHtml(String("Firebase settings saved (") + (en ? "enabled" : "disabled") + ")."));
 }
+static void portalHandleFbauth() {                            // POST /fbauth -- Firebase device account
+  if (!portalRequireAdmin()) return;
+  // "Forget password": drop the password but keep the refresh token, so the device stays signed in
+  // with no reusable account credential left on it. This is the intended end state after provisioning.
+  if (portalServer.arg("forget") == "pass") {
+    xSemaphoreTake(netMux, portMAX_DELAY); fbPassword = ""; xSemaphoreGive(netMux);
+    fbCredsPersistPending = true;
+    portalServer.send(200, "text/html", portalAdminHtml("Password forgotten (refresh token kept)."));
+    return;
+  }
+  String key   = portalServer.arg("key");   key.trim();
+  String email = portalServer.arg("email"); email.trim();
+  String pass  = portalServer.arg("pass");                    // NOT trimmed: spaces can be legitimate
+  bool   signin = (portalServer.arg("signin") == "yes");
+  // Blank means "keep what's stored" for the two secrets, mirroring the Supabase service-key form.
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  if (key.length())  fbApiKey = key;
+  if (pass.length()) fbPassword = pass;
+  if (email != fbEmail) { fbEmail = email; fbRefresh = ""; }  // new identity -> old refresh token is void
+  xSemaphoreGive(netMux);
+  fbCredsPersistPending = true;
+  if (signin) { fbSignInPending = true; fbAuthFails = 0; fbAuthNextTryMs = 0; }  // clear backoff, retry now
+  portalServer.send(200, "text/html", portalAdminHtml(signin ? "Saved. Signing in on the next network tick."
+                                                             : "Device account saved."));
+}
 static void portalHandleSupa() {                              // POST /supa -- set Supabase URL + service key
   if (!portalRequireAdmin()) return;
   String url = portalServer.arg("url"); url.trim();
@@ -4300,6 +4758,7 @@ static void portalStart() {
     portalServer.on("/upload", HTTP_POST, portalHandleUpload); // queue a Supabase CSV push
     portalServer.on("/supa", HTTP_POST, portalHandleSupa);     // set Supabase URL + service key (NVS)
     portalServer.on("/fbase", HTTP_POST, portalHandleFbase);   // set Firebase RTDB URL + enable flag (NVS)
+    portalServer.on("/fbauth", HTTP_POST, portalHandleFbauth); // set Firebase device account creds (NVS)
     portalServer.on("/tskey", HTTP_POST, portalHandleTskey);   // config forms (staged -> core-1 handleSms)
     portalServer.on("/colmode", HTTP_POST, portalHandleColMode);
     portalServer.on("/colname", HTTP_POST, portalHandleColName);
@@ -4384,6 +4843,10 @@ void netTask(void *pv) {
     // only one TLS session is ever open at a time.
     unsigned long fbInterval = (sysState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
     if (millis() - fbLastUploadMs >= fbInterval) firebaseUploadLive();
+    // Remote-command transport, both directions. Cheap: they ride the SAME keep-alive TLS
+    // socket as the upload above, so a 3 s poll costs one small GET, not a handshake.
+    firebaseFlushStatus();                                 // results first: report before fetching more
+    firebasePollCommands();
 
     // Supabase CSV push: core 1 sets uploadReqStamp; do one attempt here and publish the result.
     if (uploadReqStamp != 0 && !uploadBusy) {
@@ -4458,6 +4921,7 @@ void enterEmergencyStop(bool cutPower) {
   wo.active = false; wo.stage = WO_IDLE;
   pendingRun.active = false; pendingRun.colIdx = -1;
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
+  firebaseRemoteExerciseDone("failed", "aborted by emergency stop");   // release the remote slot
   if (cutPower) esp2SetPower(false, true);        // (sec.23.1.1) -- FORCE immediate cut (bypass min-on hold)
   runUiAbort("EMERGENCY_STOP");                   // close the run UI so the E-stop prompt owns the screen
   editConfirm = false; restoreConfirm = false; resetConfirm = false; editDirty = false;   // force-dismiss + auto-discard (§B.3.1)

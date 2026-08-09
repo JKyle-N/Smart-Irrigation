@@ -24,7 +24,7 @@ client; its web server binds only to the SoftAP at `192.168.4.1`). True off-site
 | Decision | Choice |
 |---|---|
 | **Reach** | True internet via **Firebase** (Realtime Database + Hosting + Auth), **Spark/free** plan |
-| **Scope** | **Reads + config only** — NO e-stop/recovery from web (STOP/RELEASE/IRRIGATE/NORMAL stay SMS/LCD-only) |
+| **Scope** | ~~Reads + config only~~ → **REVISED 2026-08-09:** reads, config, **remote EMERGENCY_STOP, and a bounded 5 s pump test**. RELEASE/IRRIGATE/NORMAL recovery still stay SMS/LCD-only. Remote requests are transported by core 0 but validated and dispatched on core 1 through the same idle gate and the same `pendingExercise` flow the local UI uses. **SMS/LCD remain the authoritative stop path** — a web e-stop silently does nothing when WiFi is down, so the dashboard must grey out its controls when `meta/updatedAt` goes stale (the device publishes `meta/refreshMs` for exactly this). |
 | **Logs** | **Batched new-rows** — per-day byte offset, upload every ~1–5 min into **RTDB**, pruned to **90 days**; SD keeps the full archive |
 | **Telemetry** | **Keep ThingSpeak** for sensor graphs; Firebase handles logs/errors/config |
 | **Sync** | Poll RTDB for pending config commands every **~30–60 s**; **backfill** missed logs/errors from SD offset on reconnect |
