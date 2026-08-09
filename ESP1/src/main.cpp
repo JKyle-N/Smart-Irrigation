@@ -4004,6 +4004,18 @@ static void fbNoteAuthError(int code, const String &resp) {
   fbAuthErrLogPending = true;
 }
 
+// A locally-detected auth blocker (no network involved). Same reporting path as a Google
+// rejection, because "FAIL|http=0|n=0" with no reason is exactly the dead end this avoids.
+// Deduped: these conditions persist for many ticks and must not flood the CSV.
+static void fbNoteAuthLocal(const char *why) {
+  if (fbAuthErr == why) return;
+  fbAuthErr = why;
+  fbAuthErrMs = millis();
+  Serial.print(F("[FIREBASE] auth blocked: ")); Serial.println(fbAuthErr);
+  strlcpy(fbAuthErrLog, fbAuthErr.c_str(), sizeof(fbAuthErrLog));
+  fbAuthErrLogPending = true;
+}
+
 // Shared tail: parse a token response, store it, reset the backoff. Returns true on success.
 static bool fbStoreToken(const String &idToken, const String &refresh, unsigned long expSec) {
   if (!idToken.length()) return false;
@@ -4073,18 +4085,27 @@ static bool fbEnsureToken() {
   apiKey = fbApiKey; email = fbEmail; pass = fbPassword; refresh = fbRefresh;
   xSemaphoreGive(netMux);
   force = fbSignInPending; fbSignInPending = false;
-  if (apiKey.length() < 8) { fbAuthOk = false; return false; }                     // not provisioned yet
+  if (apiKey.length() < 8) {
+    fbAuthOk = false;
+    fbNoteAuthLocal("no Web API key stored (portal form, or FBASE,APIKEY,<key>)");
+    return false;
+  }
 
-  bool ok = false;
+  bool ok = false, tried = false;
   // Prefer the refresh token; only fall back to the password when provisioning or when the
   // refresh token has been revoked/expired (a forced sign-in from the portal also lands here).
-  if (!force && refresh.length()) ok = fbRefreshToken(apiKey, refresh);
+  if (!force && refresh.length()) { tried = true; ok = fbRefreshToken(apiKey, refresh); }
   if (!ok && email.length() && pass.length()) {
+    tried = true;
     ok = fbPasswordSignIn(apiKey, email, pass);
     if (ok) fbCredsPersistPending = true;                                          // persist the new refresh token
   }
   if (!ok) {
     fbAuthOk = false;
+    // Nothing was even attempted: the key is present but there is no password and no refresh
+    // token, so there is no credential to exchange. Previously this fell straight into the
+    // backoff and reported nothing at all.
+    if (!tried) fbNoteAuthLocal("have API key but no password and no refresh token");
     fbIdToken = "";                                                                // don't reuse a dead token
     // Escalate: 30 s -> 2 m -> 8 m -> 30 m. Retrying a wrong password every poll is
     // credential hammering and Google will rate-limit or lock the account.
@@ -4340,7 +4361,11 @@ void firebaseLogTick() {
   if (now == lastState) return;
   lastState = now;
   uint32_t stackFree = netTaskHandle ? uxTaskGetStackHighWaterMark(netTaskHandle) : 0;
+  // auth= and url= make an n=0 row self-explanatory: with no attempt counted, the cause is
+  // always upstream of the request, and it is one of these two.
   logEvent("ESP1", "FBASE", String(now ? "OK" : "FAIL") + "|http=" + String(fbLastHttp) +
+                            "|auth=" + String(fbAuthOk ? "ok" : "no") +
+                            "|url=" + String(fbUrl.length() >= 8 ? "set" : "unset") +
                             "|heap=" + String(fbLastHeap) + "|netstk=" + String(stackFree) +
                             "|n=" + String(fbAttempts) + "|fail=" + String(fbFailures));
 }
