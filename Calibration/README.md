@@ -27,6 +27,8 @@ Calibration/
     ACS712/       mixer-current zero offset (+ optional sensitivity)
     Flow/         8x flow K-factors; DRIVES the paired pump/valve under a dead-man
     FlowPinFinder/ identify which flow sensor is on which GPIO (reads all flow pins)
+  ESP1/        PlatformIO projects (env esp32dev)
+    ACS758/       high-current zero offset + sensitivity, read via an ADS1115 I2C ADC
 ```
 
 Flow is separated from the other sensors on both controllers, as required.
@@ -39,6 +41,9 @@ Flow is separated from the other sensors on both controllers, as required.
 # ESP2 tools (from the tool folder)
 cd ESP2/pH   && pio run -e esp32dev            # -t upload to flash (set upload_port first)
 cd ESP2/Flow && pio run -e esp32dev
+
+# ESP1 tools
+cd ESP1/ACS758 && pio run -e esp32dev
 
 # Nano tools (each folder has a platformio.ini so it builds in CI / on a phone too)
 cd Nano/Soil && pio run -e nanoatmega328       # -t upload to flash
@@ -66,6 +71,25 @@ Every tool prints a **help banner** on boot; type `h` any time. All use a common
 | ESP2/EC | linear least-squares (zero + standard) | `main.cpp` `EC_CAL_M` / `EC_CAL_B` |
 | ESP2/ACS712 | zero-offset (motor OFF) | `main.cpp` `ACS712_ZERO_V` |
 | ESP2/Flow | K = pulses/L, 3-run + outlier, per channel | `main.cpp` `K_RES_MIX`/`K_MIX_IRR`/`K_NUT[]` |
+| ESP1/ACS758 | zero-offset (load OFF) + V/A from a known current, via ADS1115 | ESP1 `ACS758_ZERO_V` / `ACS758_SENS_V_PER_A` / `ACS758_DIV_RATIO` |
+
+## ⚠️ ESP1/ACS758 — the ACS758 output can destroy the ADS1115
+
+The ACS758 is a 5 V part whose output swings to ~5 V. The ADS1115's absolute maximum input is
+**VDD + 0.3 V**, so a direct connection to an ADS1115 powered from 3.3 V will damage the ADC. Put a
+divider on the sensor output (10k/10k → ratio 2.0) and power the ADS1115 from **3.3 V**, not 5 V — at
+5 V its logic-high threshold is 0.7 × VDD = 3.5 V, which the ESP32's 3.3 V I2C lines cannot reliably
+reach. Tell the tool your measured ratio with `div`.
+
+The ACS758 is also **ratiometric**: both its zero point (VCC/2 for "B" parts, 0.12 × VCC for "U") and
+its sensitivity scale with its supply. Measure the rail with a DMM and enter it with `vcc` — a rail
+that is really 4.85 V instead of 5.00 V shifts the zero by 75 mV, which on a 40 mV/A part reads as a
+phantom **1.9 A**. That single step is the most common source of a wrong ACS758 calibration.
+
+Procedure: `variant 50B` (your part number) → `vcc 4.98` (measured) → `div 2.003` (measured resistors)
+→ **load OFF** → `zero` → load at a known current (clamp meter) → `sens 12.5` → `show` to print the
+paste-ready constants. `scan` finds the ADS1115 if it doesn't answer at 0x48; `stats` reports the
+ripple, which is the honest floor below which a current is not measurable.
 
 ## ⚠️ ESP2/Flow drives real actuators
 
