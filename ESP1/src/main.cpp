@@ -148,7 +148,11 @@ int   calSoilAir[NUM_COLUMNS]   = { 656, 707, 800 };   // raw ADC when DRY  (map
 int   calSoilWater[NUM_COLUMNS] = { 524, 391, 300 };   // raw ADC when WET  (maps to 100%)
 // A capacitive probe reading <=LO or >=HI is treated as disconnected/shorted and dropped from the combine.
 const int SOIL_ADC_RAIL_LO = 8, SOIL_ADC_RAIL_HI = 1015;
-float calResEmptyCm = 53.0f, calResFullCm = 3.0f;      // ultrasonic geometry (moved from Nano)
+// Measured on the rig: sensor-to-water 38 cm = empty (0 %), 11 cm = full (100 %).
+// NOTE: loadCal() overrides these from the `calib` NVS namespace, so a value captured earlier by
+// the Calibration menu WINS over these defaults. If the tank still reads wrong after flashing,
+// re-run Calibration > ultrasonic (or clear NVS) -- editing the constant alone will not take.
+float calResEmptyCm = 38.0f, calResFullCm = 11.0f;     // ultrasonic geometry (moved from Nano) [MEASURED]
 float calMixEmptyCm = 50.0f, calMixFullCm = 4.0f;
 float calFlowResScale = 1.0f;                          // reservoir flow correction factor
 float calNpkScale[7] = { 10, 10, 1, 10, 1, 1, 1 };     // raw register -> engineering (moved from Nano)
@@ -184,10 +188,16 @@ static int soilCombine(int col, int v1, int v2) {
   else                 return -1;             // both look disconnected -> honest invalid
   return soilPct(col, raw);
 }
-// Map a raw ultrasonic distance (cm) to 0..100 % using empty/full geometry.
+// Map a raw ultrasonic distance (cm) to a WHOLE percent, 0..100, using empty/full geometry.
+// Rounded to an integer on purpose: an ultrasonic ranger's real resolution is coarser than 1 % of
+// a 27 cm span, so the decimals were noise being displayed and logged as if they meant something.
+// The clamp is hard at both ends -- a reading past "full" reports exactly 100, never 101.
 static float levelPct(float distCm, float emptyCm, float fullCm) {
+  if (emptyCm == fullCm) return 0;                    // degenerate geometry -> refuse to divide by 0
   float pct = (emptyCm - distCm) * 100.0f / (emptyCm - fullCm);
-  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+  pct = roundf(pct);
+  if (pct < 0)   pct = 0;
+  if (pct > 100) pct = 100;
   return pct;
 }
 
@@ -623,6 +633,11 @@ QueueHandle_t fbCommandQueue = NULL;                // core0 -> core1: requests 
 QueueHandle_t fbStatusQueue  = NULL;                // core1 -> core0: results to PATCH back
 char     fbRemoteExerciseId[48] = "";               // command id owning the in-flight pump test ("" = none)
 unsigned long fbLastCommandPollMs = 0;
+// Server-side throttle between ACCEPTED remote actuations: a browser-side lock can be bypassed by a
+// second tab or a direct RTDB write. Only a command that actually ran starts the cooldown -- see
+// firebaseCommandTick() for why arming it on a rejection is worse than not throttling at all.
+unsigned long fbLastRemoteActionMs = 0;
+const unsigned long FB_REMOTE_MIN_GAP_MS = 10000;
 volatile uint32_t fbHandshakes = 0;                 // TLS connects; the keep-alive health metric (H-1)
 
 /* Google Trust Services Root R1 (https://pki.goog/repo/certs/gtsr1.pem, valid to 2036-06-22)
@@ -4581,6 +4596,18 @@ void firebaseCommandTick() {
       logEvent("FIREBASE", "REJECT", "NOT_IDLE");
       continue;
     }
+
+    // Rate-limit only ACTUAL actuations, and only AFTER every other check has passed. Starting the
+    // cooldown earlier (before validation, as a naive placement does) means a command rejected for
+    // an unrelated reason -- not idle, unknown pump -- still arms a 10 s block, so the operator's
+    // legitimate retry is refused too and the button looks permanently dead.
+    if (fbLastRemoteActionMs && millis() - fbLastRemoteActionMs < FB_REMOTE_MIN_GAP_MS) {
+      unsigned long waitS = (FB_REMOTE_MIN_GAP_MS - (millis() - fbLastRemoteActionMs) + 999) / 1000;
+      firebaseQueueStatus(c.id, "rejected", (String("wait ") + waitS + "s between commands").c_str());
+      logEvent("FIREBASE", "REJECT", "THROTTLE");
+      continue;
+    }
+    fbLastRemoteActionMs = millis();
 
     // Arm exactly as exerciseTick() does -- including acked=false, which the ACK/START log and
     // the NOACK-vs-NODONE timeout distinction both depend on.
