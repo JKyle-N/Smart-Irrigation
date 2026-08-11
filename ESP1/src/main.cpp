@@ -4234,8 +4234,17 @@ static bool fbRefreshToken(const String &apiKey, const String &refresh) {
   fbHttp.end();
   fbAuthHttp = code;
   if (code != 200) { fbNoteAuthError(code, resp); return false; }
-  StaticJsonDocument<1536> r;
-  if (deserializeJson(r, resp)) { fbAuthErr = "malformed refresh response"; return false; }
+  // 4096, not 1536. A real securetoken response is ~1.5 KB -- the ID token alone is a ~980-char JWT
+  // and the refresh token another ~270 -- and deserializeJson() from a String COPIES every string
+  // into the document's pool, then adds ~16 B per member on top. Measured need is ~1594 B, so 1536
+  // fell ~60 B short: deserializeJson returned NoMemory and this reported "malformed" on a
+  // perfectly good HTTP 200, meaning the device could never hold a token. THIS is why Firebase
+  // never connected. Do not shrink it back.
+  StaticJsonDocument<4096> r;
+  // Report WHICH parse failure. Calling a NoMemory "malformed" is what disguised the undersized
+  // pool as a server problem for so long -- c.f() names it (NoMemory / IncompleteInput / ...).
+  DeserializationError de = deserializeJson(r, resp);
+  if (de) { fbNoteAuthLocal((String("refresh parse: ") + de.c_str() + " (body " + resp.length() + "B)").c_str()); return false; }
   String uid = r["user_id"] | "";
   if (uid.length()) fbUid = uid;
   return fbStoreToken(r["id_token"] | "", r["refresh_token"] | "", (r["expires_in"] | String("3600")).toInt());
@@ -4255,8 +4264,11 @@ static bool fbPasswordSignIn(const String &apiKey, const String &email, const St
   fbHttp.end();
   fbAuthHttp = code;
   if (code != 200) { fbNoteAuthError(code, resp); return false; }
-  StaticJsonDocument<1536> r;
-  if (deserializeJson(r, resp)) { fbAuthErr = "malformed sign-in response"; return false; }
+  // 4096 for the same reason as fbRefreshToken: an Email/Password success body measured 1504 B
+  // (982 B idToken + 268 B refreshToken + the rest), needing ~1594 B of document. See that note.
+  StaticJsonDocument<4096> r;
+  DeserializationError de = deserializeJson(r, resp);      // name the failure -- see fbRefreshToken
+  if (de) { fbNoteAuthLocal((String("sign-in parse: ") + de.c_str() + " (body " + resp.length() + "B)").c_str()); return false; }
   // localId is the account's UID. The firmware never needs it (the token carries it, and rules
   // compare auth.uid server-side) but you need it to WRITE those rules -- so surface it.
   String uid = r["localId"] | "";
