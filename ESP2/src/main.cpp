@@ -17,6 +17,13 @@
  *         <START>,SEQ_FERTIGATION_<X>,FLUSH,<pct>,DOSE,<mlA>,<mlB>,<mlC>,
  *                 DCEIL,<sA>,<sB>,<sC>,BATCHV,<L>,EC,<lo>,<hi>,PH,<lo>,<hi>,MIX,<ms>,<END>
  *                 (DCEIL = per-dose 2x timed ceiling s; a dose past it -> DOSE_TIMEOUT hold, dosing spec §2.4/§5)
+ *         Optional operator-FORCE fields, valid on either form (dashboard force-run):
+ *                 COLS,<letters>  deliver into every listed ENABLED column AT ONCE, e.g. COLS,AB.
+ *                                 Default = the single column named in the command. With more than
+ *                                 one column the tank's single outlet + single flow meter can only
+ *                                 measure a COMBINED total; the per-column split is not knowable.
+ *                 WATER,<L>       TOTAL batch litres for this run, overriding WATER_BUDGET_L.
+ *                                 Ignored unless 0 < L <= MIXING_TANK_MAX_L.
  *         <START>,STOP_ALL,<END> / RESET_SELF / STATUS_REQ
  *         RESUME,<NORMAL|IRRIGATE|RELEASE>  (user-gated fault recovery, sec.19.4.8.2):
  *                 NORMAL  = re-energize P17, resume the paused sequence from where it stopped;
@@ -202,6 +209,10 @@ const unsigned long PRIME_HOLD_TIMEOUT_MS = 400;    // no keep-alive within this
  * A FILL stage whose remaining target is below this is treated as "already full"
  * (no pump run) -- avoids a zero/negative-target pump cycle when resuming.       */
 const float TANK_EPS_L = 0.05f;
+// Mixing-tank safety ceiling -- must mirror ESP1's MIXING_TANK_MAX_VOLUME. Second line of defence
+// on an operator-supplied WATER,<L>: ESP1 caps it too, but ESP2 must never accept a volume its own
+// tank cannot hold just because the value arrived over the wire.            [MEASURE]
+const float MIXING_TANK_MAX_L = 50.0f;
 
 /* ---- PCF8575 health / fault reporting ------------------------------------ */
 const unsigned long PCF_PROBE_MS    = 2000;    // active I2C probe cadence
@@ -273,7 +284,15 @@ void IRAM_ATTR flowISR() { flowPulses++; }
 /* ---- Work order ---------------------------------------------------------- */
 struct WorkOrder {
   bool   active;
-  int    col;            // 0..2
+  int    col;            // 0..2 -- PRIMARY column (budget lookup, logging)
+  // Bitmask of every column to deliver into (bit0=A, bit1=B, bit2=C). Normally just `col`, but an
+  // operator FORCE run may open several at once. NOTE: the mixing tank has ONE outlet through ONE
+  // flow meter, so with >1 bit set the delivered litres are a COMBINED total -- the per-column split
+  // is decided by plumbing resistance and is NOT measurable. ESP1 marks such runs estimated.
+  uint8_t colMask;
+  // Operator-specified batch volume in litres (TOTAL, not per column). 0 = use WATER_BUDGET_L[col],
+  // which is the normal scheduled-run behaviour.
+  float  waterL;
   bool   fertigate;
   float  flushPct;       // 0..100
   float  dose[3];        // mL A,B,C
@@ -675,8 +694,9 @@ void dispatch(const String &payload) {
   //  KNUT,a,b,c,ECCAL,m,b,PHCAL,m,b). At 24 the frame still arrived whole (207B < 256) but the
   // tokenizer dropped KNUT/ECCAL/PHCAL, so every fertigation ran on stale nutrient K-factors and
   // stale EC/pH calibration -- silently defeating the self-contained job cal of §A.5.1 #3.
+  // A FORCE run adds COLS,<letters> and WATER,<L> -> 38 tokens. 48 leaves headroom.
   // Do NOT shrink this below the largest work order.
-  const int MAXT = 40; String tok[MAXT]; int n = 0, start = 0;
+  const int MAXT = 48; String tok[MAXT]; int n = 0, start = 0;
   for (int i = 0; i <= payload.length() && n < MAXT; i++) {
     if (i == payload.length() || payload[i] == ',') { tok[n++] = payload.substring(start, i); start = i + 1; }
   }
@@ -817,7 +837,8 @@ void dispatch(const String &payload) {
   if (!COLUMN_ENABLED[c]) { reply("INVALID,COL_DISABLED"); return; }
 
   // defaults
-  wo.col = c; wo.fertigate = isFert; wo.flushPct = 0;
+  wo.col = c; wo.colMask = (uint8_t)(1 << c); wo.waterL = 0.0f;
+  wo.fertigate = isFert; wo.flushPct = 0;
   wo.dose[0] = wo.dose[1] = wo.dose[2] = 0;
   wo.doseCeilMs[0] = wo.doseCeilMs[1] = wo.doseCeilMs[2] = 0;   // 0 -> fall back to STAGE_MAX_MS
   wo.ecLo = 0.0f; wo.ecHi = 99; wo.phLo = 0; wo.phHi = 14;   // wide defaults; ESP1 sends real window
@@ -829,6 +850,21 @@ void dispatch(const String &payload) {
     else if (tok[i] == "DOSE" && i + 3 < n)  { wo.dose[0] = tok[++i].toFloat(); wo.dose[1] = tok[++i].toFloat(); wo.dose[2] = tok[++i].toFloat(); }
     else if (tok[i] == "DCEIL" && i + 3 < n) { for (int j = 0; j < 3; j++) wo.doseCeilMs[j] = (unsigned long)(tok[++i].toFloat() * 1000.0f); }  // per-dose 2x ceiling (s->ms)
     else if (tok[i] == "BATCHV" && i + 1 < n){ ++i; /* planned batch L: ESP1 dose-calc input; logged there */ }
+    // COLS,<letters> -- deliver into every listed column at once (operator FORCE run). Disabled
+    // columns are silently ignored so a stale dashboard cannot actuate unwired hardware.
+    else if (tok[i] == "COLS" && i + 1 < n) {
+      String s = tok[++i]; uint8_t m = 0;
+      for (unsigned k = 0; k < s.length(); k++) {
+        int b = (s[k] == 'A') ? 0 : (s[k] == 'B') ? 1 : (s[k] == 'C') ? 2 : -1;
+        if (b >= 0 && COLUMN_ENABLED[b]) m |= (uint8_t)(1 << b);
+      }
+      if (m) wo.colMask = m;                 // ignore an empty/invalid mask -> keep the single column
+    }
+    // WATER,<L> -- operator-specified TOTAL batch volume, overriding WATER_BUDGET_L for this run.
+    else if (tok[i] == "WATER" && i + 1 < n) {
+      float v = tok[++i].toFloat();
+      if (v > 0.0f && v <= MIXING_TANK_MAX_L) wo.waterL = v;   // out-of-range -> ignore, use the table
+    }
     else if (tok[i] == "EC" && i + 2 < n)    { wo.ecLo = tok[++i].toFloat(); wo.ecHi = tok[++i].toFloat(); }
     else if (tok[i] == "PH" && i + 2 < n)    { wo.phLo = tok[++i].toFloat(); wo.phHi = tok[++i].toFloat(); }
     else if (tok[i] == "MIX" && i + 1 < n)   { wo.mixMs = (unsigned long)tok[++i].toInt(); }
@@ -1000,11 +1036,28 @@ void resumeWork(const String &mode) {
   reply("ACK,RESUME," + mode);
 }
 
+// Open / close every column valve in the work order's mask. Normally exactly one bit; an operator
+// FORCE run may set several, delivering one batch into them simultaneously.
+static void colValves(uint8_t mask, bool on) {
+  for (int b = 0; b < 3; b++) {
+    if (!(mask & (1 << b))) continue;
+    if (on) pcfOn(COL_VALVE_BIT[b]); else pcfOff(COL_VALVE_BIT[b]);
+  }
+}
+// "COL_A" / "COL_AB" -- names every column the batch actually went to, so the log and any fault
+// reply cannot imply a single column when the water was shared.
+static String colMaskName(uint8_t mask) {
+  String s = "COL_";
+  for (int b = 0; b < 3; b++) if (mask & (1 << b)) s += (char)('A' + b);
+  return s;
+}
+
 void runSequence() {
   if (step == SEQ_NONE) return;
   if (faultHeld) return;                 // paused after a fault -> wait for RESUME (sec.19.4.8)
   int c = wo.col;
-  const char *colLoc = (c == 0) ? "COL_A" : (c == 1) ? "COL_B" : "COL_C";
+  String colLocS = colMaskName(wo.colMask);
+  const char *colLoc = colLocS.c_str();
 
   switch (step) {
 
@@ -1013,8 +1066,9 @@ void runSequence() {
      * already in the tank (mixTankL) -- so a resume never re-fills from 0 and overfills. */
     case SEQ_FILL: {
       if (!stepInit) {
-        float desired = wo.fertigate ? WATER_BUDGET_L[c] * (1.0f - wo.flushPct / 100.0f)
-                                     : WATER_BUDGET_L[c];
+        // Operator FORCE runs carry their own TOTAL batch volume; scheduled runs use the table.
+        float budget  = (wo.waterL > 0.0f) ? wo.waterL : WATER_BUDGET_L[c];
+        float desired = wo.fertigate ? budget * (1.0f - wo.flushPct / 100.0f) : budget;
         float remaining = desired - mixTankL;
         if (remaining < TANK_EPS_L) {                 // already enough in the tank -> skip the fill
           goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); break;
@@ -1108,7 +1162,7 @@ void runSequence() {
     case SEQ_DELIVER: {
       if (!stepInit) {
         if (mixTankL < TANK_EPS_L) { finishOk(); break; }   // nothing to deliver
-        pcfOn(OUT_MIX_VALVE); pcfOn(COL_VALVE_BIT[c]);
+        pcfOn(OUT_MIX_VALVE); colValves(wo.colMask, true);
         stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
         sgTankSign = -1;                                     // this stage drains the mix tank
         if (resumeTimed) {                                   // flow sensor dead -> run the booster on a timer
@@ -1120,11 +1174,11 @@ void runSequence() {
       }
       int r = stagePoll();
       if (r == 1) {
-        endMeteredStage(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]);
+        endMeteredStage(); pcfOff(OUT_MIX_VALVE); colValves(wo.colMask, false);
         if (wo.fertigate && wo.flushPct > 0) goStep(SEQ_FLUSH_FILL);
         else finishOk();
       } else if (r == -1) {
-        endMeteredStage(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]);
+        endMeteredStage(); pcfOff(OUT_MIX_VALVE); colValves(wo.colMask, false);
         holdFault("FLOW_FAIL", "MAIN");
       }
       break;
@@ -1133,7 +1187,7 @@ void runSequence() {
     /* ---- FLUSH_FILL: plain reservoir water -> mixing tank ---------------- */
     case SEQ_FLUSH_FILL: {
       if (!stepInit) {
-        float remaining = WATER_BUDGET_L[c] * (wo.flushPct / 100.0f) - mixTankL;
+        float remaining = ((wo.waterL > 0.0f) ? wo.waterL : WATER_BUDGET_L[c]) * (wo.flushPct / 100.0f) - mixTankL;
         if (remaining < TANK_EPS_L) { goStep(SEQ_FLUSH_DELIVER); break; }
         pcfOn(OUT_RES_VALVE);
         stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
@@ -1150,14 +1204,14 @@ void runSequence() {
     case SEQ_FLUSH_DELIVER: {
       if (!stepInit) {
         if (mixTankL < TANK_EPS_L) { finishOk(); break; }
-        pcfOn(OUT_MIX_VALVE); pcfOn(COL_VALVE_BIT[c]);
+        pcfOn(OUT_MIX_VALVE); colValves(wo.colMask, true);
         stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
         sgTankSign = -1;
         stepInit = true;
       }
       int r = stagePoll();
-      if (r == 1)      { endMeteredStage(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]); finishOk(); }
-      else if (r == -1){ endMeteredStage(); pcfOff(OUT_MIX_VALVE); pcfOff(COL_VALVE_BIT[c]); holdFault("FLOW_FAIL", "MAIN"); }
+      if (r == 1)      { endMeteredStage(); pcfOff(OUT_MIX_VALVE); colValves(wo.colMask, false); finishOk(); }
+      else if (r == -1){ endMeteredStage(); pcfOff(OUT_MIX_VALVE); colValves(wo.colMask, false); holdFault("FLOW_FAIL", "MAIN"); }
       break;
     }
 

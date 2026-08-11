@@ -556,6 +556,17 @@ const unsigned long FIREBASE_UPLOAD_ACTIVE_MS = 20000;  // faster during ACTIVE_
 // Command poll cadence. The TLS connection is REUSED between polls (fbClient/fbHttp below),
 // so this is one small GET on an open socket -- not a handshake every 3 s.
 const unsigned long FIREBASE_COMMAND_POLL_MS  = 3000;
+/* ---- Operator FORCE run limits -------------------------------------------- *
+ * A FORCE_RUN is a full irrigation/fertigation with operator-supplied volume and doses -- far more
+ * consequential than the bounded 5 s pump test the other remote commands allow. These are the caps
+ * that stop a typo (500 instead of 5.0) from trying to move half a tonne of water, or 5000 instead
+ * of 50 from running a dosing pump to its timed ceiling. ESP2 re-checks the volume independently. */
+const float FORCE_MAX_LITERS   = 20.0f;   // per request, TOTAL across the selected columns  [CONFIRM]
+const float FORCE_MAX_DOSE_ML  = 500.0f;  // per nutrient, per request                        [CONFIRM]
+// Columns the in-flight FORCE run is delivering into (0 = not a force run), and the dashboard
+// command id to report completion against ("" = started from SMS/LCD).
+uint8_t forceMask = 0;
+char    forceCmdId[48] = "";
 // Skip an upload below this much free heap: an mbedTLS session needs ~40-50 KB and a
 // failed alloc mid-handshake is far worse than a skipped dashboard tick.
 const uint32_t FIREBASE_MIN_HEAP = 60000;
@@ -603,7 +614,10 @@ unsigned long fbAuthNextTryMs = 0;
 /* ---- Firebase remote commands --------------------------------------------- *
  * Core 0 (netTask) only transports; core 1 validates and dispatches. FreeRTOS queues
  * carry POD structs across the core boundary -- no Strings, no shared mutable state.  */
-struct FirebaseCommand       { char id[48]; char type[32]; char pump[16]; };
+// FORCE_RUN carries an operator-chosen batch: which columns, how many litres TOTAL, and explicit
+// per-nutrient mL. POD only -- this crosses a core boundary through a FreeRTOS queue.
+struct FirebaseCommand       { char id[48]; char type[32]; char pump[16];
+                               char cols[4]; float liters; float doseMl[3]; };
 struct FirebaseCommandStatus { char id[48]; char status[16]; char detail[48]; };
 QueueHandle_t fbCommandQueue = NULL;                // core0 -> core1: requests awaiting validation
 QueueHandle_t fbStatusQueue  = NULL;                // core1 -> core0: results to PATCH back
@@ -1069,6 +1083,7 @@ void sendNanoCommand(const char *cmd);
 
 void pollESP2();
 void sendWorkOrder(int c, bool fertigate);
+void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const char *fbCmdId);
 void handleEsp2Response(const String &payload);
 void esp2PowerCycle();
 void esp2ReinitUart();
@@ -2045,10 +2060,32 @@ void handleEsp2Response(const String &payload) {
         // B1: optional measured water volume reported as ...,WATER,<liters> on DONE.
         int wi = payload.indexOf("WATER,");
         float liters = (wi >= 0) ? payload.substring(wi + 6).toFloat() : 0.0f;
-        if (wi >= 0) waterUsedToday[c] += liters;
-        // Log the litres in the ACT row (|W=) so SUMMARY/FULL can recover per-day water totals.
-        logEvent("ESP1", "ACT", String(wo.fertigate ? "FERTIGATION" : "IRRIGATION")
-                                  + "|STOP|COL_" + COL_TAG[c] + "|W=" + String(liters, 2));
+        if (forceMask && __builtin_popcount(forceMask) > 1) {
+          // Multi-column FORCE run: one tank, one outlet, one flow meter. The measured litres are a
+          // COMBINED total and the per-column split is set by plumbing resistance, not by us. Split
+          // it evenly for the daily tally but mark the row EST so the thesis data never presents a
+          // divided estimate as if it were measured.
+          int nc = __builtin_popcount(forceMask);
+          String cols;
+          for (int b = 0; b < NUM_COLUMNS; b++) if (forceMask & (1 << b)) {
+            waterUsedToday[b] += liters / nc;
+            cols += (char)('A' + b);
+          }
+          logEvent("ESP1", "ACT", String(wo.fertigate ? "FERTIGATION" : "IRRIGATION")
+                                    + "|STOP|FORCE|COL_" + cols + "|W=" + String(liters, 2)
+                                    + "|SPLIT=EST/" + String(nc));
+        } else {
+          if (wi >= 0) waterUsedToday[c] += liters;
+          // Log the litres in the ACT row (|W=) so SUMMARY/FULL can recover per-day water totals.
+          logEvent("ESP1", "ACT", String(wo.fertigate ? "FERTIGATION" : "IRRIGATION")
+                                    + "|STOP|" + (forceMask ? "FORCE|" : "") + "COL_" + COL_TAG[c]
+                                    + "|W=" + String(liters, 2));
+        }
+        if (forceCmdId[0]) {                       // report the run back to the dashboard
+          firebaseQueueStatus(forceCmdId, "completed", (String("delivered ") + String(liters, 2) + " L").c_str());
+          forceCmdId[0] = 0;
+        }
+        forceMask = 0;
       }
       // A real run exercises transfer+booster (and mixer if fertigating) -> reset their clocks.
       lastPumpUseMs[0] = millis(); lastPumpUseMs[1] = millis();
@@ -2170,6 +2207,65 @@ void sendWorkOrder(int c, bool fertigate) {
 
   // Consolidated run notice (one per column service; sec.12.1.2)
   sendSMS(String("RUN,COL_") + COL_TAG[c] + "," + (fertigate ? "FERTIGATION" : "IRRIGATION"));
+}
+
+/* Operator FORCE run: build a work order from explicit litres + explicit per-nutrient mL instead of
+ * the schedule and calcDose(). Everything is already bounds-checked by the caller.
+ * `mask` may name several columns -- ESP2 opens them together, so `liters` is the TOTAL batch.
+ * fbCmdId is echoed to the dashboard when the run finishes ("" for an SMS-initiated force). */
+void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const char *fbCmdId) {
+  int primary = 0;                                   // lowest column in the mask: budget + logging anchor
+  while (primary < NUM_COLUMNS && !(mask & (1 << primary))) primary++;
+  if (primary >= NUM_COLUMNS) return;
+
+  bool fert = (doseMl[0] > 0.0f || doseMl[1] > 0.0f || doseMl[2] > 0.0f);
+  String cols;
+  for (int b = 0; b < NUM_COLUMNS; b++) if (mask & (1 << b)) cols += (char)('A' + b);
+
+  String name = String("SEQ_") + (fert ? "FERTIGATION_" : "IRRIGATION_") + COL_TAG[primary];
+  String cmd  = String(FRAME_START) + "," + name +
+                ",COLS," + cols +
+                ",WATER," + String(liters, 2) +
+                ",FLUSH," + String((int)FLUSH_PCT);
+  if (fert) {
+    cmd += ",DOSE," + String(doseMl[0], 1) + "," + String(doseMl[1], 1) + "," + String(doseMl[2], 1);
+    // Same 2x timed ceiling calcDose() uses, derived from the operator's mL rather than the gap.
+    cmd += ",DCEIL,";
+    for (int i = 0; i < 3; i++) {
+      float s = (doseMl[i] > 0.0f) ? doseMl[i] / PUMP_FLOWRATE_MLPM[i] * 60.0f * CEILING_MARGIN : 0.0f;
+      cmd += String(s, 0) + (i < 2 ? "," : "");
+    }
+    cmd += ",BATCHV," + String(liters * (1.0f - FLUSH_PCT / 100.0f), 1);
+    cmd += ",EC," + String(EC_MIN, 1) + "," + String(EC_MAX, 1);
+    cmd += ",PH," + String(PH_MIN, 1) + "," + String(PH_MAX, 1);
+    cmd += ",MIX," + String(MIXING_DURATION_MS);
+  }
+  cmd += ",KMAIN," + String(calKResMix, 1) + "," + String(calKMixIrr, 1);
+  if (fert) {
+    cmd += ",KNUT," + String(calKNut[0], 1) + "," + String(calKNut[1], 1) + "," + String(calKNut[2], 1);
+    cmd += ",ECCAL," + String(calEcM, 6) + "," + String(calEcB, 4);
+    cmd += ",PHCAL," + String(calPhM, 6) + "," + String(calPhB, 4);
+  }
+  cmd += "," + String(FRAME_END);
+
+  wo.active = true; wo.stage = WO_SENT; wo.colIdx = primary; wo.fertigate = fert;
+  wo.cmd = cmd; wo.retries = 0; wo.sentMs = millis();
+  forceMask = mask;                                  // remembered so DONE can be attributed honestly
+  strlcpy(forceCmdId, fbCmdId ? fbCmdId : "", sizeof(forceCmdId));
+
+  setState(ACTIVE_STATE);
+  runUiBegin(primary, fert);
+  esp2WarmupMs = millis();
+  if (esp2Available && esp2Powered) esp2Serial.println(cmd);   // already up -> send now
+  else                             esp2SetPower(true);         // warm up; READY re-sends via wo.cmd
+
+  logEvent("ESP1", "CMD", "ESP2|" + name + "|FORCE");
+  logEvent("ESP1", "ACT", String(fert ? "FERTIGATION" : "IRRIGATION") + "|START|FORCE|COL_" + cols +
+                          "|W=" + String(liters, 2) +
+                          (fert ? "|mL=" + String(doseMl[0], 0) + "/" + String(doseMl[1], 0) + "/" + String(doseMl[2], 0) : ""));
+  sendSMS(String("RUN,FORCE,COL_") + cols + "," + (fert ? "FERTIGATION" : "IRRIGATION") +
+          "," + String(liters, 1) + "L");
+  if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "accepted", "force run started");
 }
 
 /* =============================================================================
@@ -4324,10 +4420,13 @@ static void firebasePollCommands() {
 
   // Filter: we only ever read these four fields, so ArduinoJson can skip the rest of the
   // document instead of allocating it. Keeps this off the netTask stack (was 6 KB in the fork).
-  StaticJsonDocument<128> filter;
+  StaticJsonDocument<256> filter;
   JsonObject any = filter.createNestedObject("*");
   any["status"] = true; any["type"] = true;
-  any.createNestedObject("payload")["pump"] = true;
+  JsonObject pf = any.createNestedObject("payload");
+  pf["pump"] = true;
+  pf["columns"] = true; pf["liters"] = true;      // FORCE_RUN: which columns, TOTAL litres
+  pf.createNestedObject("doseMl");                 // FORCE_RUN: {"A":mL,"B":mL,"C":mL}
 
   StaticJsonDocument<1024> doc;
   if (deserializeJson(doc, resp, DeserializationOption::Filter(filter)) || !doc.is<JsonObject>()) return;
@@ -4339,6 +4438,22 @@ static void firebasePollCommands() {
     strlcpy(c.id,   item.key().c_str(),          sizeof(c.id));
     strlcpy(c.type, req["type"] | "",            sizeof(c.type));
     strlcpy(c.pump, req["payload"]["pump"] | "", sizeof(c.pump));
+    // FORCE_RUN extras. "columns" accepts "AB" or ["A","B"]; anything else leaves cols empty and
+    // core 1 rejects the request rather than guessing which column to water.
+    JsonVariant jc = req["payload"]["columns"];
+    if (jc.is<const char *>()) strlcpy(c.cols, jc.as<const char *>(), sizeof(c.cols));
+    else if (jc.is<JsonArray>()) {
+      uint8_t k = 0;
+      for (JsonVariant e : jc.as<JsonArray>()) {
+        const char *s = e.as<const char *>();
+        if (s && *s && k < sizeof(c.cols) - 1) c.cols[k++] = s[0];
+      }
+      c.cols[k] = '\0';
+    }
+    c.liters    = req["payload"]["liters"] | 0.0f;
+    c.doseMl[0] = req["payload"]["doseMl"]["A"] | 0.0f;
+    c.doseMl[1] = req["payload"]["doseMl"]["B"] | 0.0f;
+    c.doseMl[2] = req["payload"]["doseMl"]["C"] | 0.0f;
     FirebaseCommandStatus ack = {};
     strlcpy(ack.id, c.id, sizeof(ack.id));
     // Mark it non-"queued" immediately, so the next poll cannot hand the same request to
@@ -4387,6 +4502,44 @@ void firebaseCommandTick() {
   if (!fbCommandQueue) return;
   FirebaseCommand c;
   while (xQueueReceive(fbCommandQueue, &c, 0) == pdTRUE) {
+    // ---- FORCE_RUN: operator-specified irrigation/fertigation -------------------------------
+    // Unlike the other remote commands this actuates a REAL run, so every input is bounded here on
+    // the control core before anything is sent. "Force" overrides the schedule window, the soil
+    // threshold and serviced-today -- it does NOT override hardware safety.
+    if (!strcmp(c.type, "FORCE_RUN")) {
+      uint8_t mask = 0;
+      for (const char *p = c.cols; *p; p++) {
+        int b = (*p == 'A') ? 0 : (*p == 'B') ? 1 : (*p == 'C') ? 2 : -1;
+        if (b >= 0 && COLUMN_ENABLED[b]) mask |= (uint8_t)(1 << b);
+      }
+      if (!mask) {
+        firebaseQueueStatus(c.id, "rejected", "no valid enabled column in 'columns'");
+        logEvent("FIREBASE", "REJECT", "FORCE|NO_COLUMN"); continue;
+      }
+      if (c.liters <= 0.0f || c.liters > FORCE_MAX_LITERS) {
+        firebaseQueueStatus(c.id, "rejected", "liters out of range");
+        logEvent("FIREBASE", "REJECT", "FORCE|LITERS=" + String(c.liters, 1)); continue;
+      }
+      bool overDose = false;
+      for (int i = 0; i < 3; i++) if (c.doseMl[i] < 0.0f || c.doseMl[i] > FORCE_MAX_DOSE_ML) overDose = true;
+      if (overDose) {
+        firebaseQueueStatus(c.id, "rejected", "nutrient mL out of range");
+        logEvent("FIREBASE", "REJECT", "FORCE|DOSE_RANGE"); continue;
+      }
+      // Same hardware gate the local UI honours. Schedule/soil are deliberately NOT checked.
+      if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
+          pendingExercise.active || esp2Held || fbRemoteExerciseId[0]) {
+        firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
+        logEvent("FIREBASE", "REJECT", "FORCE|NOT_IDLE"); continue;
+      }
+      if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT) {
+        firebaseQueueStatus(c.id, "rejected", "reservoir too low");
+        logEvent("FIREBASE", "REJECT", "FORCE|RES_LOW"); continue;
+      }
+      sendForceWorkOrder(mask, c.liters, c.doseMl, c.id);
+      continue;
+    }
+
     if (!strcmp(c.type, "EMERGENCY_STOP")) {
       enterEmergencyStop(true);                            // existing system-wide physical stop
       logEvent("FIREBASE", "CMD", "ESTOP");
@@ -5250,6 +5403,10 @@ void cancelRun(int mode, const char *why) {
   wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
   pendingRun.active = false; pendingRun.colIdx = -1;
   esp2Held = false;
+  // A cancelled FORCE run must not leave the dashboard sitting on "accepted", nor let a later
+  // scheduled run inherit this one's column mask.
+  if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", why); forceCmdId[0] = 0; }
+  forceMask = 0;
   lastHoldCode = ""; sameHoldN = 0; steerRelease = false;        // a cancel resolves the re-hold loop
   cancelPrompt = false; cancelSel = 0;
 
