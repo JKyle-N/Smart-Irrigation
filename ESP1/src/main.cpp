@@ -212,6 +212,30 @@ const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD
 const float INA226_SHUNT_OHMS   = 0.002f;   // shunt resistor value         [MEASURE]
 const float INA226_MAX_CURRENT_A = 10.0f;   // expected max current         [MEASURE]
 
+/* ---- Battery CURRENT: ACS758-050B via ADS1115 (replaces the opto ADC) ------ *
+ * The GPIO34 opto path logged I=0.00 on all 44,303 samples across 16 days -- battery %, the daily
+ * Wh totals and the low/critical thresholds never had real data. An ADS1115 gives 125 uV/LSB against
+ * a stable internal reference, so the current is now read from a hall sensor on the battery wire.
+ *
+ * WIRING: the ACS758 runs on 5 V and its output sits at VCC/2 (~2.5 V), swinging 0.5..4.5 V over
+ * +/-50 A. The ADS1115 must be powered from 3.3 V (at 5 V its logic-high threshold is 0.7*VDD =
+ * 3.5 V, which the ESP32's 3.3 V I2C cannot reach) and NO input may exceed VDD+0.3 V. So a 2:1
+ * divider on A0 is REQUIRED -- wired direct, anything above ~+27 A drives the input past the limit.
+ * With 10k/10k: zero -> 1.25 V, +/-50 A -> 0.25..2.25 V, inside the +/-4.096 V PGA, ~6 mA/LSB.
+ * Set ACS_DIV to 1.0 only if the divider is genuinely absent.                                     */
+#define ACS_ADDR        0x48        // ADS1115 ADDR -> GND (no clash: LCD 0x27, EEPROM 0x57, RTC 0x68)
+#define ACS_CHANNEL     0           // ACS758 output on A0; A1..A3 unused
+const float ACS_DIV          = 2.0f;    // (R1+R2)/R2 in front of A0                    [MEASURE]
+const float ACS_ZERO_V       = 2.5f;    // sensor output at 0 A = VCC/2 (050B)          [MEASURE]
+const float ACS_SENS_V_PER_A = 0.040f;  // 40 mV/A = ACS758LCB-050B                     [CONFIRM]
+const uint8_t ACS_PGA        = 1;       // 1 = +/-4.096 V full scale (125 uV/LSB)
+// ThingSpeak Ch3 ("Chem") slot for the battery current. Ch2 "System" is full (all 8 fields).
+// Must stay ABOVE 2 x (enabled columns), since the EC/pH loop claims 2 fields per enabled column.
+const int TS3_CURRENT_FIELD  = 5;       // safe while <=2 columns are enabled  [CONFIRM if C is on]
+bool  acsOk = false;                    // last ADS1115 read succeeded -- a dead ADC must be VISIBLE,
+                                        // not silently read as 0 A, which is how the opto failure hid
+float battIsigned = 0;                  // signed amps (050B is bidirectional); battI stays magnitude
+
 /* ---- Timing / supervisory constants (spec sec.10.14) --------------------- */
 const unsigned long UART_ACK_TIMEOUT_MS   = 3000;    // ESP2 ACK wait
 const unsigned long UART_DONE_TIMEOUT_MS  = 600000;  // ESP2 sequence completion (10 min)
@@ -761,7 +785,7 @@ struct TelemetrySnapshot {
   float npkN[NUM_COLUMNS], npkP[NUM_COLUMNS], npkK[NUM_COLUMNS];
   float npkEC[NUM_COLUMNS], npkPH[NUM_COLUMNS];
   bool  npkValid[NUM_COLUMNS];
-  float battV, battP;
+  float battV, battP, battI;   // battI added for the ACS758 ThingSpeak field (core-0 uploader)
   // Validity/state mirrored here so the core-0 uploaders never touch core-1's `sensor`/`wo`/`sysState`
   // directly (a torn read there publishes e.g. tankValid against a half-updated level).
   bool  envValid, tankValid, lightValid, inaValid;
@@ -948,7 +972,7 @@ String calMsg = "";                        // transient calibration message (e.g
  * NOT streamed in normal operation, so the ESP2 pages power ESP2 up and CAL-stream each sensor's
  * raw value in turn (one at a time), reusing the calibration transport. Purely diagnostic.      */
 uint8_t diagPage = 0;
-const uint8_t DIAG_PAGES = 9;              // 0 Env,1 Tank,2 Soil,3 NPK,4 ESP1,5 ESP2 chem,6 ESP2 pwr,7 flow1,8 flow2
+const uint8_t DIAG_PAGES = 10;             // 0 Env,1 Tank,2 Soil,3 NPK,4 NPK chem,5 ESP1,6 ESP2 chem,7 ESP2 pwr,8 flow1,9 flow2
 const unsigned long NANO_STALE_MS = 90000; // a Nano sensor is "stale" after this (~2x the active TX interval)
 // ESP2 sensors are pulled live one-at-a-time via a CAL round-robin (not streamed in normal operation).
 const char *DIAG_ESP2_ID[] = { "PH", "EC", "ACS712", "PZEM_V", "PZEM_I", "PZEM_P",
@@ -3776,9 +3800,56 @@ void loadBattCal() {
   p.end();
   Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS" : "using firmware defaults (calibrate!)");
 }
+/* One single-shot ADS1115 conversion on ACS_CHANNEL, returned as volts AT THE ADC PIN (the caller
+ * undoes the divider). Shares the existing Wire bus. Returns false on any I2C fault so a missing or
+ * unpowered ADC surfaces as a fault flag rather than a plausible-looking 0 A. ~10 ms worst case,
+ * negligible against the 8 s task WDT. Registers per the datasheet, same sequence as the bench tool
+ * in Test Code/ESP1_ADS1115_VI. */
+static bool acsReadVolts(float &v) {
+  const uint16_t OS_SINGLE = 0x8000, MODE_SINGLE = 0x0100, DR_128SPS = 0x0080, COMP_OFF = 0x0003;
+  uint16_t cfg = OS_SINGLE | MODE_SINGLE | DR_128SPS | COMP_OFF;
+  cfg |= (uint16_t)(0x4000 | ((ACS_CHANNEL & 0x03) << 12));    // MUX 1xx = AINx vs GND
+  cfg |= (uint16_t)((ACS_PGA & 0x07) << 9);
+
+  Wire.beginTransmission(ACS_ADDR);
+  Wire.write(0x01);                                            // config register
+  Wire.write((uint8_t)(cfg >> 8)); Wire.write((uint8_t)(cfg & 0xFF));
+  if (Wire.endTransmission() != 0) return false;
+
+  unsigned long t0 = millis();                                 // poll OS rather than blind-delay
+  for (;;) {
+    Wire.beginTransmission(ACS_ADDR); Wire.write(0x01);
+    if (Wire.endTransmission() != 0) return false;
+    if (Wire.requestFrom((int)ACS_ADDR, 2) != 2) return false;
+    uint16_t st = ((uint16_t)Wire.read() << 8) | Wire.read();
+    if (st & OS_SINGLE) break;                                 // 1 = conversion complete
+    if (millis() - t0 > 50) return false;                      // bounded: never stall the loop
+    delay(1);
+  }
+
+  Wire.beginTransmission(ACS_ADDR); Wire.write(0x00);          // conversion register
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((int)ACS_ADDR, 2) != 2) return false;
+  int16_t raw = (int16_t)(((uint16_t)Wire.read() << 8) | Wire.read());
+  const float FS[6] = { 6.144f, 4.096f, 2.048f, 1.024f, 0.512f, 0.256f };
+  v = raw * (FS[ACS_PGA] / 32768.0f);
+  return true;
+}
+
 void readBatteryAdc() {
   battV = (float)applyPoly(calBattV, readAdcTrimmed(PIN_BATT_V));
-  battI = (float)fabs(applyPoly(calBattI, readAdcTrimmed(PIN_BATT_I)));   // opto current = magnitude
+  // Current now comes from the ACS758 via the ADS1115, NOT the opto ADC on GPIO34 (which read 0.00 A
+  // on every sample for 16 days). On an I2C failure hold the last value and clear acsOk so the fault
+  // is visible on the Diag page -- reporting 0 A would repeat exactly the failure this replaces.
+  float vAdc;
+  acsOk = acsReadVolts(vAdc);
+  if (acsOk) {
+    battIsigned = (vAdc * ACS_DIV - ACS_ZERO_V) / ACS_SENS_V_PER_A;   // signed: 050B is bidirectional
+    // Magnitude only, per CLAUDE.md: all energy counts as consumption, no charge/discharge split.
+    // The sensor CAN now tell the two apart (battIsigned) -- restoring that split is a separate
+    // decision against a documented design choice, so it is deliberately not taken here.
+    battI = fabsf(battIsigned);
+  }
   battP = battV * battI;
 }
 
@@ -4046,7 +4117,7 @@ void telemetryCollect() {
     telem.npkN[c] = sensor.npk[c][4]; telem.npkP[c] = sensor.npk[c][5]; telem.npkK[c] = sensor.npk[c][6];
     telem.npkEC[c] = sensor.npk[c][2]; telem.npkPH[c] = sensor.npk[c][3];
   }
-  telem.battV = battV; telem.battP = battP;
+  telem.battV = battV; telem.battP = battP; telem.battI = battI;
   // Mirror the per-group validity + coarse system state so core-0 uploaders read only from the snapshot.
   telem.envValid = sensor.envValid; telem.tankValid = sensor.tankValid; telem.lightValid = sensor.lightValid;
   telem.inaValid = inaOk;
@@ -4112,6 +4183,10 @@ static void tsUpload() {
         url += "&field" + String(fld++) + "=" + String(t.npkPH[c], 2);
       } else fld += 2;
     }
+    // Battery current (ACS758) rides Ch3 because Ch2 "System" has all 8 fields used.
+    // CONSTRAINT: the loop above consumes 2 fields per ENABLED column -- 4 today with A and B.
+    // Enabling column C would take fields 1-6 and collide with field 5. Move this constant if so.
+    url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
     ok = tsGet(url) || ok;
   }
   lastTsOk = ok; lastTsUploadMs = millis();
@@ -4438,7 +4513,15 @@ static void firebasePollCommands() {
   if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
   if (!fbCommandQueue || !fbEnsureToken()) return;
 
-  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json"))) return;
+  // Fetch only the NEWEST few commands, not the whole node. The firmware never deletes processed
+  // commands (the dashboard renders their status/detail), so this node grows without bound -- measured
+  // at 28 nodes / 4.6 KB on the live rig. Parsing all of that overflowed the document below, and
+  // deserializeJson's NoMemory made EVERY command invisible from then on: press the web button a few
+  // times and the device stops acknowledging forever. Firebase push keys are chronological, so the
+  // newest entries are always inside this window, and $key ordering needs no index rule. Making the
+  // response size independent of history is what actually fixes that.
+  // fbBuildUrl already appended "?auth=<token>", hence the leading '&'.
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json") + "&orderBy=%22%24key%22&limitToLast=5")) return;
   int code = fbHttp.GET();
   String resp = (code == 200) ? fbHttp.getString() : "";
   fbHttp.end();
@@ -4455,8 +4538,20 @@ static void firebasePollCommands() {
   pf["columns"] = true; pf["liters"] = true;      // FORCE_RUN: which columns, TOTAL litres
   pf.createNestedObject("doseMl");                 // FORCE_RUN: {"A":mL,"B":mL,"C":mL}
 
-  StaticJsonDocument<1024> doc;
-  if (deserializeJson(doc, resp, DeserializationOption::Filter(filter)) || !doc.is<JsonObject>()) return;
+  // 2048 as belt-and-braces on top of the limitToLast bound above. The failure is now REPORTED
+  // rather than swallowed: a bare `return` here is what let a NoMemory look like "the device just
+  // stopped responding" for days -- the same trap as the auth path.
+  StaticJsonDocument<2048> doc;
+  DeserializationError de = deserializeJson(doc, resp, DeserializationOption::Filter(filter));
+  if (de) {
+    static unsigned long lastParseLogMs = 0;                  // dedupe: this path polls every 3 s
+    if (millis() - lastParseLogMs > 60000) {
+      lastParseLogMs = millis();
+      logEvent("FIREBASE", "POLL", String("parse ") + de.c_str() + "|body=" + resp.length() + "B");
+    }
+    return;
+  }
+  if (!doc.is<JsonObject>()) return;
 
   for (JsonPair item : doc.as<JsonObject>()) {
     JsonObject req = item.value().as<JsonObject>();
@@ -5946,31 +6041,48 @@ void lcdRenderDiag() {
       }
       break;
     }
-    case 4:   // ESP1 local: battery raw ADC + device presence
+    case 4: {  // Nano: the NPK sensor's OWN EC + pH per column.
+      // These were captured (sensor.npk[c][2]/[3]), uploaded to ThingSpeak Ch3 and published to
+      // Firebase, but had no on-rig view at all -- page 3 shows only N/P/K. Distinct from page 6,
+      // which is ESP2's separate EC/pH probes in the mixing tank.
+      snprintf(l, 21, "%-8s NPK Chem", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
+      for (int c = 0; c < NUM_COLUMNS && c < 3; c++) {
+        String v;
+        if (!COLUMN_ENABLED[c]) v = "-";
+        else v = "EC" + String(sensor.npk[c][2], 2) + " pH" + String(sensor.npk[c][3], 1);
+        const char *fl = COLUMN_ENABLED[c] ? diagNanoFlag(sensor.msNpk[c], sensor.npkValid[c]) : "off";
+        snprintf(l, 21, "%c %-13s%4s", COL_TAG[c], v.c_str(), fl);
+        lcd.setCursor(0, c + 1); lcd.print(l);
+      }
+      break;
+    }
+    case 5:   // ESP1 local: battery raw ADC + device presence
       snprintf(l, 21, "%-8s ESP1 Loc", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "BatV raw%-5d%5.1fV", (int)readAdcTrimmed(PIN_BATT_V), battV); lcd.setCursor(0, 1); lcd.print(l);
-      snprintf(l, 21, "BatI raw%-5d%5.2fA", (int)readAdcTrimmed(PIN_BATT_I), battI); lcd.setCursor(0, 2); lcd.print(l);
+      // ACS758 via ADS1115 (replaces the dead GPIO34 opto read). Shows the SIGNED amps -- the 050B is
+      // bidirectional -- plus an ok/X flag, so a missing ADC reads as a fault and never as "0.0 A".
+      snprintf(l, 21, "Cur %7.2fA ADS:%s", battIsigned, acsOk ? "ok" : "X"); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "RTC:%s LCD:%s SD:%s", i2cPresent(0x68) ? "ok" : "X", i2cPresent(LCD_ADDR) ? "ok" : "X", sdOk ? "ok" : "X"); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 5:   // ESP2: pH / EC / ACS712 raw ADC (live CAL stream)
+    case 6:   // ESP2: pH / EC / ACS712 raw ADC (live CAL stream) -- ESP2's OWN probes, not the NPK's
       snprintf(l, 21, "%-8s ESP2 Chem", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "pH",  (long)diagEsp2Raw[0], diagEsp2Flag(0)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "EC",  (long)diagEsp2Raw[1], diagEsp2Flag(1)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "ACS", (long)diagEsp2Raw[2], diagEsp2Flag(2)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 6:   // ESP2: PZEM AC power (V/I/P, engineering values from the CAL stream)
+    case 7:   // ESP2: PZEM AC power (V/I/P, engineering values from the CAL stream)
       snprintf(l, 21, "%-8s ESP2 Pwr", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "Vac:%-8s%5s", String(diagEsp2Raw[3], 0).c_str(), diagEsp2Flag(3)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "Iac:%-8s%5s", String(diagEsp2Raw[4], 2).c_str(), diagEsp2Flag(4)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "Pw :%-8s%5s", String(diagEsp2Raw[5], 0).c_str(), diagEsp2Flag(5)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 7:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
+    case 8:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
       snprintf(l, 21, "%-8s ESP2 Flw1", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "RESMIX", (long)diagEsp2Raw[6], diagEsp2Flag(6)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "MIXIRR", (long)diagEsp2Raw[7], diagEsp2Flag(7)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT A",  (long)diagEsp2Raw[8], diagEsp2Flag(8)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    default:  // case 8: ESP2 flow (2/2): NUT B / NUT C
+    default:  // case 9: ESP2 flow (2/2): NUT B / NUT C
       snprintf(l, 21, "%-8s ESP2 Flw2", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT B", (long)diagEsp2Raw[9],  diagEsp2Flag(9));  lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT C", (long)diagEsp2Raw[10], diagEsp2Flag(10)); lcd.setCursor(0, 2); lcd.print(l);
