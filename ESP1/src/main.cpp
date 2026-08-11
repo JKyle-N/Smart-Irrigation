@@ -3800,36 +3800,42 @@ void loadBattCal() {
   p.end();
   Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS" : "using firmware defaults (calibrate!)");
 }
-/* One single-shot ADS1115 conversion on ACS_CHANNEL, returned as volts AT THE ADC PIN (the caller
- * undoes the divider). Shares the existing Wire bus. Returns false on any I2C fault so a missing or
- * unpowered ADC surfaces as a fault flag rather than a plausible-looking 0 A. ~10 ms worst case,
- * negligible against the 8 s task WDT. Registers per the datasheet, same sequence as the bench tool
- * in Test Code/ESP1_ADS1115_VI. */
-static bool acsReadVolts(float &v) {
-  const uint16_t OS_SINGLE = 0x8000, MODE_SINGLE = 0x0100, DR_128SPS = 0x0080, COMP_OFF = 0x0003;
-  uint16_t cfg = OS_SINGLE | MODE_SINGLE | DR_128SPS | COMP_OFF;
+/* ADS1115 in CONTINUOUS-conversion mode, so reading it costs ONE 2-byte I2C read and never waits.
+ * A single-shot read would have to poll the OS bit for the ~7.8 ms conversion, and polling it with
+ * delay() inside powerTick() breaks the "no delay() in any main loop" rule (CLAUDE.md / sec.10.6.5).
+ * Continuous mode sidesteps that entirely: the ADC free-runs at 128 SPS and we simply take the
+ * latest sample, which is at most 7.8 ms old -- far fresher than the powerTick cadence needs.
+ * Configure once; re-configure automatically after any I2C failure so a power glitch on the ADC
+ * recovers on its own. Registers per the datasheet. */
+static bool acsConfigured = false;
+
+static bool acsConfigure() {
+  const uint16_t MODE_CONT = 0x0000, DR_128SPS = 0x0080, COMP_OFF = 0x0003;
+  uint16_t cfg = MODE_CONT | DR_128SPS | COMP_OFF;
   cfg |= (uint16_t)(0x4000 | ((ACS_CHANNEL & 0x03) << 12));    // MUX 1xx = AINx vs GND
   cfg |= (uint16_t)((ACS_PGA & 0x07) << 9);
-
   Wire.beginTransmission(ACS_ADDR);
   Wire.write(0x01);                                            // config register
   Wire.write((uint8_t)(cfg >> 8)); Wire.write((uint8_t)(cfg & 0xFF));
   if (Wire.endTransmission() != 0) return false;
+  Wire.beginTransmission(ACS_ADDR);
+  Wire.write(0x00);                                            // leave the pointer on conversion,
+  if (Wire.endTransmission() != 0) return false;               // so steady-state reads are 1 xfer
+  acsConfigured = true;
+  return true;
+}
 
-  unsigned long t0 = millis();                                 // poll OS rather than blind-delay
-  for (;;) {
-    Wire.beginTransmission(ACS_ADDR); Wire.write(0x01);
-    if (Wire.endTransmission() != 0) return false;
-    if (Wire.requestFrom((int)ACS_ADDR, 2) != 2) return false;
-    uint16_t st = ((uint16_t)Wire.read() << 8) | Wire.read();
-    if (st & OS_SINGLE) break;                                 // 1 = conversion complete
-    if (millis() - t0 > 50) return false;                      // bounded: never stall the loop
-    delay(1);
+// Volts AT THE ADC PIN (the caller undoes the divider). Returns false on any I2C fault, so a
+// missing or unpowered ADC surfaces as a fault flag rather than a plausible-looking 0 A.
+static bool acsReadVolts(float &v) {
+  if (!acsConfigured) {
+    // Configure, but report no sample this tick: the first conversion is still ~7.8 ms away, so the
+    // conversion register holds whatever preceded it (0 on a fresh ADC). Publishing that would log
+    // and upload a bogus current as if it were real. The next powerTick gets a genuine reading.
+    acsConfigure();
+    return false;
   }
-
-  Wire.beginTransmission(ACS_ADDR); Wire.write(0x00);          // conversion register
-  if (Wire.endTransmission() != 0) return false;
-  if (Wire.requestFrom((int)ACS_ADDR, 2) != 2) return false;
+  if (Wire.requestFrom((int)ACS_ADDR, 2) != 2) { acsConfigured = false; return false; }
   int16_t raw = (int16_t)(((uint16_t)Wire.read() << 8) | Wire.read());
   const float FS[6] = { 6.144f, 4.096f, 2.048f, 1.024f, 0.512f, 0.256f };
   v = raw * (FS[ACS_PGA] / 32768.0f);
@@ -4521,7 +4527,11 @@ static void firebasePollCommands() {
   // newest entries are always inside this window, and $key ordering needs no index rule. Making the
   // response size independent of history is what actually fixes that.
   // fbBuildUrl already appended "?auth=<token>", hence the leading '&'.
-  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json") + "&orderBy=%22%24key%22&limitToLast=5")) return;
+  // limitToLast=10, not 5: the poll takes ONE command per 3 s tick (sequential by design), so the
+  // window has to outlast a burst of clicks. Anything that scrolls out of it is never seen and stays
+  // "queued" forever -- the same invisible-loss failure this whole change exists to remove, just at a
+  // higher threshold. 10 nodes is ~550 B filtered, comfortably inside the 2048 B document.
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json") + "&orderBy=%22%24key%22&limitToLast=10")) return;
   int code = fbHttp.GET();
   String resp = (code == 200) ? fbHttp.getString() : "";
   fbHttp.end();
