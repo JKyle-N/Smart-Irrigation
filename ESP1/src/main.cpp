@@ -235,6 +235,14 @@ const int TS3_CURRENT_FIELD  = 5;       // safe while <=2 columns are enabled  [
 bool  acsOk = false;                    // last ADS1115 read succeeded -- a dead ADC must be VISIBLE,
                                         // not silently read as 0 A, which is how the opto failure hid
 float battIsigned = 0;                  // signed amps (050B is bidirectional); battI stays magnitude
+// Mixing-tank chemistry, captured from ESP2's TELE during a run (the tank is empty at idle, so these
+// describe the LAST batch). -1 / 0 stamp = never measured. Published as sensors.waterEC / waterPH.
+float tankEC = -1, tankPH = -1;
+unsigned long tankChemMs = 0;
+// Battery percent needs a full/empty voltage pair; BATT_LOW_V/BATT_CRIT_V are alarm points, not
+// endpoints. 12 V lead-acid resting voltages.                                          [MEASURE]
+const float BATT_FULL_V  = 12.70f;
+const float BATT_EMPTY_V = 11.20f;
 
 /* ---- Timing / supervisory constants (spec sec.10.14) --------------------- */
 const unsigned long UART_ACK_TIMEOUT_MS   = 3000;    // ESP2 ACK wait
@@ -786,6 +794,11 @@ struct TelemetrySnapshot {
   float npkEC[NUM_COLUMNS], npkPH[NUM_COLUMNS];
   bool  npkValid[NUM_COLUMNS];
   float battV, battP, battI;   // battI added for the ACS758 ThingSpeak field (core-0 uploader)
+  // Which pumps are energised, derived on CORE 1 from ESP2's reported stage. Derived here rather
+  // than read from run.stage in the uploader: run[] is core-1 state and a char array read from
+  // core 0 can tear -- the same cross-core mistake this snapshot exists to prevent.
+  bool pumpTransfer, pumpBooster, pumpMixer;
+  float tankEC, tankPH;        // last mixing-tank chemistry from ESP2's TELE (-1 = never measured)
   // Validity/state mirrored here so the core-0 uploaders never touch core-1's `sensor`/`wo`/`sysState`
   // directly (a torn read there publishes e.g. tankValid against a half-updated level).
   bool  envValid, tankValid, lightValid, inaValid;
@@ -2002,9 +2015,23 @@ void handleEsp2Response(const String &payload) {
     return;
   }
   if (resp == "TELE") {                                   // power telemetry during a run: PZEM,<v>,<i>,<p>,ACS,<a>
-    // arg = "PZEM,228.0,1.40,319.0,ACS,0.80" -> log verbatim as pipe-delimited for the SD log / SUMMARY.
+    // arg = "PZEM,228.0,1.40,319.0,ACS,0.80,ECPH,1.42,6.30" -> log verbatim as pipe-delimited.
     String d = arg; d.replace(",", "|");                  // CSV-safe (sec.25.2: no commas in detail)
     logEvent("ESP2", "SENSOR", d);
+    // Capture the mixing-tank EC/pH for telemetry. ESP2 only sends these during a run (the tank is
+    // empty otherwise), so they are the LAST BATCH's chemistry, not a live idle reading -- which is
+    // the only honest thing a single-outlet tank can report. -1 = probe railed / not measured.
+    int ei = arg.indexOf("ECPH,");
+    if (ei >= 0) {
+      String chem = arg.substring(ei + 5);          // not `t` -- that is the token array in this scope
+      int c1 = chem.indexOf(',');
+      if (c1 > 0) {
+        float ec = chem.substring(0, c1).toFloat();
+        float ph = chem.substring(c1 + 1).toFloat();
+        if (ec >= 0) { tankEC = ec; tankChemMs = millis(); }
+        if (ph >= 0) { tankPH = ph; tankChemMs = millis(); }
+      }
+    }
     return;
   }
   if (resp == "READY") {
@@ -4124,10 +4151,19 @@ void telemetryCollect() {
     telem.npkEC[c] = sensor.npk[c][2]; telem.npkPH[c] = sensor.npk[c][3];
   }
   telem.battV = battV; telem.battP = battP; telem.battI = battI;
+  telem.tankEC = tankEC; telem.tankPH = tankPH;
   // Mirror the per-group validity + coarse system state so core-0 uploaders read only from the snapshot.
   telem.envValid = sensor.envValid; telem.tankValid = sensor.tankValid; telem.lightValid = sensor.lightValid;
   telem.inaValid = inaOk;
   telem.state = sysState; telem.woActive = wo.active;
+  // Pump flags from ESP2's reported stage name, resolved here on core 1 so the uploader never
+  // touches run.stage. Anything outside a live run is off, which is the truth at idle.
+  {
+    bool live = (runPhase == RUN_PRE || runPhase == RUN_LIVE);
+    telem.pumpTransfer = live && (!strcmp(run.stage, "Transfer Water") || !strcmp(run.stage, "Flush Fill"));
+    telem.pumpBooster  = live && (!strcmp(run.stage, "Release")        || !strcmp(run.stage, "Flush Release"));
+    telem.pumpMixer    = live && !strcmp(run.stage, "Mixing");
+  }
   telem.valid = true;
   portEXIT_CRITICAL(&telemMux);
 }
@@ -4438,9 +4474,10 @@ static bool firebaseUploadLive() {
 
   if (!fbEnsureToken()) { fbLastOk = false; return false; }   // no token -> no request (respects backoff)
 
-  // 1536 B covers all NUM_COLUMNS zones with headroom. Overflow is CHECKED below, not assumed: an
-  // over-capacity document serializes silently truncated, which would PUT malformed JSON.
-  StaticJsonDocument<1536> doc;
+  // 2048 B covers all NUM_COLUMNS zones with headroom (raised from 1536 when powerSource, battery
+  // percent/current, tank EC/pH and the actuators object were added). Overflow is CHECKED below, not
+  // assumed: an over-capacity document serializes silently truncated, which would PUT malformed JSON.
+  StaticJsonDocument<2048> doc;
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
   meta["deviceOnline"] = true;
@@ -4452,12 +4489,35 @@ static bool firebaseUploadLive() {
   JsonObject system = doc.createNestedObject("system");
   system["state"] = stateName(t.state);
   system["masterWorkOrderActive"] = t.woActive;
+  // The dashboard has a Power Source tile; without this key it reads "--". The rig runs from the
+  // battery bank, with the inverter raised only for AC pumps during a run.
+  system["powerSource"] = t.woActive ? "Battery + inverter (run)" : "Battery";
 
   JsonObject sensors = doc.createNestedObject("sensors");
   if (t.tankValid)  { sensors["reservoirLevel"] = t.resLevel; sensors["mixingLevel"] = t.mixLevel; sensors["flowRate"] = t.flow; }
   if (t.envValid)   { sensors["temperature"] = t.temp; sensors["humidity"] = t.hum; }
   if (t.lightValid) sensors["lightLevel"] = t.lux;
-  if (t.inaValid)   sensors["batteryVoltage"] = t.battV;
+  if (t.inaValid) {
+    sensors["batteryVoltage"] = t.battV;
+    // Percent from resting voltage. BATT_LOW_V/BATT_CRIT_V are alarm points, not endpoints, so the
+    // scale uses its own full/empty pair. Clamped, and only published when the reading is valid --
+    // a made-up 0 % would look like a flat battery rather than a missing sensor.
+    float pct = (t.battV - BATT_EMPTY_V) * 100.0f / (BATT_FULL_V - BATT_EMPTY_V);
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    sensors["batteryPercent"] = (int)(pct + 0.5f);
+    sensors["batteryCurrent"] = t.battI;                 // ACS758, magnitude (see readBatteryAdc)
+  }
+  // Mixing-tank chemistry from ESP2's TELE. Only ever measured during a run, so this is the last
+  // batch -- published only if we have actually seen a value, never as a placeholder zero.
+  if (t.tankEC >= 0) sensors["waterEC"] = t.tankEC;
+  if (t.tankPH >= 0) sensors["waterPH"] = t.tankPH;
+
+  // Which pumps are energised right now, derived on core 1 from the stage ESP2 reports
+  // (STAGE,<ord>,<n>,<name>) -- no extra ESP2 traffic needed.
+  JsonObject act = doc.createNestedObject("actuators");
+  act["transferRunning"] = t.pumpTransfer;
+  act["boosterRunning"]  = t.pumpBooster;
+  act["mixerRunning"]    = t.pumpMixer;
 
   JsonObject zones = sensors.createNestedObject("zones");
   for (int c = 0; c < NUM_COLUMNS; c++) {
