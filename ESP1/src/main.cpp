@@ -148,7 +148,11 @@ int   calSoilAir[NUM_COLUMNS]   = { 656, 707, 800 };   // raw ADC when DRY  (map
 int   calSoilWater[NUM_COLUMNS] = { 524, 391, 300 };   // raw ADC when WET  (maps to 100%)
 // A capacitive probe reading <=LO or >=HI is treated as disconnected/shorted and dropped from the combine.
 const int SOIL_ADC_RAIL_LO = 8, SOIL_ADC_RAIL_HI = 1015;
-float calResEmptyCm = 53.0f, calResFullCm = 3.0f;      // ultrasonic geometry (moved from Nano)
+// Measured on the rig: sensor-to-water 38 cm = empty (0 %), 11 cm = full (100 %).
+// NOTE: loadCal() overrides these from the `calib` NVS namespace, so a value captured earlier by
+// the Calibration menu WINS over these defaults. If the tank still reads wrong after flashing,
+// re-run Calibration > ultrasonic (or clear NVS) -- editing the constant alone will not take.
+float calResEmptyCm = 38.0f, calResFullCm = 11.0f;     // ultrasonic geometry (moved from Nano) [MEASURED]
 float calMixEmptyCm = 50.0f, calMixFullCm = 4.0f;
 float calFlowResScale = 1.0f;                          // reservoir flow correction factor
 float calNpkScale[7] = { 10, 10, 1, 10, 1, 1, 1 };     // raw register -> engineering (moved from Nano)
@@ -184,10 +188,16 @@ static int soilCombine(int col, int v1, int v2) {
   else                 return -1;             // both look disconnected -> honest invalid
   return soilPct(col, raw);
 }
-// Map a raw ultrasonic distance (cm) to 0..100 % using empty/full geometry.
+// Map a raw ultrasonic distance (cm) to a WHOLE percent, 0..100, using empty/full geometry.
+// Rounded to an integer on purpose: an ultrasonic ranger's real resolution is coarser than 1 % of
+// a 27 cm span, so the decimals were noise being displayed and logged as if they meant something.
+// The clamp is hard at both ends -- a reading past "full" reports exactly 100, never 101.
 static float levelPct(float distCm, float emptyCm, float fullCm) {
+  if (emptyCm == fullCm) return 0;                    // degenerate geometry -> refuse to divide by 0
   float pct = (emptyCm - distCm) * 100.0f / (emptyCm - fullCm);
-  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+  pct = roundf(pct);
+  if (pct < 0)   pct = 0;
+  if (pct > 100) pct = 100;
   return pct;
 }
 
@@ -201,6 +211,38 @@ const float BATT_LOW_V       = 11.8f;   // disable fertigation below        [TBD
 const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD]
 const float INA226_SHUNT_OHMS   = 0.002f;   // shunt resistor value         [MEASURE]
 const float INA226_MAX_CURRENT_A = 10.0f;   // expected max current         [MEASURE]
+
+/* ---- Battery CURRENT: ACS758-050B via ADS1115 (replaces the opto ADC) ------ *
+ * The GPIO34 opto path logged I=0.00 on all 44,303 samples across 16 days -- battery %, the daily
+ * Wh totals and the low/critical thresholds never had real data. An ADS1115 gives 125 uV/LSB against
+ * a stable internal reference, so the current is now read from a hall sensor on the battery wire.
+ *
+ * WIRING: the ACS758 runs on 5 V and its output sits at VCC/2 (~2.5 V), swinging 0.5..4.5 V over
+ * +/-50 A. The ADS1115 must be powered from 3.3 V (at 5 V its logic-high threshold is 0.7*VDD =
+ * 3.5 V, which the ESP32's 3.3 V I2C cannot reach) and NO input may exceed VDD+0.3 V. So a 2:1
+ * divider on A0 is REQUIRED -- wired direct, anything above ~+27 A drives the input past the limit.
+ * With 10k/10k: zero -> 1.25 V, +/-50 A -> 0.25..2.25 V, inside the +/-4.096 V PGA, ~6 mA/LSB.
+ * Set ACS_DIV to 1.0 only if the divider is genuinely absent.                                     */
+#define ACS_ADDR        0x48        // ADS1115 ADDR -> GND (no clash: LCD 0x27, EEPROM 0x57, RTC 0x68)
+#define ACS_CHANNEL     0           // ACS758 output on A0; A1..A3 unused
+const float ACS_DIV          = 2.0f;    // (R1+R2)/R2 in front of A0                    [MEASURE]
+const float ACS_ZERO_V       = 2.5f;    // sensor output at 0 A = VCC/2 (050B)          [MEASURE]
+const float ACS_SENS_V_PER_A = 0.040f;  // 40 mV/A = ACS758LCB-050B                     [CONFIRM]
+const uint8_t ACS_PGA        = 1;       // 1 = +/-4.096 V full scale (125 uV/LSB)
+// ThingSpeak Ch3 ("Chem") slot for the battery current. Ch2 "System" is full (all 8 fields).
+// Must stay ABOVE 2 x (enabled columns), since the EC/pH loop claims 2 fields per enabled column.
+const int TS3_CURRENT_FIELD  = 5;       // safe while <=2 columns are enabled  [CONFIRM if C is on]
+bool  acsOk = false;                    // last ADS1115 read succeeded -- a dead ADC must be VISIBLE,
+                                        // not silently read as 0 A, which is how the opto failure hid
+float battIsigned = 0;                  // signed amps (050B is bidirectional); battI stays magnitude
+// Mixing-tank chemistry, captured from ESP2's TELE during a run (the tank is empty at idle, so these
+// describe the LAST batch). -1 / 0 stamp = never measured. Published as sensors.waterEC / waterPH.
+float tankEC = -1, tankPH = -1;
+unsigned long tankChemMs = 0;
+// Battery percent needs a full/empty voltage pair; BATT_LOW_V/BATT_CRIT_V are alarm points, not
+// endpoints. 12 V lead-acid resting voltages.                                          [MEASURE]
+const float BATT_FULL_V  = 12.70f;
+const float BATT_EMPTY_V = 11.20f;
 
 /* ---- Timing / supervisory constants (spec sec.10.14) --------------------- */
 const unsigned long UART_ACK_TIMEOUT_MS   = 3000;    // ESP2 ACK wait
@@ -623,6 +665,11 @@ QueueHandle_t fbCommandQueue = NULL;                // core0 -> core1: requests 
 QueueHandle_t fbStatusQueue  = NULL;                // core1 -> core0: results to PATCH back
 char     fbRemoteExerciseId[48] = "";               // command id owning the in-flight pump test ("" = none)
 unsigned long fbLastCommandPollMs = 0;
+// Server-side throttle between ACCEPTED remote actuations: a browser-side lock can be bypassed by a
+// second tab or a direct RTDB write. Only a command that actually ran starts the cooldown -- see
+// firebaseCommandTick() for why arming it on a rejection is worse than not throttling at all.
+unsigned long fbLastRemoteActionMs = 0;
+const unsigned long FB_REMOTE_MIN_GAP_MS = 10000;
 volatile uint32_t fbHandshakes = 0;                 // TLS connects; the keep-alive health metric (H-1)
 
 /* Google Trust Services Root R1 (https://pki.goog/repo/certs/gtsr1.pem, valid to 2036-06-22)
@@ -746,7 +793,12 @@ struct TelemetrySnapshot {
   float npkN[NUM_COLUMNS], npkP[NUM_COLUMNS], npkK[NUM_COLUMNS];
   float npkEC[NUM_COLUMNS], npkPH[NUM_COLUMNS];
   bool  npkValid[NUM_COLUMNS];
-  float battV, battP;
+  float battV, battP, battI;   // battI added for the ACS758 ThingSpeak field (core-0 uploader)
+  // Which pumps are energised, derived on CORE 1 from ESP2's reported stage. Derived here rather
+  // than read from run.stage in the uploader: run[] is core-1 state and a char array read from
+  // core 0 can tear -- the same cross-core mistake this snapshot exists to prevent.
+  bool pumpTransfer, pumpBooster, pumpMixer;
+  float tankEC, tankPH;        // last mixing-tank chemistry from ESP2's TELE (-1 = never measured)
   // Validity/state mirrored here so the core-0 uploaders never touch core-1's `sensor`/`wo`/`sysState`
   // directly (a torn read there publishes e.g. tankValid against a half-updated level).
   bool  envValid, tankValid, lightValid, inaValid;
@@ -933,7 +985,7 @@ String calMsg = "";                        // transient calibration message (e.g
  * NOT streamed in normal operation, so the ESP2 pages power ESP2 up and CAL-stream each sensor's
  * raw value in turn (one at a time), reusing the calibration transport. Purely diagnostic.      */
 uint8_t diagPage = 0;
-const uint8_t DIAG_PAGES = 9;              // 0 Env,1 Tank,2 Soil,3 NPK,4 ESP1,5 ESP2 chem,6 ESP2 pwr,7 flow1,8 flow2
+const uint8_t DIAG_PAGES = 10;             // 0 Env,1 Tank,2 Soil,3 NPK,4 NPK chem,5 ESP1,6 ESP2 chem,7 ESP2 pwr,8 flow1,9 flow2
 const unsigned long NANO_STALE_MS = 90000; // a Nano sensor is "stale" after this (~2x the active TX interval)
 // ESP2 sensors are pulled live one-at-a-time via a CAL round-robin (not streamed in normal operation).
 const char *DIAG_ESP2_ID[] = { "PH", "EC", "ACS712", "PZEM_V", "PZEM_I", "PZEM_P",
@@ -1963,9 +2015,23 @@ void handleEsp2Response(const String &payload) {
     return;
   }
   if (resp == "TELE") {                                   // power telemetry during a run: PZEM,<v>,<i>,<p>,ACS,<a>
-    // arg = "PZEM,228.0,1.40,319.0,ACS,0.80" -> log verbatim as pipe-delimited for the SD log / SUMMARY.
+    // arg = "PZEM,228.0,1.40,319.0,ACS,0.80,ECPH,1.42,6.30" -> log verbatim as pipe-delimited.
     String d = arg; d.replace(",", "|");                  // CSV-safe (sec.25.2: no commas in detail)
     logEvent("ESP2", "SENSOR", d);
+    // Capture the mixing-tank EC/pH for telemetry. ESP2 only sends these during a run (the tank is
+    // empty otherwise), so they are the LAST BATCH's chemistry, not a live idle reading -- which is
+    // the only honest thing a single-outlet tank can report. -1 = probe railed / not measured.
+    int ei = arg.indexOf("ECPH,");
+    if (ei >= 0) {
+      String chem = arg.substring(ei + 5);          // not `t` -- that is the token array in this scope
+      int c1 = chem.indexOf(',');
+      if (c1 > 0) {
+        float ec = chem.substring(0, c1).toFloat();
+        float ph = chem.substring(c1 + 1).toFloat();
+        if (ec >= 0) { tankEC = ec; tankChemMs = millis(); }
+        if (ph >= 0) { tankPH = ph; tankChemMs = millis(); }
+      }
+    }
     return;
   }
   if (resp == "READY") {
@@ -3761,9 +3827,62 @@ void loadBattCal() {
   p.end();
   Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS" : "using firmware defaults (calibrate!)");
 }
+/* ADS1115 in CONTINUOUS-conversion mode, so reading it costs ONE 2-byte I2C read and never waits.
+ * A single-shot read would have to poll the OS bit for the ~7.8 ms conversion, and polling it with
+ * delay() inside powerTick() breaks the "no delay() in any main loop" rule (CLAUDE.md / sec.10.6.5).
+ * Continuous mode sidesteps that entirely: the ADC free-runs at 128 SPS and we simply take the
+ * latest sample, which is at most 7.8 ms old -- far fresher than the powerTick cadence needs.
+ * Configure once; re-configure automatically after any I2C failure so a power glitch on the ADC
+ * recovers on its own. Registers per the datasheet. */
+static bool acsConfigured = false;
+
+static bool acsConfigure() {
+  const uint16_t MODE_CONT = 0x0000, DR_128SPS = 0x0080, COMP_OFF = 0x0003;
+  uint16_t cfg = MODE_CONT | DR_128SPS | COMP_OFF;
+  cfg |= (uint16_t)(0x4000 | ((ACS_CHANNEL & 0x03) << 12));    // MUX 1xx = AINx vs GND
+  cfg |= (uint16_t)((ACS_PGA & 0x07) << 9);
+  Wire.beginTransmission(ACS_ADDR);
+  Wire.write(0x01);                                            // config register
+  Wire.write((uint8_t)(cfg >> 8)); Wire.write((uint8_t)(cfg & 0xFF));
+  if (Wire.endTransmission() != 0) return false;
+  Wire.beginTransmission(ACS_ADDR);
+  Wire.write(0x00);                                            // leave the pointer on conversion,
+  if (Wire.endTransmission() != 0) return false;               // so steady-state reads are 1 xfer
+  acsConfigured = true;
+  return true;
+}
+
+// Volts AT THE ADC PIN (the caller undoes the divider). Returns false on any I2C fault, so a
+// missing or unpowered ADC surfaces as a fault flag rather than a plausible-looking 0 A.
+static bool acsReadVolts(float &v) {
+  if (!acsConfigured) {
+    // Configure, but report no sample this tick: the first conversion is still ~7.8 ms away, so the
+    // conversion register holds whatever preceded it (0 on a fresh ADC). Publishing that would log
+    // and upload a bogus current as if it were real. The next powerTick gets a genuine reading.
+    acsConfigure();
+    return false;
+  }
+  if (Wire.requestFrom((int)ACS_ADDR, 2) != 2) { acsConfigured = false; return false; }
+  int16_t raw = (int16_t)(((uint16_t)Wire.read() << 8) | Wire.read());
+  const float FS[6] = { 6.144f, 4.096f, 2.048f, 1.024f, 0.512f, 0.256f };
+  v = raw * (FS[ACS_PGA] / 32768.0f);
+  return true;
+}
+
 void readBatteryAdc() {
   battV = (float)applyPoly(calBattV, readAdcTrimmed(PIN_BATT_V));
-  battI = (float)fabs(applyPoly(calBattI, readAdcTrimmed(PIN_BATT_I)));   // opto current = magnitude
+  // Current now comes from the ACS758 via the ADS1115, NOT the opto ADC on GPIO34 (which read 0.00 A
+  // on every sample for 16 days). On an I2C failure hold the last value and clear acsOk so the fault
+  // is visible on the Diag page -- reporting 0 A would repeat exactly the failure this replaces.
+  float vAdc;
+  acsOk = acsReadVolts(vAdc);
+  if (acsOk) {
+    battIsigned = (vAdc * ACS_DIV - ACS_ZERO_V) / ACS_SENS_V_PER_A;   // signed: 050B is bidirectional
+    // Magnitude only, per CLAUDE.md: all energy counts as consumption, no charge/discharge split.
+    // The sensor CAN now tell the two apart (battIsigned) -- restoring that split is a separate
+    // decision against a documented design choice, so it is deliberately not taken here.
+    battI = fabsf(battIsigned);
+  }
   battP = battV * battI;
 }
 
@@ -4031,11 +4150,20 @@ void telemetryCollect() {
     telem.npkN[c] = sensor.npk[c][4]; telem.npkP[c] = sensor.npk[c][5]; telem.npkK[c] = sensor.npk[c][6];
     telem.npkEC[c] = sensor.npk[c][2]; telem.npkPH[c] = sensor.npk[c][3];
   }
-  telem.battV = battV; telem.battP = battP;
+  telem.battV = battV; telem.battP = battP; telem.battI = battI;
+  telem.tankEC = tankEC; telem.tankPH = tankPH;
   // Mirror the per-group validity + coarse system state so core-0 uploaders read only from the snapshot.
   telem.envValid = sensor.envValid; telem.tankValid = sensor.tankValid; telem.lightValid = sensor.lightValid;
   telem.inaValid = inaOk;
   telem.state = sysState; telem.woActive = wo.active;
+  // Pump flags from ESP2's reported stage name, resolved here on core 1 so the uploader never
+  // touches run.stage. Anything outside a live run is off, which is the truth at idle.
+  {
+    bool live = (runPhase == RUN_PRE || runPhase == RUN_LIVE);
+    telem.pumpTransfer = live && (!strcmp(run.stage, "Transfer Water") || !strcmp(run.stage, "Flush Fill"));
+    telem.pumpBooster  = live && (!strcmp(run.stage, "Release")        || !strcmp(run.stage, "Flush Release"));
+    telem.pumpMixer    = live && !strcmp(run.stage, "Mixing");
+  }
   telem.valid = true;
   portEXIT_CRITICAL(&telemMux);
 }
@@ -4097,6 +4225,10 @@ static void tsUpload() {
         url += "&field" + String(fld++) + "=" + String(t.npkPH[c], 2);
       } else fld += 2;
     }
+    // Battery current (ACS758) rides Ch3 because Ch2 "System" has all 8 fields used.
+    // CONSTRAINT: the loop above consumes 2 fields per ENABLED column -- 4 today with A and B.
+    // Enabling column C would take fields 1-6 and collide with field 5. Move this constant if so.
+    url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
     ok = tsGet(url) || ok;
   }
   lastTsOk = ok; lastTsUploadMs = millis();
@@ -4234,8 +4366,17 @@ static bool fbRefreshToken(const String &apiKey, const String &refresh) {
   fbHttp.end();
   fbAuthHttp = code;
   if (code != 200) { fbNoteAuthError(code, resp); return false; }
-  StaticJsonDocument<1536> r;
-  if (deserializeJson(r, resp)) { fbAuthErr = "malformed refresh response"; return false; }
+  // 4096, not 1536. A real securetoken response is ~1.5 KB -- the ID token alone is a ~980-char JWT
+  // and the refresh token another ~270 -- and deserializeJson() from a String COPIES every string
+  // into the document's pool, then adds ~16 B per member on top. Measured need is ~1594 B, so 1536
+  // fell ~60 B short: deserializeJson returned NoMemory and this reported "malformed" on a
+  // perfectly good HTTP 200, meaning the device could never hold a token. THIS is why Firebase
+  // never connected. Do not shrink it back.
+  StaticJsonDocument<4096> r;
+  // Report WHICH parse failure. Calling a NoMemory "malformed" is what disguised the undersized
+  // pool as a server problem for so long -- c.f() names it (NoMemory / IncompleteInput / ...).
+  DeserializationError de = deserializeJson(r, resp);
+  if (de) { fbNoteAuthLocal((String("refresh parse: ") + de.c_str() + " (body " + resp.length() + "B)").c_str()); return false; }
   String uid = r["user_id"] | "";
   if (uid.length()) fbUid = uid;
   return fbStoreToken(r["id_token"] | "", r["refresh_token"] | "", (r["expires_in"] | String("3600")).toInt());
@@ -4255,8 +4396,11 @@ static bool fbPasswordSignIn(const String &apiKey, const String &email, const St
   fbHttp.end();
   fbAuthHttp = code;
   if (code != 200) { fbNoteAuthError(code, resp); return false; }
-  StaticJsonDocument<1536> r;
-  if (deserializeJson(r, resp)) { fbAuthErr = "malformed sign-in response"; return false; }
+  // 4096 for the same reason as fbRefreshToken: an Email/Password success body measured 1504 B
+  // (982 B idToken + 268 B refreshToken + the rest), needing ~1594 B of document. See that note.
+  StaticJsonDocument<4096> r;
+  DeserializationError de = deserializeJson(r, resp);      // name the failure -- see fbRefreshToken
+  if (de) { fbNoteAuthLocal((String("sign-in parse: ") + de.c_str() + " (body " + resp.length() + "B)").c_str()); return false; }
   // localId is the account's UID. The firmware never needs it (the token carries it, and rules
   // compare auth.uid server-side) but you need it to WRITE those rules -- so surface it.
   String uid = r["localId"] | "";
@@ -4330,9 +4474,10 @@ static bool firebaseUploadLive() {
 
   if (!fbEnsureToken()) { fbLastOk = false; return false; }   // no token -> no request (respects backoff)
 
-  // 1536 B covers all NUM_COLUMNS zones with headroom. Overflow is CHECKED below, not assumed: an
-  // over-capacity document serializes silently truncated, which would PUT malformed JSON.
-  StaticJsonDocument<1536> doc;
+  // 2048 B covers all NUM_COLUMNS zones with headroom (raised from 1536 when powerSource, battery
+  // percent/current, tank EC/pH and the actuators object were added). Overflow is CHECKED below, not
+  // assumed: an over-capacity document serializes silently truncated, which would PUT malformed JSON.
+  StaticJsonDocument<2048> doc;
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
   meta["deviceOnline"] = true;
@@ -4344,12 +4489,35 @@ static bool firebaseUploadLive() {
   JsonObject system = doc.createNestedObject("system");
   system["state"] = stateName(t.state);
   system["masterWorkOrderActive"] = t.woActive;
+  // The dashboard has a Power Source tile; without this key it reads "--". The rig runs from the
+  // battery bank, with the inverter raised only for AC pumps during a run.
+  system["powerSource"] = t.woActive ? "Battery + inverter (run)" : "Battery";
 
   JsonObject sensors = doc.createNestedObject("sensors");
   if (t.tankValid)  { sensors["reservoirLevel"] = t.resLevel; sensors["mixingLevel"] = t.mixLevel; sensors["flowRate"] = t.flow; }
   if (t.envValid)   { sensors["temperature"] = t.temp; sensors["humidity"] = t.hum; }
   if (t.lightValid) sensors["lightLevel"] = t.lux;
-  if (t.inaValid)   sensors["batteryVoltage"] = t.battV;
+  if (t.inaValid) {
+    sensors["batteryVoltage"] = t.battV;
+    // Percent from resting voltage. BATT_LOW_V/BATT_CRIT_V are alarm points, not endpoints, so the
+    // scale uses its own full/empty pair. Clamped, and only published when the reading is valid --
+    // a made-up 0 % would look like a flat battery rather than a missing sensor.
+    float pct = (t.battV - BATT_EMPTY_V) * 100.0f / (BATT_FULL_V - BATT_EMPTY_V);
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    sensors["batteryPercent"] = (int)(pct + 0.5f);
+    sensors["batteryCurrent"] = t.battI;                 // ACS758, magnitude (see readBatteryAdc)
+  }
+  // Mixing-tank chemistry from ESP2's TELE. Only ever measured during a run, so this is the last
+  // batch -- published only if we have actually seen a value, never as a placeholder zero.
+  if (t.tankEC >= 0) sensors["waterEC"] = t.tankEC;
+  if (t.tankPH >= 0) sensors["waterPH"] = t.tankPH;
+
+  // Which pumps are energised right now, derived on core 1 from the stage ESP2 reports
+  // (STAGE,<ord>,<n>,<name>) -- no extra ESP2 traffic needed.
+  JsonObject act = doc.createNestedObject("actuators");
+  act["transferRunning"] = t.pumpTransfer;
+  act["boosterRunning"]  = t.pumpBooster;
+  act["mixerRunning"]    = t.pumpMixer;
 
   JsonObject zones = sensors.createNestedObject("zones");
   for (int c = 0; c < NUM_COLUMNS; c++) {
@@ -4411,7 +4579,19 @@ static void firebasePollCommands() {
   if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
   if (!fbCommandQueue || !fbEnsureToken()) return;
 
-  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json"))) return;
+  // Fetch only the NEWEST few commands, not the whole node. The firmware never deletes processed
+  // commands (the dashboard renders their status/detail), so this node grows without bound -- measured
+  // at 28 nodes / 4.6 KB on the live rig. Parsing all of that overflowed the document below, and
+  // deserializeJson's NoMemory made EVERY command invisible from then on: press the web button a few
+  // times and the device stops acknowledging forever. Firebase push keys are chronological, so the
+  // newest entries are always inside this window, and $key ordering needs no index rule. Making the
+  // response size independent of history is what actually fixes that.
+  // fbBuildUrl already appended "?auth=<token>", hence the leading '&'.
+  // limitToLast=10, not 5: the poll takes ONE command per 3 s tick (sequential by design), so the
+  // window has to outlast a burst of clicks. Anything that scrolls out of it is never seen and stays
+  // "queued" forever -- the same invisible-loss failure this whole change exists to remove, just at a
+  // higher threshold. 10 nodes is ~550 B filtered, comfortably inside the 2048 B document.
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json") + "&orderBy=%22%24key%22&limitToLast=10")) return;
   int code = fbHttp.GET();
   String resp = (code == 200) ? fbHttp.getString() : "";
   fbHttp.end();
@@ -4428,8 +4608,20 @@ static void firebasePollCommands() {
   pf["columns"] = true; pf["liters"] = true;      // FORCE_RUN: which columns, TOTAL litres
   pf.createNestedObject("doseMl");                 // FORCE_RUN: {"A":mL,"B":mL,"C":mL}
 
-  StaticJsonDocument<1024> doc;
-  if (deserializeJson(doc, resp, DeserializationOption::Filter(filter)) || !doc.is<JsonObject>()) return;
+  // 2048 as belt-and-braces on top of the limitToLast bound above. The failure is now REPORTED
+  // rather than swallowed: a bare `return` here is what let a NoMemory look like "the device just
+  // stopped responding" for days -- the same trap as the auth path.
+  StaticJsonDocument<2048> doc;
+  DeserializationError de = deserializeJson(doc, resp, DeserializationOption::Filter(filter));
+  if (de) {
+    static unsigned long lastParseLogMs = 0;                  // dedupe: this path polls every 3 s
+    if (millis() - lastParseLogMs > 60000) {
+      lastParseLogMs = millis();
+      logEvent("FIREBASE", "POLL", String("parse ") + de.c_str() + "|body=" + resp.length() + "B");
+    }
+    return;
+  }
+  if (!doc.is<JsonObject>()) return;
 
   for (JsonPair item : doc.as<JsonObject>()) {
     JsonObject req = item.value().as<JsonObject>();
@@ -4569,6 +4761,18 @@ void firebaseCommandTick() {
       logEvent("FIREBASE", "REJECT", "NOT_IDLE");
       continue;
     }
+
+    // Rate-limit only ACTUAL actuations, and only AFTER every other check has passed. Starting the
+    // cooldown earlier (before validation, as a naive placement does) means a command rejected for
+    // an unrelated reason -- not idle, unknown pump -- still arms a 10 s block, so the operator's
+    // legitimate retry is refused too and the button looks permanently dead.
+    if (fbLastRemoteActionMs && millis() - fbLastRemoteActionMs < FB_REMOTE_MIN_GAP_MS) {
+      unsigned long waitS = (FB_REMOTE_MIN_GAP_MS - (millis() - fbLastRemoteActionMs) + 999) / 1000;
+      firebaseQueueStatus(c.id, "rejected", (String("wait ") + waitS + "s between commands").c_str());
+      logEvent("FIREBASE", "REJECT", "THROTTLE");
+      continue;
+    }
+    fbLastRemoteActionMs = millis();
 
     // Arm exactly as exerciseTick() does -- including acked=false, which the ACK/START log and
     // the NOACK-vs-NODONE timeout distinction both depend on.
@@ -5907,31 +6111,48 @@ void lcdRenderDiag() {
       }
       break;
     }
-    case 4:   // ESP1 local: battery raw ADC + device presence
+    case 4: {  // Nano: the NPK sensor's OWN EC + pH per column.
+      // These were captured (sensor.npk[c][2]/[3]), uploaded to ThingSpeak Ch3 and published to
+      // Firebase, but had no on-rig view at all -- page 3 shows only N/P/K. Distinct from page 6,
+      // which is ESP2's separate EC/pH probes in the mixing tank.
+      snprintf(l, 21, "%-8s NPK Chem", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
+      for (int c = 0; c < NUM_COLUMNS && c < 3; c++) {
+        String v;
+        if (!COLUMN_ENABLED[c]) v = "-";
+        else v = "EC" + String(sensor.npk[c][2], 2) + " pH" + String(sensor.npk[c][3], 1);
+        const char *fl = COLUMN_ENABLED[c] ? diagNanoFlag(sensor.msNpk[c], sensor.npkValid[c]) : "off";
+        snprintf(l, 21, "%c %-13s%4s", COL_TAG[c], v.c_str(), fl);
+        lcd.setCursor(0, c + 1); lcd.print(l);
+      }
+      break;
+    }
+    case 5:   // ESP1 local: battery raw ADC + device presence
       snprintf(l, 21, "%-8s ESP1 Loc", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "BatV raw%-5d%5.1fV", (int)readAdcTrimmed(PIN_BATT_V), battV); lcd.setCursor(0, 1); lcd.print(l);
-      snprintf(l, 21, "BatI raw%-5d%5.2fA", (int)readAdcTrimmed(PIN_BATT_I), battI); lcd.setCursor(0, 2); lcd.print(l);
+      // ACS758 via ADS1115 (replaces the dead GPIO34 opto read). Shows the SIGNED amps -- the 050B is
+      // bidirectional -- plus an ok/X flag, so a missing ADC reads as a fault and never as "0.0 A".
+      snprintf(l, 21, "Cur %7.2fA ADS:%s", battIsigned, acsOk ? "ok" : "X"); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "RTC:%s LCD:%s SD:%s", i2cPresent(0x68) ? "ok" : "X", i2cPresent(LCD_ADDR) ? "ok" : "X", sdOk ? "ok" : "X"); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 5:   // ESP2: pH / EC / ACS712 raw ADC (live CAL stream)
+    case 6:   // ESP2: pH / EC / ACS712 raw ADC (live CAL stream) -- ESP2's OWN probes, not the NPK's
       snprintf(l, 21, "%-8s ESP2 Chem", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "pH",  (long)diagEsp2Raw[0], diagEsp2Flag(0)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "EC",  (long)diagEsp2Raw[1], diagEsp2Flag(1)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "ACS", (long)diagEsp2Raw[2], diagEsp2Flag(2)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 6:   // ESP2: PZEM AC power (V/I/P, engineering values from the CAL stream)
+    case 7:   // ESP2: PZEM AC power (V/I/P, engineering values from the CAL stream)
       snprintf(l, 21, "%-8s ESP2 Pwr", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "Vac:%-8s%5s", String(diagEsp2Raw[3], 0).c_str(), diagEsp2Flag(3)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "Iac:%-8s%5s", String(diagEsp2Raw[4], 2).c_str(), diagEsp2Flag(4)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "Pw :%-8s%5s", String(diagEsp2Raw[5], 0).c_str(), diagEsp2Flag(5)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 7:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
+    case 8:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
       snprintf(l, 21, "%-8s ESP2 Flw1", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "RESMIX", (long)diagEsp2Raw[6], diagEsp2Flag(6)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "MIXIRR", (long)diagEsp2Raw[7], diagEsp2Flag(7)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT A",  (long)diagEsp2Raw[8], diagEsp2Flag(8)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    default:  // case 8: ESP2 flow (2/2): NUT B / NUT C
+    default:  // case 9: ESP2 flow (2/2): NUT B / NUT C
       snprintf(l, 21, "%-8s ESP2 Flw2", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT B", (long)diagEsp2Raw[9],  diagEsp2Flag(9));  lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT C", (long)diagEsp2Raw[10], diagEsp2Flag(10)); lcd.setCursor(0, 2); lcd.print(l);

@@ -1350,7 +1350,16 @@ void teleTick() {
   lastTeleMs = millis();
   float v = pzem.voltage(), i = pzem.current(), p = pzem.power();
   if (isnan(v)) v = -1; if (isnan(i)) i = -1; if (isnan(p)) p = -1;
-  reply("TELE,PZEM," + String(v, 1) + "," + String(i, 2) + "," + String(p, 1) + ",ACS," + String(readMixerCurrent(), 2));
+  // Mixing-tank EC/pH ride along with the power telemetry. Until now these were only ever reported
+  // on a FAULT (EC_FAIL / PH_FAIL), so ESP1 had no value to publish and the dashboard's Water pH and
+  // Water EC tiles read "--" permanently. Same conversion the SEQ_ECPH check uses. A railed probe is
+  // sent as -1 so ESP1 can tell "not measured" from a genuine reading.
+  int phRaw = analogRead(PIN_PH), ecRaw = analogRead(PIN_EC);
+  float ph = (phRaw <= PH_ADC_FAULT_LO || phRaw >= PH_ADC_FAULT_HI) ? -1.0f : (PH_CAL_M * phRaw + PH_CAL_B);
+  float ec = (ecRaw <= EC_ADC_FAULT_LO || ecRaw >= EC_ADC_FAULT_HI) ? -1.0f : (EC_CAL_M * ecRaw + EC_CAL_B);
+  reply("TELE,PZEM," + String(v, 1) + "," + String(i, 2) + "," + String(p, 1) +
+        ",ACS," + String(readMixerCurrent(), 2) +
+        ",ECPH," + String(ec, 2) + "," + String(ph, 2));
 }
 
 // Apply one pushed calibration constant to the matching runtime variable. pH/EC carry two
