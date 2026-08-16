@@ -304,8 +304,38 @@ function renderZonesUI() {
         <article class="card matrix-card"><h3>Soil EC</h3><p id="soilEC${zone.id}">Unavailable</p><small id="targetEC${zone.id}">Target: --</small></article>
         <article class="card matrix-card"><h3>Soil moisture</h3><p id="soil${zone.id}">Unavailable</p><small id="targetMoisture${zone.id}">Target: --</small></article>
       </div>
+      <div class="zone-config">
+        <h4>Firmware settings for column ${zone.id}</h4>
+        <p class="field-note">Unlike the crop profile above, these are sent to ESP1 and change how it runs. Blank fields are left unchanged.</p>
+        <div class="force-row">
+          <label>Operation<select id="cfgMode${zone.id}">
+            <option value="">(unchanged)</option>
+            <option value="AUTO">Auto — irrigation + fertigation</option>
+            <option value="IRRIGATION_ONLY">Irrigation only</option>
+          </select></label>
+          <label>Column enabled<select id="cfgEnabled${zone.id}">
+            <option value="">(unchanged)</option><option value="1">Enabled</option><option value="0">Disabled</option>
+          </select></label>
+          <label>Schedule<select id="cfgSched${zone.id}">
+            <option value="">(unchanged)</option><option value="0">Automatic window</option><option value="1">Manual window</option>
+          </select></label>
+        </div>
+        <div class="force-row">
+          <label>Window start<input id="cfgWinStart${zone.id}" type="time"></label>
+          <label>Window end<input id="cfgWinEnd${zone.id}" type="time"></label>
+        </div>
+        <div class="force-row">
+          <label>Target N (ppm)<input id="cfgN${zone.id}" type="number" min="0" max="2000" step="1"></label>
+          <label>Target P (ppm)<input id="cfgP${zone.id}" type="number" min="0" max="2000" step="1"></label>
+          <label>Target K (ppm)<input id="cfgK${zone.id}" type="number" min="0" max="2000" step="1"></label>
+          <label>Target pH<input id="cfgPH${zone.id}" type="number" min="3" max="9" step="0.1"></label>
+        </div>
+        <button type="button" id="cfgSave${zone.id}">Send to ESP1</button>
+        <p id="cfgResult${zone.id}" class="control-result" aria-live="polite"></p>
+      </div>
       <p class="zone-note">Actuator/solenoid feedback: not reported by the current ESP1 Firebase snapshot.</p>`;
     container.appendChild(block);
+    block.querySelector(`#cfgSave${zone.id}`)?.addEventListener("click", () => submitColumnConfig(zone.id));
 
     const cropSelect = block.querySelector(`#cropSelect${zone.id}`);
     const stageSelect = block.querySelector(`#growthStage${zone.id}`);
@@ -404,6 +434,9 @@ function updateDashboard() {
   });
 
   renderDiagnostics();
+  renderRawSensors();
+  updateFaultBanner();
+  updateForceArmed();
   syncControlAvailability();
 }
 
@@ -547,6 +580,213 @@ function renderCommandHistory() {
   });
 }
 
+/* ---- Fault / recovery banner ------------------------------------------------------------------
+ * Rendered from diagnostics.fault, so the choices offered here are exactly the ones the LCD recovery
+ * menu offers. Recovery commands are sent with {emergency:true}: they bypass the freshness gate and
+ * the cooldown on purpose, because a stale snapshot is often *why* you are trying to recover, and a
+ * dashboard that locks you out at that moment is worse than useless. */
+let faultAckLocalUntil = 0;          // client-side half of the "ask me again in 2 minutes" snooze
+
+function updateFaultBanner() {
+  const banner = document.getElementById("faultBanner");
+  if (!banner) return;
+  const d = liveData.diagnostics || {};
+  const f = d.fault || {};
+  const state = String(f.state || liveData.system?.state || "");
+  const held = Boolean(f.held);
+  const stopped = state === "EMERGENCY_STOP";
+  const lockedOut = Boolean(d.actuationsDisabled);
+
+  // Nothing wrong -> no banner. A lockout is not a fault, but it must still be visible and
+  // reversible, so it raises the banner in a calmer form.
+  if (!held && !stopped && !lockedOut) { banner.hidden = true; faultAckLocalUntil = 0; return; }
+
+  // "Do nothing" snooze. Honour whichever of the device's countdown or our own is still running, so
+  // the prompt reappears even if the snapshot is stale.
+  const deviceAck = Number(f.ackSecondsLeft || 0);
+  const snoozed = deviceAck > 0 || Date.now() < faultAckLocalUntil;
+  const ackNote = document.getElementById("faultAck");
+  if (ackNote) {
+    const left = Math.max(deviceAck, Math.ceil((faultAckLocalUntil - Date.now()) / 1000));
+    ackNote.hidden = !snoozed;
+    if (snoozed) ackNote.textContent = `Acknowledged — this prompt will return in ${Math.max(0, left)}s. The system is still in this state.`;
+  }
+  banner.hidden = false;
+  banner.classList.toggle("snoozed", snoozed);
+  banner.classList.toggle("lockout-only", !held && !stopped && lockedOut);
+
+  setText("faultKind", held ? "Held fault — awaiting your decision"
+                     : stopped ? "Emergency stop active"
+                     : "Actuations disabled");
+  setText("faultTitle", held ? rawText(f.code, "Fault reported by ESP2")
+                       : stopped ? "The system is stopped"
+                       : "Monitoring only — nothing will run");
+  setText("faultDetail", held
+    ? `Reported ${rawText(f.at, "at an unknown time")}. ESP2 is paused with the actuator bank de-energised; pick how to continue.`
+    : stopped
+      ? "All actuators are off and ESP2 is unpowered. Returning to normal re-powers and re-validates ESP2 before anything runs."
+      : "Sensors, logging and telemetry are still running. Scheduled runs, pump exercises and forced runs are all blocked until actuations are re-enabled.");
+  setDeviceStatus("faultState", state || "UNKNOWN", held || stopped ? "danger" : "off");
+
+  // The re-hold guard, surfaced rather than hidden: after repeated identical holds ESP1 steers
+  // toward Release and eventually self-cancels, so "Resume normal" is not an endless option.
+  const steer = document.getElementById("faultSteer");
+  if (steer) {
+    const show = held && (f.steerRelease || Number(f.repeats || 0) > 1);
+    steer.hidden = !show;
+    if (show) {
+      steer.textContent = f.steerRelease
+        ? `This fault has held ${f.repeats} times. Resuming normally keeps re-holding — Release tank or Only irrigate run on a timer instead and will actually complete. The run self-cancels at ${rawText(f.autoCancelAt, "4")} holds.`
+        : `This fault has held ${f.repeats} times.`;
+    }
+  }
+
+  const rec = document.getElementById("faultRecovery");
+  if (rec) rec.hidden = !held;
+  const estopBtn = document.getElementById("estopRecoverBtn");
+  if (estopBtn) estopBtn.hidden = !stopped || held;
+  const enableBtn = document.getElementById("enableActBtn");
+  if (enableBtn) enableBtn.hidden = !lockedOut;
+  const disableBtn = document.getElementById("disableActBtn");
+  if (disableBtn) disableBtn.hidden = lockedOut;
+}
+
+/* ---- Armed forced-run countdown ---------------------------------------------------------------
+ * Driven by diagnostics.forceArmed, NOT by whether this browser sent the request -- an LCD-armed run
+ * must show here too. secondsLeft is re-seeded on every snapshot and ticked locally in between, so
+ * the number stays smooth at a 20-60 s publish cadence without ever drifting past the truth. */
+let armedSeed = null;                // { at: epoch ms, left: seconds } from the last snapshot
+
+function updateForceArmed() {
+  const panel = document.getElementById("forceArmedPanel");
+  if (!panel) return;
+  const a = liveData.diagnostics?.forceArmed || {};
+  if (!a.armed || !deviceIsFresh()) { panel.hidden = true; armedSeed = null; return; }
+  panel.hidden = false;
+  const doses = a.doseMl || {};
+  const fert = Number(doses.A || 0) + Number(doses.B || 0) + Number(doses.C || 0) > 0;
+  setText("forceArmedDetail",
+    `${fert ? "Fertigation" : "Irrigation"} · column ${rawText(a.columns, "?")} · ${numberText(a.liters, 1, "L")}`
+    + (fert ? ` · A/B/C ${Number(doses.A || 0)}/${Number(doses.B || 0)}/${Number(doses.C || 0)} mL` : "")
+    + ` · armed from the ${a.source === "web" ? "dashboard" : "LCD"}`);
+  armedSeed = { at: Date.now(), left: Number(a.secondsLeft || 0) };
+  tickArmedCountdown();
+}
+
+function tickArmedCountdown() {
+  if (!armedSeed) return;
+  const left = Math.max(0, armedSeed.left - Math.floor((Date.now() - armedSeed.at) / 1000));
+  setDeviceStatus("forceArmedCountdown", left > 0 ? `STARTS IN ${left}s` : "STARTING…", "active");
+}
+
+/* ---- Raw sensor diagnostics -------------------------------------------------------------------- */
+function ageFlag(ms) {
+  const v = Number(ms);
+  if (!Number.isFinite(v) || v === 0xFFFFFFFF) return "never";
+  if (v > 90000) return "STALE";                   // mirrors the firmware's NANO_STALE_MS
+  return "ok";
+}
+
+function renderRawSensors() {
+  const nano = document.getElementById("rawNanoGrid");
+  const r = liveData.diagnostics?.sensorsRaw;
+  if (nano) {
+    nano.innerHTML = "";
+    if (!r) {
+      nano.innerHTML = '<p class="muted">ESP1 has not published raw sensor values yet.</p>';
+    } else {
+      nano.appendChild(diagnosticGroup("Environment (raw)", [
+        ["Temperature", numberText(r.env?.tempC, 1, "C")],
+        ["Humidity", numberText(r.env?.humidity, 1, "%")],
+        ["Reading age", `${formatAge(r.env?.ageMs)} (${ageFlag(r.env?.ageMs)})`]
+      ]));
+      nano.appendChild(diagnosticGroup("Light (raw)", [
+        ["Lux", numberText(r.light?.lux, 0)],
+        ["Reading age", `${formatAge(r.light?.ageMs)} (${ageFlag(r.light?.ageMs)})`]
+      ]));
+      nano.appendChild(diagnosticGroup("Tank (raw)", [
+        ["Reservoir distance", numberText(r.tank?.reservoirCm, 1, "cm")],
+        ["Mixing distance", numberText(r.tank?.mixingCm, 1, "cm")],
+        ["Flow", numberText(r.tank?.flowLpm, 2, "L/min")],
+        ["Reading age", `${formatAge(r.tank?.ageMs)} (${ageFlag(r.tank?.ageMs)})`]
+      ]));
+      const soilRows = ["A", "B", "C"]
+        .filter(id => Array.isArray(r.soil?.[id]))
+        .map(id => [`Column ${id} probes`, `${r.soil[id][0]} / ${r.soil[id][1]}`]);
+      soilRows.push(["Reading age", `${formatAge(r.soil?.ageMs)} (${ageFlag(r.soil?.ageMs)})`]);
+      nano.appendChild(diagnosticGroup("Soil ADC (raw)", soilRows));
+      // Modbus register order is fixed by the sensor: moisture, temp, EC, pH, N, P, K.
+      const NPK_LABEL = ["Moisture", "Temp", "EC", "pH", "N", "P", "K"];
+      ["A", "B", "C"].forEach(id => {
+        const regs = r.npk?.[id]?.regs;
+        if (!Array.isArray(regs)) return;
+        const rows = regs.map((v, i) => [NPK_LABEL[i] || `reg${i}`, numberText(v, 2)]);
+        rows.push(["Reading age", `${formatAge(r.npk[id].ageMs)} (${ageFlag(r.npk[id].ageMs)})`]);
+        nano.appendChild(diagnosticGroup(`NPK column ${id} (raw registers)`, rows));
+      });
+    }
+  }
+
+  const sweeping = Boolean(r?.esp2?.sweepActive);
+  const sweepLeft = Number(r?.esp2?.sweepSecondsLeft || 0);
+  setDeviceStatus("rawEsp2Sweep", sweeping ? (sweepLeft ? `SWEEPING ${sweepLeft}s` : "SWEEPING") : "ESP2 IDLE",
+                  sweeping ? "active" : "off");
+
+  const box = document.getElementById("rawEsp2Grid");
+  if (!box) return;
+  const vals = r?.esp2?.values;
+  box.innerHTML = "";
+  if (!vals || !Object.keys(vals).length) {
+    box.innerHTML = '<p class="muted">No ESP2 values yet. ESP2 is powered down between runs — run a sweep to read them.</p>';
+    return;
+  }
+  const rows = Object.entries(vals).map(([id, v]) =>
+    [id, `${numberText(v.raw, 2)} · ${v.valid ? "ok" : "BAD"} · ${formatAge(v.ageMs)}`]);
+  box.appendChild(diagnosticGroup("ESP2 raw sensors", rows));
+}
+
+/* ---- Per-column firmware configuration --------------------------------------------------------- */
+function hhmmToMinutes(value) {
+  if (!value) return null;
+  const [h, m] = String(value).split(":").map(Number);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  return h * 60 + m;
+}
+
+function submitColumnConfig(id) {
+  const result = document.getElementById(`cfgResult${id}`);
+  const show = (text, error = true) => {
+    if (!result) return;
+    result.textContent = text;
+    result.className = `control-result${error ? " error" : ""}`;
+  };
+  // Only send what was actually filled in: the firmware treats absent fields as "leave unchanged",
+  // so a partial edit cannot clobber the rest of the column's configuration.
+  const payload = { col: id };
+  const mode = document.getElementById(`cfgMode${id}`)?.value;
+  if (mode) payload.mode = mode;
+  const en = document.getElementById(`cfgEnabled${id}`)?.value;
+  if (en !== "") payload.enabled = en === "1";
+  const sm = document.getElementById(`cfgSched${id}`)?.value;
+  if (sm !== "") payload.schedMode = Number(sm);
+  const ws = hhmmToMinutes(document.getElementById(`cfgWinStart${id}`)?.value);
+  const we = hhmmToMinutes(document.getElementById(`cfgWinEnd${id}`)?.value);
+  if (ws !== null) payload.winStart = ws;
+  if (we !== null) payload.winEnd = we;
+  if (ws !== null && we !== null && ws === we) { show("Window start and end cannot be the same. Nothing was sent."); return; }
+  const nums = { targetN: `cfgN${id}`, targetP: `cfgP${id}`, targetK: `cfgK${id}`, targetPH: `cfgPH${id}` };
+  for (const [key, el] of Object.entries(nums)) {
+    const raw = document.getElementById(el)?.value;
+    if (raw === "" || raw === undefined) continue;
+    const v = Number(raw);
+    if (!Number.isFinite(v)) { show(`${key} is not a number. Nothing was sent.`); return; }
+    payload[key] = v;
+  }
+  if (Object.keys(payload).length < 2) { show("Nothing to change — fill in at least one field."); return; }
+  show("Sending to ESP1…", false);
+  queueCommand("SET_COLUMN", payload);
+}
+
 // Forced run. Payload keys and bounds are the firmware's, verified against firebaseCommandTick():
 // columns / liters / doseMl{A,B,C}. Any non-zero dose makes ESP1 build a fertigation work order.
 function submitForceRun(event) {
@@ -577,9 +817,17 @@ function submitForceRun(event) {
     doseMl[key] = value;
   }
 
+  const delayRaw = document.getElementById("forceDelay")?.value;
+  const delaySeconds = delayRaw === "" || delayRaw === undefined ? 30 : Number(delayRaw);
+  if (!Number.isFinite(delaySeconds) || delaySeconds < 0 || delaySeconds > 300) {
+    show("Start delay must be between 0 and 300 seconds. Nothing was sent."); return;
+  }
+
   const fertigation = doseMl.A > 0 || doseMl.B > 0 || doseMl.C > 0;
-  show(`Queued ${fertigation ? "fertigation" : "irrigation"}: ${liters} L to ${columns}${fertigation ? ` with A/B/C ${doseMl.A}/${doseMl.B}/${doseMl.C} mL` : ""}. Waiting for ESP1 to accept it.`, false);
-  queueCommand("FORCE_RUN", { columns, liters, doseMl });
+  show(`Queued ${fertigation ? "fertigation" : "irrigation"}: ${liters} L to ${columns}`
+     + `${fertigation ? ` with A/B/C ${doseMl.A}/${doseMl.B}/${doseMl.C} mL` : ""}`
+     + `, starting in ${delaySeconds}s. Watch the armed panel below — you can still cancel.`, false);
+  queueCommand("FORCE_RUN", { columns, liters, doseMl, delaySeconds });
 }
 
 const loginForm = document.getElementById("loginForm");
@@ -607,6 +855,35 @@ document.getElementById("mixerBtn")?.addEventListener("click", () => queueComman
 document.getElementById("emergencyStop")?.addEventListener("click", () => queueCommand("EMERGENCY_STOP", {}, { emergency: true }));
 document.getElementById("forceRunForm")?.addEventListener("submit", submitForceRun);
 
+// Recovery controls all pass {emergency:true}. They must work when the snapshot is stale or the
+// cooldown is armed -- being unable to recover the rig because the page thinks it is offline is the
+// exact failure this whole feature exists to remove.
+document.querySelectorAll("#faultRecovery button[data-recover]").forEach(btn =>
+  btn.addEventListener("click", () => queueCommand("RECOVER", { action: btn.dataset.recover }, { emergency: true })));
+document.getElementById("estopRecoverBtn")?.addEventListener("click", () => queueCommand("ESTOP_RECOVER", {}, { emergency: true }));
+document.getElementById("enableActBtn")?.addEventListener("click", () => queueCommand("ENABLE_ACTUATIONS", {}, { emergency: true }));
+document.getElementById("disableActBtn")?.addEventListener("click", () => queueCommand("DISABLE_ACTUATIONS", {}, { emergency: true }));
+document.getElementById("rebootNanoBtn")?.addEventListener("click", () => queueCommand("REBOOT", { target: "nano" }, { emergency: true }));
+document.getElementById("rebootEsp2Btn")?.addEventListener("click", () => queueCommand("REBOOT", { target: "esp2" }, { emergency: true }));
+document.getElementById("rebootEsp1Btn")?.addEventListener("click", () => {
+  // ESP1 owns the Firebase link, so this one goes quiet for ~15 s before it comes back.
+  if (!confirm("Reboot ESP1? The dashboard will lose contact for about 15 seconds while it restarts.")) return;
+  queueCommand("REBOOT", { target: "esp1" }, { emergency: true });
+});
+document.getElementById("ackFaultBtn")?.addEventListener("click", () => {
+  faultAckLocalUntil = Date.now() + 120000;
+  queueCommand("ACK_FAULT", {}, { emergency: true });
+  updateFaultBanner();
+});
+document.getElementById("cancelForceBtn")?.addEventListener("click", () => queueCommand("CANCEL_FORCE", {}, { emergency: true }));
+document.getElementById("pulseBtn")?.addEventListener("click", () => queueCommand("TEST_PULSE", {
+  zone: document.getElementById("pulseZone")?.value || "A",
+  seconds: Number(document.getElementById("pulseSeconds")?.value || 5)
+}));
+document.getElementById("sweepBtn")?.addEventListener("click", () => queueCommand("DIAG_SWEEP", {
+  seconds: Number(document.getElementById("sweepSeconds")?.value || 60)
+}));
+
 document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach(item => item.classList.toggle("active", item === tab));
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === tab.dataset.view));
@@ -633,6 +910,15 @@ setInterval(() => {
   setText("liveAge", snapshotAgeText());
   syncControlAvailability();
 }, 15000);
+
+// 1 s tick: the armed-run countdown has to move between snapshots (ESP1 publishes every 20-60 s),
+// and the fault banner has to re-raise itself the moment a "do nothing" snooze expires -- that
+// re-prompt is the whole point of the option.
+setInterval(() => {
+  tickArmedCountdown();
+  if (faultAckLocalUntil && Date.now() >= faultAckLocalUntil) faultAckLocalUntil = 0;
+  updateFaultBanner();
+}, 1000);
 
 renderZonesUI();
 updateDashboard();

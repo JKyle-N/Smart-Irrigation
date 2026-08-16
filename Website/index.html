@@ -43,6 +43,37 @@
   </aside>
 
   <main class="main-content">
+    <!-- Fault / lockout banner. Sits above the tabs so it is visible whichever view is open: a held
+         fault or an actuation lockout is not a "diagnostics tab" concern. Hidden until ESP1 reports
+         one. -->
+    <section id="faultBanner" class="fault-banner" hidden aria-live="assertive">
+      <div class="fault-head">
+        <div>
+          <p class="eyebrow" id="faultKind">System fault</p>
+          <h2 id="faultTitle">--</h2>
+          <p id="faultDetail" class="fault-detail">--</p>
+        </div>
+        <span id="faultState" class="device-status danger">--</span>
+      </div>
+      <p id="faultSteer" class="fault-steer" hidden></p>
+      <div id="faultRecovery" class="fault-actions" hidden>
+        <button data-recover="hold">Hold (wait)</button>
+        <button data-recover="release">Release tank</button>
+        <button data-recover="irrigate">Only irrigate</button>
+        <button data-recover="normal">Resume normal</button>
+      </div>
+      <div class="fault-actions">
+        <button id="estopRecoverBtn" hidden>Return to normal</button>
+        <button id="enableActBtn" hidden>Re-enable actuations</button>
+        <button id="disableActBtn" class="warn">Disable actuations</button>
+        <button id="rebootNanoBtn">Reboot Nano</button>
+        <button id="rebootEsp2Btn">Reboot ESP2</button>
+        <button id="rebootEsp1Btn">Reboot ESP1</button>
+        <button id="ackFaultBtn">Do nothing (ask again in 2 min)</button>
+      </div>
+      <p id="faultAck" class="field-note" hidden></p>
+    </section>
+
     <header class="topbar">
       <div>
         <p class="eyebrow">Pinamungahan Automated FarmD</p>
@@ -128,8 +159,16 @@
         </article>
       </div>
 
+      <h3>Push to column (booster test with a destination)</h3>
+      <p class="hint">Opens the mixing valve, the column valve and the booster together for a fixed few seconds — the same combination the LCD Testing screen drives, but on a timer instead of a held button. ESP2 stops it on its own if this page or ESP1 goes silent, so a lost connection ends the pulse rather than leaving a pump running.</p>
+      <div class="control-grid">
+        <label>Destination<select id="pulseZone"><option value="A">Column A</option><option value="B">Column B</option><option value="C">Column C</option></select></label>
+        <label>Duration (seconds)<input id="pulseSeconds" type="number" min="1" max="15" step="1" value="5"></label>
+        <button id="pulseBtn" type="button">Run push pulse</button>
+      </div>
+
       <article class="emergency-panel">
-        <div><h3>Emergency system stop</h3><p>Immediately queues an ESP1 emergency-stop request. It is never blocked by the normal 10-second cooldown or by stale live telemetry. “Queued” is not physical-stop confirmation; wait for ESP1’s command status.</p></div>
+        <div><h3>Emergency system stop</h3><p>Immediately queues an ESP1 emergency-stop request. It is never blocked by the normal 10-second cooldown or by stale live telemetry. “Queued” is not physical-stop confirmation; wait for ESP1’s command status. Use <strong>Return to normal</strong> in the banner above to come back out.</p></div>
         <button id="emergencyStop" class="danger" type="button">Emergency stop now</button>
       </article>
 
@@ -149,6 +188,9 @@
             <label>Water to mix tank (L)
               <input id="forceLiters" type="number" min="0.1" max="20" step="0.1" required>
             </label>
+            <label title="ESP1 counts down before starting, on both the LCD and this page. Either can cancel during the countdown.">Start delay (seconds)
+              <input id="forceDelay" type="number" min="0" max="300" step="5" value="30">
+            </label>
           </div>
           <fieldset class="dose-fieldset">
             <legend>Nutrients (mL) — leave at 0 for irrigation</legend>
@@ -158,10 +200,20 @@
               <label>Nutrient C<input id="forceDoseC" type="number" min="0" max="500" step="1" value="0" required></label>
             </div>
           </fieldset>
-          <p class="field-note">Limits mirror the firmware: at most 20 L total per request and 500 mL per nutrient. Mixing time and run duration are not settable — ESP1 mixes for its compiled duration and runs to the metered volume, not to a clock.</p>
+          <p class="field-note">Limits mirror the firmware: at most 20 L total per request and 500 mL per nutrient. Mixing time and run duration are not settable — ESP1 mixes for its compiled duration and runs to the metered volume, not to a clock. ESP1 re-checks safety when the countdown expires, so a fault or a falling reservoir during the delay cancels the run instead of starting it late.</p>
           <button type="submit">Queue forced run</button>
           <p id="forceRunResult" class="control-result" aria-live="polite"></p>
         </form>
+
+        <!-- Shown whenever ESP1 reports an armed run, whether it was armed here or at the LCD. -->
+        <article id="forceArmedPanel" class="panel armed-panel" hidden>
+          <div class="panel-heading">
+            <div><h3>Forced run armed</h3><p id="forceArmedDetail">--</p></div>
+            <span id="forceArmedCountdown" class="device-status active">--</span>
+          </div>
+          <p class="field-note">ESP1 has accepted this and is counting down. Press BACK on the LCD, or use the button here, to cancel before it starts.</p>
+          <button id="cancelForceBtn" type="button" class="danger">Cancel forced run</button>
+        </article>
       </section>
 
       <article class="panel limitation-panel">
@@ -173,6 +225,21 @@
     <section class="view" id="diagnostics">
       <div class="section-heading"><div><h2>ESP1 diagnostics</h2><p class="hint">Actual diagnostics published by ESP1. Credentials, tokens, keys, and private service values are never displayed — only whether a service is configured.</p></div></div>
       <div id="diagnosticsGrid" class="diagnostics-grid"><p class="muted">Waiting for an ESP1 diagnostics snapshot.</p></div>
+
+      <article class="panel raw-panel">
+        <div class="panel-heading">
+          <div><h3>Raw sensor readings</h3><p>Pre-conversion values, the same ones the LCD Sensor Diag pages show. A converted reading can look plausible while the raw one is railed, which is what makes these worth having.</p></div>
+          <span id="rawEsp2Sweep" class="device-status off">ESP2 IDLE</span>
+        </div>
+        <div id="rawNanoGrid" class="diagnostics-grid"><p class="muted">Waiting for Nano data.</p></div>
+        <h4>ESP2 sensors</h4>
+        <p class="hint">ESP2 is powered down between runs, so its sensors are not streamed continuously. Running a sweep powers it up, reads pH / EC / current / PZEM / flow counters, then powers it back off. Idle-only.</p>
+        <div class="control-grid">
+          <label>Sweep length (seconds)<input id="sweepSeconds" type="number" min="10" max="120" step="10" value="60"></label>
+          <button id="sweepBtn" type="button">Run ESP2 sweep</button>
+        </div>
+        <div id="rawEsp2Grid" class="diagnostics-grid"><p class="muted">No sweep has run in this session.</p></div>
+      </article>
       <article class="panel event-panel">
         <div class="panel-heading"><div><h3>Recent ESP1 events</h3><p>Short, sanitized operational events mirrored from ESP1’s local log buffer.</p></div></div>
         <div id="diagnosticEvents" class="event-list"><p class="muted">No event data reported yet.</p></div>

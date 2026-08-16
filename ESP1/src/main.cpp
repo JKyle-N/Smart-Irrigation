@@ -4931,7 +4931,10 @@ static bool firebaseUploadLive() {
   // Publish the cadence so the dashboard can compute its own staleness threshold and grey out the
   // control buttons when this snapshot goes cold. With remote e-stop in scope, a page that cannot
   // tell "idle" from "device offline" is the dangerous failure mode.
-  meta["refreshMs"] = (sysState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
+  // t.state, not sysState: this runs on core 0 and the snapshot is the only sanctioned view of
+  // core-1 state. The enum read happened to be atomic, but mixing the two invites the next field
+  // added here to be one that is not.
+  meta["refreshMs"] = (t.state == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
 
   JsonObject system = doc.createNestedObject("system");
   system["state"] = stateName(t.state);
@@ -5216,7 +5219,11 @@ static void firebasePollCommands() {
 
   // Filter: we only ever read these four fields, so ArduinoJson can skip the rest of the
   // document instead of allocating it. Keeps this off the netTask stack (was 6 KB in the fork).
-  StaticJsonDocument<256> filter;
+  // 1024, raised from 256 when the recovery/config commands added ~15 payload keys. A filter that
+  // OVERFLOWS silently drops the keys that did not fit, and the fields behind them then parse as
+  // absent -- indistinguishable from the operator not sending them. That is the same silent-drop
+  // class as the doseMl empty-object bug, so it is checked below rather than assumed.
+  StaticJsonDocument<1024> filter;
   JsonObject any = filter.createNestedObject("*");
   any["status"] = true; any["type"] = true;
   JsonObject pf = any.createNestedObject("payload");
@@ -5237,10 +5244,21 @@ static void firebasePollCommands() {
   pf["winStart"] = true; pf["winEnd"] = true;
   pf["targetN"] = true; pf["targetP"] = true; pf["targetK"] = true; pf["targetPH"] = true;
 
-  // 2048 as belt-and-braces on top of the limitToLast bound above. The failure is now REPORTED
-  // rather than swallowed: a bare `return` here is what let a NoMemory look like "the device just
-  // stopped responding" for days -- the same trap as the auth path.
-  StaticJsonDocument<2048> doc;
+  // A filter that did not fit would silently drop keys; say so loudly instead of mis-parsing.
+  if (filter.overflowed()) {
+    static unsigned long lastFiltLogMs = 0;
+    if (millis() - lastFiltLogMs > 60000) {
+      lastFiltLogMs = millis();
+      logEvent("FIREBASE", "POLL", "filter overflow -- payload keys dropped");
+    }
+    return;
+  }
+
+  // 4096, raised from 2048 alongside the filter: a SET_COLUMN node retains ~12 values, and
+  // limitToLast=10 of those is well past what 2048 held. Belt-and-braces on top of the limitToLast
+  // bound above; the failure is REPORTED rather than swallowed, because a bare `return` here is
+  // what let a NoMemory look like "the device just stopped responding" for days.
+  StaticJsonDocument<4096> doc;
   DeserializationError de = deserializeJson(doc, resp, DeserializationOption::Filter(filter));
   if (de) {
     static unsigned long lastParseLogMs = 0;                  // dedupe: this path polls every 3 s
