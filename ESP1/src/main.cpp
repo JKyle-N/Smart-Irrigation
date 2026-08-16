@@ -110,6 +110,16 @@ const char COL_TAG[NUM_COLUMNS] = { 'A', 'B', 'C' };
 // Editable at commissioning AND on-device via Settings menu (persisted to NVS).
 int soilStartPct = 35;   // start irrigation below this %   [TBD]
 int soilStopPct  = 45;   // stop irrigation above this %    [TBD]
+/* ---- NPK 7-in-1 trust thresholds ----------------------------------------- *
+ * The probe reads moisture and N/P/K unreliably in unsaturated soil, so neither is trusted blindly:
+ *  AGREE  how far its moisture may sit from the capacitive pair before it is dropped from the
+ *         column average (percentage points).
+ *  MIN    below this column moisture its N/P/K are not usable, so fertigation downgrades to
+ *         irrigation-only until the soil is wet enough to read.
+ * MIN must stay BELOW soilStartPct: irrigation only starts below 35 %, so fertigation is always
+ * decided on dry-ish soil, and a floor at or above that would disable fertigation permanently.  */
+const int NPK_MOIST_AGREE_PCT = 15;   // [TBD]
+const int NPK_MIN_MOIST_PCT   = 15;   // [TBD] must be < soilStartPct
 // DEFAULT (AUTO) per-column service window, minutes since midnight {start, end}  [TBD]
 const uint16_t DEF_WIN_START[NUM_COLUMNS] = { 6*60, 8*60, 6*60 };   // 06:00 / 08:00 / 06:00
 const uint16_t DEF_WIN_END[NUM_COLUMNS]   = { 8*60, 10*60, 8*60 };  // 08:00 / 10:00 / 08:00
@@ -169,25 +179,54 @@ String calRxId = "";                    // sensor id of the last CAL sample rece
 float  calRxRaw = 0; bool calRxValid = false; unsigned long calRxMs = 0;
 
 // Map a raw soil ADC to 0..100 % using the per-column endpoints (dry=high ADC, wet=low ADC).
-// Column moisture is CAPACITIVE-ONLY: the NPK 7-in-1 moisture field is never blended in here (it reads
-// unreliably in unsaturated soil) -- the NPK parser writes only sensor.npk[c][*], never sensor.soil[c].
+// Column moisture blends THREE sensors: the two capacitive probes and the NPK 7-in-1 moisture field.
+// The NPK reads unreliably in unsaturated soil, so it is admitted only when it agrees with the
+// capacitive pair -- see soilCombine(), which is the single owner of that policy.
 static int soilPct(int col, int raw) {
   long p = map(raw, calSoilAir[col], calSoilWater[col], 0, 100);
   if (p < 0) p = 0; if (p > 100) p = 100;
   return (int)p;
 }
-// Combine the two capacitive probes of a column, dropping one that reads a rail (disconnected/shorted)
-// so a single dead probe can't peg the column. Returns 0..100 %, or -1 if BOTH probes look dead.
-static int soilCombine(int col, int v1, int v2) {
+/* Combine a column's three moisture sensors into one 0..100 %, or -1 if none is usable.
+ *
+ * Capacitive first: drop a probe reading a rail (disconnected/shorted) so one dead probe cannot peg
+ * the column, and average the rest in RAW ADC space before mapping (the two share endpoints, so the
+ * average is meaningful there; the NPK does not, and is blended in PERCENT space below).
+ *
+ * The NPK moisture then gets ONE vote against the capacitive pair's two -- final = (2*cap + npk)/3 --
+ * and only when it agrees with them to within NPK_MOIST_AGREE_PCT. Weighting it this way means a bad
+ * NPK reading can move the column by at most a third of its own error, and a wildly wrong one is
+ * excluded outright rather than averaged in. This is the whole reason the probe was previously
+ * barred from the average: it is useful when the soil is wet enough for it, and misleading when not,
+ * so the test is "does it agree", not "do we trust it in general".
+ *
+ * npkPct < 0 means no usable NPK reading (invalid, stale, or absent) -- caller decides that.
+ * Caller-visible outcomes are reported through `why` so the SOIL packet handler can log them
+ * without this function needing to know about logging. */
+enum SoilBlend { SB_CAP_ONLY, SB_BLENDED, SB_NPK_DIVERGED, SB_NPK_FALLBACK, SB_NONE };
+static int soilCombine(int col, int v1, int v2, int npkPct, SoilBlend *why) {
   bool ok1 = (v1 > SOIL_ADC_RAIL_LO && v1 < SOIL_ADC_RAIL_HI);
   bool ok2 = (v2 > SOIL_ADC_RAIL_LO && v2 < SOIL_ADC_RAIL_HI);
   int raw;
   if      (ok1 && ok2) raw = (v1 + v2) / 2;   // both good -> average
   else if (ok1)        raw = v1;              // one railed -> use the good probe
   else if (ok2)        raw = v2;
-  else                 return -1;             // both look disconnected -> honest invalid
-  return soilPct(col, raw);
+  else {
+    // BOTH capacitive probes look disconnected. Rather than declaring the column blind (which stops
+    // it irrigating entirely), fall back to the NPK moisture if there is one. The caller still
+    // raises SOIL_MISSING, so the dead probes get fixed -- this only keeps the plants watered in
+    // the meantime, on the one sensor still reporting.
+    if (npkPct >= 0) { if (why) *why = SB_NPK_FALLBACK; return npkPct; }
+    if (why) *why = SB_NONE;
+    return -1;
+  }
+  int capPct = soilPct(col, raw);
+  if (npkPct < 0) { if (why) *why = SB_CAP_ONLY; return capPct; }
+  if (abs(npkPct - capPct) > NPK_MOIST_AGREE_PCT) { if (why) *why = SB_NPK_DIVERGED; return capPct; }
+  if (why) *why = SB_BLENDED;
+  return (2 * capPct + npkPct) / 3;
 }
+
 // Map a raw ultrasonic distance (cm) to a WHOLE percent, 0..100, using empty/full geometry.
 // Rounded to an integer on purpose: an ultrasonic ranger's real resolution is coarser than 1 % of
 // a 27 cm span, so the decimals were noise being displayed and logged as if they meant something.
@@ -860,6 +899,9 @@ struct TelemetrySnapshot {
   int   soil[NUM_COLUMNS];
   float npkN[NUM_COLUMNS], npkP[NUM_COLUMNS], npkK[NUM_COLUMNS];
   float npkEC[NUM_COLUMNS], npkPH[NUM_COLUMNS];
+  // The 7-in-1's other two channels. Both were read and scaled, then thrown away: root-zone
+  // temperature is genuinely useful, and its moisture now votes in the column average.
+  float npkMoist[NUM_COLUMNS], npkTemp[NUM_COLUMNS];
   bool  npkValid[NUM_COLUMNS];
   float battV, battP, battI;   // battI added for the ACS758 ThingSpeak field (core-0 uploader)
   // Which pumps are energised, derived on CORE 1 from ESP2's reported stage. Derived here rather
@@ -1192,7 +1234,12 @@ String calMsg = "";                        // transient calibration message (e.g
  * NOT streamed in normal operation, so the ESP2 pages power ESP2 up and CAL-stream each sensor's
  * raw value in turn (one at a time), reusing the calibration transport. Purely diagnostic.      */
 uint8_t diagPage = 0;
-const uint8_t DIAG_PAGES = 10;             // 0 Env,1 Tank,2 Soil,3 NPK,4 NPK chem,5 ESP1,6 ESP2 chem,7 ESP2 pwr,8 flow1,9 flow2
+// 0 Env,1 Tank,2 Soil,3 NPK N/P/K raw,4..6 NPK A/B/C full,7 ESP1,8 ESP2 chem,9 ESP2 pwr,10 flow1,11 flow2
+// Pages 4..6 replaced the old single "NPK chem" row-per-column page: the 7-in-1 reports moisture,
+// temperature, EC, pH, N, P and K, and all seven fit one 20x4 page per column. One page each keeps
+// the values in engineering units at a readable size -- the raw registers are on the web page.
+const uint8_t DIAG_PAGES = 12;
+const uint8_t DIAG_NPK_FIRST = 4;          // first per-column NPK detail page
 const unsigned long NANO_STALE_MS = 90000; // a Nano sensor is "stale" after this (~2x the active TX interval)
 float         diagEsp2Raw[DIAG_ESP2_N];
 bool          diagEsp2Valid[DIAG_ESP2_N];
@@ -2050,6 +2097,40 @@ static bool isNumericToken(const String &s) {
   return digits > 0;
 }
 
+// The column's NPK moisture as a percent, or -1 when there is no usable reading. Stale counts as
+// unusable: a probe that stopped answering must not keep voting with its last value forever.
+static int npkMoistPct(int c) {
+  if (!sensor.npkValid[c] || sensor.npk[c][0] < 0) return -1;
+  if (!sensor.msNpk[c] || millis() - sensor.msNpk[c] > NANO_STALE_MS) return -1;
+  int p = (int)(sensor.npk[c][0] + 0.5f);
+  if (p < 0) p = 0; if (p > 100) p = 100;
+  return p;
+}
+
+/* Recompute one column's blended moisture from the retained capacitive raws plus the current NPK
+ * reading, and log whichever exceptional outcome applied. Called from BOTH the SOIL and the NPK
+ * packet handlers: the Nano sends SOIL immediately before NPK in the same burst, so blending only at
+ * SOIL time would always use the PREVIOUS cycle's NPK. Re-running it when NPK lands keeps
+ * sensor.soil[] as fresh as the data allows, with one implementation of the policy. */
+static SoilBlend soilRecompute(int c) {
+  if (c < 0 || c >= NUM_COLUMNS) return SB_NONE;
+  if (sensor.rawSoil[c][0] < 0 && sensor.rawSoil[c][1] < 0) return SB_NONE;   // no capacitive packet yet
+  SoilBlend why = SB_CAP_ONLY;
+  int npk = npkMoistPct(c);                    // sampled ONCE: the log must report the value actually used
+  sensor.soil[c] = soilCombine(c, sensor.rawSoil[c][0], sensor.rawSoil[c][1], npk, &why);
+  // Log only the exceptional outcomes, and only on a CHANGE of outcome: these fire per packet, and a
+  // permanently-diverged probe would otherwise fill the SD card and the 12-slot web ring.
+  static SoilBlend last[NUM_COLUMNS] = { SB_CAP_ONLY, SB_CAP_ONLY, SB_CAP_ONLY };
+  if (why != last[c]) {
+    last[c] = why;
+    if (why == SB_NPK_DIVERGED)
+      logEvent("NANO", "SOIL_NPK_DIVERGE", String(COL_TAG[c]) + "|cap=" + sensor.soil[c] + "|npk=" + npk);
+    else if (why == SB_NPK_FALLBACK)
+      logEvent("NANO", "SOIL_FALLBACK", String("NPK_ONLY|") + COL_TAG[c]);
+  }
+  return why;
+}
+
 // Returns true if packet is clean+plausible (and applies it); false = garbage.
 bool classifyAndApply(const String &payload, const String &raw) {
   // STRUCTURAL (Tier 1): the payload is taken from BETWEEN the frame markers, so a marker inside it
@@ -2121,21 +2202,31 @@ bool classifyAndApply(const String &payload, const String &raw) {
       int v1 = tok[i + 1].toInt(), v2 = tok[i + 2].toInt();   // RAW per-probe ADC (companion spec §A)
       if (v1 < 0 || v1 > 1023 || v2 < 0 || v2 > 1023) return false;   // Tier 2: 10-bit ADC range
       rawTmp[c][0] = v1; rawTmp[c][1] = v2;              // keep each raw probe (log + Sensor Diag)
-      tmp[c] = soilCombine(c, v1, v2);                  // 2-probe combine (drops a railed probe) -> %
+      // Blend is applied below via soilRecompute(), once the raws are stored -- it needs them in
+      // sensor.rawSoil[] so the NPK packet can re-run the same combine a moment later.
+      tmp[c] = 0;                                        // placeholder; real value set by soilRecompute
       if (abs(v1 - v2) > 400) logEvent("NANO", "SOIL_DIVERGE", String(COL_TAG[c]) + "|" + v1 + "|" + v2);
     }
     for (int c = 0; c < NUM_COLUMNS; c++) {
-      sensor.soil[c] = tmp[c];
       sensor.rawSoil[c][0] = rawTmp[c][0]; sensor.rawSoil[c][1] = rawTmp[c][1];
-      // A column ESP1 has ENABLED but the Nano did not report. Without this the column just logs
-      // SOIL_INVALID in controlTick and never irrigates, with nothing raised to the operator --
-      // the failure mode when the two COLUMN_ENABLED tables disagree (see the latch declaration).
-      if (COLUMN_ENABLED[c] && tmp[c] < 0) {
+      // Store the raws FIRST, then blend from them -- soilRecompute() reads sensor.rawSoil[], which
+      // is also what lets the NPK packet re-run the same combine when its reading lands.
+      SoilBlend why = SB_NONE;
+      if (rawTmp[c][0] < 0 && rawTmp[c][1] < 0) sensor.soil[c] = -1;   // column absent from the packet
+      else why = soilRecompute(c);
+      tmp[c] = sensor.soil[c];
+      // A column ESP1 has ENABLED but the Nano did not report, OR both its capacitive probes are
+      // dead. SB_NPK_FALLBACK still counts as broken hardware even though the NPK is covering the
+      // reading -- the whole point of the fallback is to keep watering WHILE the fault is visible,
+      // not to hide it. Without this the column just logs SOIL_INVALID in controlTick and never
+      // irrigates, with nothing raised (the failure mode when the two COLUMN_ENABLED tables disagree).
+      bool broken = (tmp[c] < 0) || (why == SB_NPK_FALLBACK);
+      if (COLUMN_ENABLED[c] && broken) {
         if (!soilMissingLatched[c]) {
           soilMissingLatched[c] = true;
           raiseFault('M', "SOIL_MISSING", c == 0 ? "COL_A" : c == 1 ? "COL_B" : "COL_C");
         }
-      } else if (tmp[c] >= 0) soilMissingLatched[c] = false;      // reporting again -> re-arm
+      } else if (!broken && tmp[c] >= 0) soilMissingLatched[c] = false;   // healthy again -> re-arm
     }
     sensor.msSoil = millis();
     sensor.lastNanoMs = millis();
@@ -2189,6 +2280,10 @@ bool classifyAndApply(const String &payload, const String &raw) {
     sensor.npkValid[c] = !anyInvalid;     // -1 sentinel is honest, NOT garbage
     sensor.msNpk[c] = millis();
     sensor.lastNanoMs = millis();
+    // Re-blend now that this column's moisture is current. The Nano sends SOIL immediately before
+    // NPK in the same burst, so the combine done at SOIL time used the PREVIOUS cycle's NPK -- this
+    // is the point at which both sensors are genuinely from the same moment.
+    soilRecompute(c);
     String d = "NPK";                     // pipe-delimited, CSV-safe (sec.25.2 -- no commas in detail)
     for (int i = 1; i < n; i++) d += "|" + tok[i];
     logEvent("NANO", "SENSOR", d);
@@ -4218,6 +4313,15 @@ bool decideFertigate(int c) {
     logEvent("ESP1", "CTRL", String("COL_") + COL_TAG[c] + "|FERT_DOWNGRADE|reason=NPK_INVALID");
     return false;
   }
+  // The probe needs moist soil for its N/P/K to mean anything -- in dry soil it returns numbers that
+  // look plausible and are not. Water first, measure next cycle: this is self-correcting, because
+  // the irrigation this triggers is exactly what makes the reading trustworthy. NPK_MIN_MOIST_PCT
+  // sits below soilStartPct on purpose; at or above it, fertigation could never run at all.
+  if (sensor.soil[c] >= 0 && sensor.soil[c] < NPK_MIN_MOIST_PCT) {
+    logEvent("ESP1", "CTRL", String("COL_") + COL_TAG[c] + "|FERT_DOWNGRADE|reason=DRY_SOIL"
+                             + "|soil=" + String(sensor.soil[c]) + "|min=" + String(NPK_MIN_MOIST_PCT));
+    return false;
+  }
   float n = sensor.npk[c][4], p = sensor.npk[c][5], k = sensor.npk[c][6];
   float gapN = col[c].targetN - n, gapP = col[c].targetP - p, gapK = col[c].targetK - k;
   bool fert = (gapN >= fertGap) || (gapP >= fertGap) || (gapK >= fertGap);
@@ -4648,6 +4752,7 @@ void telemetryCollect() {
     telem.npkValid[c] = sensor.npkValid[c];
     telem.npkN[c] = sensor.npk[c][4]; telem.npkP[c] = sensor.npk[c][5]; telem.npkK[c] = sensor.npk[c][6];
     telem.npkEC[c] = sensor.npk[c][2]; telem.npkPH[c] = sensor.npk[c][3];
+    telem.npkMoist[c] = sensor.npk[c][0]; telem.npkTemp[c] = sensor.npk[c][1];
   }
   telem.battV = battV; telem.battP = battP; telem.battI = battI;
   telem.tankEC = tankEC; telem.tankPH = tankPH;
@@ -5282,6 +5387,10 @@ static bool firebaseUploadLive() {
     if (t.npkValid[c]) {
       z["nitrogen"] = t.npkN[c]; z["phosphorus"] = t.npkP[c]; z["potassium"] = t.npkK[c];
       z["ec"] = t.npkEC[c]; z["ph"] = t.npkPH[c];
+      // The probe's own moisture, published alongside the blended `moisture` above so the two can be
+      // compared -- that difference is exactly what the divergence gate acts on.
+      z["npkMoisture"] = t.npkMoist[c];
+      z["soilTemperature"] = t.npkTemp[c];
     }
   }
 
@@ -7221,22 +7330,26 @@ void lcdRenderDiag() {
       }
       break;
     }
-    case 4: {  // Nano: the NPK sensor's OWN EC + pH per column.
-      // These were captured (sensor.npk[c][2]/[3]), uploaded to ThingSpeak Ch3 and published to
-      // Firebase, but had no on-rig view at all -- page 3 shows only N/P/K. Distinct from page 6,
-      // which is ESP2's separate EC/pH probes in the mixing tank.
-      snprintf(l, 21, "%-8s NPK Chem", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
-      for (int c = 0; c < NUM_COLUMNS && c < 3; c++) {
-        String v;
-        if (!COLUMN_ENABLED[c]) v = "-";
-        else v = "EC" + String(sensor.npk[c][2], 2) + " pH" + String(sensor.npk[c][3], 1);
-        const char *fl = COLUMN_ENABLED[c] ? diagNanoFlag(sensor.msNpk[c], sensor.npkValid[c]) : "off";
-        snprintf(l, 21, "%c %-13s%4s", COL_TAG[c], v.c_str(), fl);
-        lcd.setCursor(0, c + 1); lcd.print(l);
-      }
+    case 4: case 5: case 6: {  // Nano: ALL SEVEN channels of ONE column's 7-in-1 probe.
+      // The probe is not just N/P/K -- it also reports moisture, soil temperature, EC and pH, all of
+      // which were being measured and then discarded. This replaced a single shared "NPK Chem" row
+      // per column, which could only fit EC/pH. Engineering units here; the raw Modbus registers are
+      // on the dashboard's raw-sensor table. Distinct from the ESP2 chem page, which is the separate
+      // EC/pH pair in the MIXING TANK rather than in the soil.
+      int c = diagPage - DIAG_NPK_FIRST;
+      // These three cases assume one page per column. If NUM_COLUMNS is ever reduced without
+      // shrinking DIAG_PAGES to match, bail rather than index past sensor.npk[].
+      if (c < 0 || c >= NUM_COLUMNS) { lcdRow(0, "NPK page n/a"); lcdRow(1, ""); lcdRow(2, ""); lcdRow(3, ""); break; }
+      snprintf(l, 21, "%-8s NPK %c", hdr, COL_TAG[c]);                    lcd.setCursor(0, 0); lcd.print(l);
+      if (!COLUMN_ENABLED[c]) { lcdRow(1, "column disabled"); lcdRow(2, ""); lcdRow(3, ""); break; }
+      snprintf(l, 21, "M%5.1f%%  T%5.1fC", sensor.npk[c][0], sensor.npk[c][1]);  lcdRow(1, l);
+      snprintf(l, 21, "EC%-7.2f pH%4.1f", sensor.npk[c][2], sensor.npk[c][3]);   lcdRow(2, l);
+      snprintf(l, 21, "N%-4d P%-4d K%-4d%4s", (int)sensor.npk[c][4], (int)sensor.npk[c][5],
+               (int)sensor.npk[c][6], diagNanoFlag(sensor.msNpk[c], sensor.npkValid[c]));
+      lcdRow(3, l);
       break;
     }
-    case 5:   // ESP1 local: battery raw ADC + device presence
+    case 7:   // ESP1 local: battery raw ADC + device presence
       snprintf(l, 21, "%-8s ESP1 Loc", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "BatV raw%-5d%5.1fV", (int)readAdcTrimmed(PIN_BATT_V), battV); lcd.setCursor(0, 1); lcd.print(l);
       // ACS758 via ADS1115 (replaces the dead GPIO34 opto read). Shows the SIGNED amps -- the 050B is
@@ -7244,25 +7357,25 @@ void lcdRenderDiag() {
       snprintf(l, 21, "Cur %7.2fA ADS:%s", battIsigned, acsOk ? "ok" : "X"); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "RTC:%s LCD:%s SD:%s", i2cPresent(0x68) ? "ok" : "X", i2cPresent(LCD_ADDR) ? "ok" : "X", sdOk ? "ok" : "X"); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 6:   // ESP2: pH / EC / ACS712 raw ADC (live CAL stream) -- ESP2's OWN probes, not the NPK's
+    case 8:   // ESP2: pH / EC / ACS712 raw ADC (live CAL stream) -- ESP2's OWN probes, not the NPK's
       snprintf(l, 21, "%-8s ESP2 Chem", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "pH",  (long)diagEsp2Raw[0], diagEsp2Flag(0)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "EC",  (long)diagEsp2Raw[1], diagEsp2Flag(1)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-4sraw%-8ld%5s", "ACS", (long)diagEsp2Raw[2], diagEsp2Flag(2)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 7:   // ESP2: PZEM AC power (V/I/P, engineering values from the CAL stream)
+    case 9:   // ESP2: PZEM AC power (V/I/P, engineering values from the CAL stream)
       snprintf(l, 21, "%-8s ESP2 Pwr", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "Vac:%-8s%5s", String(diagEsp2Raw[3], 0).c_str(), diagEsp2Flag(3)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "Iac:%-8s%5s", String(diagEsp2Raw[4], 2).c_str(), diagEsp2Flag(4)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "Pw :%-8s%5s", String(diagEsp2Raw[5], 0).c_str(), diagEsp2Flag(5)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 8:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
+    case 10:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
       snprintf(l, 21, "%-8s ESP2 Flw1", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "RESMIX", (long)diagEsp2Raw[6], diagEsp2Flag(6)); lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "MIXIRR", (long)diagEsp2Raw[7], diagEsp2Flag(7)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT A",  (long)diagEsp2Raw[8], diagEsp2Flag(8)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    default:  // case 9: ESP2 flow (2/2): NUT B / NUT C
+    default:  // case 11: ESP2 flow (2/2): NUT B / NUT C
       snprintf(l, 21, "%-8s ESP2 Flw2", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT B", (long)diagEsp2Raw[9],  diagEsp2Flag(9));  lcd.setCursor(0, 1); lcd.print(l);
       snprintf(l, 21, "%-7s p%-7ld%4s", "NUT C", (long)diagEsp2Raw[10], diagEsp2Flag(10)); lcd.setCursor(0, 2); lcd.print(l);
