@@ -167,6 +167,19 @@
         <button id="pulseBtn" type="button">Run push pulse</button>
       </div>
 
+      <!-- Always reachable, unlike the copies in the fault banner: the banner only appears once
+           something is already wrong, and disabling actuations is most useful *before* that. Both
+           sets of buttons call the same handlers. -->
+      <h3>System control</h3>
+      <p class="hint">Available at any time, not just during a fault. Disabling actuations keeps every sensor, log and upload running but blocks scheduled runs, pump exercises and forced runs — and it survives a reboot, so a power blip cannot quietly re-arm the pumps. Re-enable from here or from the LCD (Settings &gt; Enable Actuations, which appears only while disabled).</p>
+      <div class="control-grid">
+        <button id="disableActBtn2" class="warn" type="button">Disable actuations</button>
+        <button id="enableActBtn2" type="button">Re-enable actuations</button>
+        <button id="rebootNanoBtn2" type="button">Reboot Nano</button>
+        <button id="rebootEsp2Btn2" type="button">Reboot ESP2</button>
+        <button id="rebootEsp1Btn2" type="button">Reboot ESP1</button>
+      </div>
+
       <article class="emergency-panel">
         <div><h3>Emergency system stop</h3><p>Immediately queues an ESP1 emergency-stop request. It is never blocked by the normal 10-second cooldown or by stale live telemetry. “Queued” is not physical-stop confirmation; wait for ESP1’s command status. Use <strong>Return to normal</strong> in the banner above to come back out.</p></div>
         <button id="emergencyStop" class="danger" type="button">Emergency stop now</button>

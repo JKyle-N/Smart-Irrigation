@@ -415,6 +415,17 @@ const char *stateName(SystemState s) {
   }
 }
 
+/* Display label. The actuation lockout is a FLAG (actuationsDisabled), not a system state: parking
+ * SAFE_MODE in sysState looked tidy but there are 17 setState(IDLE_STATE) sites and no SAFE_MODE
+ * case in stateMachineTick, so any run completion or recovery silently cleared it and the LCD then
+ * read "IDLE_STATE" on a locked-out rig. Deriving the label from the flag makes that impossible.
+ * The flag is passed in rather than read as a global so the core-0 uploader can hand over its
+ * snapshot copy instead of reaching across cores. */
+static const char *stateLabel(SystemState s, bool lockedOut) {
+  if (lockedOut && s == IDLE_STATE) return "SAFE_MODE";
+  return stateName(s);
+}
+
 /* ---- Per-column configuration (NVS-persisted) ---------------------------- */
 enum ColMode { MODE_AUTO = 0, MODE_IRRIGATION_ONLY = 1 };
 struct ColumnConfig {
@@ -1829,14 +1840,15 @@ void setActuationsEnabled(bool on, const char *why) {
   logEvent("ESP1", "ACT", String("ACTUATION|") + (on ? "ENABLED" : "DISABLED") + "|" + why);
   sendSMS(String("ACK,ACTUATION,") + (on ? "ENABLED" : "DISABLED"));
   if (!on) {
-    // Nothing in flight may survive the lockout, or "disabled" would be a lie until the current
-    // run finished. Cancel the armed force sequence too -- its countdown would otherwise fire into
-    // a system that has just been told not to actuate.
+    // Nothing in flight survives the lockout, or "disabled" would be a lie until the current run
+    // finished. The armed force countdown would otherwise fire into a system that has just been
+    // told not to actuate; a LIVE run needs the real stop, which cancelRun() already does properly
+    // (STOP_ALL to ESP2, run UI closed, forceCmdId/forceMask cleared, dashboard command resolved).
     forceAbort("ACTUATIONS_DISABLED");
-    if (sysState == IDLE_STATE) setState(SAFE_MODE);
-  } else if (sysState == SAFE_MODE) {
-    setState(IDLE_STATE);                                // released -> back to normal scheduling
+    if (wo.active || pendingRun.active) cancelRun(-1, "ACTUATIONS_DISABLED");
   }
+  // Note: sysState is deliberately NOT touched here. The lockout is reported via stateLabel(), so
+  // it cannot be cleared by any of the many setState(IDLE_STATE) sites. See stateLabel().
   wakeBacklight();
 }
 void saveWifiEn() {
@@ -3574,7 +3586,7 @@ void sendDailyReport() {
   }
   r += ",FLT,C" + String(faultsToday[0]) + "M" + String(faultsToday[1]) + "m" + String(faultsToday[2]);
   r += ",RST," + String(nanoResetsToday);
-  r += ",ST," + String(stateName(sysState));
+  r += ",ST," + String(stateLabel(sysState, actuationsDisabled));
   r += ",BAT," + String(battV, 1) + "V";
   // Daily energy (sec.12.1.3): integrated discharge (CONS) + charge (CHG), Wh.
   r += ",CONS," + String((int)(energyConsumedWh + 0.5)) + "Wh";
@@ -4937,7 +4949,7 @@ static bool firebaseUploadLive() {
   meta["refreshMs"] = (t.state == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
 
   JsonObject system = doc.createNestedObject("system");
-  system["state"] = stateName(t.state);
+  system["state"] = stateLabel(t.state, t.actDisabled);
   system["masterWorkOrderActive"] = t.woActive;
   // The dashboard has a Power Source tile; without this key it reads "--". The rig runs from the
   // battery bank, with the inverter raised only for AC pumps during a run.
@@ -5040,7 +5052,7 @@ static bool firebaseUploadLive() {
   // LCD menu does, so the two surfaces cannot disagree about what is available.
   JsonObject dfa = dg.createNestedObject("fault");
   dfa["held"]  = t.held;
-  dfa["state"] = stateName(t.state);
+  dfa["state"] = stateLabel(t.state, t.actDisabled);
   if (t.lastFault[0])   dfa["code"] = t.lastFault;
   if (t.lastFaultAt[0]) dfa["at"]   = t.lastFaultAt;
   if (t.ackLeftS > 0)   dfa["ackSecondsLeft"] = t.ackLeftS;   // "do nothing" snooze still running
@@ -6503,7 +6515,11 @@ void cancelRun(int mode, const char *why) {
 
   String scope;
   if (c >= 0 && c < NUM_COLUMNS) {
-    if (mode == 0)      { COLUMN_ENABLED[c] = false; saveColEnable(c); scope = "OFF"; }
+    // mode < 0: stop the run WITHOUT penalising the column. Used by the actuation lockout, which is
+    // a system-wide decision -- the column did nothing wrong, and a snooze would outlive the lockout
+    // and silently skip it for another 10 minutes after the operator re-enables.
+    if      (mode < 0)  { scope = "NOPENALTY"; }
+    else if (mode == 0) { COLUMN_ENABLED[c] = false; saveColEnable(c); scope = "OFF"; }
     else if (mode == 1) { colSnoozeUntil[c] = millis() + SNOOZE_LONG_MS;  scope = "SNOOZE30"; }
     else                { colSnoozeUntil[c] = millis() + SNOOZE_SHORT_MS; scope = "SNOOZE10"; }
   } else scope = "NOCOL";                                        // nothing was running -- still a clean stop
@@ -6938,7 +6954,12 @@ void diagRemoteTick() {
   if (!expired && !preempted) return;
   diagStopStream();
   diagRemoteUntilMs = 0;
-  esp2SetPower(false);
+  // HAND ESP2 OVER rather than switching it off when something preempted us. If the LCD diag page is
+  // what preempted, enterDiag() has already powered ESP2 up for it earlier in this same loop --
+  // powering down here would be deferred by the min-on hold and then executed ~10 s later, killing
+  // the page the operator just opened. exitDiag() owns the power-down in that case, and a run or a
+  // fault likewise owns ESP2 once it has taken it. Only a clean expiry powers it down here.
+  if (!preempted) esp2SetPower(false);
   logEvent("ESP1", "DIAG", expired ? "REMOTE|DONE" : "REMOTE|PREEMPTED");
 }
 
@@ -7210,7 +7231,7 @@ void handleButtons() {
         // MODE (i==4): toggle into/out of the Settings menu (spec sec.18.10)
         if (i == 4) {
           if (sysState == EMERGENCY_STOP) continue;  // keep the recovery prompt up; use the combo to re-stop
-          if (uiMode == UI_DATA) { uiMode = UI_MENU; setSel = 0; }
+          if (uiMode == UI_DATA) { uiMode = UI_MENU; setSel = setRowAt(0); }   // never start on a hidden row
           else settingsLeaveToData();                // leave any menu -> clean up + resume normal operation
           continue;
         }
@@ -7455,7 +7476,7 @@ void settingsButton(int i) {
       if (setSel == SET_EXIT) { uiMode = UI_DATA; }
       else if (setSel == SET_ENABLE) {                          // the escape hatch (re-enable only)
         setActuationsEnabled(true, "LCD");
-        uiMode = UI_DATA; setSel = 0;
+        uiMode = UI_DATA; setSel = setRowAt(0);
       }
       else if (setSel == SET_LOCK) {                            // lock the LCD (Part D)
         lcdLocked = true; saveLock();
@@ -7779,8 +7800,11 @@ void lcdTick() {
   if (lcdLocked) {
     if (!lastLocked) { lcd.clear(); lastLocked = true; }
     lcd.setCursor(0, 0); lcd.print("***   LOCKED   ***  ");
+    // A locked screen must not claim "running OK" while the rig is stopped or locked out -- this is
+    // the one line a passer-by reads, and it is exactly the state they need to know is not normal.
     lcd.setCursor(0, 1); lcd.print(sysState == EMERGENCY_STOP ? "E-STOP active!      "
-                                                              : "System running OK   ");
+                                 : actuationsDisabled        ? "Actuations DISABLED "
+                                                             : "System running OK   ");
     lcd.setCursor(0, 2); lcd.print("Hold UP + DOWN      ");
     lcd.setCursor(0, 3); lcd.print("together to unlock  ");
     return;
@@ -7857,7 +7881,7 @@ void lcdTick() {
   switch (lcdPage) {
     case PAGE_HOME:
       lcdRow(0, tsString().substring(0, 19).c_str());
-      snprintf(l, 21, "State:%-13s", stateName(sysState)); lcdRow(1, l);
+      snprintf(l, 21, "State:%-13s", stateLabel(sysState, actuationsDisabled)); lcdRow(1, l);
       snprintf(l, 21, "Bat:%.1fV %s", battV, batteryCritical ? "CRIT" : batteryLow ? "LOW" : "OK"); lcdRow(2, l);
       snprintf(l, 21, "Res:%d%% Mix:%d%%", (int)sensor.resLevel, (int)sensor.mixLevel); lcdRow(3, l);
       break;
