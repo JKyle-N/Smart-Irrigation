@@ -143,6 +143,25 @@ button.danger { min-width: 200px; border-color: var(--danger); background: var(-
 .pump-lamps { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-top: 16px; }
 .pump-lamps > div { display: grid; gap: 7px; padding: 14px; border-radius: 9px; background: var(--surface-muted); }
 
+/* Fault / lockout banner. Above the tabs, because a held fault is not a "diagnostics tab" concern.
+   Danger-toned by default; a lockout is a calmer state and gets the warning colour instead. */
+.fault-banner { margin-bottom: 26px; padding: 20px; border: 1px solid rgb(239 98 98 / .65); border-left: 6px solid var(--danger); border-radius: 13px; background: rgb(239 98 98 / .08); box-shadow: var(--shadow); }
+.fault-banner[hidden] { display: none; }
+.fault-banner.lockout-only { border-color: color-mix(in srgb, var(--warning) 65%, var(--border)); border-left-color: var(--warning); background: rgb(242 174 73 / .08); }
+.fault-banner.snoozed { opacity: .82; }
+.fault-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.fault-head h2 { margin-bottom: 6px; }
+.fault-detail { margin-bottom: 0; color: var(--muted); line-height: 1.5; max-width: 900px; }
+.fault-steer { margin: 14px 0 0; padding: 11px 13px; border-left: 4px solid var(--warning); border-radius: 8px; background: var(--surface-muted); color: var(--text); font-size: .88rem; line-height: 1.5; }
+.fault-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.fault-actions button { flex: 0 1 auto; }
+button.warn { border-color: var(--warning); color: var(--warning); }
+
+.armed-panel { border-left: 5px solid var(--warning); }
+.zone-config { display: grid; gap: 14px; margin: 18px 0; padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
+.zone-config h4 { margin-bottom: 4px; }
+.raw-panel h4 { margin: 22px 0 6px; }
+
 .diagnostics-grid { grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); }
 .diagnostic-card { padding: 17px; box-shadow: none; }
 .diagnostic-card dl { display: grid; grid-template-columns: minmax(90px, .9fr) minmax(0, 1.1fr); gap: 8px 12px; margin: 13px 0 0; font-size: .82rem; }
