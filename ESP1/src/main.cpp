@@ -927,14 +927,38 @@ String    lastFaultTime = "";        // RTC timestamp of the last fault (shown o
 enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST, UI_CAL, UI_DIAG };
 UiMode    uiMode = UI_DATA;
 // Top-level Settings menu rows
-enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
+enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
 // SET_WIFI and SET_SOFTAP show a live [ON]/[OFF] suffix via setRowLabel(); their base names here are placeholders.
-const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
+const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
 int  setSel    = 0;          // selected settings row
 int  editItem  = -1;         // SetItem currently being edited
 int  editField = 0;          // field index within the editor
 int  editCol   = 0;          // column index for per-column editors
 int  editTmp[6] = { 0 };     // working copy of the field values being edited
+
+/* ---- Settings > Force Run (operator-initiated irrigation/fertigation) ------ *
+ * Its own state rather than editTmp[6]: A-then-B needs eleven fields. Values are held as integers
+ * so the existing clampi()/delta editor convention applies unchanged (litres are x10).
+ * The armed run outlives the menu -- the operator sets it up, confirms, and walks away while a
+ * countdown runs on the data screen.                                                              */
+struct ForceSeq {
+  uint16_t dL;        // litres x10   (5..200 = 0.5..20.0 L)
+  uint16_t ml[3];     // nutrient A/B/C mL (0..FORCE_MAX_DOSE_ML)
+  uint16_t delayS;    // start delay 20..300 s
+};
+ForceSeq fcSeq[2] = { { 20, {0,0,0}, 30 }, { 20, {0,0,0}, 30 } };   // slot0 = A/B/AB, slot1 = B (A-then-B)
+uint8_t  fcMode  = 0;        // 0=A  1=B  2=AB-together  3=A-then-B
+uint8_t  fcField = 0;        // editor cursor (0 = mode, then 5 per active slot)
+const char *FC_MODE_NAMES[4] = { "Col A", "Col B", "A+B together", "A then B" };
+// Editor steps. handleButtons is edge-triggered (no hold-repeat), so every press is one step --
+// these are coarse on purpose to keep a full entry to a sane number of presses.
+const uint16_t FC_STEP_DL = 5, FC_STEP_ML = 25, FC_STEP_DELAY = 10;
+const uint16_t FC_DELAY_MIN = 20, FC_DELAY_MAX = 300;
+
+enum ForcePhase { FP_NONE, FP_WAIT, FP_RUNNING };
+ForcePhase    fcPhase = FP_NONE;
+uint8_t       fcSlot  = 0;         // which slot is counting down / running
+unsigned long fcFireAtMs = 0;      // countdown deadline for FP_WAIT
 // Edit-Confirmation (companion spec §B): a "dirty" edit shows SAVE/DISCARD/CANCEL on exit.
 bool editDirty   = false;    // any value changed since the editor opened
 bool editConfirm = false;    // the three-way unsaved-changes dialog is open
@@ -1185,6 +1209,8 @@ void runNoteErr(const String &e);
 void lcdRenderRun();
 static void lcdRow(uint8_t row, const char *s);   // full-width (20-col) padded row writer
 void exerciseTick();
+void forceTick();
+void forceAbort(const char *why);
 void i2cBusRecover();
 
 void pollGSM();
@@ -1404,6 +1430,7 @@ void loop() {
   g_lastStage = 'M'; stateMachineTick();
   g_lastStage = 'C'; controlTick();
   g_lastStage = 'X'; exerciseTick();       // preventive pump exercise (sec.14.9.1)
+  g_lastStage = 'f'; forceTick();          // Settings force run: countdown -> gate re-check -> fire
   g_lastStage = 'P'; powerTick();          // INA226 I2C read
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
@@ -2019,6 +2046,13 @@ void pollESP2() {
     } else {
       logEvent("ESP1", "RESP", "TIMEOUT|" + wo.cmd);
       wo.active = false; wo.stage = WO_IDLE;
+      // A Settings force sequence only advances A->B from the DONE handler, so an abnormal end has
+      // to release it explicitly. Without this fcPhase stays FP_RUNNING forever: column B never
+      // fires, and the stale non-idle phase blocks the next arm. Same for the DONE timeout below.
+      forceAbort("ESP2_TIMEOUT");
+      // Tell the dashboard too, or a web-initiated FORCE_RUN sits on "accepted" for good.
+      if (forceCmdId[0]) firebaseQueueStatus(forceCmdId, "failed", "ESP2 never acknowledged the work order");
+      forceCmdId[0] = '\0'; forceMask = 0;   // a later stray DONE must not be attributed to this run
       esp2SoftResetTried = false;            // fresh ladder: soft reset (RESET_SELF) before power-cycle
       setState(RECOVERY_STATE);              // RECOVERY_STATE tick owns the escalation now
     }
@@ -2027,6 +2061,9 @@ void pollESP2() {
     logEvent("ESP1", "RESP", "TIMEOUT|" + wo.cmd);
     raiseFault('C', "ESP2_DONE_TIMEOUT", "ESP2");
     wo.active = false; wo.stage = WO_IDLE;
+    forceAbort("ESP2_NO_DONE");
+    if (forceCmdId[0]) firebaseQueueStatus(forceCmdId, "failed", "ESP2 never reported the run finished");
+    forceCmdId[0] = '\0'; forceMask = 0;
   }
 }
 
@@ -2181,6 +2218,17 @@ void handleEsp2Response(const String &payload) {
           forceCmdId[0] = 0;
         }
         forceMask = 0;
+        // A-then-B: column A has finished, so start B's countdown now. Its delay is measured from
+        // THIS moment, not from arming -- ESP2 runs one work order at a time, so the two sequences
+        // are inherently back-to-back and each gets its own fully metered batch.
+        if (fcPhase == FP_RUNNING) {
+          if (fcMode == 3 && fcSlot == 0) {
+            fcSlot = 1; fcPhase = FP_WAIT;
+            fcFireAtMs = millis() + (unsigned long)fcSeq[1].delayS * 1000UL;
+            logEvent("ESP1", "ACT", String("FORCE|NEXT|COL_B|L=") + String(fcSeq[1].dL / 10.0f, 1) +
+                                    "|in=" + String(fcSeq[1].delayS) + "s");
+          } else fcPhase = FP_NONE;                // sequence complete
+        }
       }
       // A real run exercises transfer+booster (and mixer if fertigating) -> reset their clocks.
       lastPumpUseMs[0] = millis(); lastPumpUseMs[1] = millis();
@@ -2229,6 +2277,11 @@ void handleEsp2Response(const String &payload) {
     // and let the still-due column re-run normally -- ESP2 will fill only the remaining liters.
     if (esp2Held && arg.startsWith("NOT_HELD")) {
       esp2Held = false; wo.active = false; wo.stage = WO_IDLE;
+      // Same release as the other abnormal endings: this work order is gone, so nothing may keep
+      // waiting on it -- an armed A-then-B sequence or a dashboard command most of all.
+      forceAbort("ESP2_RESTARTED");
+      if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", "ESP2 restarted during the run"); forceCmdId[0] = 0; }
+      forceMask = 0;
       logEvent("ESP1", "RESP", "RESUME_REFUSED|ESP2_RESTARTED");
       sendSMS("ESP2 restarted; tank volume kept. Column will re-run on its own.");
       if (sysState == EMERGENCY_STOP) setState(IDLE_STATE);
@@ -2302,6 +2355,43 @@ void sendWorkOrder(int c, bool fertigate) {
 
   // Consolidated run notice (one per column service; sec.12.1.2)
   sendSMS(String("RUN,COL_") + COL_TAG[c] + "," + (fertigate ? "FERTIGATION" : "IRRIGATION"));
+}
+
+/* Abandon a pending/running Settings force sequence and say why. */
+void forceAbort(const char *why) {
+  if (fcPhase == FP_NONE) return;
+  fcPhase = FP_NONE;
+  logEvent("ESP1", "ACT", String("FORCE|ABORT|") + why);
+  sendSMS(String("ALERT,MIN,FORCE_ABORT,") + why);
+}
+
+/* Core 1: run the armed Settings force sequence. The safety gate is re-checked HERE, at fire time,
+ * not when the operator armed it -- a scheduled run, a fault, or a dropping reservoir during a
+ * 5-minute countdown must stop it rather than let it fire late into a changed system. */
+void forceTick() {
+  if (fcPhase != FP_WAIT) return;
+  if ((long)(millis() - fcFireAtMs) < 0) return;          // still counting down
+
+  const char *bad = NULL;
+  if      (sysState != IDLE_STATE)                              bad = "NOT_IDLE";
+  else if (uiMode != UI_DATA)                                   bad = "IN_MENU";
+  else if (wo.active || pendingRun.active || pendingExercise.active) bad = "BUSY";
+  else if (esp2Held)                                            bad = "HELD";
+  else if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT)    bad = "RES_LOW";
+  if (bad) { forceAbort(bad); return; }
+
+  const ForceSeq &q = fcSeq[fcSlot];
+  uint8_t mask;
+  if      (fcMode == 0) mask = 0b001;                     // A
+  else if (fcMode == 1) mask = 0b010;                     // B
+  else if (fcMode == 2) mask = 0b011;                     // A+B together (one shared batch)
+  else                  mask = (fcSlot == 0) ? 0b001 : 0b010;   // A then B
+  for (int b = 0; b < NUM_COLUMNS; b++) if ((mask & (1 << b)) && !COLUMN_ENABLED[b]) mask &= ~(1 << b);
+  if (!mask) { forceAbort("COL_DISABLED"); return; }
+
+  float doseMl[3] = { (float)q.ml[0], (float)q.ml[1], (float)q.ml[2] };
+  fcPhase = FP_RUNNING;
+  sendForceWorkOrder(mask, q.dL / 10.0f, doseMl, "");     // "" = started locally, not from the dashboard
 }
 
 /* Operator FORCE run: build a work order from explicit litres + explicit per-nutrient mL instead of
@@ -3646,6 +3736,7 @@ void stateMachineTick() {
         else if (millis() - esp2WarmupMs > ESP2_WARMUP_TIMEOUT_MS) {
           raiseFault('M', "ESP2_NO_READY", "FORCE");    // executor never came up for the forced run
           if (forceCmdId[0]) firebaseQueueStatus(forceCmdId, "failed", "ESP2 never powered up");
+          forceAbort("ESP2_NO_READY");                  // release an A-then-B sequence (see pollESP2)
           forceCmdId[0] = '\0'; forceMask = 0;
           wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
           runUiAbort("ESP2_NO_READY");                  // release the LCD takeover (runLocked)
@@ -5762,6 +5853,12 @@ void enterEmergencyStop(bool cutPower) {
   pendingRun.active = false; pendingRun.colIdx = -1;
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
   firebaseRemoteExerciseDone("failed", "aborted by emergency stop");   // release the remote slot
+  if (fcPhase != FP_NONE) { fcPhase = FP_NONE; logEvent("ESP1", "ACT", "FORCE|ABORT|ESTOP"); }
+  // An E-stop is exactly when the dashboard must not keep showing "accepted" for a run that has
+  // just been killed, and a stale forceMask would mis-attribute the next run's DONE. The cancel
+  // path already does this; the E-stop path did not.
+  if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", "aborted by emergency stop"); forceCmdId[0] = 0; }
+  forceMask = 0;
   if (cutPower) esp2SetPower(false, true);        // (sec.23.1.1) -- FORCE immediate cut (bypass min-on hold)
   runUiAbort("EMERGENCY_STOP");                   // close the run UI so the E-stop prompt owns the screen
   editConfirm = false; restoreConfirm = false; resetConfirm = false; editDirty = false;   // force-dismiss + auto-discard (§B.3.1)
@@ -5826,6 +5923,7 @@ void cancelRun(int mode, const char *why) {
   // scheduled run inherit this one's column mask.
   if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", why); forceCmdId[0] = 0; }
   forceMask = 0;
+  if (fcPhase != FP_NONE) { fcPhase = FP_NONE; logEvent("ESP1", "ACT", "FORCE|CANCELLED"); }
   lastHoldCode = ""; sameHoldN = 0; steerRelease = false;        // a cancel resolves the re-hold loop
   cancelPrompt = false; cancelSel = 0;
 
@@ -6416,6 +6514,16 @@ void handleButtons() {
     return;
   }
 
+  // ---- Force-run countdown: BACK cancels it -----------------------------------
+  // Only while WAITING. Once the work order is away, stopping it is the Cancel-run path (which
+  // must also stop ESP2), not a keypress here.
+  if (fcPhase == FP_WAIT && uiMode == UI_DATA) {
+    static bool fcBackLatch = false;
+    if (digitalRead(BTN_BACK) == LOW) {
+      if (!fcBackLatch) { fcBackLatch = true; wakeBacklight(); forceAbort("OPERATOR"); }
+    } else fcBackLatch = false;
+  }
+
   // ---- Locked: ignore all buttons except the UP+DOWN unlock combo (Part D) -----
   if (lcdLocked) {
     static bool unlockLatch = false;
@@ -6645,6 +6753,18 @@ void commitEditor() {
       soilStartPct = editTmp[0]; soilStopPct = editTmp[1]; fertGap = editTmp[2]; saveThresholds();
       logEvent("ESP1", "STATE", "THRESH_SET");
       break;
+    case SET_FORCE:
+      // ARM, don't run. forceTick() fires it after the countdown and re-checks safety THEN, because
+      // conditions can change during a delay of up to 5 minutes. Return to UI_DATA so automation
+      // (and the fire check, which requires uiMode == UI_DATA) is live while the clock runs.
+      fcSlot = 0; fcPhase = FP_WAIT;
+      fcFireAtMs = millis() + (unsigned long)fcSeq[0].delayS * 1000UL;
+      uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
+      logEvent("ESP1", "ACT", String("FORCE|ARM|") + FC_MODE_NAMES[fcMode] +
+                              "|L=" + String(fcSeq[0].dL / 10.0f, 1) +
+                              "|mL=" + String(fcSeq[0].ml[0]) + "/" + String(fcSeq[0].ml[1]) + "/" + String(fcSeq[0].ml[2]) +
+                              "|in=" + String(fcSeq[0].delayS) + "s");
+      break;
   }
 }
 
@@ -6748,6 +6868,10 @@ void settingsButton(int i) {
       else if (setSel == SET_SOFTAP) {                          // toggle the SoftAP provisioning portal
         if (portalActive || portalRequested) { portalCancel = true; logEvent("ESP1", "CMD", "WIFI_PORTAL|CANCEL"); }
         else { portalRequested = true; logEvent("ESP1", "CMD", "WIFI_PORTAL|START"); }   // netTask brings up the AP (banner)
+      }
+      else if (setSel == SET_FORCE) {                            // operator force run: idle-only
+        if (sysState != IDLE_STATE || wo.active || pendingRun.active || esp2Held) return;
+        fcField = 0; editItem = SET_FORCE; editDirty = false; uiMode = UI_EDIT;
       }
       else if (setSel == SET_CALIB) enterCal();                 // idle-only calibration (§A.6)
       else if (setSel == SET_DIAG)  enterDiag();                // read-only raw sensor diagnostics
@@ -6857,6 +6981,30 @@ void settingsButton(int i) {
           if (++editField > lastField) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
         break;
+
+      case SET_FORCE: {
+        // field 0 = mode; then 5 fields per active slot: litres, mlA, mlB, mlC, delay.
+        int slots    = (fcMode == 3) ? 2 : 1;
+        int lastField = slots * 5;                       // fields 1..slots*5
+        if (delta) {
+          if (fcField == 0) {
+            fcMode = (uint8_t)((fcMode + (delta > 0 ? 1 : 3)) % 4);
+            if (fcMode != 3) fcField = 0;                // mode change re-anchors the cursor
+          } else {
+            int s = (fcField - 1) / 5, f = (fcField - 1) % 5;
+            ForceSeq &q = fcSeq[s];
+            if      (f == 0) q.dL     = (uint16_t)clampi(q.dL + delta * FC_STEP_DL, 5, (int)(FORCE_MAX_LITERS * 10));
+            else if (f <= 3) q.ml[f-1]= (uint16_t)clampi(q.ml[f-1] + delta * FC_STEP_ML, 0, (int)FORCE_MAX_DOSE_ML);
+            else             q.delayS = (uint16_t)clampi(q.delayS + delta * FC_STEP_DELAY, FC_DELAY_MIN, FC_DELAY_MAX);
+          }
+        } else if (i == 2) {                             // ENTER advances; past the last field = ARM
+          if ((int)++fcField > lastField) {
+            commitEditor();                              // arms the countdown + returns to UI_DATA
+            editDirty = false; editItem = -1;
+          }
+        }
+        break;
+      }
 
       case SET_THRESH:
         if (delta) {
@@ -6969,6 +7117,26 @@ void lcdTick() {
     return;
   }
   if (lcdInPortal) { lcd.clear(); lcdInPortal = false; }  // just left portal -> clean redraw
+
+  // Force-run countdown banner: the operator armed a run and walked away, so the pending action has
+  // to be visible from across the room -- and cancellable without hunting through the menu.
+  static bool lcdInForce = false;
+  // Never mask a held fault or an E-stop prompt -- those carry choices the operator must answer.
+  // Same guard the run UI uses below. forceTick() also refuses to fire in either state.
+  if (fcPhase == FP_WAIT && !esp2Held && sysState != EMERGENCY_STOP) {
+    if (!lcdInForce) { lcd.clear(); lcdInForce = true; }
+    char fb[21];
+    const ForceSeq &q = fcSeq[fcSlot];
+    long left = ((long)fcFireAtMs - (long)millis()) / 1000; if (left < 0) left = 0;
+    const char *tag = (fcMode == 3) ? (fcSlot == 0 ? "A" : "B")
+                                    : (fcMode == 0 ? "A" : fcMode == 1 ? "B" : "AB");
+    lcd.setCursor(0, 0); lcd.print("FORCE RUN ARMED     ");
+    snprintf(fb, 21, "COL_%-3s %4.1fL        ", tag, q.dL / 10.0f);       lcd.setCursor(0, 1); lcd.print(fb);
+    snprintf(fb, 21, "N%3u P%3u K%3u mL   ", q.ml[0], q.ml[1], q.ml[2]);  lcd.setCursor(0, 2); lcd.print(fb);
+    snprintf(fb, 21, "starts %3lds  BACK=X ", left);                      lcd.setCursor(0, 3); lcd.print(fb);
+    return;
+  }
+  if (lcdInForce) { lcd.clear(); lcdInForce = false; }
 
   // Service-run UI takes over: receipt -> live stages -> result -> errors. Released by UP+DOWN
   // (runLocked=false), which only frees the screen -- the run itself keeps going.
@@ -7258,8 +7426,27 @@ void lcdRenderSettings() {
       lcd.setCursor(0, 2);
       snprintf(l, 21, "%cFert gap %3d mg/kg  ", editField==2?'>':' ', editTmp[2]); lcd.print(l);
       break;
+
+    case SET_FORCE: {
+      // Row 0 = mode. Rows 1-2 show the slot the cursor is in, so A-then-B's eleven fields fit a
+      // 4-row display without paging: you always see the slot you are editing.
+      int slot = (fcField == 0) ? 0 : (fcField - 1) / 5;
+      int f    = (fcField == 0) ? -1 : (fcField - 1) % 5;
+      const ForceSeq &q = fcSeq[slot];
+      snprintf(l, 21, "%cForce: %-12s", fcField==0?'>':' ', FC_MODE_NAMES[fcMode]); lcd.setCursor(0,0); lcd.print(l);
+      // Which column this slot actually waters (A-then-B: slot0=A, slot1=B).
+      const char *tag = (fcMode == 3) ? (slot == 0 ? "A" : "B")
+                                      : (fcMode == 0 ? "A" : fcMode == 1 ? "B" : "AB");
+      snprintf(l, 21, "%s %c%4.1fL %cN%3u %cP%3u", tag,
+               f==0?'>':' ', q.dL / 10.0f, f==1?'>':' ', q.ml[0], f==2?'>':' ', q.ml[1]);
+      lcd.setCursor(0,1); lcd.print(l);
+      snprintf(l, 21, "   %cK%3u  %cstart %3us", f==3?'>':' ', q.ml[2], f==4?'>':' ', q.delayS);
+      lcd.setCursor(0,2); lcd.print(l);
+      break;
+    }
   }
-  lcd.setCursor(0, 3); lcd.print("UP/DN edit ENT next ");
+  lcd.setCursor(0, 3);
+  lcd.print(editItem == SET_FORCE ? "UP/DN set ENT next  " : "UP/DN edit ENT next ");
 }
 
 /* =============================================================================
