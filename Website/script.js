@@ -378,6 +378,9 @@ function updateDashboard() {
   setText("batteryVoltage", numberText(sensors.batteryVoltage, 2, "V"));
   setText("batteryPercent", numberText(sensors.batteryPercent, 0, "%"));
   setText("batteryCurrent", numberText(sensors.batteryCurrent, 2, "A"));
+  // Watts comes from the diagnostics tree, not sensors -- ESP1 publishes battP there alongside the
+  // low/critical flags. Also shown under Diagnostics > Power; this is the front-page copy.
+  setText("batteryPower", numberText(diagnostics.power?.batteryPower, 1, "W"));
   setText("powerSource", rawText(system.powerSource));
   setText("liveAge", snapshotAgeText());
 
