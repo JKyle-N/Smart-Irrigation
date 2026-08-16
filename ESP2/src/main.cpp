@@ -147,6 +147,18 @@ const uint8_t NUT_FLOW_PIN[3] = { FLOW_NUT_A, FLOW_NUT_B, FLOW_NUT_C };
 float K_RES_MIX = 450.0f;
 float K_MIX_IRR = 450.0f;
 float K_NUT[3]   = { 450.0f, 450.0f, 450.0f };   // small dosing sensors differ [MEASURE]
+/* Flow K-factors are DIVISORS in litersSoFar(), and every metered stage decides when to stop its
+ * pump from that result -- so a bad K is not a measurement error, it is an actuation fault:
+ *   k == 0        -> pulses/0 = inf -> "target reached" on the first pulse. The stage completes
+ *                    instantly, the run reports DONE, and no water ever moved.
+ *   k far too big -> litres barely climb, so the pump runs to the 180 s hard cap. On SEQ_FILL that
+ *                    is the mixing tank overflowing.
+ * The ESP1 link has framing but no checksum, so a bit-flip inside a KMAIN/KNUT number survives as a
+ * plausible float (toFloat() on a mangled token yields 0). Both intake paths are therefore range
+ * checked, following the same "out of range -> ignore, keep the known-good value" convention the
+ * WATER token already uses. 450 is the bench value; this band is wide enough for any real sensor. */
+const float K_FLOW_MIN = 1.0f, K_FLOW_MAX = 100000.0f;
+static bool kSane(float k) { return isfinite(k) && k >= K_FLOW_MIN && k <= K_FLOW_MAX; }
 
 /* ---- Per-column water budget (liters per service) [TBD] ------------------ */
 const float WATER_BUDGET_L[3] = { 5.0f, 5.0f, 5.0f };
@@ -601,6 +613,10 @@ void tankLoad() {
 void tankApply(float deltaL) {
   mixTankL += deltaL;
   if (mixTankL < 0.0f) mixTankL = 0.0f;
+  // Clamp the top as well as the bottom. The bookkeeping should never exceed the tank -- SEQ_FILL
+  // caps its target -- but if it ever did, an over-reading volume would make the next DELIVER run
+  // longer than there is water for, which is how a booster ends up running dry.
+  if (mixTankL > MIXING_TANK_MAX_L) mixTankL = MIXING_TANK_MAX_L;
   tankSave();
 }
 
@@ -661,6 +677,12 @@ void detachFlow() {
 }
 float litersSoFar(float k) {
   noInterrupts(); unsigned long p = flowPulses; interrupts();
+  // Both intake paths range check K now, but this is the line that would actually produce the
+  // damage, so it refuses independently. Returning 0 makes an unusable K look like NO FLOW, which
+  // the stage already handles safely (FLOW_TIMEOUT_MS -> FLOW_FAIL -> hold for the operator).
+  // Dividing by a zero K instead yields inf, which reads as "target reached" and completes the
+  // stage instantly with nothing delivered -- a silent failure, and the worst possible answer.
+  if (!kSane(k)) return 0.0f;
   return (float)p / k;
 }
 
@@ -869,8 +891,19 @@ void dispatch(const String &payload) {
     else if (tok[i] == "PH" && i + 2 < n)    { wo.phLo = tok[++i].toFloat(); wo.phHi = tok[++i].toFloat(); }
     else if (tok[i] == "MIX" && i + 1 < n)   { wo.mixMs = (unsigned long)tok[++i].toInt(); }
     // Job-critical calibration carried in the work order (§A.5.1 #3): never run a dose on stale K/cal.
-    else if (tok[i] == "KMAIN" && i + 2 < n) { K_RES_MIX = tok[++i].toFloat(); K_MIX_IRR = tok[++i].toFloat(); }
-    else if (tok[i] == "KNUT" && i + 3 < n)  { K_NUT[0] = tok[++i].toFloat(); K_NUT[1] = tok[++i].toFloat(); K_NUT[2] = tok[++i].toFloat(); }
+    // Range checked (see kSane): an implausible K is ignored so metering keeps the last known-good
+    // value, and ESP1 is told, so a corrupted frame is visible instead of silently mis-metering.
+    else if (tok[i] == "KMAIN" && i + 2 < n) {
+      float a = tok[++i].toFloat(), b = tok[++i].toFloat();
+      if (kSane(a)) K_RES_MIX = a; else reply("INVALID,KMAIN_RESMIX");
+      if (kSane(b)) K_MIX_IRR = b; else reply("INVALID,KMAIN_MIXIRR");
+    }
+    else if (tok[i] == "KNUT" && i + 3 < n)  {
+      for (int j = 0; j < 3; j++) {
+        float k = tok[++i].toFloat();
+        if (kSane(k)) K_NUT[j] = k; else reply(String("INVALID,KNUT_") + (char)('A' + j));
+      }
+    }
     else if (tok[i] == "ECCAL" && i + 2 < n) { EC_CAL_M = tok[++i].toFloat(); EC_CAL_B = tok[++i].toFloat(); }
     else if (tok[i] == "PHCAL" && i + 2 < n) { PH_CAL_M = tok[++i].toFloat(); PH_CAL_B = tok[++i].toFloat(); }
   }
@@ -1070,6 +1103,13 @@ void runSequence() {
         float budget  = (wo.waterL > 0.0f) ? wo.waterL : WATER_BUDGET_L[c];
         float desired = wo.fertigate ? budget * (1.0f - wo.flushPct / 100.0f) : budget;
         float remaining = desired - mixTankL;
+        // Never ask for more than the tank can still hold. `desired` is already bounded, but the
+        // stage can overshoot its target: with a wrong-but-plausible K the metered litres under-read
+        // and the pump runs to STAGE_MAX_MS instead -- 180 s at TRANSFER_LPM is ~24 L, which on top
+        // of a partly-full tank would put water on the floor. Capping the request means the hard cap
+        // is the only overshoot, not the target as well.
+        float headroom = MIXING_TANK_MAX_L - mixTankL;
+        if (remaining > headroom) remaining = headroom;
         if (remaining < TANK_EPS_L) {                 // already enough in the tank -> skip the fill
           goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); break;
         }
@@ -1366,11 +1406,14 @@ void teleTick() {
 // values (slope M then offset B). Flow ids that ESP2 does not meter in normal operation
 // (NUTD/PHUP/PHDN) are accepted as a no-op so the ESP1 block-until-ACK save still completes.
 bool applySetCal(const String &id, const String *tok, int n, int i) {
-  if      (id == "FLOW_RESMIX") K_RES_MIX = tok[i].toFloat();
-  else if (id == "FLOW_MIXIRR") K_MIX_IRR = tok[i].toFloat();
-  else if (id == "FLOW_NUTA")   K_NUT[0]  = tok[i].toFloat();
-  else if (id == "FLOW_NUTB")   K_NUT[1]  = tok[i].toFloat();
-  else if (id == "FLOW_NUTC")   K_NUT[2]  = tok[i].toFloat();
+  // Flow K-factors are range checked here too (see kSane) -- SET_CAL is the other way a bad divisor
+  // can reach the metering path. Returning false makes ESP1 see INVALID,SET_CAL_ID rather than a
+  // silent accept, so a mistyped or corrupted calibration cannot quietly take over the metering.
+  if      (id == "FLOW_RESMIX") { if (!kSane(tok[i].toFloat())) return false; K_RES_MIX = tok[i].toFloat(); }
+  else if (id == "FLOW_MIXIRR") { if (!kSane(tok[i].toFloat())) return false; K_MIX_IRR = tok[i].toFloat(); }
+  else if (id == "FLOW_NUTA")   { if (!kSane(tok[i].toFloat())) return false; K_NUT[0]  = tok[i].toFloat(); }
+  else if (id == "FLOW_NUTB")   { if (!kSane(tok[i].toFloat())) return false; K_NUT[1]  = tok[i].toFloat(); }
+  else if (id == "FLOW_NUTC")   { if (!kSane(tok[i].toFloat())) return false; K_NUT[2]  = tok[i].toFloat(); }
   else if (id == "ACS712")      ACS712_ZERO_V = tok[i].toFloat();
   else if (id == "PH") { PH_CAL_M = tok[i].toFloat(); if (i + 1 < n) PH_CAL_B = tok[i + 1].toFloat(); }
   else if (id == "EC") { EC_CAL_M = tok[i].toFloat(); if (i + 1 < n) EC_CAL_B = tok[i + 1].toFloat(); }

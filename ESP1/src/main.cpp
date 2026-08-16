@@ -2977,10 +2977,23 @@ void netHealthTick() {
   unsigned long stalled = millis() - lastBeatMs;
   if (!warned && stalled >= NET_STALL_WARN_MS) {
     warned = true;
-    raiseFault('W', "NET_STALL", "NETTASK");        // logs + alerts; does not stop the rig
+    // Log + SMS directly rather than via raiseFault(). raiseFault preempts the LCD to PAGE_FAULT and
+    // tears down an in-progress Testing session (TEST,EXIT + power off) for EVERY tier, and a purely
+    // network problem must not do that: it affects no actuator, and dumping an operator out of
+    // Calibration or a relay test to report that the dashboard is offline would be worse than the
+    // fault. The FAULT type still puts it in the SD log and the web event ring, and the SMS goes out
+    // over the GSM path, which is independent of the task that just stalled.
+    logEvent("ESP1", "FAULT", "WARN|NET_STALL|NETTASK");
+    sendSMS("ALERT,WARN,NET_STALL,NETTASK");
     return;
   }
-  if (warned && stalled >= NET_STALL_RESET_MS && sysState == IDLE_STATE && !wo.active && !esp2Held) {
+  // Reboot only when there is genuinely nothing to lose: no run, no held fault, no armed force
+  // countdown, and nobody part-way through a menu (a reboot mid-calibration would discard their
+  // work to fix a problem that only costs remote visibility). Anything else simply waits -- the
+  // stall persists, and the next tick re-checks.
+  if (warned && stalled >= NET_STALL_RESET_MS &&
+      sysState == IDLE_STATE && !wo.active && !pendingRun.active && !esp2Held &&
+      fcPhase == FP_NONE && uiMode == UI_DATA && !portalActive) {
     esp1SelfResetOncePerDay("NET_STALL");           // once-per-day capped -> cannot boot-loop
   }
 }
