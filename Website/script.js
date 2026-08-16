@@ -320,6 +320,8 @@ function renderZonesUI() {
         <article class="card matrix-card"><h3>Soil pH</h3><p id="soilPH${zone.id}">Unavailable</p><small id="targetPH${zone.id}">Target: --</small></article>
         <article class="card matrix-card"><h3>Soil EC</h3><p id="soilEC${zone.id}">Unavailable</p><small id="targetEC${zone.id}">Target: --</small></article>
         <article class="card matrix-card"><h3>Soil moisture</h3><p id="soil${zone.id}">Unavailable</p><small id="targetMoisture${zone.id}">Target: --</small></article>
+        <article class="card matrix-card"><h3>NPK probe moisture</h3><p id="npkMoist${zone.id}">Unavailable</p><small>Blended into the figure at left when it agrees</small></article>
+        <article class="card matrix-card"><h3>Soil temperature</h3><p id="soilTemp${zone.id}">Unavailable</p><small>Root zone, from the 7-in-1 probe</small></article>
       </div>
       <div class="zone-config">
         <h4>Firmware settings for column ${zone.id}</h4>
@@ -448,6 +450,11 @@ function updateDashboard() {
     zoneMetric(zone, "ph", `soilPH${zone.id}`, 2, "", "ph");
     zoneMetric(zone, "ec", `soilEC${zone.id}`, 2, "mS/cm", "ec");
     zoneMetric(zone, "moisture", `soil${zone.id}`, 0, "%", "moisture");
+    // No target key for these two: the probe's own moisture is shown for comparison against the
+    // blended figure, and soil temperature has no configured target to fall short of.
+    const z = liveData.sensors?.zones?.[zone.id] || {};
+    setText(`npkMoist${zone.id}`, numberText(z.npkMoisture, 1, "%"));
+    setText(`soilTemp${zone.id}`, numberText(z.soilTemperature, 1, "°C"));
   });
 
   renderDiagnostics();
