@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Authenticated monitoring and safe remote command dashboard for the CIT-U EE smart irrigation master controller.">
+  <title>CIT-U EE Smart Irrigation</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="loginScreen" class="login-screen">
+    <form id="loginForm" class="login-card">
+      <p class="eyebrow">CIT-U Electrical Engineering</p>
+      <h1>Smart Irrigation</h1>
+      <p>Sign in with an authorized Firebase account to monitor the ESP1 master controller and use the available safe commands.</p>
+      <label>Email<input id="loginEmail" type="email" autocomplete="email" required></label>
+      <label>Password<input id="loginPassword" type="password" autocomplete="current-password" required></label>
+      <p id="loginError" class="login-error" role="alert"></p>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+
+  <aside class="sidebar">
+    <div>
+      <p class="eyebrow">CIT-U EE</p>
+      <h2>Smart<br>Irrigation</h2>
+    </div>
+    <nav class="tabs" aria-label="Dashboard sections">
+      <button class="tab active" data-view="dashboard">Live dashboard</button>
+      <button class="tab" data-view="zones">Zone profiles</button>
+      <button class="tab" data-view="manual">Controls</button>
+      <button class="tab" data-view="diagnostics">Diagnostics</button>
+    </nav>
+    <div class="system-status" aria-live="polite">
+      <p class="status-label">ESP1 state</p>
+      <span id="systemState" class="device-status off">WAITING FOR DATA</span>
+      <p class="status-label">ESP1 connection</p>
+      <span id="sideConnection" class="device-status off">NOT CONNECTED</span>
+      <p class="status-label">Run state</p>
+      <span id="sideRunState" class="device-status off">NO ACTIVE RUN</span>
+    </div>
+    <button id="contributorsBtn" class="link-button">Contributors &amp; project</button>
+  </aside>
+
+  <main class="main-content">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Pinamungahan Automated FarmD</p>
+        <h1>ESP1 live operations</h1>
+      </div>
+      <div class="topbar-actions">
+        <span class="connection-status"><i id="connectionDot" class="online-dot"></i><span id="connectionStatus">Firebase not configured</span></span>
+        <button id="theme-toggle" type="button">Light theme</button>
+        <button id="logoutBtn" type="button" hidden>Sign out</button>
+      </div>
+    </header>
+
+    <section class="view active" id="dashboard">
+      <div class="section-heading">
+        <div>
+          <h2>Live farm status</h2>
+          <p class="hint">Values come from ESP1’s verified Firebase snapshot. A value is shown as unavailable when ESP1 does not report it.</p>
+        </div>
+        <div id="liveAge" class="snapshot-age">Waiting for first snapshot</div>
+      </div>
+      <div class="card-grid metric-grid">
+        <article class="card"><h3>Reservoir level</h3><p id="reservoirLevel">Unavailable</p></article>
+        <article class="card"><h3>Mixing tank level</h3><p id="mixingLevel">Unavailable</p></article>
+        <article class="card"><h3>System flow</h3><p id="flowRate">Unavailable</p></article>
+        <article class="card"><h3>Air temperature</h3><p id="temperature">Unavailable</p></article>
+        <article class="card"><h3>Ambient humidity</h3><p id="humidity">Unavailable</p></article>
+        <article class="card"><h3>Light level</h3><p id="lightLevel">Unavailable</p></article>
+        <article class="card"><h3>Mix tank pH</h3><p id="waterPH">Unavailable</p></article>
+        <article class="card"><h3>Mix tank EC</h3><p id="waterEC">Unavailable</p></article>
+        <article class="card"><h3>Battery voltage</h3><p id="batteryVoltage">Unavailable</p></article>
+        <article class="card"><h3>Battery charge</h3><p id="batteryPercent">Unavailable</p></article>
+        <article class="card"><h3>Battery current</h3><p id="batteryCurrent">Unavailable</p></article>
+        <article class="card"><h3>Power source</h3><p id="powerSource">Unavailable</p></article>
+      </div>
+
+      <article class="panel run-panel">
+        <div class="panel-heading"><div><h3>Run progress</h3><p id="runSummary">No active irrigation or fertigation run reported by ESP1.</p></div><span id="runStateBadge" class="device-status off">IDLE</span></div>
+        <div class="progress-layout">
+          <div><span class="status-label">Current stage</span><strong id="runStage">Unavailable</strong></div>
+          <div><span class="status-label">Stage progress</span><strong id="runStageProgress">Unavailable</strong></div>
+          <div><span class="status-label">Water delivered</span><strong id="runWaterProgress">Unavailable</strong></div>
+          <div><span class="status-label">Nutrient delivery</span><strong id="runDoseProgress">Unavailable</strong></div>
+        </div>
+        <div class="pump-lamps">
+          <div><span class="status-label">Transfer pump</span><span id="transferPumpStatus" class="device-status off">OFF</span></div>
+          <div><span class="status-label">Booster pump</span><span id="boosterPumpStatus" class="device-status off">OFF</span></div>
+          <div><span class="status-label">Tank mixer</span><span id="mixerPumpStatus" class="device-status off">OFF</span></div>
+        </div>
+      </article>
+
+      <article class="panel command-panel">
+        <div class="panel-heading"><div><h3>Command status</h3><p>Only ESP1 statuses such as accepted, completed, failed, or rejected confirm command handling.</p></div></div>
+        <p id="commandStatus" class="command-status" aria-live="polite">No dashboard command has been sent in this session.</p>
+        <div id="commandHistory" class="command-history"><p class="muted">No command history received yet.</p></div>
+      </article>
+    </section>
+
+    <section class="view" id="zones">
+      <h2>Three physical zone profiles</h2>
+      <p class="hint">A, B, and C remain the physical ESP1 zone identifiers. Crop profiles are dashboard planning notes only: the current ESP1 firmware does not read them to start or change an irrigation run.</p>
+      <div id="dynamic-zones-container"></div>
+    </section>
+
+    <section class="view" id="manual">
+      <h2>Safe remote controls</h2>
+      <p class="hint">ESP1 validates every request before it reaches ESP2, and refuses anything that arrives while the system is not safely idle. A “queued” badge is not confirmation that anything moved — wait for ESP1’s own status.</p>
+      <div class="control-grid">
+        <article class="control-card">
+          <h3>Transfer pump test</h3>
+          <p>ESP1 safe exercise: 5 seconds.</p>
+          <button id="transferPumpBtn" type="button">Start transfer test</button>
+        </article>
+        <article class="control-card">
+          <h3>Booster pump test</h3>
+          <p>ESP1 safe exercise: 5 seconds. The exercise has no destination — ESP1 runs the pump only, and does not open a distribution valve.</p>
+          <button id="boosterPumpBtn" type="button">Start booster test</button>
+        </article>
+        <article class="control-card">
+          <h3>Tank mixer test</h3>
+          <p>ESP1 safe exercise: 5 seconds. This dashboard does not change inverter settings.</p>
+          <button id="mixerBtn" type="button">Start mixer test</button>
+        </article>
+      </div>
+
+      <article class="emergency-panel">
+        <div><h3>Emergency system stop</h3><p>Immediately queues an ESP1 emergency-stop request. It is never blocked by the normal 10-second cooldown or by stale live telemetry. “Queued” is not physical-stop confirmation; wait for ESP1’s command status.</p></div>
+        <button id="emergencyStop" class="danger" type="button">Emergency stop now</button>
+      </article>
+
+      <section class="forced-section">
+        <h3>Forced irrigation / fertigation</h3>
+        <p class="hint">Sends a real <code>FORCE_RUN</code> work order. This overrides the schedule, the soil-moisture threshold and serviced-today — it does <strong>not</strong> override hardware safety, and ESP1 still refuses it unless the system is idle and the reservoir is above its low mark. Leave every nutrient at 0 for plain irrigation; any non-zero dose makes it a fertigation.</p>
+        <form id="forceRunForm" class="force-form">
+          <div class="force-row">
+            <label>Destination columns
+              <select id="forceColumns" required>
+                <option value="A">Column A</option>
+                <option value="B">Column B</option>
+                <option value="C">Column C</option>
+                <option value="AB">A + B together</option>
+              </select>
+            </label>
+            <label>Water to mix tank (L)
+              <input id="forceLiters" type="number" min="0.1" max="20" step="0.1" required>
+            </label>
+          </div>
+          <fieldset class="dose-fieldset">
+            <legend>Nutrients (mL) — leave at 0 for irrigation</legend>
+            <div class="force-row">
+              <label>Nutrient A<input id="forceDoseA" type="number" min="0" max="500" step="1" value="0" required></label>
+              <label>Nutrient B<input id="forceDoseB" type="number" min="0" max="500" step="1" value="0" required></label>
+              <label>Nutrient C<input id="forceDoseC" type="number" min="0" max="500" step="1" value="0" required></label>
+            </div>
+          </fieldset>
+          <p class="field-note">Limits mirror the firmware: at most 20 L total per request and 500 mL per nutrient. Mixing time and run duration are not settable — ESP1 mixes for its compiled duration and runs to the metered volume, not to a clock.</p>
+          <button type="submit">Queue forced run</button>
+          <p id="forceRunResult" class="control-result" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <article class="panel limitation-panel">
+        <h3>Distribution valves / solenoids</h3>
+        <p>There are deliberately no Valve A/B/C buttons. ESP1 rejects a standalone remote solenoid request as “not a remotely safe control”, and there is no relay feedback to confirm what a valve actually did, so such a button would report success it cannot verify. Valves are opened only as part of a work order, where ESP2 sequences and closes them.</p>
+      </article>
+    </section>
+
+    <section class="view" id="diagnostics">
+      <div class="section-heading"><div><h2>ESP1 diagnostics</h2><p class="hint">Actual diagnostics published by ESP1. Credentials, tokens, keys, and private service values are never displayed — only whether a service is configured.</p></div></div>
+      <div id="diagnosticsGrid" class="diagnostics-grid"><p class="muted">Waiting for an ESP1 diagnostics snapshot.</p></div>
+      <article class="panel event-panel">
+        <div class="panel-heading"><div><h3>Recent ESP1 events</h3><p>Short, sanitized operational events mirrored from ESP1’s local log buffer.</p></div></div>
+        <div id="diagnosticEvents" class="event-list"><p class="muted">No event data reported yet.</p></div>
+      </article>
+    </section>
+  </main>
+
+  <dialog id="contributorsDialog">
+    <button class="closeDialog" type="button">Close</button>
+    <h2>Research project contributors</h2>
+    <p>CIT-U EE Smart Irrigation / Pinamungahan Automated FarmD</p>
+    <ul><li>Christian Jay A. Tibon</li><li>Mark Bon Q. Compuesto</li><li>Johnbert Kyle T. Nacor</li><li>John Michael N. Sugian</li><li>John Ray C. Lagamayo</li><li>John Christopher S. Cabrillos</li></ul>
+    <p><a href="https://github.com/JKyle-N/Smart-Irrigation" target="_blank" rel="noreferrer">View the Smart Irrigation project on GitHub</a></p>
+  </dialog>
+
+  <script src="firebase-config.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/12.10.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/12.10.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/12.10.0/firebase-database-compat.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
