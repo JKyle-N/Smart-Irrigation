@@ -800,6 +800,19 @@ volatile bool wifiCredsChanged = false;            // SMS sets new creds -> task
 volatile unsigned long lastTsUploadMs = 0;
 volatile bool lastTsOk = false;
 TaskHandle_t  netTaskHandle = NULL;
+/* ---- netTask liveness ------------------------------------------------------ *
+ * esp_task_wdt_add(NULL) in wdtSetup() registers only the CALLING task, so the core-1 control loop
+ * is watchdogged and netTask is not. A wedged netTask (mbedTLS, the WiFi stack, a driver) kills
+ * telemetry, remote commands and remote recovery silently and permanently -- irrigation carries on
+ * as normal, so nothing signals that the dashboard has died. That was tolerable when the dashboard
+ * was read-only; it is now the primary remote-control surface, emergency stop included.
+ *
+ * netTask bumps this each pass; netHealthTick() on core 1 watches it. Deliberately NOT an
+ * esp_task_wdt_add on netTask itself: a panic reboot would be a far blunter response than an alarm
+ * plus an idle-only reset, and a slow TLS handshake is not a hang.                                */
+volatile uint32_t netBeat = 0;
+const unsigned long NET_STALL_WARN_MS  = 300000;   // 5 min without a beat -> fault + SMS
+const unsigned long NET_STALL_RESET_MS = 600000;   // 10 min -> self-reset, but only when idle
 
 // ---- WiFi provisioning portal (SoftAP + captive web form, edit SSID/pass from a phone) ----
 // The ESP32 briefly hosts its own WPA2 AP + a web form so creds can be set without SMS/buttons.
@@ -916,7 +929,11 @@ unsigned long lastTelemCollectMs = 0;
  * log call could ever happen underneath that lock the two would deadlock. Separate locks make that
  * impossible by construction. The critical section is one fixed-size struct copy.               */
 const uint8_t WEB_EVT_N = 12;
-struct WebEvent { char at[20]; char src[8]; char type[12]; char detail[96]; };
+// detail is 128, not 96: the fertigation PRE receipt reaches 117 chars in the worst case --
+// "PRE|COL_A|FERTIGATION|PLANT=" + a 16-char col[].name + WATER/FLUSH/STEPS + N/P/K at 4 digits
+// + "|A=500.0|B=500.0|C=500.0". At 96 the doses fell off the end, which is the most useful part of
+// the one row the operator actually asked to see. Sized against the worst case, not the typical.
+struct WebEvent { char at[20]; char src[8]; char type[12]; char detail[128]; };
 WebEvent      webEvt[WEB_EVT_N] = {};
 uint8_t       webEvtHead = 0;        // next slot to write
 uint8_t       webEvtCount = 0;       // entries filled (saturates at WEB_EVT_N)
@@ -1401,6 +1418,7 @@ void scheduleTick();
 void heartbeatTick();
 void nanoPaceTick();
 void deviceHealthTick();
+void netHealthTick();
 static bool i2cPresent(uint8_t addr);
 void saveLock();
 void saveWifiEn();
@@ -1581,6 +1599,7 @@ void loop() {
   g_lastStage = 'r'; esp2CommRetryTick();  // gentle 20-min retry while ESP2_COMM_LOST is latched (sec.18.9)
   g_lastStage = 'n'; nanoPaceTick();       // drive Nano ACTIVE/DAY/NIGHT interval (A2)
   g_lastStage = 'd'; deviceHealthTick();   // device-loss watchdog -> daily self-reset (Part C)
+  g_lastStage = 'h'; netHealthTick();      // netTask liveness: core 0 has no task watchdog
   g_lastStage = 'w'; telemetryCollect();   // snapshot for the WiFi/ThingSpeak uplink task (Part A)
   g_lastStage = 'U'; summaryTick();        // incremental SD parse for SUMMARY (bounded)
 
@@ -2524,6 +2543,21 @@ void calcDose(int c, float mL[3], float ceilS[3]) {
   }
 }
 
+/* ESP2 rejects any frame over 256 B as INVALID,FRAMING (ESP2/src/main.cpp pollEsp1). A worst-case
+ * FORCE fertigation already runs ~230 B, so there is not much room left -- and the failure is ugly:
+ * ESP1 would retry three times and then drop into RECOVERY_STATE, with nothing in the log naming
+ * the length as the cause. Refuse to emit a frame that cannot be parsed, and say why.
+ * WO_FRAME_MAX is below ESP2's 256 so a marginal frame is caught here rather than on the wire. */
+const size_t WO_FRAME_MAX = 240;
+static bool woFrameFits(const String &cmd, const char *what) {
+  if (cmd.length() <= WO_FRAME_MAX) return true;
+  logEvent("ESP1", "FAULT", String("WO|OVERSIZE|") + what + "|" + cmd.length() + "B>" + WO_FRAME_MAX);
+  // ALERT, not ERR: "ERR," is the reply convention for a REJECTED INBOUND command, and sendSMS now
+  // logs those as SMS_ERR -- using it here would file an outbound alarm as an inbound parse failure.
+  sendSMS(String("ALERT,MAJ,WO_OVERSIZE,") + cmd.length() + "B");
+  return false;
+}
+
 void sendWorkOrder(int c, bool fertigate) {
   // Last line of defence. controlTick() already gates, but this is the single function that can put
   // a run on the wire, so it refuses independently rather than trusting every future caller.
@@ -2557,6 +2591,16 @@ void sendWorkOrder(int c, bool fertigate) {
     cmd += ",PHCAL," + String(calPhM, 6) + "," + String(calPhB, 4);
   }
   cmd += "," + String(FRAME_END);
+  // Refusing is only safe if we also unwind. By here the caller has cleared pendingRun and we are in
+  // ACTIVE_STATE with the pre-run receipt on screen, so a bare `return` would strand the rig in
+  // ACTIVE_STATE with no work order and nothing supervising it -- worse than the frame we refused.
+  if (!woFrameFits(cmd, "SCHED")) {
+    wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
+    runUiAbort("WO_OVERSIZE");                 // release the LCD takeover
+    esp2SetPower(false);
+    setState(IDLE_STATE);
+    return;
+  }
 
   wo.active = true; wo.stage = WO_SENT; wo.colIdx = c; wo.fertigate = fertigate;
   wo.cmd = cmd; wo.retries = 0; wo.sentMs = millis();
@@ -2658,6 +2702,10 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
     cmd += ",PHCAL," + String(calPhM, 6) + "," + String(calPhB, 4);
   }
   cmd += "," + String(FRAME_END);
+  // Safe to return early here -- unlike the scheduled path, nothing has been committed yet (no
+  // wo, no ACTIVE_STATE, no run UI). forceTick() has set fcPhase = FP_RUNNING though, so release
+  // it: forceAbort logs, alerts and resolves the dashboard command in one place.
+  if (!woFrameFits(cmd, "FORCE")) { forceAbort("WO_OVERSIZE"); return; }
 
   wo.active = true; wo.colIdx = primary; wo.fertigate = fert;
   wo.cmd = cmd; wo.retries = 0;
@@ -2909,6 +2957,34 @@ void esp1SelfResetOncePerDay(const char *reason) {
   ESP.restart();
 }
 
+/* Core 1: watch netTask's heartbeat (see netBeat). Alarm first, and only self-reset when the rig is
+ * IDLE -- rebooting mid-run would abandon a live work order to fix a problem that costs nothing
+ * while the run finishes. ESP2 keeps executing either way, so waiting is free. */
+void netHealthTick() {
+  static uint32_t      lastBeat   = 0;
+  static unsigned long lastBeatMs = 0;
+  static bool          warned     = false;
+
+  if (!lastBeatMs) lastBeatMs = millis();          // first call: start the clock, don't judge yet
+  uint32_t beat = netBeat;
+  if (beat != lastBeat) {                          // alive -> reset the timer and the alarm latch
+    lastBeat = beat; lastBeatMs = millis();
+    if (warned) { warned = false; logEvent("ESP1", "NET", "NET_STALL|RECOVERED"); }
+    return;
+  }
+  // netTask parks on vTaskDelay in several normal paths, so only judge it stalled when it has had
+  // every opportunity to tick. The 5 min threshold is far longer than any legitimate wait.
+  unsigned long stalled = millis() - lastBeatMs;
+  if (!warned && stalled >= NET_STALL_WARN_MS) {
+    warned = true;
+    raiseFault('W', "NET_STALL", "NETTASK");        // logs + alerts; does not stop the rig
+    return;
+  }
+  if (warned && stalled >= NET_STALL_RESET_MS && sysState == IDLE_STATE && !wo.active && !esp2Held) {
+    esp1SelfResetOncePerDay("NET_STALL");           // once-per-day capped -> cannot boot-loop
+  }
+}
+
 /* ---- Dead-RTC daily reboot ------------------------------------------------ *
  * When the RTC is unreadable, tsString() stamps every row "0000-00-00 00:00:00" and logs land in
  * NODATE.CSV -- scheduling is dead too (controlTick bails on !rtcOk), so the rig silently does nothing.
@@ -3022,7 +3098,12 @@ static bool isNight() {
   return (mod >= NIGHT_START_MIN) || (mod < NIGHT_END_MIN);
 }
 void esp2PowerTick() {
-  if (esp2OffPending && esp2Powered && millis() >= esp2OffAt) esp2SetPower(false);   // min-on elapsed -> off
+  // Signed difference, not `millis() >= esp2OffAt`. esp2OffAt is esp2OnMs + ESP2_MIN_ON_MS, so if
+  // ESP2 is powered on within 10 s of the millis() wrap that sum wraps to a small number and the
+  // plain comparison is immediately true -- cutting ESP2's power during the very minimum-on hold
+  // that exists to stop it being cut before it can boot. Once per 49.7 days, and this rig is meant
+  // to run unattended for months.
+  if (esp2OffPending && esp2Powered && (long)(millis() - esp2OffAt) >= 0) esp2SetPower(false);
   if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held || esp2CommLost) { esp2PollActive = false; return; }
   unsigned long interval = isNight() ? ESP2_IDLE_POLL_NIGHT_MS : ESP2_IDLE_POLL_DAY_MS;
   if (!esp2PollActive) {
@@ -4965,8 +5046,8 @@ static bool firebaseUploadLive() {
   // fail first, mid-TLS, in a way that looks like a network fault rather than a stack overflow.
   // In .bss it costs the same RAM without competing for stack, and re-entrancy is not a concern:
   // this function is only ever called from netTask.
-  static StaticJsonDocument<12288> doc;          // 10240 -> 12288 for the 12-entry recentEvents ring
-  doc.clear();                                   // static -> must be reset each pass
+  static StaticJsonDocument<16384> doc;          // margin for the event ring, which is fitted to
+  doc.clear();                                   // whatever is left (see recentEvents below)
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
   meta["deviceOnline"] = true;
@@ -5155,29 +5236,6 @@ static bool firebaseUploadLive() {
     }
   }
 
-  /* Recent events. Read straight from the ring under its own lock rather than via TelemetrySnapshot:
-   * the ring is shared state with a lock built for exactly this, and mirroring 1.6 KB into the
-   * snapshot every second would copy data that changes a few times an hour. Copied out under the
-   * spinlock and released before touching JSON -- building the array with interrupts disabled would
-   * be far worse than the copy. Oldest first, so the dashboard's reverse() shows newest at top. */
-  {
-    static WebEvent snap[WEB_EVT_N];
-    uint8_t n, head;
-    portENTER_CRITICAL(&evtMux);
-    n = webEvtCount; head = webEvtHead;
-    memcpy(snap, webEvt, sizeof(snap));
-    portEXIT_CRITICAL(&evtMux);
-    if (n) {
-      JsonArray ev = dg.createNestedArray("recentEvents");
-      uint8_t start = (n < WEB_EVT_N) ? 0 : head;         // not yet wrapped -> slot 0 is oldest
-      for (uint8_t i = 0; i < n; i++) {
-        const WebEvent &e = snap[(start + i) % WEB_EVT_N];
-        JsonObject o = ev.createNestedObject();
-        o["at"] = e.at; o["source"] = e.src; o["type"] = e.type; o["detail"] = e.detail;
-      }
-    }
-  }
-
   // Live run progress. The dashboard's run panel needs stage ordinal + litres delivered/target to
   // draw a bar; publishing only "a run is active" left it blank. Always emitted (with active=false
   // at idle) so the panel can distinguish "idle" from "field missing".
@@ -5211,6 +5269,45 @@ static bool firebaseUploadLive() {
     if (t.npkValid[c]) {
       z["nitrogen"] = t.npkN[c]; z["phosphorus"] = t.npkP[c]; z["potassium"] = t.npkK[c];
       z["ec"] = t.npkEC[c]; z["ph"] = t.npkPH[c];
+    }
+  }
+
+  /* Recent events -- built LAST, and only into the capacity that is genuinely left over.
+   *
+   * This ordering is the point. Everything above is telemetry the dashboard needs; the log is the
+   * least important thing in the payload. Appending it blindly meant a long fertigation receipt
+   * could tip the document over capacity, and doc.overflowed() then aborts the ENTIRE PUT -- so the
+   * log could take the sensors, the fault state and the run progress down with it, reporting
+   * http=-100 that reads like a network fault. Fitting events to the remaining room means the log
+   * loses its oldest rows instead, which is the right thing to sacrifice.
+   *
+   * Read from the ring under its own lock (it is shared state with a lock built for exactly this),
+   * copied out and released before touching JSON -- building the array with interrupts disabled
+   * would be far worse than the copy. Emitted oldest-first so the dashboard's reverse() puts the
+   * newest at the top; trimming therefore drops the oldest, which is what you want to lose. */
+  {
+    static WebEvent snap[WEB_EVT_N];
+    uint8_t n, head;
+    portENTER_CRITICAL(&evtMux);
+    n = webEvtCount; head = webEvtHead;
+    memcpy(snap, webEvt, sizeof(snap));
+    portEXIT_CRITICAL(&evtMux);
+
+    // Per-entry cost: 4 members plus their copied strings, with slack for ArduinoJson's own slots.
+    const size_t EVT_COST = sizeof(WebEvent) + 96;
+    const size_t RESERVE  = 512;                       // leave room for serialization headroom
+    size_t room = (doc.capacity() > doc.memoryUsage() + RESERVE)
+                ? (doc.capacity() - doc.memoryUsage() - RESERVE) : 0;
+    uint8_t fit = (uint8_t)(room / EVT_COST);
+    if (fit > n) fit = n;
+    if (fit) {
+      JsonArray ev = dg.createNestedArray("recentEvents");
+      uint8_t start = (n < WEB_EVT_N) ? 0 : head;      // not yet wrapped -> slot 0 is oldest
+      for (uint8_t i = n - fit; i < n; i++) {          // keep the NEWEST `fit` entries
+        const WebEvent &e = snap[(start + i) % WEB_EVT_N];
+        JsonObject o = ev.createNestedObject();
+        o["at"] = e.at; o["source"] = e.src; o["type"] = e.type; o["detail"] = e.detail;
+      }
     }
   }
 
@@ -6355,6 +6452,7 @@ void netTask(void *pv) {
   (void)pv;
   unsigned long lastUpload = 0;
   for (;;) {
+    netBeat++;                 // liveness for netHealthTick() on core 1 -- see the WDT note there
     // WiFi provisioning portal takes over the radio when requested (SoftAP + web form).
     if (portalRequested && !portalActive) portalStart();
     if (portalActive) {
