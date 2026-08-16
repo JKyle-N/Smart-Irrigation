@@ -2046,6 +2046,13 @@ void pollESP2() {
     } else {
       logEvent("ESP1", "RESP", "TIMEOUT|" + wo.cmd);
       wo.active = false; wo.stage = WO_IDLE;
+      // A Settings force sequence only advances A->B from the DONE handler, so an abnormal end has
+      // to release it explicitly. Without this fcPhase stays FP_RUNNING forever: column B never
+      // fires, and the stale non-idle phase blocks the next arm. Same for the DONE timeout below.
+      forceAbort("ESP2_TIMEOUT");
+      // Tell the dashboard too, or a web-initiated FORCE_RUN sits on "accepted" for good.
+      if (forceCmdId[0]) firebaseQueueStatus(forceCmdId, "failed", "ESP2 never acknowledged the work order");
+      forceCmdId[0] = '\0'; forceMask = 0;   // a later stray DONE must not be attributed to this run
       esp2SoftResetTried = false;            // fresh ladder: soft reset (RESET_SELF) before power-cycle
       setState(RECOVERY_STATE);              // RECOVERY_STATE tick owns the escalation now
     }
@@ -2054,6 +2061,9 @@ void pollESP2() {
     logEvent("ESP1", "RESP", "TIMEOUT|" + wo.cmd);
     raiseFault('C', "ESP2_DONE_TIMEOUT", "ESP2");
     wo.active = false; wo.stage = WO_IDLE;
+    forceAbort("ESP2_NO_DONE");
+    if (forceCmdId[0]) firebaseQueueStatus(forceCmdId, "failed", "ESP2 never reported the run finished");
+    forceCmdId[0] = '\0'; forceMask = 0;
   }
 }
 
@@ -2267,6 +2277,11 @@ void handleEsp2Response(const String &payload) {
     // and let the still-due column re-run normally -- ESP2 will fill only the remaining liters.
     if (esp2Held && arg.startsWith("NOT_HELD")) {
       esp2Held = false; wo.active = false; wo.stage = WO_IDLE;
+      // Same release as the other abnormal endings: this work order is gone, so nothing may keep
+      // waiting on it -- an armed A-then-B sequence or a dashboard command most of all.
+      forceAbort("ESP2_RESTARTED");
+      if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", "ESP2 restarted during the run"); forceCmdId[0] = 0; }
+      forceMask = 0;
       logEvent("ESP1", "RESP", "RESUME_REFUSED|ESP2_RESTARTED");
       sendSMS("ESP2 restarted; tank volume kept. Column will re-run on its own.");
       if (sysState == EMERGENCY_STOP) setState(IDLE_STATE);
@@ -3721,6 +3736,7 @@ void stateMachineTick() {
         else if (millis() - esp2WarmupMs > ESP2_WARMUP_TIMEOUT_MS) {
           raiseFault('M', "ESP2_NO_READY", "FORCE");    // executor never came up for the forced run
           if (forceCmdId[0]) firebaseQueueStatus(forceCmdId, "failed", "ESP2 never powered up");
+          forceAbort("ESP2_NO_READY");                  // release an A-then-B sequence (see pollESP2)
           forceCmdId[0] = '\0'; forceMask = 0;
           wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
           runUiAbort("ESP2_NO_READY");                  // release the LCD takeover (runLocked)
@@ -5838,6 +5854,11 @@ void enterEmergencyStop(bool cutPower) {
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
   firebaseRemoteExerciseDone("failed", "aborted by emergency stop");   // release the remote slot
   if (fcPhase != FP_NONE) { fcPhase = FP_NONE; logEvent("ESP1", "ACT", "FORCE|ABORT|ESTOP"); }
+  // An E-stop is exactly when the dashboard must not keep showing "accepted" for a run that has
+  // just been killed, and a stale forceMask would mis-attribute the next run's DONE. The cancel
+  // path already does this; the E-stop path did not.
+  if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", "aborted by emergency stop"); forceCmdId[0] = 0; }
+  forceMask = 0;
   if (cutPower) esp2SetPower(false, true);        // (sec.23.1.1) -- FORCE immediate cut (bypass min-on hold)
   runUiAbort("EMERGENCY_STOP");                   // close the run UI so the E-stop prompt owns the screen
   editConfirm = false; restoreConfirm = false; resetConfirm = false; editDirty = false;   // force-dismiss + auto-discard (§B.3.1)
