@@ -1595,7 +1595,15 @@ void setup() {
 
   // ---- sensor snapshot defaults (invalid until first packet) ----
   sensor.envValid = sensor.tankValid = sensor.lightValid = false;
-  for (int i = 0; i < NUM_COLUMNS; i++) { sensor.soil[i] = -1; sensor.npkValid[i] = false; sensor.npkReason[i] = "INIT"; }
+  // rawSoil MUST start at -1, not the zero-init a global gets: 0 is below SOIL_ADC_RAIL_LO, so an
+  // uninitialised pair reads as "both probes railed". An NPK packet arriving before the first valid
+  // SOIL packet (at boot, or when a SOIL packet is rejected as garbage but the NPK one parses) would
+  // then log SOIL_FALLBACK|NPK_ONLY and drive the column from the NPK alone, on probes that are
+  // perfectly healthy and simply have not reported yet.
+  for (int i = 0; i < NUM_COLUMNS; i++) {
+    sensor.soil[i] = -1; sensor.npkValid[i] = false; sensor.npkReason[i] = "INIT";
+    sensor.rawSoil[i][0] = -1; sensor.rawSoil[i][1] = -1;
+  }
   sensor.lastNanoMs = millis();
   lastEsp2Ms = millis();
   lastPumpUseMs[0] = lastPumpUseMs[1] = lastPumpUseMs[2] = millis();   // exercise clock starts at boot
@@ -2033,6 +2041,17 @@ void saveThresholds() {
   prefs.putInt("sstart", soilStartPct);
   prefs.putInt("sstop",  soilStopPct);
   prefs.putFloat("fgap", fertGap);
+  // Warn about a combination that silently disables fertigation. Irrigation only starts below
+  // soilStartPct, so if that sits at or under the NPK trust floor the probe will always be too dry
+  // to read when the decision is made, and every run downgrades to irrigation-only forever. Not
+  // clamped -- irrigation-only operation at a low threshold is a legitimate choice -- but it must
+  // not be a silent one. Reaches the LCD Thresholds editor, the THRESH SMS and Restore Defaults,
+  // because all three come through here.
+  if (soilStartPct <= NPK_MIN_MOIST_PCT) {
+    logEvent("ESP1", "FAULT", String("WARN|THRESH_NO_FERT|start=") + soilStartPct
+                              + "|npkMin=" + NPK_MIN_MOIST_PCT);
+    sendSMS(String("ALERT,WARN,THRESH_NO_FERT,start=") + soilStartPct);
+  }
 }
 
 /* =============================================================================
@@ -4317,9 +4336,18 @@ bool decideFertigate(int c) {
   // look plausible and are not. Water first, measure next cycle: this is self-correcting, because
   // the irrigation this triggers is exactly what makes the reading trustworthy. NPK_MIN_MOIST_PCT
   // sits below soilStartPct on purpose; at or above it, fertigation could never run at all.
-  if (sensor.soil[c] >= 0 && sensor.soil[c] < NPK_MIN_MOIST_PCT) {
+  // Judge this on the PROBE'S OWN moisture, not the blended column figure. What determines whether
+  // these N/P/K numbers are readable is the moisture at THIS probe -- and the blend deliberately
+  // excludes the NPK when it disagrees with the capacitive pair, so using sensor.soil[c] would let
+  // bad nutrient data through in exactly the case the gate exists for: probe sitting dry at 5 %,
+  // capacitive probes elsewhere in the column reading 40 %, blend says 40 %, gate passes.
+  // npk[c][0] is guaranteed real here -- npkValid is false if ANY of the seven channels is -1, and
+  // that was already checked above.
+  float probeMoist = sensor.npk[c][0];
+  if (probeMoist < NPK_MIN_MOIST_PCT) {
     logEvent("ESP1", "CTRL", String("COL_") + COL_TAG[c] + "|FERT_DOWNGRADE|reason=DRY_SOIL"
-                             + "|soil=" + String(sensor.soil[c]) + "|min=" + String(NPK_MIN_MOIST_PCT));
+                             + "|npkMoist=" + String(probeMoist, 1)
+                             + "|col=" + String(sensor.soil[c]) + "|min=" + String(NPK_MIN_MOIST_PCT));
     return false;
   }
   float n = sensor.npk[c][4], p = sensor.npk[c][5], k = sensor.npk[c][6];
