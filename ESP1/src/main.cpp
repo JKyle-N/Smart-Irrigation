@@ -518,6 +518,18 @@ const unsigned long TEST_ARM_RETRY_MS = 1000;  // re-send TEST,ENTER this often 
 const uint8_t       TEST_ARM_NOACK_HINT = 5;   // sends w/o ACK (ESP2 alive) -> suspect ESP1->ESP2 link
 const uint8_t       TEST_ARM_MAX_TRIES  = 20;  // stop re-sending after this (link likely broken; no log spam)
 
+/* ---- Remote push-to-column pulse (dashboard counterpart to LCD Testing) ---- *
+ * State only; the machine itself lives next to testHoldTick(), whose arming pattern it mirrors.   */
+enum PulsePhase { PU_NONE, PU_ARM, PU_RUN };
+PulsePhase    puPhase   = PU_NONE;
+int           puRow     = -1;              // ESP2 TEST row: 17 + column index
+int           puSeconds = 0;
+unsigned long puEndMs = 0, puArmMs = 0, puLastSendMs = 0;
+char          puCmdId[48] = "";
+const int           PULSE_MAX_S          = 15;    // hard cap, well inside ESP2's own 30 s
+const unsigned long PULSE_ARM_TIMEOUT_MS = 14000; // ESP2 boot + TEST,ENTER ACK budget
+void pulseTick();
+
 /* ---- Preventive pump exercise (ESP1-owned; sec.14.9.1) -------------------- *
  * lastPumpUseMs[]: last time each AC pump ran (real run OR exercise). Indices:
  * 0=transfer, 1=booster, 2=mixer. pendingExercise drives the on-demand ESP2 cycle
@@ -664,7 +676,20 @@ unsigned long fbAuthNextTryMs = 0;
 // FORCE_RUN carries an operator-chosen batch: which columns, how many litres TOTAL, and explicit
 // per-nutrient mL. POD only -- this crosses a core boundary through a FreeRTOS queue.
 struct FirebaseCommand       { char id[48]; char type[32]; char pump[16];
-                               char cols[4]; float liters; float doseMl[3]; };
+                               char cols[4]; float liters; float doseMl[3];
+                               uint16_t delayS;      // FORCE_RUN start delay (s), 0..FORCE_MAX_DELAY_S
+                               char arg[16];         // RECOVER action / REBOOT target / SET_COLUMN col / TEST_PULSE zone
+                               int   seconds;        // TEST_PULSE duration
+                               // SET_COLUMN, all optional: -1 means "field absent, leave unchanged".
+                               char  colMode[14];    // "AUTO" | "IRRIGATION_ONLY" ("" = absent)
+                               int8_t enabled, schedMode;
+                               int   winStart, winEnd;
+                               float tgt[4]; };      // N, P, K, pH  (-1 = absent)
+// A forced run arms a countdown before it fires, so the operator can see the rig accepted it and
+// can still stop it. The default is deliberately non-zero: an immediate start leaves no window to
+// catch a mistyped volume. 0 is still allowed for a deliberate fire-now.
+const uint16_t FORCE_DEFAULT_DELAY_S = 30;
+const uint16_t FORCE_MAX_DELAY_S     = 300;
 struct FirebaseCommandStatus { char id[48]; char status[16]; char detail[48]; };
 QueueHandle_t fbCommandQueue = NULL;                // core0 -> core1: requests awaiting validation
 QueueHandle_t fbStatusQueue  = NULL;                // core1 -> core0: results to PATCH back
@@ -790,6 +815,13 @@ String        portalCfgQ[6];
 volatile uint8_t cfgHead = 0, cfgTail = 0;
 volatile bool smsMute = false;                     // when set, sendSMS() drops (suppress ACKs for portal replays)
 
+// ESP2 sensors are pulled live one-at-a-time via a CAL round-robin (not streamed in normal
+// operation). Declared here rather than with the rest of the diag globals because
+// TelemetrySnapshot below sizes its mirror array from DIAG_ESP2_N.
+const char *DIAG_ESP2_ID[] = { "PH", "EC", "ACS712", "PZEM_V", "PZEM_I", "PZEM_P",
+                               "FLOW_RESMIX", "FLOW_MIXIRR", "FLOW_NUTA", "FLOW_NUTB", "FLOW_NUTC" };
+const uint8_t DIAG_ESP2_N = sizeof(DIAG_ESP2_ID) / sizeof(DIAG_ESP2_ID[0]);
+
 // Inter-core telemetry snapshot: filled on core 1 (telemetryCollect, POD only -> spinlock),
 // read on core 0 by the upload task.
 struct TelemetrySnapshot {
@@ -824,6 +856,28 @@ struct TelemetrySnapshot {
   int      rssi, creg;
   bool     battLow, battCrit;
   char     lastFault[24], lastFaultAt[20];
+  // Fault / recovery, so the dashboard can offer the same choices the LCD menu does.
+  bool     held, steerRel;
+  uint8_t  holdRepeats;
+  long     ackLeftS;              // >0 = operator asked to be re-prompted in this many seconds
+  bool     actDisabled;
+  // Armed forced run. secondsLeft is computed HERE: fcFireAtMs is a millis() value and means
+  // nothing to a browser on a different clock.
+  bool     fcArmed, fcWeb;
+  long     fcLeftS;
+  float    fcLiters, fcDose[3];
+  char     fcCols[4];
+  // Raw sensor block for the web diagnostics tab -- the same values the LCD Sensor Diag pages show.
+  float    rTemp, rHum, rLux, rResCm, rMixCm, rFlow;
+  int      rSoil[NUM_COLUMNS][2];
+  float    rNpk[NUM_COLUMNS][7];
+  unsigned long agEnv, agTank, agSoil, agLight, agNpk[NUM_COLUMNS];
+  // ESP2 raws, only meaningful after a sweep (LCD Sensor Diag or a remote DIAG_SWEEP).
+  float    e2Raw[DIAG_ESP2_N];
+  bool     e2Valid[DIAG_ESP2_N];
+  unsigned long e2Age[DIAG_ESP2_N];
+  bool     e2Any, sweepActive;
+  long     sweepLeftS;
   // Validity/state mirrored here so the core-0 uploaders never touch core-1's `sensor`/`wo`/`sysState`
   // directly (a torn read there publishes e.g. tankValid against a half-updated level).
   bool  envValid, tankValid, lightValid, inaValid;
@@ -927,9 +981,38 @@ String    lastFaultTime = "";        // RTC timestamp of the last fault (shown o
 enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST, UI_CAL, UI_DIAG };
 UiMode    uiMode = UI_DATA;
 // Top-level Settings menu rows
-enum SetItem { SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
+/* ---- Actuation lockout (operator "disable actuations") -------------------- *
+ * Distinct from lcdLocked (which only gates the screen) and from EMERGENCY_STOP (which is a fault
+ * response with its own recovery prompt). This is a standing operator decision: keep MONITORING the
+ * farm -- sensors, logging, telemetry, SMS, uploads -- but never energize anything.
+ *
+ * Persisted, so a crash-and-reboot cannot silently re-arm the pumps while nobody is watching. That
+ * is the safe default, but it means a bug here could strand the rig -- which is why
+ * ENABLE_ACTUATIONS is reachable from a deliberately wider gate than every other remote command,
+ * and why the LCD grows the SET_ENABLE row below.                                                  */
+bool actuationsDisabled = false;
+void setActuationsEnabled(bool on, const char *why);
+
+// SET_ENABLE is FIRST and exists ONLY while actuationsDisabled -- so the moment an operator opens
+// Settings on a locked-out rig, "Enable Actuations" is the row already under the cursor. The LCD can
+// only RE-ENABLE, never disable: a stray button press must not be able to take the farm offline, so
+// disabling stays a deliberate web/SMS action. See setRowVisible/setRowAt.
+enum SetItem { SET_ENABLE, SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
 // SET_WIFI and SET_SOFTAP show a live [ON]/[OFF] suffix via setRowLabel(); their base names here are placeholders.
-const char *SET_NAMES[SET_COUNT] = { "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
+const char *SET_NAMES[SET_COUNT] = { "Enable Actuations", "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
+// Row visibility + position<->item mapping, so the windowed 3-row render and the UP/DOWN wrap both
+// operate on what is actually on screen rather than on the raw enum.
+static bool setRowVisible(int i)  { return i != SET_ENABLE || actuationsDisabled; }
+static int  setRowCount()         { return SET_COUNT - (actuationsDisabled ? 0 : 1); }
+static int  setRowAt(int pos) {                       // visible position -> SetItem
+  for (int i = 0, k = 0; i < SET_COUNT; i++) if (setRowVisible(i)) { if (k == pos) return i; k++; }
+  return SET_EXIT;
+}
+static int  setPosOf(int item) {                      // SetItem -> visible position
+  int k = 0;
+  for (int i = 0; i < SET_COUNT; i++) { if (i == item) return k; if (setRowVisible(i)) k++; }
+  return 0;
+}
 int  setSel    = 0;          // selected settings row
 int  editItem  = -1;         // SetItem currently being edited
 int  editField = 0;          // field index within the editor
@@ -945,8 +1028,13 @@ struct ForceSeq {
   uint16_t dL;        // litres x10   (5..200 = 0.5..20.0 L)
   uint16_t ml[3];     // nutrient A/B/C mL (0..FORCE_MAX_DOSE_ML)
   uint16_t delayS;    // start delay 20..300 s
+  // Column mask, resolved at ARM time rather than derived from fcMode at fire time. The LCD editor
+  // only offers A/B/AB/A-then-B, but a dashboard FORCE_RUN can name any column including C, and
+  // both now share this one countdown. Storing it per slot also lets A-then-B carry a different
+  // mask in each slot without special-casing the fire path.
+  uint8_t  mask;
 };
-ForceSeq fcSeq[2] = { { 20, {0,0,0}, 30 }, { 20, {0,0,0}, 30 } };   // slot0 = A/B/AB, slot1 = B (A-then-B)
+ForceSeq fcSeq[2] = { { 20, {0,0,0}, 30, 0 }, { 20, {0,0,0}, 30, 0 } };  // slot0 = A/B/AB, slot1 = B (A-then-B)
 uint8_t  fcMode  = 0;        // 0=A  1=B  2=AB-together  3=A-then-B
 uint8_t  fcField = 0;        // editor cursor (0 = mode, then 5 per active slot)
 const char *FC_MODE_NAMES[4] = { "Col A", "Col B", "A+B together", "A then B" };
@@ -959,6 +1047,12 @@ enum ForcePhase { FP_NONE, FP_WAIT, FP_RUNNING };
 ForcePhase    fcPhase = FP_NONE;
 uint8_t       fcSlot  = 0;         // which slot is counting down / running
 unsigned long fcFireAtMs = 0;      // countdown deadline for FP_WAIT
+// A dashboard-initiated force run now arms this same countdown instead of dispatching immediately,
+// so the LCD "FORCE RUN ARMED" screen shows it, LCD BACK can abort it, and forceTick() re-checks the
+// safety gate at FIRE time. fcCmdId carries the command id through the wait so the dashboard entry
+// still resolves; fcFromWeb only labels the source in telemetry.
+char          fcCmdId[48] = "";
+bool          fcFromWeb   = false;
 // Edit-Confirmation (companion spec §B): a "dirty" edit shows SAVE/DISCARD/CANCEL on exit.
 bool editDirty   = false;    // any value changed since the editor opened
 bool editConfirm = false;    // the three-way unsaved-changes dialog is open
@@ -970,6 +1064,17 @@ int  restoreSel  = 0;        // 0 NO, 1 YES
 bool resetConfirm = false;   // the YES/NO reboot dialog is open
 int  resetSel    = 0;        // 0 NO, 1 YES
 volatile bool rebootPending = false;   // menu/portal -> core-1 loop: clean logFlush then ESP.restart()
+// Remote reboot is deferred, not immediate: loop() waits for fbStatusQueue to drain so the "completed"
+// PATCH actually lands before we restart. 0 = no remote reboot pending.
+unsigned long rebootReqMs = 0;
+const unsigned long REBOOT_FLUSH_WAIT_MS = 10000;   // give up waiting and reboot anyway (NVS guard covers us)
+// Second half of the same guard: the command id we rebooted for, loaded from NVS at boot. The core-0
+// poller consumes it once; core 1 owns the NVS erase (core 0 must never write NVS).
+String fbSkipCmdId = "";
+volatile bool fbSkipCmdClear = false;
+// "Do nothing for now" from the dashboard fault prompt: a UI snooze only, it changes no rig behaviour.
+unsigned long faultAckUntilMs = 0;
+const unsigned long FAULT_REPROMPT_MS = 120000;     // 2 minutes, per the operator's request
 // Remote SMS config-write deferral while a local edit is open (companion spec §B.3.1).
 String pendingCfgSms = "";   // queued config SMS, applied when the local edit exits
 // Testing submenu: PCF8575 OUT_* bit -> short name (MUST match ESP2 OUT_* numbering)
@@ -1036,16 +1141,18 @@ String calMsg = "";                        // transient calibration message (e.g
 uint8_t diagPage = 0;
 const uint8_t DIAG_PAGES = 10;             // 0 Env,1 Tank,2 Soil,3 NPK,4 NPK chem,5 ESP1,6 ESP2 chem,7 ESP2 pwr,8 flow1,9 flow2
 const unsigned long NANO_STALE_MS = 90000; // a Nano sensor is "stale" after this (~2x the active TX interval)
-// ESP2 sensors are pulled live one-at-a-time via a CAL round-robin (not streamed in normal operation).
-const char *DIAG_ESP2_ID[] = { "PH", "EC", "ACS712", "PZEM_V", "PZEM_I", "PZEM_P",
-                               "FLOW_RESMIX", "FLOW_MIXIRR", "FLOW_NUTA", "FLOW_NUTB", "FLOW_NUTC" };
-const uint8_t DIAG_ESP2_N = sizeof(DIAG_ESP2_ID) / sizeof(DIAG_ESP2_ID[0]);
 float         diagEsp2Raw[DIAG_ESP2_N];
 bool          diagEsp2Valid[DIAG_ESP2_N];
 unsigned long diagEsp2Ms[DIAG_ESP2_N];
 int           diagEsp2Idx = -1;            // index currently CAL-streaming (-1 = not streaming)
 unsigned long diagEsp2DwellMs = 0;         // when the current id started streaming
 bool          diagEsp2Streaming = false;   // sweep active (idle + ESP2 powered)
+// Non-zero while a dashboard-requested sweep is running: the deadline in millis(). ESP2 is normally
+// OFF at idle, so a remote sweep must be time-boxed and must hand the power back.
+unsigned long diagRemoteUntilMs = 0;
+const unsigned long DIAG_REMOTE_DEFAULT_MS = 60000, DIAG_REMOTE_MAX_MS = 120000;
+bool diagRemoteStart(unsigned long ms);
+void diagRemoteTick();
 const unsigned long DIAG_ESP2_DWELL_MS = 900;    // per-id dwell before advancing the round-robin
 const unsigned long DIAG_ESP2_STALE_MS = 16000;  // full sweep ~10 s; mark a value stale a bit beyond
 // Per-probe soil raw for the Soil page comes straight from sensor.rawSoil[][] (the Nano now sends both
@@ -1443,8 +1550,10 @@ void loop() {
 
   g_lastStage = 'B'; handleButtons();
   g_lastStage = 'T'; testHoldTick();
+  g_lastStage = 'u'; pulseTick();          // remote push-to-column pulse (bounded TEST,HOLD stream)
   g_lastStage = 'C'; calHoldTick();        // flow-cal dead-man (prime pump while ENTER held)
   g_lastStage = 'D'; diagTick();           // Sensor Diag: round-robin CAL sweep of ESP2 sensors
+  g_lastStage = 'S'; diagRemoteTick();     // close a dashboard-requested sweep + hand ESP2 back
   g_lastStage = 'U'; uiIdleTick();         // fail-safe: auto-return to data screen after 5 min idle in a menu
   g_lastStage = 'M'; healthTick();         // module-health logging: edge changes + periodic HEALTH snapshot
   g_lastStage = 'Z'; rtcDeadRebootTick();  // dead-RTC (all-zero timestamp): daily idle-only reboot to recover
@@ -1486,6 +1595,19 @@ void loop() {
     logEvent("ESP1", "RESET", "MANUAL|REBOOT");
     logFlush(true); delay(60);
     ESP.restart();
+  }
+  // Remote reboot: hold off until core 0 has PATCHed the "completed" status, so the command cannot
+  // still read "queued" after we come back and trigger another reboot. Bounded -- if the link is
+  // down the flush will never happen, and the NVS "rbcmd" guard is what stops the loop then.
+  // Core 0 consumed the reboot-guard id; erase the NVS key here (all NVS writes stay on core 1).
+  if (fbSkipCmdClear) { fbSkipCmdClear = false; prefs.remove("rbcmd"); }
+  if (rebootReqMs) {
+    bool flushed = (fbStatusQueue == NULL) || (uxQueueMessagesWaiting(fbStatusQueue) == 0);
+    if (flushed || millis() - rebootReqMs > REBOOT_FLUSH_WAIT_MS) {
+      logEvent("ESP1", "RESET", flushed ? "REMOTE|REBOOT" : "REMOTE|REBOOT|STATUS_UNFLUSHED");
+      logFlush(true); delay(60);
+      ESP.restart();
+    }
   }
   // Drain one portal config command (SET/MODE/NAME/THRESH) through handleSms with SMS muted. Allowed in
   // UI_DATA *and* UI_MENU: the portal is often launched from the Settings menu, which leaves uiMode==UI_MENU
@@ -1605,6 +1727,10 @@ void loadConfig() {
   soilStopPct  = prefs.getInt("sstop",  soilStopPct);
   fertGap      = prefs.getFloat("fgap", fertGap);
   lcdLocked    = prefs.getBool("lock", false);   // LCD lock persists across reboot (Part D)
+  // Deliberately survives a reboot: see the actuationsDisabled comment. A power blip must not
+  // re-arm the actuators behind the operator's back.
+  actuationsDisabled = prefs.getBool("actdis", false);
+  fbSkipCmdId = prefs.getString("rbcmd", "");     // remote-reboot bootloop guard (consumed once)
   // WiFi + ThingSpeak (Part A/B): creds + write keys persist in NVS.
   wifiEnabled = prefs.getBool("wifien", true);   // WiFi master switch (Settings > WiFi)
   PHONE_NUMBER = prefs.getString("owner", PHONE_NUMBER);   // owner number (portal-editable; SMS gating)
@@ -1690,6 +1816,29 @@ bool setCalPushBlocking(const String &id, const String &payload) {
 void saveLock() {
   prefs.putBool("lock", lcdLocked);
 }
+
+/* Single owner of the actuation lockout, so the LCD row, the Firebase command and any future SMS
+ * path cannot drift. Called from core 1 only (it writes NVS). */
+void setActuationsEnabled(bool on, const char *why) {
+  if (actuationsDisabled == !on) {                       // already in the requested state
+    logEvent("ESP1", "ACT", String("ACTUATION|NOCHANGE|") + (on ? "ON" : "OFF") + "|" + why);
+    return;
+  }
+  actuationsDisabled = !on;
+  prefs.putBool("actdis", actuationsDisabled);
+  logEvent("ESP1", "ACT", String("ACTUATION|") + (on ? "ENABLED" : "DISABLED") + "|" + why);
+  sendSMS(String("ACK,ACTUATION,") + (on ? "ENABLED" : "DISABLED"));
+  if (!on) {
+    // Nothing in flight may survive the lockout, or "disabled" would be a lie until the current
+    // run finished. Cancel the armed force sequence too -- its countdown would otherwise fire into
+    // a system that has just been told not to actuate.
+    forceAbort("ACTUATIONS_DISABLED");
+    if (sysState == IDLE_STATE) setState(SAFE_MODE);
+  } else if (sysState == SAFE_MODE) {
+    setState(IDLE_STATE);                                // released -> back to normal scheduling
+  }
+  wakeBacklight();
+}
 void saveWifiEn() {
   prefs.putBool("wifien", wifiEnabled);
 }
@@ -1753,6 +1902,29 @@ void saveColEnable(int c) {
   char key[8];
   snprintf(key, sizeof(key), "c%d", c);
   prefs.putBool((String(key) + "en").c_str(), COLUMN_ENABLED[c]);
+}
+
+/* Bounds for an operator-supplied nutrient target. The SMS "SET,COL_A,N,150,..." path historically
+ * assigned whatever float arrived -- a typo'd negative or a stray extra digit went straight into
+ * NVS and then into calcDose()'s gap maths. One shared validator so the SMS and Firebase paths
+ * cannot drift, and so neither can write a target the doser cannot honour.       [CONFIRM bounds] */
+const float TGT_PPM_MAX = 2000.0f;      // well above any CROP_PRESETS value; catches typos, not use
+const float TGT_PH_MIN  = 3.0f, TGT_PH_MAX = 9.0f;
+
+// key: "N" | "P" | "K" | "PH" (case-insensitive). Returns false + a reason on a rejected value.
+bool applyColumnTarget(int c, const String &keyIn, float v, String &err) {
+  if (c < 0 || c >= NUM_COLUMNS) { err = "bad column"; return false; }
+  String key = keyIn; key.toUpperCase();
+  if (key == "PH") {
+    if (!(v >= TGT_PH_MIN && v <= TGT_PH_MAX)) { err = "pH out of range 3.0-9.0"; return false; }
+    col[c].targetPH = v; return true;
+  }
+  if (!(v >= 0.0f && v <= TGT_PPM_MAX)) { err = key + " out of range 0-2000 ppm"; return false; }
+  if      (key == "N") col[c].targetN = v;
+  else if (key == "P") col[c].targetP = v;
+  else if (key == "K") col[c].targetK = v;
+  else { err = "unknown field " + key; return false; }
+  return true;
 }
 void saveThresholds() {
   prefs.putInt("sstart", soilStartPct);
@@ -2316,6 +2488,9 @@ void calcDose(int c, float mL[3], float ceilS[3]) {
 }
 
 void sendWorkOrder(int c, bool fertigate) {
+  // Last line of defence. controlTick() already gates, but this is the single function that can put
+  // a run on the wire, so it refuses independently rather than trusting every future caller.
+  if (actuationsDisabled) { logEvent("ESP1", "ACT", "WO|BLOCKED|ACTUATIONS_OFF"); return; }
   // Doses were computed once in runUiBegin() (so the pre-run receipt and the work order agree, and
   // calcDose's per-nutrient log lines are not emitted twice). Fall back if the run state is stale.
   float mL[3] = { 0, 0, 0 }, ceilS[3] = { 0, 0, 0 };
@@ -2363,6 +2538,13 @@ void forceAbort(const char *why) {
   fcPhase = FP_NONE;
   logEvent("ESP1", "ACT", String("FORCE|ABORT|") + why);
   sendSMS(String("ALERT,MIN,FORCE_ABORT,") + why);
+  // A web-armed run that is aborted during its countdown must not leave the dashboard command
+  // sitting on "accepted" -- it never ran, and the operator needs to see why.
+  if (fcCmdId[0]) {
+    firebaseQueueStatus(fcCmdId, "failed", (String("cancelled before start: ") + why).c_str());
+    fcCmdId[0] = '\0';
+  }
+  fcFromWeb = false;
 }
 
 /* Core 1: run the armed Settings force sequence. The safety gate is re-checked HERE, at fire time,
@@ -2373,7 +2555,8 @@ void forceTick() {
   if ((long)(millis() - fcFireAtMs) < 0) return;          // still counting down
 
   const char *bad = NULL;
-  if      (sysState != IDLE_STATE)                              bad = "NOT_IDLE";
+  if      (actuationsDisabled)                                  bad = "ACTUATIONS_OFF";
+  else if (sysState != IDLE_STATE)                              bad = "NOT_IDLE";
   else if (uiMode != UI_DATA)                                   bad = "IN_MENU";
   else if (wo.active || pendingRun.active || pendingExercise.active) bad = "BUSY";
   else if (esp2Held)                                            bad = "HELD";
@@ -2381,17 +2564,18 @@ void forceTick() {
   if (bad) { forceAbort(bad); return; }
 
   const ForceSeq &q = fcSeq[fcSlot];
-  uint8_t mask;
-  if      (fcMode == 0) mask = 0b001;                     // A
-  else if (fcMode == 1) mask = 0b010;                     // B
-  else if (fcMode == 2) mask = 0b011;                     // A+B together (one shared batch)
-  else                  mask = (fcSlot == 0) ? 0b001 : 0b010;   // A then B
+  uint8_t mask = q.mask;                                  // resolved at arm time (LCD fcMode or web columns)
   for (int b = 0; b < NUM_COLUMNS; b++) if ((mask & (1 << b)) && !COLUMN_ENABLED[b]) mask &= ~(1 << b);
   if (!mask) { forceAbort("COL_DISABLED"); return; }
 
   float doseMl[3] = { (float)q.ml[0], (float)q.ml[1], (float)q.ml[2] };
   fcPhase = FP_RUNNING;
-  sendForceWorkOrder(mask, q.dL / 10.0f, doseMl, "");     // "" = started locally, not from the dashboard
+  // fcCmdId is "" for an LCD-armed run; sendForceWorkOrder treats that as "not from the dashboard".
+  sendForceWorkOrder(mask, q.dL / 10.0f, doseMl, fcCmdId);
+  // Ownership of the dashboard command passes to forceCmdId now that the run is live -- the DONE
+  // and failure paths resolve it from there. Leaving a copy here would let a LATER abort (e.g. the
+  // A-then-B second leg) report against a command that has already finished.
+  fcCmdId[0] = '\0';
 }
 
 /* Operator FORCE run: build a work order from explicit litres + explicit per-nutrient mL instead of
@@ -2399,6 +2583,11 @@ void forceTick() {
  * `mask` may name several columns -- ESP2 opens them together, so `liters` is the TOTAL batch.
  * fbCmdId is echoed to the dashboard when the run finishes ("" for an SMS-initiated force). */
 void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const char *fbCmdId) {
+  if (actuationsDisabled) {                          // last line of defence, as in sendWorkOrder
+    logEvent("ESP1", "ACT", "FORCE|BLOCKED|ACTUATIONS_OFF");
+    if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "actuations are disabled");
+    return;
+  }
   int primary = 0;                                   // lowest column in the mask: budget + logging anchor
   while (primary < NUM_COLUMNS && !(mask & (1 << primary))) primary++;
   if (primary >= NUM_COLUMNS) return;
@@ -2849,6 +3038,7 @@ void dispatchPendingExercise() {
 // PUMP_EXERCISE_INTERVAL_MS, power ESP2 up and have it run that pump briefly. Lowest
 // priority -- controlTick runs first, so a due column always wins.
 void exerciseTick() {
+  if (actuationsDisabled) return;         // operator lockout: no preventive pump runs either
   if (sysState != IDLE_STATE) return;
   if (uiMode != UI_DATA) return;
   if (wo.active || pendingRun.active || pendingExercise.active) return;
@@ -3232,12 +3422,13 @@ void handleSms(const String &body) {
       sendSMS("ERR,PRESET"); return;
     }
     // explicit: SET,COL_A,N,150,P,40,K,200,pH,5.8  (key/value pairs)
+    // Shares applyColumnTarget() with the dashboard's SET_COLUMN, so both reject the same values.
+    // Previously this assigned unchecked -- a mistyped target went straight into NVS and calcDose().
+    String err;
     for (int i = 2; i + 1 < n; i += 2) {
-      String key = tok[i]; key.toUpperCase(); float v = tok[i + 1].toFloat();
-      if (key == "N") col[c].targetN = v;
-      else if (key == "P") col[c].targetP = v;
-      else if (key == "K") col[c].targetK = v;
-      else if (key == "PH") col[c].targetPH = v;
+      if (!applyColumnTarget(c, tok[i], tok[i + 1].toFloat(), err)) {
+        sendSMS(String("ERR,SET,") + err); return;
+      }
     }
     saveColumn(c);
     sendSMS(String("ACK,SET,COL_") + COL_TAG[c]);
@@ -3822,6 +4013,7 @@ static void ctrlNote(int c, const String &r) {
 }
 
 void controlTick() {
+  if (actuationsDisabled) return;         // operator lockout: monitor only, never energize
   if (uiMode != UI_DATA) return;          // operator in Settings/Testing -> pause automation
   if (sysState != IDLE_STATE) return;     // only dispatch new work from IDLE
   if (wo.active) return;                   // ESP2 busy -> sequential (sec.14.2.0.1)
@@ -4341,6 +4533,49 @@ void telemetryCollect() {
   telem.battLow = batteryLow; telem.battCrit = batteryCritical;
   strlcpy(telem.lastFault,   lastFaultMsg.c_str(),  sizeof(telem.lastFault));
   strlcpy(telem.lastFaultAt, lastFaultTime.c_str(), sizeof(telem.lastFaultAt));
+  // Fault / recovery + lockout.
+  telem.held        = esp2Held;
+  telem.steerRel    = steerRelease;
+  telem.holdRepeats = (uint8_t)(sameHoldN > 255 ? 255 : sameHoldN);
+  telem.ackLeftS    = (faultAckUntilMs && (long)(faultAckUntilMs - millis()) > 0)
+                    ? (long)((faultAckUntilMs - millis()) / 1000) : 0;
+  telem.actDisabled = actuationsDisabled;
+  // Armed forced run: seconds resolved here, never a raw millis() deadline.
+  telem.fcArmed = (fcPhase == FP_WAIT);
+  telem.fcWeb   = fcFromWeb;
+  telem.fcLeftS = telem.fcArmed ? (long)(((long)(fcFireAtMs - millis())) / 1000) : 0;
+  if (telem.fcLeftS < 0) telem.fcLeftS = 0;
+  {
+    const ForceSeq &q = fcSeq[fcSlot];
+    telem.fcLiters = q.dL / 10.0f;
+    for (int i = 0; i < 3; i++) telem.fcDose[i] = (float)q.ml[i];
+    uint8_t k = 0;
+    for (int b = 0; b < NUM_COLUMNS && k < sizeof(telem.fcCols) - 1; b++)
+      if (q.mask & (1 << b)) telem.fcCols[k++] = COL_TAG[b];
+    telem.fcCols[k] = '\0';
+  }
+  // Raw sensor mirror for the web diagnostics tab (same values the LCD Sensor Diag pages show).
+  telem.rTemp = sensor.rawTemp; telem.rHum = sensor.rawHum; telem.rLux = sensor.rawLux;
+  telem.rResCm = sensor.rawResCm; telem.rMixCm = sensor.rawMixCm; telem.rFlow = sensor.rawFlow;
+  for (int cc = 0; cc < NUM_COLUMNS; cc++) {
+    telem.rSoil[cc][0] = sensor.rawSoil[cc][0]; telem.rSoil[cc][1] = sensor.rawSoil[cc][1];
+    for (int r = 0; r < 7; r++) telem.rNpk[cc][r] = sensor.rawNpk[cc][r];
+    telem.agNpk[cc] = sensor.msNpk[cc] ? (millis() - sensor.msNpk[cc]) : 0xFFFFFFFF;
+  }
+  telem.agEnv   = sensor.msEnv   ? (millis() - sensor.msEnv)   : 0xFFFFFFFF;
+  telem.agTank  = sensor.msTank  ? (millis() - sensor.msTank)  : 0xFFFFFFFF;
+  telem.agSoil  = sensor.msSoil  ? (millis() - sensor.msSoil)  : 0xFFFFFFFF;
+  telem.agLight = sensor.msLight ? (millis() - sensor.msLight) : 0xFFFFFFFF;
+  telem.e2Any = false;
+  for (int k = 0; k < DIAG_ESP2_N; k++) {
+    telem.e2Raw[k]   = diagEsp2Raw[k];
+    telem.e2Valid[k] = diagEsp2Valid[k];
+    telem.e2Age[k]   = diagEsp2Ms[k] ? (millis() - diagEsp2Ms[k]) : 0xFFFFFFFF;
+    if (diagEsp2Ms[k]) telem.e2Any = true;
+  }
+  telem.sweepActive = (diagRemoteUntilMs != 0) || (uiMode == UI_DIAG);
+  telem.sweepLeftS  = diagRemoteUntilMs ? (long)(((long)(diagRemoteUntilMs - millis())) / 1000) : 0;
+  if (telem.sweepLeftS < 0) telem.sweepLeftS = 0;
   // Live run progress. Same reason as the pump flags: run[] belongs to core 1.
   telem.runActive  = (runPhase != RUN_NONE);
   telem.runFert    = run.fert;
@@ -4677,11 +4912,19 @@ static bool firebaseUploadLive() {
 
   if (!fbEnsureToken()) { fbLastOk = false; return false; }   // no token -> no request (respects backoff)
 
-  // 6144 B: all NUM_COLUMNS zones + a fertigation run node + the full diagnostics tree (1536 -> 2048
-  // for powerSource/battery/tank-chemistry/actuators, -> 6144 for diagnostics). Overflow is CHECKED
-  // below, not assumed: an over-capacity document serializes silently TRUNCATED, which would PUT
-  // malformed JSON. netTask is a 28 KB stack with ~20 KB free, so this is affordable where it lands.
-  StaticJsonDocument<6144> doc;
+  // 10240 B: zones + run node + the diagnostics tree + fault/forceArmed + the raw sensor block
+  // (1536 -> 2048 for powerSource/battery/chemistry/actuators, -> 6144 for diagnostics, -> 10240 for
+  // the raw NPK registers, which are 7 values per enabled column). Overflow is CHECKED below, not
+  // assumed: an over-capacity document serializes silently TRUNCATED, which would PUT malformed
+  // JSON.
+  //
+  // STATIC, not a stack local: at 10 KB this would eat a third of netTask's 28 KB stack, which it
+  // shares with the mbedTLS handshake frames -- the deepest consumer here and the one that would
+  // fail first, mid-TLS, in a way that looks like a network fault rather than a stack overflow.
+  // In .bss it costs the same RAM without competing for stack, and re-entrancy is not a concern:
+  // this function is only ever called from netTask.
+  static StaticJsonDocument<10240> doc;
+  doc.clear();                                   // static -> must be reset each pass
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
   meta["deviceOnline"] = true;
@@ -4790,11 +5033,82 @@ static bool firebaseUploadLive() {
   dpw["batteryCurrent"]  = t.battI;
   dpw["batteryPower"]    = t.battP;
 
+  // Fault + recovery. The dashboard renders its prompt from this and offers exactly the choices the
+  // LCD menu does, so the two surfaces cannot disagree about what is available.
+  JsonObject dfa = dg.createNestedObject("fault");
+  dfa["held"]  = t.held;
+  dfa["state"] = stateName(t.state);
+  if (t.lastFault[0])   dfa["code"] = t.lastFault;
+  if (t.lastFaultAt[0]) dfa["at"]   = t.lastFaultAt;
+  if (t.ackLeftS > 0)   dfa["ackSecondsLeft"] = t.ackLeftS;   // "do nothing" snooze still running
+  if (t.held) {
+    // Surface the re-hold guard: after 3 identical FLOW_FAIL holds the firmware steers toward
+    // Release, and self-cancels the run at the 4th. A prompt that hid that would keep offering
+    // "Resume normal" against dead hardware.
+    dfa["repeats"]      = t.holdRepeats;
+    dfa["steerRelease"] = t.steerRel;
+    dfa["autoCancelAt"] = HOLD_AUTOCANCEL_N;
+    JsonArray ra = dfa.createNestedArray("recovery");
+    ra.add("hold"); ra.add("release"); ra.add("irrigate"); ra.add("normal");
+  }
+  dg["actuationsDisabled"] = t.actDisabled;
+
+  // Armed forced run -- the operator's proof the rig received the request and is counting down.
+  JsonObject dfc = dg.createNestedObject("forceArmed");
+  dfc["armed"] = t.fcArmed;
+  if (t.fcArmed) {
+    dfc["secondsLeft"] = t.fcLeftS;
+    dfc["columns"]     = t.fcCols;
+    dfc["liters"]      = t.fcLiters;
+    dfc["source"]      = t.fcWeb ? "web" : "lcd";
+    JsonObject fd = dfc.createNestedObject("doseMl");
+    fd["A"] = t.fcDose[0]; fd["B"] = t.fcDose[1]; fd["C"] = t.fcDose[2];
+  }
+
   JsonObject dac = dg.createNestedObject("actuator");
   dac["relayFeedback"]   = "notReported";      // no relay sense hardware -- say so rather than imply OK
   dac["workOrderActive"] = t.woActive;
   dac["pumpTestActive"]  = t.pendEx;
   dac["pumpUnderTest"]   = (t.pendEx && t.pendExIdx >= 0 && t.pendExIdx < 3) ? EX_NAME[t.pendExIdx] : "none";
+
+  /* Raw sensor values -- the web equivalent of the LCD Sensor Diag pages. These are PRE-conversion
+   * readings with an honest -1 on fault, which is exactly what makes them useful for diagnosing a
+   * sensor: a converted value can look plausible while the raw one is railed. Each group carries an
+   * age so a dead branch is visible rather than showing its last good number forever. */
+  JsonObject draw = dg.createNestedObject("sensorsRaw");
+  JsonObject rEnv = draw.createNestedObject("env");
+  rEnv["tempC"] = t.rTemp; rEnv["humidity"] = t.rHum; rEnv["ageMs"] = t.agEnv;
+  JsonObject rLig = draw.createNestedObject("light");
+  rLig["lux"] = t.rLux; rLig["ageMs"] = t.agLight;
+  JsonObject rTk = draw.createNestedObject("tank");
+  rTk["reservoirCm"] = t.rResCm; rTk["mixingCm"] = t.rMixCm; rTk["flowLpm"] = t.rFlow;
+  rTk["ageMs"] = t.agTank;
+  JsonObject rSo = draw.createNestedObject("soil");
+  rSo["ageMs"] = t.agSoil;
+  JsonObject rNp = draw.createNestedObject("npk");
+  for (int cc = 0; cc < NUM_COLUMNS; cc++) {
+    if (!COLUMN_ENABLED[cc]) continue;
+    String tag = String(COL_TAG[cc]);
+    JsonArray sa = rSo.createNestedArray(tag);          // both probes, so a single dead probe shows
+    sa.add(t.rSoil[cc][0]); sa.add(t.rSoil[cc][1]);
+    JsonObject nc = rNp.createNestedObject(tag);
+    JsonArray na = nc.createNestedArray("regs");        // moist,temp,EC,pH,N,P,K as read over Modbus
+    for (int r = 0; r < 7; r++) na.add(t.rNpk[cc][r]);
+    nc["ageMs"] = t.agNpk[cc];
+  }
+  // ESP2 raws only exist after a sweep (LCD Sensor Diag or a remote DIAG_SWEEP), so they are
+  // omitted entirely until one has run -- an all-zero block would read as "everything is 0.00".
+  JsonObject rE2 = draw.createNestedObject("esp2");
+  rE2["sweepActive"] = t.sweepActive;
+  if (t.sweepLeftS > 0) rE2["sweepSecondsLeft"] = t.sweepLeftS;
+  if (t.e2Any) {
+    JsonObject vals = rE2.createNestedObject("values");
+    for (int k = 0; k < DIAG_ESP2_N; k++) {
+      if (t.e2Age[k] == 0xFFFFFFFF) continue;           // never answered this sweep
+      JsonObject one = vals.createNestedObject(DIAG_ESP2_ID[k]);
+      one["raw"] = t.e2Raw[k]; one["valid"] = t.e2Valid[k]; one["ageMs"] = t.e2Age[k];
+    }
+  }
 
   // Live run progress. The dashboard's run panel needs stage ordinal + litres delivered/target to
   // draw a bar; publishing only "a run is active" left it blank. Always emitted (with active=false
@@ -4913,6 +5227,15 @@ static void firebasePollCommands() {
   // dose read back 0.0 -- which made `fert` false, so a requested fertigation silently ran as
   // plain irrigation. `true` allows the whole subtree. (Filter.hpp: allow() on a null member.)
   pf["doseMl"] = true;                             // FORCE_RUN: {"A":mL,"B":mL,"C":mL}
+  pf["delaySeconds"] = true;                       // FORCE_RUN: countdown before it fires
+  // One shared scalar for the single-argument commands: RECOVER{action}, REBOOT{target},
+  // SET_COLUMN{col}, TEST_PULSE{zone}. Keeping them one key keeps this filter small, and the
+  // filter is what bounds the parse buffer.
+  pf["action"] = true; pf["target"] = true; pf["col"] = true; pf["zone"] = true;
+  pf["seconds"] = true;
+  pf["mode"] = true; pf["enabled"] = true; pf["schedMode"] = true;
+  pf["winStart"] = true; pf["winEnd"] = true;
+  pf["targetN"] = true; pf["targetP"] = true; pf["targetK"] = true; pf["targetPH"] = true;
 
   // 2048 as belt-and-braces on top of the limitToLast bound above. The failure is now REPORTED
   // rather than swallowed: a bare `return` here is what let a NoMemory look like "the device just
@@ -4932,6 +5255,19 @@ static void firebasePollCommands() {
   for (JsonPair item : doc.as<JsonObject>()) {
     JsonObject req = item.value().as<JsonObject>();
     if (String(req["status"] | "") != "queued") continue;
+    // Bootloop guard, second half. A REBOOT esp1 whose "completed" PATCH never landed comes back
+    // still marked "queued" and would reboot us again, forever. The id was written to NVS before
+    // restarting; consume it once here and re-mark the node so the cycle cannot repeat.
+    if (fbSkipCmdId.length() && fbSkipCmdId == item.key().c_str()) {
+      fbSkipCmdId = "";
+      fbSkipCmdClear = true;                               // core 1 clears the NVS key (no NVS from core 0)
+      FirebaseCommandStatus done = {};
+      strlcpy(done.id, item.key().c_str(), sizeof(done.id));
+      strlcpy(done.status, "completed", sizeof(done.status));
+      strlcpy(done.detail, "esp1 rebooted", sizeof(done.detail));
+      xQueueSend(fbStatusQueue, &done, 0);
+      continue;
+    }
     FirebaseCommand c = {};
     strlcpy(c.id,   item.key().c_str(),          sizeof(c.id));
     strlcpy(c.type, req["type"] | "",            sizeof(c.type));
@@ -4952,6 +5288,26 @@ static void firebasePollCommands() {
     c.doseMl[0] = req["payload"]["doseMl"]["A"] | 0.0f;
     c.doseMl[1] = req["payload"]["doseMl"]["B"] | 0.0f;
     c.doseMl[2] = req["payload"]["doseMl"]["C"] | 0.0f;
+    // Absent delaySeconds -> the safe default, not 0. Clamped again on core 1.
+    c.delayS    = (uint16_t)constrain((int)(req["payload"]["delaySeconds"] | (int)FORCE_DEFAULT_DELAY_S),
+                                      0, (int)FORCE_MAX_DELAY_S);
+    // One scalar shared by the single-argument commands, first match wins.
+    JsonVariant ja = req["payload"]["action"];
+    if (ja.isNull()) ja = req["payload"]["target"];
+    if (ja.isNull()) ja = req["payload"]["col"];
+    if (ja.isNull()) ja = req["payload"]["zone"];
+    strlcpy(c.arg, ja.is<const char *>() ? ja.as<const char *>() : "", sizeof(c.arg));
+    c.seconds = req["payload"]["seconds"] | 0;
+    // SET_COLUMN: -1 / "" mean "not supplied", so a partial update leaves the rest alone.
+    strlcpy(c.colMode, req["payload"]["mode"] | "", sizeof(c.colMode));
+    c.enabled   = req["payload"]["enabled"].isNull()   ? -1 : (req["payload"]["enabled"]   ? 1 : 0);
+    c.schedMode = req["payload"]["schedMode"].isNull() ? -1 : (int8_t)(req["payload"]["schedMode"] | 0);
+    c.winStart  = req["payload"]["winStart"] | -1;
+    c.winEnd    = req["payload"]["winEnd"]   | -1;
+    c.tgt[0]    = req["payload"]["targetN"]  | -1.0f;
+    c.tgt[1]    = req["payload"]["targetP"]  | -1.0f;
+    c.tgt[2]    = req["payload"]["targetK"]  | -1.0f;
+    c.tgt[3]    = req["payload"]["targetPH"] | -1.0f;
     FirebaseCommandStatus ack = {};
     strlcpy(ack.id, c.id, sizeof(ack.id));
     // Mark it non-"queued" immediately, so the next poll cannot hand the same request to
@@ -5034,7 +5390,28 @@ void firebaseCommandTick() {
         firebaseQueueStatus(c.id, "rejected", "reservoir too low");
         logEvent("FIREBASE", "REJECT", "FORCE|RES_LOW"); continue;
       }
-      sendForceWorkOrder(mask, c.liters, c.doseMl, c.id);
+      // ARM the same countdown the LCD uses rather than dispatching now. The operator gets visible
+      // proof the rig received the request (LCD "FORCE RUN ARMED" + the published countdown), either
+      // surface can abort it, and forceTick() re-checks the safety gate at FIRE time -- so a fault or
+      // a dropping reservoir during the delay cancels it instead of firing late into a changed rig.
+      if (fcPhase != FP_NONE) {
+        firebaseQueueStatus(c.id, "rejected", "another forced run is already armed");
+        logEvent("FIREBASE", "REJECT", "FORCE|ALREADY_ARMED"); continue;
+      }
+      fcSlot = 0; fcMode = 0;                       // single batch; the mask below is authoritative
+      fcSeq[0].mask = mask;
+      fcSeq[0].dL   = (uint16_t)lroundf(c.liters * 10.0f);
+      for (int i = 0; i < 3; i++) fcSeq[0].ml[i] = (uint16_t)lroundf(c.doseMl[i]);
+      fcSeq[0].delayS = c.delayS;
+      strlcpy(fcCmdId, c.id, sizeof(fcCmdId));
+      fcFromWeb = true;
+      fcPhase = FP_WAIT;
+      fcFireAtMs = millis() + (unsigned long)c.delayS * 1000UL;
+      wakeBacklight();
+      firebaseQueueStatus(c.id, "accepted",
+        (String("armed: starts in ") + c.delayS + "s").c_str());
+      logEvent("FIREBASE", "CMD", String("FORCE|ARM|WEB|COLS=") + c.cols +
+                                  "|L=" + String(c.liters, 1) + "|in=" + String(c.delayS) + "s");
       continue;
     }
 
@@ -5042,6 +5419,185 @@ void firebaseCommandTick() {
       enterEmergencyStop(true);                            // existing system-wide physical stop
       logEvent("FIREBASE", "CMD", "ESTOP");
       firebaseQueueStatus(c.id, "completed", "emergency stop executed");
+      continue;
+    }
+
+    /* ---- Recovery + lockout ---------------------------------------------------------------
+     * These are the counterpart to EMERGENCY_STOP, which until now could stop the rig remotely
+     * with no remote way back: the only exit from EMERGENCY_STOP was the physical LCD prompt.
+     * They deliberately do NOT require the system to be idle -- the whole point is that it is not. */
+
+    // ENABLE_ACTUATIONS is checked FIRST and gated on nothing. It is the escape hatch: if some other
+    // bug leaves the rig stuck, this must still get through, so it never consults sysState, uiMode,
+    // wo.active or esp2Held.
+    if (!strcmp(c.type, "ENABLE_ACTUATIONS")) {
+      setActuationsEnabled(true, "WEB");
+      firebaseQueueStatus(c.id, "completed", "actuations enabled");
+      continue;
+    }
+    if (!strcmp(c.type, "DISABLE_ACTUATIONS")) {
+      setActuationsEnabled(false, "WEB");
+      firebaseQueueStatus(c.id, "completed", "actuations disabled; monitoring continues");
+      continue;
+    }
+    if (!strcmp(c.type, "CANCEL_FORCE")) {
+      if (fcPhase == FP_NONE) { firebaseQueueStatus(c.id, "rejected", "no forced run is armed"); continue; }
+      forceAbort("WEB");                                   // resolves the armed run's own command too
+      firebaseQueueStatus(c.id, "completed", "armed forced run cancelled");
+      continue;
+    }
+    if (!strcmp(c.type, "ACK_FAULT")) {
+      // "Do nothing, but ask me again." Purely a UI snooze -- it changes no rig behaviour, it only
+      // tells the dashboard when to re-raise the prompt.
+      faultAckUntilMs = millis() + FAULT_REPROMPT_MS;
+      logEvent("FIREBASE", "CMD", "ACK_FAULT");
+      firebaseQueueStatus(c.id, "completed", "acknowledged; will re-prompt in 2 minutes");
+      continue;
+    }
+    if (!strcmp(c.type, "RECOVER")) {
+      if (!esp2Held) { firebaseQueueStatus(c.id, "rejected", "no held fault to recover from"); continue; }
+      int sel = !strcmp(c.arg, "hold")     ? 0 : !strcmp(c.arg, "release")  ? 1
+              : !strcmp(c.arg, "irrigate") ? 2 : !strcmp(c.arg, "normal")   ? 3 : -1;
+      if (sel < 0) { firebaseQueueStatus(c.id, "rejected", "action must be hold/release/irrigate/normal"); continue; }
+      issueRecovery(sel);                                  // the same call the LCD menu and SMS make
+      logEvent("FIREBASE", "CMD", String("RECOVER|") + c.arg);
+      firebaseQueueStatus(c.id, "completed", (String("recovery: ") + c.arg).c_str());
+      continue;
+    }
+    if (!strcmp(c.type, "ESTOP_RECOVER")) {
+      if (sysState != EMERGENCY_STOP) { firebaseQueueStatus(c.id, "rejected", "not in emergency stop"); continue; }
+      if (esp2Held) { firebaseQueueStatus(c.id, "rejected", "a held fault is pending; use RECOVER first"); continue; }
+      // Exactly what LCD ENTER on "Return to normal" does: re-power and re-validate ESP2 before
+      // trusting it again, rather than jumping straight to IDLE.
+      setState(STARTUP_SYNC);
+      logEvent("FIREBASE", "CMD", "ESTOP_RECOVER");
+      firebaseQueueStatus(c.id, "completed", "returning to normal via startup sync");
+      continue;
+    }
+    // ---- DIAG_SWEEP: pull ESP2's raw sensor values for the dashboard diagnostics tab ------------
+    // Reads only -- CAL_START/CAL_STOP sample sensors, they actuate nothing. It does power ESP2 up,
+    // which is why it is idle-only and time-boxed.
+    if (!strcmp(c.type, "DIAG_SWEEP")) {
+      unsigned long ms = (c.seconds > 0) ? (unsigned long)c.seconds * 1000UL : DIAG_REMOTE_DEFAULT_MS;
+      if (ms > DIAG_REMOTE_MAX_MS) ms = DIAG_REMOTE_MAX_MS;
+      if (diagRemoteUntilMs) { firebaseQueueStatus(c.id, "rejected", "a sweep is already running"); continue; }
+      if (!diagRemoteStart(ms)) {
+        firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
+        logEvent("FIREBASE", "REJECT", "DIAG_SWEEP|NOT_IDLE"); continue;
+      }
+      firebaseQueueStatus(c.id, "completed", (String("sweeping esp2 sensors for ") + (ms / 1000) + "s").c_str());
+      continue;
+    }
+
+    // ---- TEST_PULSE: bounded booster-to-column push (the web answer to LCD Testing) -------------
+    if (!strcmp(c.type, "TEST_PULSE")) {
+      int zi = (c.arg[0] == 'A') ? 0 : (c.arg[0] == 'B') ? 1 : (c.arg[0] == 'C') ? 2 : -1;
+      if (zi < 0 || zi >= NUM_COLUMNS) { firebaseQueueStatus(c.id, "rejected", "zone must be A, B or C"); continue; }
+      if (!COLUMN_ENABLED[zi])         { firebaseQueueStatus(c.id, "rejected", "that column is disabled"); continue; }
+      int secs = (c.seconds > 0) ? c.seconds : 5;
+      if (secs < 1 || secs > PULSE_MAX_S) {
+        firebaseQueueStatus(c.id, "rejected", (String("seconds must be 1-") + PULSE_MAX_S).c_str()); continue;
+      }
+      if (actuationsDisabled) { firebaseQueueStatus(c.id, "rejected", "actuations are disabled"); continue; }
+      if (puPhase != PU_NONE) { firebaseQueueStatus(c.id, "rejected", "a pulse is already running"); continue; }
+      if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
+          pendingExercise.active || esp2Held || fcPhase != FP_NONE || fbRemoteExerciseId[0]) {
+        firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
+        logEvent("FIREBASE", "REJECT", "PULSE|NOT_IDLE"); continue;
+      }
+      puRow = 17 + zi;                       // ESP2 combo rows: 17/18/19 = push to column A/B/C
+      puSeconds = secs;
+      strlcpy(puCmdId, c.id, sizeof(puCmdId));
+      esp2SetPower(true);                    // power ESP2 -> boot -> TEST,ENTER retries in pulseTick
+      esp2TestArmed = false; testArmPending = false; testArmTries = 0; lastTestArmMs = 0;
+      esp2WarmupMs = millis();               // prime reference (TEST_PRIME_MS)
+      puArmMs = millis();
+      puPhase = PU_ARM;
+      setState(TEST_MODE);                   // stops controlTick/exerciseTick starting a run underneath
+      firebaseQueueStatus(c.id, "accepted", (String("push to column ") + c.arg + " for " + secs + "s").c_str());
+      logEvent("FIREBASE", "CMD", String("PULSE|COL_") + COL_TAG[zi] + "|" + secs + "s");
+      continue;
+    }
+
+    // ---- SET_COLUMN: irrigation/fertigation mode, schedule window, target ppm ------------------
+    // Every field is optional so the page can send partial updates; -1 / "" mean "leave alone".
+    // Config only -- it actuates nothing, so it is allowed while held, stopped or locked out.
+    if (!strcmp(c.type, "SET_COLUMN")) {
+      int ci = (c.arg[0] == 'A') ? 0 : (c.arg[0] == 'B') ? 1 : (c.arg[0] == 'C') ? 2 : -1;
+      if (ci < 0 || ci >= NUM_COLUMNS) {
+        firebaseQueueStatus(c.id, "rejected", "col must be A, B or C"); continue;
+      }
+      String changed, err;
+      bool touchedCol = false, touchedSched = false, touchedEn = false;
+
+      if (c.colMode[0]) {
+        if      (!strcmp(c.colMode, "AUTO"))            { col[ci].mode = MODE_AUTO;            changed += "mode=AUTO "; touchedCol = true; }
+        else if (!strcmp(c.colMode, "IRRIGATION_ONLY")) { col[ci].mode = MODE_IRRIGATION_ONLY; changed += "mode=IRRIGATION_ONLY "; touchedCol = true; }
+        else { firebaseQueueStatus(c.id, "rejected", "mode must be AUTO or IRRIGATION_ONLY"); continue; }
+      }
+      if (c.enabled >= 0)   { COLUMN_ENABLED[ci] = (c.enabled == 1); changed += String("enabled=") + (c.enabled ? "1 " : "0 "); touchedEn = true; }
+      if (c.schedMode >= 0) {
+        if (c.schedMode > 1) { firebaseQueueStatus(c.id, "rejected", "schedMode must be 0 (auto) or 1 (manual)"); continue; }
+        colSchedMode[ci] = (uint8_t)c.schedMode; changed += String("sched=") + (c.schedMode ? "MANUAL " : "AUTO "); touchedSched = true;
+      }
+      // Minutes-of-day. Start == end would be a zero-length window that never opens, so reject it
+      // rather than quietly disabling the column's schedule.
+      if (c.winStart >= 0 || c.winEnd >= 0) {
+        int ws = (c.winStart >= 0) ? c.winStart : COL_WIN_START[ci];
+        int we = (c.winEnd   >= 0) ? c.winEnd   : COL_WIN_END[ci];
+        if (ws < 0 || ws > 1439 || we < 0 || we > 1439) {
+          firebaseQueueStatus(c.id, "rejected", "window minutes must be 0-1439"); continue;
+        }
+        if (ws == we) { firebaseQueueStatus(c.id, "rejected", "window start and end cannot be equal"); continue; }
+        COL_WIN_START[ci] = (uint16_t)ws; COL_WIN_END[ci] = (uint16_t)we;
+        changed += "win=" + String(ws) + "-" + String(we) + " "; touchedSched = true;
+      }
+      static const char *TGT_KEY[4] = { "N", "P", "K", "PH" };
+      bool bad = false;
+      for (int t = 0; t < 4; t++) {
+        if (c.tgt[t] < 0) continue;                       // absent
+        if (!applyColumnTarget(ci, TGT_KEY[t], c.tgt[t], err)) {
+          firebaseQueueStatus(c.id, "rejected", err.c_str()); bad = true; break;
+        }
+        changed += String(TGT_KEY[t]) + "=" + String(c.tgt[t], 1) + " "; touchedCol = true;
+      }
+      if (bad) continue;
+      if (!changed.length()) { firebaseQueueStatus(c.id, "rejected", "no recognised field to change"); continue; }
+
+      if (touchedCol)   saveColumn(ci);                   // only write the NVS blocks we touched
+      if (touchedSched) saveSchedule(ci);
+      if (touchedEn)    saveColEnable(ci);
+      changed.trim();
+      logEvent("FIREBASE", "CFG", String("COL_") + COL_TAG[ci] + "|" + changed);
+      firebaseQueueStatus(c.id, "completed", (String("COL_") + COL_TAG[ci] + ": " + changed).c_str());
+      continue;
+    }
+
+    if (!strcmp(c.type, "REBOOT")) {
+      if (!strcmp(c.arg, "nano")) {
+        sendNanoCommand("RESET_REQ");
+        nanoResetReqInFlight = true; nanoResetReqMs = millis(); nanoResetsToday++;
+        logEvent("FIREBASE", "CMD", "REBOOT|NANO");
+        firebaseQueueStatus(c.id, "completed", "nano soft reset requested");
+      } else if (!strcmp(c.arg, "esp2")) {
+        if (wo.active) { firebaseQueueStatus(c.id, "rejected", "a work order is running"); continue; }
+        sendEsp2("RESET_SELF");                            // soft first; the ladder power-cycles if it stays dark
+        esp2SoftResetTried = true; esp2RecoverMs = millis();
+        logEvent("FIREBASE", "CMD", "REBOOT|ESP2");
+        firebaseQueueStatus(c.id, "completed", "esp2 soft reset sent");
+      } else if (!strcmp(c.arg, "esp1")) {
+        if (wo.active) { firebaseQueueStatus(c.id, "rejected", "a work order is running"); continue; }
+        // BOOTLOOP GUARD. firebaseFlushStatus() is core-0 and queued, so restarting now can beat the
+        // status PATCH: the node would stay "queued", the poller would see it again after boot and
+        // reboot forever. Persist the id so the post-boot poll skips it even if the PATCH never
+        // lands, THEN mark it, and let rebootReqMs wait for the queue to drain before restarting.
+        prefs.putString("rbcmd", c.id);
+        firebaseQueueStatus(c.id, "completed", "rebooting esp1");
+        logEvent("FIREBASE", "CMD", "REBOOT|ESP1");
+        rebootReqMs = millis();                            // loop() restarts once the status is flushed
+      } else {
+        firebaseQueueStatus(c.id, "rejected", "target must be nano/esp1/esp2");
+      }
       continue;
     }
 
@@ -6341,9 +6897,37 @@ void exitDiag() {
   logEvent("ESP1", "DIAG", "EXIT");
 }
 
+/* Start a headless sweep for the dashboard. Same round-robin the LCD page uses -- diagTick() now
+ * runs whenever EITHER the LCD Sensor Diag screen is open or this window is live, so there is one
+ * implementation rather than two that can disagree. Bounded: it powers ESP2 up, sweeps, and hands
+ * it back, because ESP2 is normally OFF at idle and must not be left running by a browser. */
+bool diagRemoteStart(unsigned long ms) {
+  if (sysState != IDLE_STATE || wo.active || esp2Held || uiMode != UI_DATA) return false;
+  for (int k = 0; k < DIAG_ESP2_N; k++) { diagEsp2Raw[k] = 0; diagEsp2Valid[k] = false; diagEsp2Ms[k] = 0; }
+  diagEsp2Idx = -1; diagEsp2DwellMs = 0; diagEsp2Streaming = false;
+  diagRemoteUntilMs = millis() + ms;
+  esp2SetPower(true);
+  logEvent("ESP1", "DIAG", String("REMOTE|START|") + (ms / 1000) + "s");
+  return true;
+}
+
+// Close a remote sweep and power ESP2 back down. Safe to call when none is running.
+void diagRemoteTick() {
+  if (!diagRemoteUntilMs) return;
+  bool expired = (long)(millis() - diagRemoteUntilMs) >= 0;
+  // A run, a fault or the operator opening the LCD diag page all take ESP2 back off us.
+  bool preempted = (sysState != IDLE_STATE || wo.active || esp2Held || uiMode != UI_DATA);
+  if (!expired && !preempted) return;
+  diagStopStream();
+  diagRemoteUntilMs = 0;
+  esp2SetPower(false);
+  logEvent("ESP1", "DIAG", expired ? "REMOTE|DONE" : "REMOTE|PREEMPTED");
+}
+
 // Round-robin the ESP2 CAL stream (self-starting): arm one id, dwell, record raw, stop, advance.
 void diagTick() {
-  if (uiMode != UI_DIAG) return;
+  // Driven by the LCD page OR a bounded remote sweep -- one implementation, two triggers.
+  if (uiMode != UI_DIAG && !diagRemoteUntilMs) return;
   if (sysState != IDLE_STATE || wo.active || esp2Held) { diagStopStream(); return; }   // ESP2 busy
   if (!diagEsp2Streaming) { diagEsp2Streaming = true; diagEsp2Idx = 0; diagEsp2DwellMs = 0; }
 
@@ -6758,6 +7342,10 @@ void commitEditor() {
       // conditions can change during a delay of up to 5 minutes. Return to UI_DATA so automation
       // (and the fire check, which requires uiMode == UI_DATA) is live while the clock runs.
       fcSlot = 0; fcPhase = FP_WAIT;
+      // Resolve both slot masks from fcMode now (see ForceSeq::mask). Slot 1 is only used by A-then-B.
+      fcSeq[0].mask = (fcMode == 0) ? 0b001 : (fcMode == 1) ? 0b010 : (fcMode == 2) ? 0b011 : 0b001;
+      fcSeq[1].mask = 0b010;
+      fcCmdId[0] = '\0'; fcFromWeb = false;        // armed at the LCD, not from the dashboard
       fcFireAtMs = millis() + (unsigned long)fcSeq[0].delayS * 1000UL;
       uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
       logEvent("ESP1", "ACT", String("FORCE|ARM|") + FC_MODE_NAMES[fcMode] +
@@ -6838,11 +7426,19 @@ void settingsButton(int i) {
   }
 
   if (uiMode == UI_MENU) {
-    if (i == 0) setSel = (setSel + SET_COUNT - 1) % SET_COUNT;
-    else if (i == 1) setSel = (setSel + 1) % SET_COUNT;
+    // Navigate in VISIBLE-position space so the wrap skips a hidden SET_ENABLE row.
+    if (i == 0 || i == 1) {
+      int n = setRowCount(), pos = setPosOf(setSel);
+      pos = (i == 0) ? (pos + n - 1) % n : (pos + 1) % n;
+      setSel = setRowAt(pos);
+    }
     else if (i == 3) uiMode = UI_DATA;                         // BACK = exit
     else if (i == 2) {                                         // ENTER = open item
       if (setSel == SET_EXIT) { uiMode = UI_DATA; }
+      else if (setSel == SET_ENABLE) {                          // the escape hatch (re-enable only)
+        setActuationsEnabled(true, "LCD");
+        uiMode = UI_DATA; setSel = 0;
+      }
       else if (setSel == SET_LOCK) {                            // lock the LCD (Part D)
         lcdLocked = true; saveLock();
         logEvent("ESP1", "STATE", "LCD_LOCK");
@@ -7023,6 +7619,74 @@ void settingsButton(int i) {
 /* ---- Dead-man relay hold: stream TEST,HOLD while ENTER is physically held ---
  * (spec sec.18.10.8.2). Runs every loop while in UI_TEST; ESP2 owns the timeout
  * and the 10 s hard cap. */
+/* =============================================================================
+ *  REMOTE PUSH-TO-COLUMN PULSE  --  bounded, no dead-man needed
+ * ==========================================================================
+ * The LCD Testing screen is a dead-man: testHoldTick() streams TEST,HOLD only while the physical
+ * ENTER button is down. A browser cannot hold a dead-man switch, so this drives the SAME ESP2 combo
+ * rows (17/18/19 = inverter + mix valve + column valve + booster) from a timer instead.
+ *
+ * That is safe because the dead-man is enforced on ESP2, not here: ESP2's TEST_HOLD_TIMEOUT_MS (400 ms)
+ * drops the relay if the HOLD stream stops for any reason -- ESP1 crashing, WiFi dying, the loop
+ * stalling -- and TEST_HARD_CAP_MS (30 s) caps it regardless. So the worst case of a lost link is a
+ * relay that switches off ~400 ms later, which is exactly what the physical button does on release.
+ *
+ * Deliberately leaves uiMode == UI_DATA: testHoldTick() returns early unless UI_TEST, so the two
+ * never drive the relay at the same time. sysState goes to TEST_MODE, which is what stops
+ * controlTick()/exerciseTick() from starting a run underneath us.                                   */
+// Shut the pulse down and hand ESP2 back. `ok` distinguishes a clean finish from an abort.
+static void pulseFinish(bool ok, const char *why) {
+  if (puPhase == PU_NONE) return;
+  if (puPhase == PU_RUN) sendEsp2("TEST,RELEASE");     // belt: ESP2 would also time out on its own
+  sendEsp2("TEST,EXIT");
+  esp2TestArmed = false; testArmPending = false;
+  puPhase = PU_NONE; puRow = -1;
+  esp2SetPower(false);
+  if (sysState == TEST_MODE) setState(IDLE_STATE);
+  logEvent("ESP1", "ACT", String("PULSE|") + (ok ? "DONE|" : "ABORT|") + why);
+  if (puCmdId[0]) {
+    firebaseQueueStatus(puCmdId, ok ? "completed" : "failed", why);
+    puCmdId[0] = '\0';
+  }
+}
+
+void pulseTick() {
+  if (puPhase == PU_NONE) return;
+
+  // Anything that makes actuation unsafe ends the pulse immediately. Checked every tick, not just
+  // at start: a fault or an operator lockout during a 15 s pulse must cut it short.
+  if (actuationsDisabled)                 { pulseFinish(false, "actuations disabled"); return; }
+  if (esp2Held || sysState == EMERGENCY_STOP) { pulseFinish(false, "fault or emergency stop"); return; }
+  if (uiMode != UI_DATA)                  { pulseFinish(false, "operator opened a menu"); return; }
+
+  if (puPhase == PU_ARM) {
+    // Same primed-arming pattern as testHoldTick: the single boot READY is easily lost on a cold
+    // relay power-up, so re-send TEST,ENTER until ESP2 ACKs.
+    if (esp2TestArmed) {
+      puPhase = PU_RUN;
+      puEndMs = millis() + (unsigned long)puSeconds * 1000UL;
+      puLastSendMs = 0;
+      logEvent("ESP1", "ACT", String("PULSE|START|") + testRowName(puRow) + "|" + puSeconds + "s");
+      return;
+    }
+    if (millis() - puArmMs > PULSE_ARM_TIMEOUT_MS) { pulseFinish(false, "ESP2 never entered test mode"); return; }
+    if ((unsigned long)(millis() - esp2WarmupMs) >= TEST_PRIME_MS
+        && (unsigned long)(millis() - lastTestArmMs) >= TEST_ARM_RETRY_MS
+        && testArmTries < TEST_ARM_MAX_TRIES) {
+      lastTestArmMs = millis(); testArmTries++;
+      sendEsp2("TEST,ENTER");
+    }
+    return;
+  }
+
+  // PU_RUN: keep-alive stream at 150 ms, comfortably inside ESP2's 400 ms release timeout.
+  if ((long)(millis() - puEndMs) >= 0) { pulseFinish(true, "pulse complete"); return; }
+  if (millis() - puLastSendMs >= 150) {
+    puLastSendMs = millis();
+    sendEsp2(String("TEST,HOLD,") + puRow);
+  }
+}
+
 void testHoldTick() {
   if (uiMode != UI_TEST) return;
 
@@ -7314,14 +7978,20 @@ void lcdRenderSettings() {
 
   if (uiMode == UI_MENU) {
     lcd.setCursor(0, 0); lcd.print("=== SETTINGS ===    ");
+    // The web can re-enable actuations while this menu is open, hiding the row under the cursor.
+    if (!setRowVisible(setSel)) setSel = setRowAt(0);
     // Like drawList, but the two WiFi rows carry a live [ON]/[OFF] suffix.
-    int top = setSel - 1; if (top < 0) top = 0;
-    if (top > SET_COUNT - 3) top = (SET_COUNT > 3) ? SET_COUNT - 3 : 0;
+    // Window over VISIBLE rows, not raw enum indices (SET_ENABLE is hidden unless locked out).
+    int n = setRowCount();
+    int top = setPosOf(setSel) - 1; if (top < 0) top = 0;
+    if (top > n - 3) top = (n > 3) ? n - 3 : 0;
     for (int r = 0; r < 3; r++) {
-      int idx = top + r;
+      int pos = top + r;
       lcd.setCursor(0, r + 1);
-      if (idx < SET_COUNT) snprintf(l, 21, "%c%-19s", idx == setSel ? '>' : ' ', setRowLabel(idx).c_str());
-      else                 snprintf(l, 21, "%-20s", "");
+      if (pos < n) {
+        int idx = setRowAt(pos);
+        snprintf(l, 21, "%c%-19s", idx == setSel ? '>' : ' ', setRowLabel(idx).c_str());
+      } else snprintf(l, 21, "%-20s", "");
       lcd.print(l);
     }
     return;
