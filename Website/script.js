@@ -130,7 +130,9 @@ function syncControlAvailability() {
   const normalAllowed = signedIn && deviceIsFresh();
   // Every actuating control needs a fresh snapshot: ESP1 will refuse anything that arrives while it
   // is not idle, and without live data the page cannot tell "idle" from "device offline".
-  ["transferPumpBtn", "boosterPumpBtn", "mixerBtn"].forEach(id => {
+  // The pulse and the ESP2 sweep both reach the rig, so they belong with the other actuating
+  // controls rather than looking alive and then failing inside queueCommand().
+  ["transferPumpBtn", "boosterPumpBtn", "mixerBtn", "pulseBtn", "sweepBtn"].forEach(id => {
     const button = document.getElementById(id);
     if (!button) return;
     button.disabled = !normalAllowed;
@@ -149,6 +151,21 @@ function syncControlAvailability() {
     emergency.disabled = !signedIn;
     emergency.title = signedIn ? "" : "Sign in before sending an emergency-stop request.";
   }
+
+  // Recovery + lockout + reboot: signed-in only, deliberately NOT freshness-gated. A stale snapshot
+  // is often exactly why you are reaching for these.
+  ["disableActBtn2", "enableActBtn2", "rebootNanoBtn2", "rebootEsp2Btn2", "rebootEsp1Btn2"].forEach(id => {
+    const b = document.getElementById(id);
+    if (!b) return;
+    b.disabled = !signedIn;
+    b.title = signedIn ? "" : "Sign in to use the system controls.";
+  });
+  // Only one of disable/re-enable is meaningful at a time; show the one that applies.
+  const locked = Boolean(liveData.diagnostics?.actuationsDisabled);
+  const d2 = document.getElementById("disableActBtn2");
+  const e2 = document.getElementById("enableActBtn2");
+  if (d2) d2.hidden = locked;
+  if (e2) e2.hidden = !locked;
 }
 
 function initializeFirebase() {
@@ -861,11 +878,21 @@ document.getElementById("forceRunForm")?.addEventListener("submit", submitForceR
 document.querySelectorAll("#faultRecovery button[data-recover]").forEach(btn =>
   btn.addEventListener("click", () => queueCommand("RECOVER", { action: btn.dataset.recover }, { emergency: true })));
 document.getElementById("estopRecoverBtn")?.addEventListener("click", () => queueCommand("ESTOP_RECOVER", {}, { emergency: true }));
-document.getElementById("enableActBtn")?.addEventListener("click", () => queueCommand("ENABLE_ACTUATIONS", {}, { emergency: true }));
-document.getElementById("disableActBtn")?.addEventListener("click", () => queueCommand("DISABLE_ACTUATIONS", {}, { emergency: true }));
-document.getElementById("rebootNanoBtn")?.addEventListener("click", () => queueCommand("REBOOT", { target: "nano" }, { emergency: true }));
-document.getElementById("rebootEsp2Btn")?.addEventListener("click", () => queueCommand("REBOOT", { target: "esp2" }, { emergency: true }));
-document.getElementById("rebootEsp1Btn")?.addEventListener("click", () => {
+
+// These controls exist twice -- in the fault banner and in the Controls tab -- because the banner is
+// hidden while the system is healthy, which is exactly when you might want to disable actuations or
+// reboot a module. One handler each, bound to both ids, so the two copies cannot drift.
+function bindAll(ids, handler) {
+  ids.forEach(id => document.getElementById(id)?.addEventListener("click", handler));
+}
+bindAll(["enableActBtn", "enableActBtn2"],  () => queueCommand("ENABLE_ACTUATIONS", {}, { emergency: true }));
+bindAll(["disableActBtn", "disableActBtn2"], () => {
+  if (!confirm("Disable actuations? Any run in progress is stopped immediately, and nothing will run again until you re-enable. Monitoring continues.")) return;
+  queueCommand("DISABLE_ACTUATIONS", {}, { emergency: true });
+});
+bindAll(["rebootNanoBtn", "rebootNanoBtn2"], () => queueCommand("REBOOT", { target: "nano" }, { emergency: true }));
+bindAll(["rebootEsp2Btn", "rebootEsp2Btn2"], () => queueCommand("REBOOT", { target: "esp2" }, { emergency: true }));
+bindAll(["rebootEsp1Btn", "rebootEsp1Btn2"], () => {
   // ESP1 owns the Firebase link, so this one goes quiet for ~15 s before it comes back.
   if (!confirm("Reboot ESP1? The dashboard will lose contact for about 15 seconds while it restarts.")) return;
   queueCommand("REBOOT", { target: "esp1" }, { emergency: true });
