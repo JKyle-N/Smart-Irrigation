@@ -623,6 +623,7 @@ const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
  *     password can be wiped afterwards (FBASE,SIGNOUT or the portal's Forget button). */
 const unsigned long FIREBASE_UPLOAD_IDLE_MS   = 60000;  // ~1 min dashboard refresh when idle
 const unsigned long FIREBASE_UPLOAD_ACTIVE_MS = 20000;  // faster during ACTIVE_STATE
+const unsigned long FB_PUSH_MIN_GAP_MS        = 5000;   // floor between error-triggered out-of-band pushes
 // Command poll cadence. The TLS connection is REUSED between polls (fbClient/fbHttp below),
 // so this is one small GET on an open socket -- not a handshake every 3 s.
 const unsigned long FIREBASE_COMMAND_POLL_MS  = 3000;
@@ -669,6 +670,12 @@ unsigned long fbAuthErrMs = 0;                     // when it happened -- the po
 // fbNoteAuthError runs on netTask, so it cannot log directly. Fixed buffer: no String across cores.
 char     fbAuthErrLog[96] = "";
 volatile bool fbAuthErrLogPending = false;
+// Same hand-off for the command-poll diagnostics. firebasePollCommands() also runs on netTask and
+// was calling logEvent() directly, which appends to logBuf -- a core-1 String. Reallocating that
+// from core 0 is a heap race; rare (both paths are deduped to once per 60 s) but not something to
+// leave in. firebaseLogTick() drains this on core 1 like the auth message above.
+char     fbPollErrLog[96] = "";
+volatile bool fbPollErrLogPending = false;
 bool     fbPinCa = true;                           // validate the server cert against FB_ROOT_CA (NVS "fbpin")
 unsigned long fbTokenExpiryMs = 0;                 // millis() deadline for the current ID token
 volatile bool fbAuthOk = false;                    // last token operation succeeded (diagnostics)
@@ -899,6 +906,24 @@ struct TelemetrySnapshot {
 TelemetrySnapshot telem = {};
 portMUX_TYPE telemMux = portMUX_INITIALIZER_UNLOCKED;
 unsigned long lastTelemCollectMs = 0;
+
+/* ---- Web event ring (dashboard "Recent ESP1 events") ---------------------- *
+ * The SD log records everything; this keeps only the handful of events an operator actually needs
+ * to see remotely (see webWorthy). Bounded and republished inside each snapshot rather than appended
+ * to a Firebase list -- an unbounded node is exactly what broke the command queue.
+ *
+ * Has its OWN spinlock, not telemMux: telemetryCollect() holds telemMux while it copies, and if a
+ * log call could ever happen underneath that lock the two would deadlock. Separate locks make that
+ * impossible by construction. The critical section is one fixed-size struct copy.               */
+const uint8_t WEB_EVT_N = 12;
+struct WebEvent { char at[20]; char src[8]; char type[12]; char detail[96]; };
+WebEvent      webEvt[WEB_EVT_N] = {};
+uint8_t       webEvtHead = 0;        // next slot to write
+uint8_t       webEvtCount = 0;       // entries filled (saturates at WEB_EVT_N)
+portMUX_TYPE  evtMux = portMUX_INITIALIZER_UNLOCKED;
+// Set when an event the operator should not wait for lands (fault / rejection). netTask uses it as
+// an extra upload trigger so an error surfaces in seconds instead of at the next 60 s tick.
+volatile bool fbPushNow = false;
 
 /* ---- Power (battery via opto-isolated ADC, polynomial-calibrated) --------- *
  * Battery V/I now come from GPIO35/34 through an optocoupler (nonlinear), fitted with a least-squares
@@ -3507,6 +3532,11 @@ void handleSms(const String &body) {
 // and fault paths never stall the loop.
 void sendSMS(const String &msg) {
   if (smsMute) return;                                 // suppress ACK/ERR for portal-replayed config commands
+  // Every SMS rejection replies "ERR,<reason>" to the sender and, until now, left no trace at all --
+  // an unrecognised command (ERR,CMD) simply vanished. Logging it HERE rather than at the ~15
+  // scattered rejection sites catches every path, including ones added later. logEvent never calls
+  // back into sendSMS, so this cannot recurse.
+  if (msg.startsWith("ERR,")) logEvent("GSM", "SMS_ERR", msg.substring(4));
   if (smsCount >= SMS_QUEUE_SIZE) {                     // queue full: drop oldest, keep newest alert
     smsHead = (smsHead + 1) % SMS_QUEUE_SIZE;
     smsCount--;
@@ -4935,7 +4965,7 @@ static bool firebaseUploadLive() {
   // fail first, mid-TLS, in a way that looks like a network fault rather than a stack overflow.
   // In .bss it costs the same RAM without competing for stack, and re-entrancy is not a concern:
   // this function is only ever called from netTask.
-  static StaticJsonDocument<10240> doc;
+  static StaticJsonDocument<12288> doc;          // 10240 -> 12288 for the 12-entry recentEvents ring
   doc.clear();                                   // static -> must be reset each pass
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
@@ -5125,6 +5155,29 @@ static bool firebaseUploadLive() {
     }
   }
 
+  /* Recent events. Read straight from the ring under its own lock rather than via TelemetrySnapshot:
+   * the ring is shared state with a lock built for exactly this, and mirroring 1.6 KB into the
+   * snapshot every second would copy data that changes a few times an hour. Copied out under the
+   * spinlock and released before touching JSON -- building the array with interrupts disabled would
+   * be far worse than the copy. Oldest first, so the dashboard's reverse() shows newest at top. */
+  {
+    static WebEvent snap[WEB_EVT_N];
+    uint8_t n, head;
+    portENTER_CRITICAL(&evtMux);
+    n = webEvtCount; head = webEvtHead;
+    memcpy(snap, webEvt, sizeof(snap));
+    portEXIT_CRITICAL(&evtMux);
+    if (n) {
+      JsonArray ev = dg.createNestedArray("recentEvents");
+      uint8_t start = (n < WEB_EVT_N) ? 0 : head;         // not yet wrapped -> slot 0 is oldest
+      for (uint8_t i = 0; i < n; i++) {
+        const WebEvent &e = snap[(start + i) % WEB_EVT_N];
+        JsonObject o = ev.createNestedObject();
+        o["at"] = e.at; o["source"] = e.src; o["type"] = e.type; o["detail"] = e.detail;
+      }
+    }
+  }
+
   // Live run progress. The dashboard's run panel needs stage ordinal + litres delivered/target to
   // draw a bar; publishing only "a run is active" left it blank. Always emitted (with active=false
   // at idle) so the panel can distinguish "idle" from "field missing".
@@ -5261,7 +5314,8 @@ static void firebasePollCommands() {
     static unsigned long lastFiltLogMs = 0;
     if (millis() - lastFiltLogMs > 60000) {
       lastFiltLogMs = millis();
-      logEvent("FIREBASE", "POLL", "filter overflow -- payload keys dropped");
+      strlcpy(fbPollErrLog, "filter overflow -- payload keys dropped", sizeof(fbPollErrLog));
+      fbPollErrLogPending = true;                             // core 1 logs it (no String from core 0)
     }
     return;
   }
@@ -5276,7 +5330,8 @@ static void firebasePollCommands() {
     static unsigned long lastParseLogMs = 0;                  // dedupe: this path polls every 3 s
     if (millis() - lastParseLogMs > 60000) {
       lastParseLogMs = millis();
-      logEvent("FIREBASE", "POLL", String("parse ") + de.c_str() + "|body=" + resp.length() + "B");
+      snprintf(fbPollErrLog, sizeof(fbPollErrLog), "parse %s|body=%uB", de.c_str(), (unsigned)resp.length());
+      fbPollErrLogPending = true;                             // core 1 logs it (no String from core 0)
     }
     return;
   }
@@ -5690,6 +5745,10 @@ void firebaseLogTick() {
   if (fbAuthErrLogPending) {
     fbAuthErrLogPending = false;
     logEvent("ESP1", "FBASE", String("AUTH|") + fbAuthErrLog);
+  }
+  if (fbPollErrLogPending) {                        // command-poll diagnostics, deferred from core 0
+    fbPollErrLogPending = false;
+    logEvent("FIREBASE", "POLL", fbPollErrLog);
   }
   static int  lastState = -1;                       // -1 unknown, 0 fail, 1 ok
   static unsigned long lastSeenUploadMs = 0;
@@ -6359,7 +6418,11 @@ void netTask(void *pv) {
     }
 
     unsigned long fbInterval = (sysState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
-    if (millis() - fbLastUploadMs >= fbInterval) firebaseUploadLive();
+    // An error should not sit unseen for up to a minute, so core 1 can force a push out of band.
+    // Rate-limited: a burst of rejections must not turn into a burst of TLS uploads on a battery.
+    bool urgent = fbPushNow && (millis() - fbLastUploadMs >= FB_PUSH_MIN_GAP_MS);
+    if (urgent) fbPushNow = false;
+    if (urgent || millis() - fbLastUploadMs >= fbInterval) firebaseUploadLive();
     // Remote-command transport, both directions. Cheap: they ride the SAME keep-alive TLS
     // socket as the upload above, so a 3 s poll costs one small GET, not a handshake.
     firebaseFlushStatus();                                 // results first: report before fetching more
@@ -8164,6 +8227,37 @@ void lcdRenderSettings() {
 /* =============================================================================
  *  LOGGING  (buffered CSV to microSD, spec sec.25)
  * ========================================================================== */
+/* Which of the ~150 log rows the rig emits deserve a place in the 12-entry dashboard ring.
+ * Everything still goes to the SD card; this is purely about what is worth looking at remotely:
+ * errors, the start of a run and its receipt, testing from either surface, and SMS traffic.
+ * Deliberately excludes the high-volume housekeeping -- CFG, CAL, STATE, SENSOR, POLL, NET -- which
+ * would push the interesting rows out of a 12-slot window within minutes. */
+static bool webWorthy(const char *type, const String &d) {
+  if (!strcmp(type, "FAULT") || !strcmp(type, "RECEIPT") ||
+      !strcmp(type, "REJECT") || !strcmp(type, "SMS_ERR")) return true;
+  if (!strcmp(type, "ACT")) {
+    // Run starts (the matching finish is the POST receipt, so |STOP| is left out as a duplicate).
+    if (d.startsWith("IRRIGATION|START") || d.startsWith("FERTIGATION|START")) return true;
+    // Testing from BOTH surfaces. TEST| is the LCD dead-man and PULSE| the dashboard push-to-column,
+    // but the dashboard's plain "Test pump (5 sec)" button runs the preventive exercise -- so
+    // EXERCISE| is website testing too, and omitting it left that button invisible here.
+    if (d.startsWith("TEST|") || d.startsWith("PULSE|") || d.startsWith("EXERCISE|")) return true;
+    // Operator decisions and anything refused: "why did nothing happen?" is the question this
+    // panel exists to answer, so the BLOCKED refusals matter as much as the actions.
+    if (d.startsWith("ACTUATION|") || d.startsWith("FORCE|") || d.startsWith("WO|BLOCKED") ||
+        d.startsWith("CANCEL|")    || d.startsWith("RESUME|")) return true;
+    return false;
+  }
+  if (!strcmp(type, "GSM"))  return d.startsWith("RX|") || d.startsWith("TX_ERR|");
+  if (!strcmp(type, "RESP")) return d.startsWith("TIMEOUT|");
+  return false;
+}
+
+// An event the operator should not have to wait up to a minute to see.
+static bool webUrgent(const char *type) {
+  return !strcmp(type, "FAULT") || !strcmp(type, "REJECT") || !strcmp(type, "SMS_ERR");
+}
+
 void logEvent(const char *source, const char *type, const String &detail) {
   // The schema is timestamp,source,event_type,detail with '|' as the secondary delimiter and NO
   // commas inside detail (sec.25.2 / CLAUDE.md). Several callers pass through raw framed payloads or
@@ -8172,7 +8266,25 @@ void logEvent(const char *source, const char *type, const String &detail) {
   // (substring past the 3rd comma), but any external reader of the thesis CSV does not.
   String d = detail;
   d.replace(',', ';');
-  String row = tsString() + "," + source + "," + type + "," + d + "\n";
+  String stamp = tsString();
+
+  // Dashboard ring first: it must capture the event even if the SD path below declines or the
+  // buffer is being dropped. Uses the sanitized `d`, so the web view matches the CSV exactly.
+  if (webWorthy(type, d)) {
+    WebEvent e = {};
+    strlcpy(e.at,     stamp.c_str(),  sizeof(e.at));
+    strlcpy(e.src,    source,         sizeof(e.src));
+    strlcpy(e.type,   type,           sizeof(e.type));
+    strlcpy(e.detail, d.c_str(),      sizeof(e.detail));
+    portENTER_CRITICAL(&evtMux);
+    webEvt[webEvtHead] = e;
+    webEvtHead = (webEvtHead + 1) % WEB_EVT_N;
+    if (webEvtCount < WEB_EVT_N) webEvtCount++;
+    portEXIT_CRITICAL(&evtMux);
+    if (webUrgent(type)) fbPushNow = true;
+  }
+
+  String row = stamp + "," + source + "," + type + "," + d + "\n";
   logBuf += row;
   logLineCount++;
   Serial.print(row);                          // mirror to USB debug

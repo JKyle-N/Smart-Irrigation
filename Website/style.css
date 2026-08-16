@@ -172,8 +172,14 @@ button.warn { border-color: var(--warning); color: var(--warning); }
 .event-row { display: grid; gap: 4px; padding: 10px 12px; border-left: 3px solid var(--border); border-radius: 7px; background: var(--surface-muted); }
 .event-row strong { font-size: .76rem; }
 .event-row span { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .8rem; overflow-wrap: anywhere; }
-.event-row.fault { border-left-color: var(--danger); }
+/* Colour by event type. The class is the firmware's type lowercased, so these track logEvent()
+   directly: red = something went wrong, green = the rig did something, blue = a run receipt,
+   amber = a request was refused or an SMS could not be understood. */
+.event-row.fault, .event-row.sms_err { border-left-color: var(--danger); }
 .event-row.act, .event-row.stage { border-left-color: var(--success); }
+.event-row.receipt { border-left-color: var(--accent); }
+.event-row.reject, .event-row.resp { border-left-color: var(--warning); }
+.event-row.gsm { border-left-color: var(--muted); }
 
 dialog { width: min(540px, calc(100% - 32px)); padding: 28px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 dialog::backdrop { background: rgb(0 0 0 / .7); }
