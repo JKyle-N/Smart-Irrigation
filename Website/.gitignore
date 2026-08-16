@@ -1,0 +1,3 @@
+# Firebase Web configuration is intentionally versioned: Firebase identifies
+# web projects with this public configuration. Database access is protected by
+# Firebase Authentication and Realtime Database Rules, never by hiding it.

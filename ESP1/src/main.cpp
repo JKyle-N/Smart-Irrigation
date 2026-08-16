@@ -453,7 +453,12 @@ bool    nanoResetReqInFlight = false;
 unsigned long nanoResetReqMs = 0;
 
 /* ---- ESP2 work-order FSM ------------------------------------------------- */
-enum WoStage { WO_IDLE, WO_SENT, WO_ACKED };
+// WO_PENDING = built and owned, but NOT yet transmitted because ESP2 is still cold-booting.
+// A scheduled run parks in pendingRun for that wait; a FORCE run has no such slot, so before this
+// stage existed sendForceWorkOrder() wrote the frame into a powered-down ESP2 and it was simply
+// lost -- the "force run never initiates" fault. Only WO_SENT arms the ACK-timeout supervisor,
+// so a pending order cannot burn its retries while the executor is still booting.
+enum WoStage { WO_IDLE, WO_PENDING, WO_SENT, WO_ACKED };
 struct WorkOrder {
   bool     active;
   WoStage  stage;
@@ -799,6 +804,26 @@ struct TelemetrySnapshot {
   // core 0 can tear -- the same cross-core mistake this snapshot exists to prevent.
   bool pumpTransfer, pumpBooster, pumpMixer;
   float tankEC, tankPH;        // last mixing-tank chemistry from ESP2's TELE (-1 = never measured)
+  // Live run progress, mirrored from RunUi so the dashboard can show a real progress bar instead of
+  // just "a run is active". Copied under the spinlock (stage included) for the same tearing reason.
+  bool     runActive, runFert;
+  char     runStage[18];
+  uint8_t  runOrd, runTotal, runPhaseId;
+  int      runCol;
+  float    runStageL, runStageTgt, runWaterGot, runWaterTgt;
+  float    runDoseTgt[3], runDoseGot[3];
+  // Diagnostics mirrored for the dashboard's diagnostics panel. All core-1 owned, so none of it may
+  // be read directly by the core-0 uploader -- lastFault especially: it is a String on core 1, and
+  // reading one across cores can catch a freed buffer mid-reassign.
+  bool     esp2Avail, esp2Pwr, esp2Lost;
+  unsigned long esp2AgeMs, nanoAgeMs, gsmHealthAgeMs;
+  bool     pendRun, pendEx;
+  int      pendExIdx;
+  bool     rtcOk_, sdOk_, acsOk_;
+  bool     simOk, netReg;
+  int      rssi, creg;
+  bool     battLow, battCrit;
+  char     lastFault[24], lastFaultAt[20];
   // Validity/state mirrored here so the core-0 uploaders never touch core-1's `sensor`/`wo`/`sysState`
   // directly (a torn read there publishes e.g. tankValid against a half-updated level).
   bool  envValid, tankValid, lightValid, inaValid;
@@ -1009,6 +1034,8 @@ const unsigned long DIAG_ESP2_STALE_MS = 16000;  // full sweep ~10 s; mark a val
  * never stalls waiting for a person. While locked, buttons are swallowed except the MODE+BACK e-stop
  * and UP+DOWN (which only releases the screen -- it never stops the run).                            */
 enum RunPhase { RUN_NONE, RUN_PRE, RUN_LIVE, RUN_POST, RUN_ERR };
+// Indexed by RunPhase for the published run node -- keep in step with the enum above.
+static const char *const RUN_PHASE_NAME[5] = { "idle", "starting", "running", "finishing", "error" };
 RunPhase runPhase = RUN_NONE;
 struct RunUi {
   bool     fert;
@@ -1136,6 +1163,7 @@ void sendNanoCommand(const char *cmd);
 void pollESP2();
 void sendWorkOrder(int c, bool fertigate);
 void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const char *fbCmdId);
+void dispatchPendingWorkOrder();
 void handleEsp2Response(const String &payload);
 void esp2PowerCycle();
 void esp2ReinitUart();
@@ -1148,7 +1176,7 @@ void esp2SetPower(bool on, bool force = false);
 void esp2PowerTick();
 void dispatchPendingRun();
 void dispatchPendingExercise();
-void runUiBegin(int c, bool fert);
+void runUiBegin(int c, bool fert, float forceL = -1.0f, const float *forceDose = nullptr);
 void runUiFinish(bool ok);
 void runUiTick();
 void runUiAdvance();
@@ -2051,6 +2079,7 @@ void handleEsp2Response(const String &payload) {
     }
     // Testing arming is handled by the primed retry in testHoldTick (the single READY here
     // can be lost on a cold relay boot), so we do NOT send TEST,ENTER from this one message.
+    dispatchPendingWorkOrder();                                 // FORCE run parked in WO_PENDING
     if (pendingRun.active && !wo.active) dispatchPendingRun();  // scheduled-run warm-up complete
     if (pendingExercise.active && !pendingExercise.sent) dispatchPendingExercise();  // exercise warm-up done
     return;
@@ -2314,16 +2343,25 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
   }
   cmd += "," + String(FRAME_END);
 
-  wo.active = true; wo.stage = WO_SENT; wo.colIdx = primary; wo.fertigate = fert;
-  wo.cmd = cmd; wo.retries = 0; wo.sentMs = millis();
+  wo.active = true; wo.colIdx = primary; wo.fertigate = fert;
+  wo.cmd = cmd; wo.retries = 0;
   forceMask = mask;                                  // remembered so DONE can be attributed honestly
   strlcpy(forceCmdId, fbCmdId ? fbCmdId : "", sizeof(forceCmdId));
 
   setState(ACTIVE_STATE);
-  runUiBegin(primary, fert);
+  runUiBegin(primary, fert, liters, doseMl);         // force targets, NOT the scheduled budget
   esp2WarmupMs = millis();
-  if (esp2Available && esp2Powered) esp2Serial.println(cmd);   // already up -> send now
-  else                             esp2SetPower(true);         // warm up; READY re-sends via wo.cmd
+  // The FORCE gate requires the system to be idle, and idle means ESP2 is POWERED OFF
+  // (OFF-during-idle, sec.18.8) -- so this else branch is the normal case, not the exception.
+  // Parking in WO_PENDING and letting READY transmit is the same wait a scheduled run does via
+  // pendingRun; writing the frame here would push it into a UART nobody is listening on yet.
+  if (esp2Available && esp2Powered) {
+    wo.stage = WO_SENT; wo.sentMs = millis();
+    esp2Serial.println(cmd);                         // already up -> send now
+  } else {
+    wo.stage = WO_PENDING;                           // READY (or the ACTIVE_STATE net) owns it now
+    esp2SetPower(true);
+  }
 
   logEvent("ESP1", "CMD", "ESP2|" + name + "|FORCE");
   logEvent("ESP1", "ACT", String(fert ? "FERTIGATION" : "IRRIGATION") + "|START|FORCE|COL_" + cols +
@@ -2348,15 +2386,30 @@ void runNoteErr(const String &e) {
 
 // Queue-time: compute the doses ONCE, snapshot the "before" NPK, and raise the pre-run receipt.
 // dispatchPendingRun() waits for this receipt to be acknowledged (or time out) before sending.
-void runUiBegin(int c, bool fert) {
+// forceL >= 0 / forceDose != nullptr override the schedule for an operator FORCE run: the receipt,
+// the LCD progress bars and the published run node must show what was actually ordered, not the
+// scheduled budget the run is deliberately bypassing.
+void runUiBegin(int c, bool fert, float forceL, const float *forceDose) {
   memset(&run, 0, sizeof(run));
   run.fert = fert; run.col = c; run.ok = true;
   run.total = fert ? ((FLUSH_PCT > 0) ? 7 : 5) : 2;
   run.ord = 0;
   strncpy(run.stage, "Starting", sizeof(run.stage) - 1);
-  run.waterTgt = WATER_BUDGET_L[c];
-  run.batchV   = WATER_BUDGET_L[c] * (1.0f - FLUSH_PCT / 100.0f);
-  if (fert) calcDose(c, run.doseTgt, run.ceilS);              // computed once; sendWorkOrder reuses these
+  float budget = (forceL >= 0.0f) ? forceL : WATER_BUDGET_L[c];
+  run.waterTgt = budget;
+  run.batchV   = budget * (1.0f - FLUSH_PCT / 100.0f);
+  if (fert) {
+    if (forceDose) {
+      // Mirror sendForceWorkOrder's DCEIL maths so the receipt and the work order agree.
+      for (int i = 0; i < 3; i++) {
+        run.doseTgt[i] = forceDose[i];
+        run.ceilS[i]   = (forceDose[i] > 0.0f)
+                       ? forceDose[i] / PUMP_FLOWRATE_MLPM[i] * 60.0f * CEILING_MARGIN : 0.0f;
+      }
+    } else {
+      calcDose(c, run.doseTgt, run.ceilS);                    // computed once; sendWorkOrder reuses these
+    }
+  }
   for (int i = 0; i < 3; i++) run.npkBefore[i] = sensor.npk[c][4 + i];
   run.startMs = millis();
   runErrN = 0; runPage = 0;
@@ -2668,6 +2721,18 @@ void esp2PowerTick() {
     logEvent("ESP1", "ESP2", "IDLE_POLL|NO_REPLY");
     esp2PollActive = false; esp2SoftResetTried = false; setState(RECOVERY_STATE);   // recovery ladder
   }
+}
+
+// Warm-up complete (ESP2 READY): transmit a work order that was built while ESP2 was still off.
+// Only FORCE runs park in WO_PENDING -- scheduled runs wait in pendingRun and are built after READY.
+// Deliberately does NOT wait on the pre-run receipt the way dispatchPendingRun() does: a force run
+// is operator-initiated from the dashboard, so there may be nobody at the LCD to acknowledge it,
+// and the 20 s receipt timeout would outlast ESP2's 8 s warm-up budget and abort the run.
+void dispatchPendingWorkOrder() {
+  if (!wo.active || wo.stage != WO_PENDING) return;
+  wo.stage = WO_SENT; wo.sentMs = millis();
+  esp2Serial.println(wo.cmd);
+  logEvent("ESP1", "CMD", "ESP2|FORCE_DISPATCH");   // frame already logged at build time
 }
 
 // Warm-up complete (ESP2 READY): send the queued scheduled run, then clear the pending slot.
@@ -3573,7 +3638,22 @@ void stateMachineTick() {
     case ACTIVE_STATE: {
       // OFF-during-idle: a scheduled run parks here while ESP2 boots; its READY dispatches
       // the work order (handleEsp2Response). This is the warm-up timeout safety net.
-      if (pendingRun.active && !wo.active) {
+      // A FORCE run holds its frame in WO_PENDING instead of a pendingRun slot, so it needs the
+      // same net: without one it would sit in ACTIVE_STATE forever with ESP2 dark, and the
+      // dashboard command would stay "accepted" and never resolve.
+      if (wo.active && wo.stage == WO_PENDING) {
+        if (esp2Available) dispatchPendingWorkOrder();
+        else if (millis() - esp2WarmupMs > ESP2_WARMUP_TIMEOUT_MS) {
+          raiseFault('M', "ESP2_NO_READY", "FORCE");    // executor never came up for the forced run
+          if (forceCmdId[0]) firebaseQueueStatus(forceCmdId, "failed", "ESP2 never powered up");
+          forceCmdId[0] = '\0'; forceMask = 0;
+          wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
+          runUiAbort("ESP2_NO_READY");                  // release the LCD takeover (runLocked)
+          esp2SetPower(false);
+          setState(IDLE_STATE);
+        }
+      }
+      else if (pendingRun.active && !wo.active) {
         if (esp2Available) dispatchPendingRun();
         else if (millis() - esp2WarmupMs > ESP2_WARMUP_TIMEOUT_MS) {
           raiseFault('M', "ESP2_NO_READY", "RUN");   // executor never came up for the run
@@ -4156,6 +4236,30 @@ void telemetryCollect() {
   telem.envValid = sensor.envValid; telem.tankValid = sensor.tankValid; telem.lightValid = sensor.lightValid;
   telem.inaValid = inaOk;
   telem.state = sysState; telem.woActive = wo.active;
+  // Diagnostics mirror. Ages are computed HERE (core 1) rather than published as raw millis(),
+  // which is meaningless to a browser on a different clock.
+  telem.esp2Avail = esp2Available; telem.esp2Pwr = esp2Powered; telem.esp2Lost = esp2CommLost;
+  telem.esp2AgeMs = lastEsp2Ms ? (millis() - lastEsp2Ms) : 0xFFFFFFFF;
+  telem.nanoAgeMs = sensor.lastNanoMs ? (millis() - sensor.lastNanoMs) : 0xFFFFFFFF;
+  telem.gsmHealthAgeMs = lastGsmHealthMs ? (millis() - lastGsmHealthMs) : 0xFFFFFFFF;
+  telem.pendRun = pendingRun.active; telem.pendEx = pendingExercise.active;
+  telem.pendExIdx = pendingExercise.idx;
+  telem.rtcOk_ = rtcOk; telem.sdOk_ = sdOk; telem.acsOk_ = acsOk;
+  telem.simOk = simReady; telem.netReg = netRegistered;
+  telem.rssi = lastRssi; telem.creg = lastCreg;
+  telem.battLow = batteryLow; telem.battCrit = batteryCritical;
+  strlcpy(telem.lastFault,   lastFaultMsg.c_str(),  sizeof(telem.lastFault));
+  strlcpy(telem.lastFaultAt, lastFaultTime.c_str(), sizeof(telem.lastFaultAt));
+  // Live run progress. Same reason as the pump flags: run[] belongs to core 1.
+  telem.runActive  = (runPhase != RUN_NONE);
+  telem.runFert    = run.fert;
+  telem.runCol     = run.col;
+  telem.runOrd     = run.ord;      telem.runTotal   = run.total;
+  telem.runPhaseId = (uint8_t)runPhase;
+  telem.runStageL  = run.stageL;   telem.runStageTgt = run.stageTgt;
+  telem.runWaterGot = run.waterGot; telem.runWaterTgt = run.waterTgt;
+  for (int i = 0; i < 3; i++) { telem.runDoseTgt[i] = run.doseTgt[i]; telem.runDoseGot[i] = run.doseGot[i]; }
+  memcpy(telem.runStage, run.stage, sizeof(telem.runStage));
   // Pump flags from ESP2's reported stage name, resolved here on core 1 so the uploader never
   // touches run.stage. Anything outside a live run is off, which is the truth at idle.
   {
@@ -4459,7 +4563,15 @@ static bool firebaseUploadLive() {
 
   String base;
   bool enabled;
-  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
+  // The diagnostics node reports whether each service is CONFIGURED, never the credential itself.
+  // Derived here, under the lock that owns those strings -- not read bare from the payload builder.
+  bool credsCfg, tsCfg, supaCfg;
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  base = fbUrl; enabled = firebaseEnabled;
+  credsCfg = fbApiKey.length() > 0 && (fbRefresh.length() > 0 || fbPassword.length() > 0);
+  tsCfg    = tsKey1.length() > 0 || tsKey2.length() > 0 || tsKey3.length() > 0;
+  supaCfg  = supaUrl.length() > 0 && supaKey.length() > 0;
+  xSemaphoreGive(netMux);
   if (!enabled || base.length() < 8) { fbLastOk = false; return false; }
 
   TelemetrySnapshot t;
@@ -4474,10 +4586,11 @@ static bool firebaseUploadLive() {
 
   if (!fbEnsureToken()) { fbLastOk = false; return false; }   // no token -> no request (respects backoff)
 
-  // 2048 B covers all NUM_COLUMNS zones with headroom (raised from 1536 when powerSource, battery
-  // percent/current, tank EC/pH and the actuators object were added). Overflow is CHECKED below, not
-  // assumed: an over-capacity document serializes silently truncated, which would PUT malformed JSON.
-  StaticJsonDocument<2048> doc;
+  // 6144 B: all NUM_COLUMNS zones + a fertigation run node + the full diagnostics tree (1536 -> 2048
+  // for powerSource/battery/tank-chemistry/actuators, -> 6144 for diagnostics). Overflow is CHECKED
+  // below, not assumed: an over-capacity document serializes silently TRUNCATED, which would PUT
+  // malformed JSON. netTask is a 28 KB stack with ~20 KB free, so this is affordable where it lands.
+  StaticJsonDocument<6144> doc;
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
   meta["deviceOnline"] = true;
@@ -4518,6 +4631,104 @@ static bool firebaseUploadLive() {
   act["transferRunning"] = t.pumpTransfer;
   act["boosterRunning"]  = t.pumpBooster;
   act["mixerRunning"]    = t.pumpMixer;
+
+  /* ---- diagnostics ------------------------------------------------------------------------
+   * The dashboard's Diagnostics tab and Run-progress panel read everything below. None of it was
+   * ever published, which is why that whole tab said "no diagnostics have been published by ESP1".
+   * All values come from the snapshot (core 1), never from live globals. */
+  JsonObject dg = doc.createNestedObject("diagnostics");
+
+  JsonObject dnet = dg.createNestedObject("network");
+  dnet["wifiEnabled"]   = (WiFi.getMode() & WIFI_MODE_STA) != 0;
+  dnet["wifiConnected"] = WiFi.status() == WL_CONNECTED;
+  dnet["wifiRssi"]      = WiFi.RSSI();
+
+  JsonObject dfb = dg.createNestedObject("firebase");
+  dfb["enabled"]        = enabled;
+  dfb["urlConfigured"]  = base.length() >= 8;
+  dfb["deviceCredentialsConfigured"] = credsCfg;
+  dfb["signedIn"]       = fbIdToken.length() > 0;
+  dfb["attempts"]       = fbAttempts;
+  dfb["lastUploadOk"]   = fbLastOk;
+  dfb["lastHttp"]       = fbLastHttp;
+  dfb["tlsValidationEnabled"] = fbPinCa;
+  if (fbAuthErr.length()) dfb["lastAuthError"] = fbAuthErr;   // Google's reason string, never a secret
+
+  JsonObject dts = dg.createNestedObject("thingspeak");
+  dts["configured"]   = tsCfg;
+  dts["attempted"]    = lastTsUploadMs != 0;
+  dts["lastUploadOk"] = lastTsOk;
+
+  JsonObject dsb = dg.createNestedObject("supabase");
+  dsb["configured"]          = supaCfg;
+  dsb["uploadBusy"]          = uploadBusy;
+  dsb["lastUploadAttempted"] = supaLast != 0;
+  dsb["lastUploadedDay"]     = supaLast;
+
+  JsonObject dsy = dg.createNestedObject("system");
+  dsy["workOrderActive"] = t.woActive;
+  dsy["pendingRun"]      = t.pendRun;
+  if (t.lastFault[0])   dsy["lastFault"]     = t.lastFault;
+  if (t.lastFaultAt[0]) dsy["lastFaultTime"] = t.lastFaultAt;
+
+  JsonObject de2 = dg.createNestedObject("esp2");
+  de2["available"]         = t.esp2Avail;
+  de2["powered"]           = t.esp2Pwr;
+  de2["communicationLost"] = t.esp2Lost;
+  de2["lastResponseAgeMs"] = t.esp2AgeMs;
+
+  JsonObject dna = dg.createNestedObject("nano");
+  dna["lastSampleAgeMs"]  = t.nanoAgeMs;
+  dna["environmentValid"] = t.envValid;
+  dna["tankValid"]        = t.tankValid;
+  dna["lightValid"]       = t.lightValid;
+
+  JsonObject dpe = dg.createNestedObject("peripherals");
+  dpe["rtcOk"] = t.rtcOk_; dpe["sdOk"] = t.sdOk_; dpe["batterySensorOk"] = t.acsOk_;
+
+  JsonObject dgs = dg.createNestedObject("gsm");
+  dgs["simReady"]          = t.simOk;
+  dgs["networkRegistered"] = t.netReg;
+  dgs["rssi"]              = t.rssi;
+  dgs["creg"]              = t.creg;
+  dgs["lastHealthAgeMs"]   = t.gsmHealthAgeMs;
+
+  JsonObject dpw = dg.createNestedObject("power");
+  dpw["batteryLow"]      = t.battLow;
+  dpw["batteryCritical"] = t.battCrit;
+  dpw["batteryCurrent"]  = t.battI;
+  dpw["batteryPower"]    = t.battP;
+
+  JsonObject dac = dg.createNestedObject("actuator");
+  dac["relayFeedback"]   = "notReported";      // no relay sense hardware -- say so rather than imply OK
+  dac["workOrderActive"] = t.woActive;
+  dac["pumpTestActive"]  = t.pendEx;
+  dac["pumpUnderTest"]   = (t.pendEx && t.pendExIdx >= 0 && t.pendExIdx < 3) ? EX_NAME[t.pendExIdx] : "none";
+
+  // Live run progress. The dashboard's run panel needs stage ordinal + litres delivered/target to
+  // draw a bar; publishing only "a run is active" left it blank. Always emitted (with active=false
+  // at idle) so the panel can distinguish "idle" from "field missing".
+  JsonObject rn = dg.createNestedObject("runProgress");
+  rn["active"] = t.runActive;
+  if (t.runActive) {
+    rn["operation"] = t.runFert ? "fertigation" : "irrigation";
+    rn["phase"]     = RUN_PHASE_NAME[t.runPhaseId < 5 ? t.runPhaseId : 0];
+    rn["zone"]      = String(COL_TAG[t.runCol >= 0 && t.runCol < NUM_COLUMNS ? t.runCol : 0]);
+    rn["stage"]     = t.runStage;
+    rn["stageOrdinal"] = t.runOrd;
+    rn["stageTotal"]   = t.runTotal;
+    rn["stageLiters"]       = t.runStageL;
+    rn["stageTargetLiters"] = t.runStageTgt;
+    rn["waterDeliveredLiters"] = t.runWaterGot;
+    rn["waterTargetLiters"]    = t.runWaterTgt;
+    if (t.runFert) {
+      JsonObject dm = rn.createNestedObject("dosesMl");
+      for (int i = 0; i < 3; i++) {
+        JsonObject d = dm.createNestedObject(String((char)('A' + i)));
+        d["target"] = t.runDoseTgt[i]; d["delivered"] = t.runDoseGot[i];
+      }
+    }
+  }
 
   JsonObject zones = sensors.createNestedObject("zones");
   for (int c = 0; c < NUM_COLUMNS; c++) {
@@ -4606,7 +4817,11 @@ static void firebasePollCommands() {
   JsonObject pf = any.createNestedObject("payload");
   pf["pump"] = true;
   pf["columns"] = true; pf["liters"] = true;      // FORCE_RUN: which columns, TOTAL litres
-  pf.createNestedObject("doseMl");                 // FORCE_RUN: {"A":mL,"B":mL,"C":mL}
+  // `true`, NOT createNestedObject(): in an ArduinoJson filter an object means "keep only the
+  // members listed inside me", so an EMPTY object keeps nothing. doseMl parsed as {} and every
+  // dose read back 0.0 -- which made `fert` false, so a requested fertigation silently ran as
+  // plain irrigation. `true` allows the whole subtree. (Filter.hpp: allow() on a null member.)
+  pf["doseMl"] = true;                             // FORCE_RUN: {"A":mL,"B":mL,"C":mL}
 
   // 2048 as belt-and-braces on top of the limitToLast bound above. The failure is now REPORTED
   // rather than swallowed: a bare `return` here is what let a NoMemory look like "the device just

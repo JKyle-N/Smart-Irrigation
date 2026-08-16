@@ -10,6 +10,14 @@
 # Redundant binary archive (the Test Code/ folder is already tracked unzipped)
 Test Code.zip
 
+# Operator notes holding the Firebase DEVICE ACCOUNT PASSWORD. This repository is public, so this
+# file must never be committed. (Website/firebase-config.js is a different thing and IS versioned:
+# a Firebase web config is public by design and is protected by Auth + database rules, not secrecy.)
+Firebase infos.txt
+
+# Field logs: large rotating CSVs, and they are rig data rather than source.
+Logs/
+
 # OS / editor junk
 Thumbs.db
 desktop.ini
