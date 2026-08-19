@@ -176,5 +176,21 @@ A build that differs sharply from these has picked up something unintended.
 
 - `research123` (the device account password) has never been rotated.
 - The SMS Summary/Status feature was specified but never implemented.
-- The host test suite (`pio test -e native`) needs a host C++ compiler installed; see
-  `ESP1/platformio.ini`.
+
+## Host test suite
+
+Both suites pass — 24 cases for ESP1, 7 for ESP2 — and are worth running before any flash, since
+they take about a second and cover the maths the dosing depends on:
+
+```bash
+cd ESP1 && pio test -e native     # 24 cases
+cd ESP2 && pio test -e native     # 7 cases
+```
+
+MinGW-w64 (g++ 14.2.0) is installed and on the persisted PATH, so this works from **a new terminal**.
+An already-open terminal from before the install will still say "gcc is not recognized" — open a
+fresh one rather than debugging it.
+
+The suites have been mutation-checked: removing the `kSane()` guard from `flow_math.h` makes exactly
+`test_zero_k_reports_no_flow_not_infinity` and `test_corrupt_k_values_all_report_no_flow` fail, which
+confirms those cases genuinely cover the guard rather than passing vacuously.
