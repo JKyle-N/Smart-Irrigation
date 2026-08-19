@@ -132,7 +132,7 @@ function syncControlAvailability() {
   // is not idle, and without live data the page cannot tell "idle" from "device offline".
   // The pulse and the ESP2 sweep both reach the rig, so they belong with the other actuating
   // controls rather than looking alive and then failing inside queueCommand().
-  ["transferPumpBtn", "boosterPumpBtn", "mixerBtn", "pulseBtn", "sweepBtn"].forEach(id => {
+  ["transferPumpBtn", "boosterPumpBtn", "mixerBtn", "pulseBtn", "mtSweepBtn", "sweepBtn"].forEach(id => {
     const button = document.getElementById(id);
     if (!button) return;
     button.disabled = !normalAllowed;
@@ -224,6 +224,7 @@ function attachDatabaseListeners() {
     const raw = snapshot.val() || {};
     commandData = Object.entries(raw).map(([id, command]) => ({ id, ...command }));
     renderCommandHistory();
+    renderPulseResult();          // the pulse verdict rides on its command status detail
   }, error => setCommandStatus(`Command status unavailable: ${error.code || "unknown"}`, "error"));
 
   db.ref("irrigation/config/zones").once("value").then(snapshot => {
@@ -459,6 +460,7 @@ function updateDashboard() {
 
   renderDiagnostics();
   renderRawSensors();
+  renderFlowMeters();
   updateFaultBanner();
   updateForceArmed();
   syncControlAvailability();
@@ -910,15 +912,114 @@ document.getElementById("ackFaultBtn")?.addEventListener("click", () => {
   updateFaultBanner();
 });
 document.getElementById("cancelForceBtn")?.addEventListener("click", () => queueCommand("CANCEL_FORCE", {}, { emergency: true }));
-document.getElementById("pulseBtn")?.addEventListener("click", () => queueCommand("TEST_PULSE", {
-  zone: document.getElementById("pulseZone")?.value || "A",
-  seconds: Number(document.getElementById("pulseSeconds")?.value || 5)
-}));
+
+/* ---- Manual/Test tab -------------------------------------------------------------------------
+ * Everything here energises a relay immediately, so the tab opens behind a gate that re-arms every
+ * time you leave it. Emergency stop is deliberately NOT here -- it lives on Controls, because a stop
+ * must never sit behind a warning that has to be dismissed first. */
+let mtArmed = false;
+
+function setManualTestArmed(on) {
+  mtArmed = on;
+  const gate = document.getElementById("mtGate");
+  const body = document.getElementById("mtControls");
+  if (gate) gate.hidden = on;
+  if (body) body.hidden = !on;
+}
+
+// Dosing pumps run at roughly PUMP_FLOWRATE_MLPM (50 mL/min) in the firmware, so a pulse dispenses a
+// real, if small, volume. Say so before it is run -- especially for the pH pumps, which dispense
+// corrosive adjuster into the tank.
+const MT_DOSING = { nutA: 1, nutB: 1, nutC: 1, nutD: 1, phUp: 1, phDn: 1 };
+function updatePulseNote() {
+  const t = document.getElementById("pulseTarget")?.value || "";
+  const s = Number(document.getElementById("pulseSeconds")?.value || 0);
+  const note = document.getElementById("pulseVolumeNote");
+  if (!note) return;
+  if (MT_DOSING[t] && s > 0) {
+    const ml = (50 * s / 60).toFixed(1);
+    const corrosive = (t === "phUp" || t === "phDn");
+    note.textContent = `This dispenses roughly ${ml} mL of ${corrosive ? "pH adjuster (corrosive)" : "nutrient concentrate"} into the mixing tank.`;
+    note.className = corrosive ? "control-result error" : "field-note";
+  } else if (t === "mixer") {
+    note.textContent = "The mixer has no flow meter, so this reports no flow reading — only that the relay ran.";
+    note.className = "field-note";
+  } else {
+    note.textContent = "";
+    note.className = "field-note";
+  }
+}
+
+// The pulse verdict comes back as the command's own status detail, which ESP1 fills in with the
+// meter count. Read the newest TEST_PULSE out of the command feed rather than inventing a second
+// telemetry path for it.
+function renderPulseResult() {
+  const el = document.getElementById("pulseResult");
+  if (!el) return;
+  const latest = commandData
+    .filter(c => c.type === "TEST_PULSE")
+    .sort((a, b) => Number(b.requestedAt || 0) - Number(a.requestedAt || 0))[0];
+  if (!latest) return;
+  const detail = String(latest.detail || "");
+  el.textContent = `${rawText(latest.status, "pending")} — ${detail || "waiting for ESP1"}`;
+  el.className = "control-result"
+    + (/NO FLOW/i.test(detail) || latest.status === "failed" || latest.status === "rejected" ? " error" : "");
+}
+
+// Flow-meter table. Shares the sweep with the Diagnostics tab -- one DIAG_SWEEP fills both.
+const MT_FLOW_LABEL = {
+  FLOW_RESMIX: "Reservoir → mix", FLOW_MIXIRR: "Mix → column",
+  FLOW_NUTA: "Nutrient A", FLOW_NUTB: "Nutrient B", FLOW_NUTC: "Nutrient C",
+  FLOW_NUTD: "Nutrient D", FLOW_PHUP: "pH up", FLOW_PHDN: "pH down"
+};
+function renderFlowMeters() {
+  const box = document.getElementById("mtFlowGrid");
+  const r = liveData.diagnostics?.sensorsRaw?.esp2;
+  const sweeping = Boolean(r?.sweepActive);
+  const left = Number(r?.sweepSecondsLeft || 0);
+  setDeviceStatus("mtSweepState", sweeping ? (left ? `SWEEPING ${left}s` : "SWEEPING") : "ESP2 IDLE",
+                  sweeping ? "active" : "off");
+  if (!box) return;
+  box.innerHTML = "";
+  const vals = r?.values;
+  const rows = Object.keys(MT_FLOW_LABEL)
+    .filter(id => vals && vals[id])
+    .map(id => [MT_FLOW_LABEL[id], `${numberText(vals[id].raw, 0)} · ${vals[id].valid ? "ok" : "BAD"} · ${formatAge(vals[id].ageMs)}`]);
+  if (!rows.length) {
+    box.innerHTML = '<p class="muted">No flow readings yet. ESP2 is powered down between runs — run a sweep.</p>';
+    return;
+  }
+  box.appendChild(diagnosticGroup("Flow meters (raw pulse counts)", rows));
+}
+
+document.getElementById("mtProceed")?.addEventListener("click", () => setManualTestArmed(true));
+document.getElementById("mtBack")?.addEventListener("click", () => {
+  setManualTestArmed(false);
+  document.querySelector('.tab[data-view="dashboard"]')?.click();
+});
+document.getElementById("pulseTarget")?.addEventListener("change", updatePulseNote);
+document.getElementById("pulseSeconds")?.addEventListener("input", updatePulseNote);
+document.getElementById("pulseBtn")?.addEventListener("click", () => {
+  const target = document.getElementById("pulseTarget")?.value || "transfer";
+  const seconds = Number(document.getElementById("pulseSeconds")?.value || 5);
+  if (!Number.isFinite(seconds) || seconds < 1 || seconds > 15) {
+    setCommandStatus("Pulse not sent: duration must be 1-15 seconds.", "error"); return;
+  }
+  if ((target === "phUp" || target === "phDn") &&
+      !confirm(`Dispense pH adjuster for ${seconds} s? This is corrosive and goes into the mixing tank.`)) return;
+  queueCommand("TEST_PULSE", { target, seconds });
+});
+// The Diagnostics tab has its own sweep button; both queue the same DIAG_SWEEP and fill both tables.
 document.getElementById("sweepBtn")?.addEventListener("click", () => queueCommand("DIAG_SWEEP", {
   seconds: Number(document.getElementById("sweepSeconds")?.value || 60)
 }));
-
+document.getElementById("mtSweepBtn")?.addEventListener("click", () => queueCommand("DIAG_SWEEP", {
+  seconds: Number(document.getElementById("mtSweepSeconds")?.value || 60)
+}));
 document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => {
+  // Leaving Manual/Test re-arms its gate, so you can never land back on live hardware controls
+  // already unlocked from a previous visit.
+  if (tab.dataset.view !== "manualtest") setManualTestArmed(false);
   document.querySelectorAll(".tab").forEach(item => item.classList.toggle("active", item === tab));
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === tab.dataset.view));
 }));

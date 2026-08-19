@@ -385,6 +385,7 @@ void reply(const String &body);
 void attachFlow(int pin);
 void detachFlow();
 float litersSoFar(float k);
+int  flowPinForBit(int bit);   // TEST pulse: which meter watches a relay (-1 = none)
 void pollEsp1();
 void dispatch(const String &payload);
 void startWorkOrder();
@@ -797,11 +798,20 @@ void dispatch(const String &payload) {
       reply("ACK,TEST,ENTER"); return;
     }
     if (sub == "EXIT") {
-      stopAll(); testMode = false; testHeldBit = -1;       // all OFF incl. master cutoff de-energized
+      stopAll(); detachFlow(); testMode = false; testHeldBit = -1;  // all OFF incl. master cutoff de-energized
       exRunOffAt = 0; exRunBit = -1;                       // drop any pending one-shot timers
       reply("DONE,TEST"); return;
     }
     if (sub == "RELEASE") {                                // explicit button-up
+      // Report what the matching flow meter saw BEFORE tearing the selection down. This is what
+      // lets the operator confirm remotely that a pump actually moved fluid: a non-zero count means
+      // the pump, line and sensor all work; zero means one of the three does not. Only sent when
+      // the output has a meter at all -- see flowPinForBit.
+      if (testHeldBit >= 0 && flowPinForBit(testHeldBit) >= 0) {
+        noInterrupts(); unsigned long fp = flowPulses; interrupts();
+        reply("TEST,FLOW," + String(testHeldBit) + "," + String(fp));
+      }
+      detachFlow();
       testOff();                                           // single relay OR combo -> off, bank stays powered
       testHeldBit = -1; testCapped = false; return;
     }
@@ -821,6 +831,11 @@ void dispatch(const String &payload) {
           stopKeepBank();                                  // clear prev selection, keep P17 up (no glitch)
           pcfOn(bit);
         }
+        // Arm the meter that watches this output, zeroed, so the count on RELEASE covers exactly
+        // this pulse. attachFlow() resets the ISR counter; outputs without a meter detach instead,
+        // so a stale count from a previous selection can never be reported against this one.
+        int fpin = flowPinForBit(bit);
+        if (fpin >= 0) attachFlow(fpin); else detachFlow();
         testHeldBit = bit; testRelayOnMs = millis(); testCapped = false;
       }
       testLastHoldMs = millis();                           // refresh dead-man timer
@@ -1347,6 +1362,24 @@ void testSafety() {
  *  CALIBRATION MODE  (companion spec §A)  --  raw stream, SET_CAL, Prime dead-man
  * ========================================================================== */
 // Map a FLOW_* CAL/Prime id to its hardware pin (-1 if not a flow id).
+/* Which flow sensor watches a given TEST relay/combo, or -1 if that output has no meter.
+ * Used by the timed test pulse so the operator can tell, remotely, whether a pump that was told to
+ * run actually moved fluid. -1 is meaningful and distinct from a zero count: "this output has no
+ * flow sensor" must not read as "this pump moved nothing". */
+int flowPinForBit(int bit) {
+  switch (bit) {
+    case OUT_TRANSFER: case 16:                 return FLOW_RES_MIX;   // 16 = Fill combo (res valve + transfer)
+    case OUT_BOOSTER:  case 17: case 18: case 19: return FLOW_MIX_IRR; // 17..19 = Push combos (mix valve + col + booster)
+    case OUT_NUT_A:                             return FLOW_NUT_A;
+    case OUT_NUT_B:                             return FLOW_NUT_B;
+    case OUT_NUT_C:                             return FLOW_NUT_C;
+    case OUT_NUT_D:                             return FLOW_NUT_D;
+    case OUT_PH_UP:                             return FLOW_PH_UP;
+    case OUT_PH_DN:                             return FLOW_PH_DN;
+    default:                                    return -1;             // mixer, valves, inverter, cutoff
+  }
+}
+
 int flowPinForId(const String &id) {
   if (id == "FLOW_RESMIX") return FLOW_RES_MIX;
   if (id == "FLOW_MIXIRR") return FLOW_MIX_IRR;
