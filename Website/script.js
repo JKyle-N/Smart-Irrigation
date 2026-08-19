@@ -132,7 +132,7 @@ function syncControlAvailability() {
   // is not idle, and without live data the page cannot tell "idle" from "device offline".
   // The pulse and the ESP2 sweep both reach the rig, so they belong with the other actuating
   // controls rather than looking alive and then failing inside queueCommand().
-  ["transferPumpBtn", "boosterPumpBtn", "mixerBtn", "pulseBtn", "mtSweepBtn", "sweepBtn"].forEach(id => {
+  ["transferPumpBtn", "boosterPumpBtn", "mixerBtn", "pulseBtn", "mtSweepBtn", "sweepBtn", "exSaveBtn"].forEach(id => {
     const button = document.getElementById(id);
     if (!button) return;
     button.disabled = !normalAllowed;
@@ -461,6 +461,7 @@ function updateDashboard() {
   renderDiagnostics();
   renderRawSensors();
   renderFlowMeters();
+  renderExercise();
   updateFaultBanner();
   updateForceArmed();
   syncControlAvailability();
@@ -991,6 +992,36 @@ function renderFlowMeters() {
   }
   box.appendChild(diagnosticGroup("Flow meters (raw pulse counts)", rows));
 }
+
+/* Preventive pump exercise. The controls mirror ESP1's current setting rather than assuming a
+ * default, so opening the tab shows what the rig is actually doing. Only re-seeded when the operator
+ * is NOT mid-edit, otherwise a snapshot landing mid-keystroke would fight them for the field. */
+let exTouched = false;
+function renderExercise() {
+  const ex = liveData.diagnostics?.pumpExercise;
+  if (!ex) { setDeviceStatus("exState", "UNKNOWN", "off"); return; }
+  const on = Boolean(ex.enabled);
+  const hrs = Number(ex.intervalHours || 0);
+  setDeviceStatus("exState",
+    on ? `ON ${Number(ex.seconds || 0)}s / ${hrs ? hrs / 24 : "?"}d` : "OFF", on ? "active" : "off");
+  if (exTouched) return;
+  const sel = document.getElementById("exEnabled");
+  const secs = document.getElementById("exSeconds");
+  if (sel)  sel.value  = on ? "1" : "0";
+  if (secs) secs.value = String(Number(ex.seconds || 5));
+}
+["exEnabled", "exSeconds"].forEach(id =>
+  document.getElementById(id)?.addEventListener("input", () => { exTouched = true; }));
+document.getElementById("exSaveBtn")?.addEventListener("click", () => {
+  const on = document.getElementById("exEnabled")?.value === "1";
+  const seconds = Number(document.getElementById("exSeconds")?.value || 5);
+  const out = document.getElementById("exResult");
+  const show = (t, err = true) => { if (out) { out.textContent = t; out.className = `control-result${err ? " error" : ""}`; } };
+  if (!Number.isFinite(seconds) || seconds < 1 || seconds > 10) { show("Duration must be 1-10 seconds. Nothing was sent."); return; }
+  show(on ? `Enabling the exercise at ${seconds}s per pump...` : "Turning the preventive exercise off...", false);
+  exTouched = false;                       // let the next snapshot confirm what ESP1 actually stored
+  queueCommand("SET_EXERCISE", { exerciseEnabled: on, exerciseSeconds: seconds });
+});
 
 document.getElementById("mtProceed")?.addEventListener("click", () => setManualTestArmed(true));
 document.getElementById("mtBack")?.addEventListener("click", () => {

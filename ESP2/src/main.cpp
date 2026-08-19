@@ -203,7 +203,8 @@ float EC_CAL_M = 0.0009766f, EC_CAL_B = 0.0f;   // [MEASURE]
 /* ---- Preventive pump exercise (spec sec.19.4.2) -------------------------- *
  * The 2-day SCHEDULE lives on ESP1 (always-on/RTC); ESP1 sends EXERCISE,<pump>.
  * ESP2 only owns the run DURATION below.                                       */
-const unsigned long PUMP_EXERCISE_RUN_MS = 5000;             // 5 s
+const unsigned long PUMP_EXERCISE_RUN_MS = 5000;             // default when ESP1 sends no length
+const unsigned long PUMP_EX_RUN_MIN_MS = 1000, PUMP_EX_RUN_MAX_MS = 10000;  // clamp for an operator-set length
 
 /* ---- Misc ---------------------------------------------------------------- */
 const unsigned long HEARTBEAT_MS    = 5000;
@@ -498,7 +499,9 @@ void loop() {
   idleResetTick();             // self-heal: reboot after prolonged idle (30 min)
 
   // non-blocking preventive-exercise completion (5 s pump run commanded by ESP1)
-  if (exRunOffAt && millis() >= exRunOffAt) {
+  // Signed difference, not a plain >=: exRunOffAt is a millis() sum, so near the 49.7-day wrap the
+  // plain comparison fires immediately and cuts the exercise short (or never fires).
+  if (exRunOffAt && (long)(millis() - exRunOffAt) >= 0) {
     pcfOff(exRunBit);
     pcfOff(OUT_INVERTER);
     cutoffDeenergize();                  // drop the master cutoff again (back to safe idle)
@@ -856,7 +859,13 @@ void dispatch(const String &payload) {
     cutoffEnergize();                                  // power the bank (sec.19.4.8)
     pcfOn(OUT_INVERTER); pcfOn(bit);                   // AC source on, then the pump
     exRunBit = bit; exRunName = tok[1];
-    exRunOffAt = millis() + PUMP_EXERCISE_RUN_MS;       // loop() turns it off + reports DONE
+    // ESP1 may carry the operator-set run length as a third token. Clamped HERE too: ESP1 already
+    // bounds it, but this is the side that actually energises the relay, so it does not take a
+    // duration on trust from the wire.
+    unsigned long runMs = (n >= 3) ? (unsigned long)tok[2].toInt() : PUMP_EXERCISE_RUN_MS;
+    if (runMs < PUMP_EX_RUN_MIN_MS) runMs = PUMP_EX_RUN_MIN_MS;
+    if (runMs > PUMP_EX_RUN_MAX_MS) runMs = PUMP_EX_RUN_MAX_MS;
+    exRunOffAt = millis() + runMs;                     // loop() turns it off + reports DONE
     return;
   }
 
