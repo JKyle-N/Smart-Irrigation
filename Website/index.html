@@ -225,9 +225,11 @@
           nothing here asks a second time.
         </p>
         <p class="field-note">
-          ESP1 still refuses anything that arrives while the system is not idle, and ESP2 stops any pulse
-          on its own if this page or ESP1 goes quiet. Those are backstops, not permission.
+          Opening this tab also takes the rig OUT OF AUTOMATIC: while you are here no scheduled run,
+          pump exercise or forced run may start, from here or from the LCD. Leaving the tab hands it
+          straight back. Whoever is at the rig can take control away from you at any time.
         </p>
+        <p id="mtHoldNote" class="control-result" aria-live="polite"></p>
         <div class="fault-actions">
           <button id="mtBack" class="gate-back" type="button">Back to Dashboard</button>
           <button id="mtProceed" class="gate-proceed" type="button">Proceed</button>
