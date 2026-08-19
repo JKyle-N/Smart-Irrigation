@@ -156,6 +156,10 @@ button.danger { min-width: 200px; border-color: var(--danger); background: var(-
 .fault-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
 .fault-actions button { flex: 0 1 auto; }
 button.warn { border-color: var(--warning); color: var(--warning); }
+/* Subordinate action sitting beside a primary one. Transparent rather than surface-muted, because
+   the card it sits on is already surface-muted and a filled button would disappear into it. */
+button.secondary { background: transparent; color: var(--muted); font-weight: 600; }
+.config-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 
 .armed-panel { border-left: 5px solid var(--warning); }
 .zone-config { display: grid; gap: 14px; margin: 18px 0; padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }

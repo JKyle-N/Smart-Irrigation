@@ -2,7 +2,12 @@
  * Dashboard contract
  * ------------------
  * irrigation/live     ESP1 -> dashboard (latest verified snapshot)
- * irrigation/config   dashboard-only zone profile notes (ESP1 does not read these)
+ * irrigation/config   which crop/stage each zone grows. ESP1 does not read this node -- the crop's
+ *                     N/P/K/pH reach the rig only when the operator fills them into the column
+ *                     settings ("Fill targets from crop profile") and sends them via SET_COLUMN.
+ * irrigation/manual   dashboard -> ESP1 { seq, want }: the Manual/Test hold. ESP1 answers in
+ *                     irrigation/live under diagnostics.webManual. Needs its own RTDB rule --
+ *                     see Website/firebase-rules.json.
  * irrigation/commands dashboard -> ESP1 (ESP1 validates every supported command)
  *
  * Commands ESP1 actually implements, and the exact payload each one expects:
@@ -326,7 +331,7 @@ function renderZonesUI() {
       </div>
       <div class="zone-config">
         <h4>Firmware settings for column ${zone.id}</h4>
-        <p class="field-note">Unlike the crop profile above, these are sent to ESP1 and change how it runs. Blank fields are left unchanged.</p>
+        <p class="field-note">Unlike the crop profile above, these are sent to ESP1 and change how it runs. Blank fields are left unchanged. Use "Fill targets from crop profile" to copy the selected crop and stage into the N/P/K/pH boxes, then review and send.</p>
         <div class="force-row">
           <label>Operation<select id="cfgMode${zone.id}">
             <option value="">(unchanged)</option>
@@ -350,12 +355,16 @@ function renderZonesUI() {
           <label>Target K (ppm)<input id="cfgK${zone.id}" type="number" min="0" max="2000" step="1"></label>
           <label>Target pH<input id="cfgPH${zone.id}" type="number" min="3" max="9" step="0.1"></label>
         </div>
-        <button type="button" id="cfgSave${zone.id}">Send to ESP1</button>
+        <div class="config-actions">
+          <button type="button" id="cfgFromCrop${zone.id}" class="secondary">Fill targets from crop profile</button>
+          <button type="button" id="cfgSave${zone.id}">Send to ESP1</button>
+        </div>
         <p id="cfgResult${zone.id}" class="control-result" aria-live="polite"></p>
       </div>
       <p class="zone-note">Actuator/solenoid feedback: not reported by the current ESP1 Firebase snapshot.</p>`;
     container.appendChild(block);
     block.querySelector(`#cfgSave${zone.id}`)?.addEventListener("click", () => submitColumnConfig(zone.id));
+    block.querySelector(`#cfgFromCrop${zone.id}`)?.addEventListener("click", () => fillTargetsFromCrop(zone));
 
     const cropSelect = block.querySelector(`#cropSelect${zone.id}`);
     const stageSelect = block.querySelector(`#growthStage${zone.id}`);
@@ -396,6 +405,31 @@ function updateZoneTargets(zone) {
   setText(`targetPH${zone.id}`, `Target: ${target.ph}`);
   setText(`targetEC${zone.id}`, `Target: ${target.ec} mS/cm`);
   setText(`targetMoisture${zone.id}`, `Target: ${target.moisture}%`);
+}
+
+// The crop profile above is dashboard-side bookkeeping; the rig only ever learns a target through
+// SET_COLUMN. This bridges the two by filling the firmware-settings inputs from the selected crop
+// and stage -- it deliberately does NOT send. The operator sees the numbers, can adjust them, and
+// presses "Send to ESP1", so the same validated path and the same confirmation apply as for any
+// other column edit. EC and moisture have no SET_COLUMN field and stay display-only.
+function fillTargetsFromCrop(zone) {
+  const id = zone.id;
+  const result = document.getElementById(`cfgResult${id}`);
+  const show = (text, error = true) => {
+    if (!result) return;
+    result.textContent = text;
+    result.className = `control-result${error ? " error" : ""}`;
+  };
+  const target = cropDatabase[zone.defaultCrop]?.[zone.defaultStage];
+  if (!target) { show("That crop and stage has no stored profile. Nothing was filled in."); return; }
+  const set = (elId, value) => { const el = document.getElementById(elId); if (el) el.value = String(value); };
+  set(`cfgN${id}`, target.n);
+  set(`cfgP${id}`, target.p);
+  set(`cfgK${id}`, target.k);
+  set(`cfgPH${id}`, target.ph);
+  const crop = readableCropNames[zone.defaultCrop] || zone.defaultCrop;
+  show(`Filled from ${crop} / ${zone.defaultStage}: N ${target.n}, P ${target.p}, K ${target.k} ppm, pH ${target.ph}. ` +
+       `Press "Send to ESP1" to apply them to column ${id}.`, false);
 }
 
 function zoneMetric(zone, metric, id, digits, unit, targetKey) {

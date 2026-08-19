@@ -43,7 +43,7 @@
 #include <ArduinoJson.h>         // Firebase live-snapshot JSON payload
 #include <WebServer.h>           // SoftAP provisioning portal (WiFi setup form)
 #include <DNSServer.h>           // captive-portal DNS for the provisioning AP
-
+#include "pure_math.h"           // soil/level/pulse maths -- host-testable, see ESP1/test/
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
 #endif
@@ -118,8 +118,8 @@ int soilStopPct  = 45;   // stop irrigation above this %    [TBD]
  *         irrigation-only until the soil is wet enough to read.
  * MIN must stay BELOW soilStartPct: irrigation only starts below 35 %, so fertigation is always
  * decided on dry-ish soil, and a floor at or above that would disable fertigation permanently.  */
-const int NPK_MOIST_AGREE_PCT = 15;   // [TBD]
-const int NPK_MIN_MOIST_PCT   = 15;   // [TBD] must be < soilStartPct
+// NPK_MOIST_AGREE_PCT and NPK_MIN_MOIST_PCT now live in include/pure_math.h, beside the soil
+// blending that enforces them, so the host tests exercise the same numbers the firmware runs.
 // DEFAULT (AUTO) per-column service window, minutes since midnight {start, end}  [TBD]
 const uint16_t DEF_WIN_START[NUM_COLUMNS] = { 6*60, 8*60, 6*60 };   // 06:00 / 08:00 / 06:00
 const uint16_t DEF_WIN_END[NUM_COLUMNS]   = { 8*60, 10*60, 8*60 };  // 08:00 / 10:00 / 08:00
@@ -156,8 +156,7 @@ const float PH_MIN = 5.0f,  PH_MAX = 7.0f;    // [TBD]
 //   C: disabled -> defaults          [MEASURE per rig]
 int   calSoilAir[NUM_COLUMNS]   = { 656, 707, 800 };   // raw ADC when DRY  (maps to 0%)
 int   calSoilWater[NUM_COLUMNS] = { 524, 391, 300 };   // raw ADC when WET  (maps to 100%)
-// A capacitive probe reading <=LO or >=HI is treated as disconnected/shorted and dropped from the combine.
-const int SOIL_ADC_RAIL_LO = 8, SOIL_ADC_RAIL_HI = 1015;
+// SOIL_ADC_RAIL_LO/HI live in include/pure_math.h beside soilCombineCal(), which applies them.
 // Measured on the rig: sensor-to-water 38 cm = empty (0 %), 11 cm = full (100 %).
 // NOTE: loadCal() overrides these from the `calib` NVS namespace, so a value captured earlier by
 // the Calibration menu WINS over these defaults. If the tank still reads wrong after flashing,
@@ -178,66 +177,16 @@ String lastSetCalAck = "";              // arg of the last ACK,SET_CAL,<id>
 String calRxId = "";                    // sensor id of the last CAL sample received
 float  calRxRaw = 0; bool calRxValid = false; unsigned long calRxMs = 0;
 
-// Map a raw soil ADC to 0..100 % using the per-column endpoints (dry=high ADC, wet=low ADC).
-// Column moisture blends THREE sensors: the two capacitive probes and the NPK 7-in-1 moisture field.
-// The NPK reads unreliably in unsaturated soil, so it is admitted only when it agrees with the
-// capacitive pair -- see soilCombine(), which is the single owner of that policy.
+/* The soil maths itself lives in include/pure_math.h so it can be compiled and tested on a host PC
+ * without an ESP32 -- see ESP1/test/test_pure_math.cpp. These two wrappers are the only difference
+ * between the firmware and the tested code: they look up this column's calibration endpoints and
+ * hand them over as plain arguments. levelPct() and pulseRowForTarget() were already pure and moved
+ * across unchanged. Behaviour is identical; imap() reproduces Arduino map()'s integer truncation. */
 static int soilPct(int col, int raw) {
-  long p = map(raw, calSoilAir[col], calSoilWater[col], 0, 100);
-  if (p < 0) p = 0; if (p > 100) p = 100;
-  return (int)p;
+  return soilPctCal(raw, calSoilAir[col], calSoilWater[col]);
 }
-/* Combine a column's three moisture sensors into one 0..100 %, or -1 if none is usable.
- *
- * Capacitive first: drop a probe reading a rail (disconnected/shorted) so one dead probe cannot peg
- * the column, and average the rest in RAW ADC space before mapping (the two share endpoints, so the
- * average is meaningful there; the NPK does not, and is blended in PERCENT space below).
- *
- * The NPK moisture then gets ONE vote against the capacitive pair's two -- final = (2*cap + npk)/3 --
- * and only when it agrees with them to within NPK_MOIST_AGREE_PCT. Weighting it this way means a bad
- * NPK reading can move the column by at most a third of its own error, and a wildly wrong one is
- * excluded outright rather than averaged in. This is the whole reason the probe was previously
- * barred from the average: it is useful when the soil is wet enough for it, and misleading when not,
- * so the test is "does it agree", not "do we trust it in general".
- *
- * npkPct < 0 means no usable NPK reading (invalid, stale, or absent) -- caller decides that.
- * Caller-visible outcomes are reported through `why` so the SOIL packet handler can log them
- * without this function needing to know about logging. */
-enum SoilBlend { SB_CAP_ONLY, SB_BLENDED, SB_NPK_DIVERGED, SB_NPK_FALLBACK, SB_NONE };
 static int soilCombine(int col, int v1, int v2, int npkPct, SoilBlend *why) {
-  bool ok1 = (v1 > SOIL_ADC_RAIL_LO && v1 < SOIL_ADC_RAIL_HI);
-  bool ok2 = (v2 > SOIL_ADC_RAIL_LO && v2 < SOIL_ADC_RAIL_HI);
-  int raw;
-  if      (ok1 && ok2) raw = (v1 + v2) / 2;   // both good -> average
-  else if (ok1)        raw = v1;              // one railed -> use the good probe
-  else if (ok2)        raw = v2;
-  else {
-    // BOTH capacitive probes look disconnected. Rather than declaring the column blind (which stops
-    // it irrigating entirely), fall back to the NPK moisture if there is one. The caller still
-    // raises SOIL_MISSING, so the dead probes get fixed -- this only keeps the plants watered in
-    // the meantime, on the one sensor still reporting.
-    if (npkPct >= 0) { if (why) *why = SB_NPK_FALLBACK; return npkPct; }
-    if (why) *why = SB_NONE;
-    return -1;
-  }
-  int capPct = soilPct(col, raw);
-  if (npkPct < 0) { if (why) *why = SB_CAP_ONLY; return capPct; }
-  if (abs(npkPct - capPct) > NPK_MOIST_AGREE_PCT) { if (why) *why = SB_NPK_DIVERGED; return capPct; }
-  if (why) *why = SB_BLENDED;
-  return (2 * capPct + npkPct) / 3;
-}
-
-// Map a raw ultrasonic distance (cm) to a WHOLE percent, 0..100, using empty/full geometry.
-// Rounded to an integer on purpose: an ultrasonic ranger's real resolution is coarser than 1 % of
-// a 27 cm span, so the decimals were noise being displayed and logged as if they meant something.
-// The clamp is hard at both ends -- a reading past "full" reports exactly 100, never 101.
-static float levelPct(float distCm, float emptyCm, float fullCm) {
-  if (emptyCm == fullCm) return 0;                    // degenerate geometry -> refuse to divide by 0
-  float pct = (emptyCm - distCm) * 100.0f / (emptyCm - fullCm);
-  pct = roundf(pct);
-  if (pct < 0)   pct = 0;
-  if (pct > 100) pct = 100;
-  return pct;
+  return soilCombineCal(v1, v2, npkPct, calSoilAir[col], calSoilWater[col], why);
 }
 
 /* ---- Tank levels (%) (spec sec.14.4) ------------------------------------- */
@@ -580,24 +529,7 @@ const uint8_t       TEST_ARM_MAX_TRIES  = 20;  // stop re-sending after this (li
 
 /* ---- Remote push-to-column pulse (dashboard counterpart to LCD Testing) ---- *
  * State only; the machine itself lives next to testHoldTick(), whose arming pattern it mirrors.   */
-/* Map a dashboard TEST_PULSE target name to the ESP2 TEST row it drives. -1 = unknown.
- * Transfer maps to the FILL COMBO (16), not the bare transfer relay: running that pump against a
- * shut reservoir valve dead-heads it. The push targets are the combos that open the mixing valve,
- * the column valve and the booster together -- the same rows the LCD Testing screen offers. */
-static int pulseRowForTarget(const char *t) {
-  if (!strcmp(t, "colA"))     return 17;
-  if (!strcmp(t, "colB"))     return 18;
-  if (!strcmp(t, "colC"))     return 19;
-  if (!strcmp(t, "transfer")) return 16;   // Fill combo: inverter + reservoir valve + transfer pump
-  if (!strcmp(t, "mixer"))    return 8;
-  if (!strcmp(t, "nutA"))     return 9;
-  if (!strcmp(t, "nutB"))     return 10;
-  if (!strcmp(t, "nutC"))     return 11;
-  if (!strcmp(t, "nutD"))     return 12;
-  if (!strcmp(t, "phUp"))     return 13;
-  if (!strcmp(t, "phDn"))     return 14;
-  return -1;
-}
+// pulseRowForTarget() moved to include/pure_math.h -- pure, and tested on host.
 // Litres-per-pulse divisor for the meter watching a TEST row, or 0 when that row has no meter.
 // Mirrors ESP2's flowPinForBit(); kept here so the pulse result can be reported as a volume.
 static float pulseKForRow(int row) {
@@ -1478,7 +1410,6 @@ void saveColumn(int c);
 void saveSchedule(int c);
 void saveColEnable(int c);
 void saveThresholds();
-static int clampi(int v, int lo, int hi);   // used by the THRESH SMS handler (defined near the LCD editor)
 void testHoldTick();
 
 void pollNano();
@@ -7980,7 +7911,6 @@ static void seedSchedule() {
   editTmp[3] = COL_WIN_END[editCol]   / 60; editTmp[4] = COL_WIN_END[editCol]   % 60;
 }
 
-static int clampi(int v, int lo, int hi);   // defined below; used by commitEditor's THRESH clamp
 
 // Apply the working copy (editTmp) for the current editItem to live config + NVS. Called by the
 // editor's final ENTER and by the three-way confirm dialog's SAVE (companion spec §B).
@@ -8084,8 +8014,7 @@ void enterEditor(int item) {
   uiMode = UI_EDIT;
 }
 
-// Clamp helper for UI_EDIT field deltas.
-static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+// clampi() -- the UI_EDIT / THRESH clamp helper -- moved to include/pure_math.h.
 
 void settingsButton(int i) {
   // i: 0=UP 1=DOWN 2=ENTER 3=BACK  (MODE handled in handleButtons)
