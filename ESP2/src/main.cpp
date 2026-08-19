@@ -79,6 +79,7 @@
 #include <esp_task_wdt.h>
 #include <esp_system.h>        // esp_reset_reason() -- clean-reboot-once on cold power-on
 #include <Preferences.h>       // NVS: persist mixing-tank volume across reboot/power-down
+#include "flow_math.h"         // K guard + pulses->litres -- host-testable, see ESP2/test/
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -153,12 +154,8 @@ float K_NUT[3]   = { 450.0f, 450.0f, 450.0f };   // small dosing sensors differ 
  *                    instantly, the run reports DONE, and no water ever moved.
  *   k far too big -> litres barely climb, so the pump runs to the 180 s hard cap. On SEQ_FILL that
  *                    is the mixing tank overflowing.
- * The ESP1 link has framing but no checksum, so a bit-flip inside a KMAIN/KNUT number survives as a
- * plausible float (toFloat() on a mangled token yields 0). Both intake paths are therefore range
- * checked, following the same "out of range -> ignore, keep the known-good value" convention the
- * WATER token already uses. 450 is the bench value; this band is wide enough for any real sensor. */
-const float K_FLOW_MIN = 1.0f, K_FLOW_MAX = 100000.0f;
-static bool kSane(float k) { return isfinite(k) && k >= K_FLOW_MIN && k <= K_FLOW_MAX; }
+ * K_FLOW_MIN/MAX, kSane() and the pulses->litres division itself live in include/flow_math.h, so
+ * `pio test -e native` can exercise the guard without an ESP32 -- see ESP2/test/. */
 
 /* ---- Per-column water budget (liters per service) [TBD] ------------------ */
 const float WATER_BUDGET_L[3] = { 5.0f, 5.0f, 5.0f };
@@ -681,13 +678,7 @@ void detachFlow() {
 }
 float litersSoFar(float k) {
   noInterrupts(); unsigned long p = flowPulses; interrupts();
-  // Both intake paths range check K now, but this is the line that would actually produce the
-  // damage, so it refuses independently. Returning 0 makes an unusable K look like NO FLOW, which
-  // the stage already handles safely (FLOW_TIMEOUT_MS -> FLOW_FAIL -> hold for the operator).
-  // Dividing by a zero K instead yields inf, which reads as "target reached" and completes the
-  // stage instantly with nothing delivered -- a silent failure, and the worst possible answer.
-  if (!kSane(k)) return 0.0f;
-  return (float)p / k;
+  return pulsesToLiters(p, k);   // the K guard lives with the division, in include/flow_math.h
 }
 
 /* =============================================================================
