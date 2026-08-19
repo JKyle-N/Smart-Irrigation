@@ -1,0 +1,24 @@
+{
+  "rules": {
+    "irrigation": {
+      "live": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2'"
+      },
+      "config": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      },
+      "manual": {
+        ".read": "auth != null",
+        ".write": "auth != null && newData.hasChildren(['seq', 'want']) && newData.child('seq').isNumber() && newData.child('want').isBoolean()"
+      },
+      "commands": {
+        ".read": "auth != null",
+        "$commandId": {
+          ".write": "(auth != null && !data.exists() && newData.child('source').val() === 'dashboard' && newData.child('status').val() === 'queued') || (auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')"
+        }
+      }
+    }
+  }
+}
