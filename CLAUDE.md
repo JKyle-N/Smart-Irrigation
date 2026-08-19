@@ -2,6 +2,9 @@
 
 This file defines the locked architecture and conventions for this project. These decisions were made deliberately and must NOT be changed without explicit instruction. The full specification lives in `docs/reference.md` (the single source of truth).
 
+## Read this at the start of every session
+**`SESSION_HANDOFF.md`** — current repo state, the one blocking user action, environment gotchas (PlatformIO is not on PATH; both `platformio.ini` files carry the skip-worktree bit, so git silently ignores edits to them), what is still outstanding, and the file-editing hazards that have corrupted `main.cpp` and `script.js` before. Short, and kept current. Read it before planning anything.
+
 ## Plan before editing
 For any non-trivial change, explain the plan and wait for approval before editing. This project's architecture was carefully reasoned; do not silently make architectural choices.
 
