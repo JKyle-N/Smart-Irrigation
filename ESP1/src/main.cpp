@@ -1058,7 +1058,13 @@ volatile bool fbPushNow = false;
  * would not. 60 s outlives a network hiccup without stranding the rig out of automatic.            */
 unsigned long webManualUntilMs = 0;          // 0 = not held; else the millis() deadline
 const unsigned long WEB_MANUAL_LEASE_MS = 60000;
-long          webManualSeq   = -1;           // last seq seen from the page (-1 = none yet)
+long          webManualSeq   = -1;           // last seq seen from the page. Written ONLY by core 0
+                                             // (firebasePollManual); core 1 must never reset it, or a
+                                             // revoke would look like a fresh request on the next poll.
+// Latched by a revoke: the page keeps pinging until it notices, and without this the very next poll
+// would re-grant the hold within ~3 s -- silently undoing the operator override this feature exists
+// for. Cleared only when the page actually stops asking.
+bool          webManualBlocked = false;
 char          webManualState[10] = "idle";   // idle | held | refused | revoked  (published)
 char          webManualWhy[40]   = "";       // why it was refused / revoked
 // core0 poll -> core1: what the page is asking for, and whether its keep-alive advanced this poll.
@@ -3196,8 +3202,9 @@ void webManualTick() {
   bool ping = webManualPing; webManualPing = false;
 
   if (!webManualReq) {                                   // page released it (or never asked)
+    webManualBlocked = false;                            // page stopped asking -> a fresh request may grant
     if (webManualUntilMs) {
-      webManualUntilMs = 0; webManualSeq = -1;
+      webManualUntilMs = 0;
       wmPeek = false; wmChooser = false;          // never resume a later hold mid-peek
       strlcpy(webManualState, "idle", sizeof(webManualState)); webManualWhy[0] = '\0';
       logEvent("ESP1", "ACT", "MANUAL|RELEASED|WEB");
@@ -3205,6 +3212,9 @@ void webManualTick() {
     }
     return;
   }
+
+  // Revoked at the LCD and the page has not caught up yet: refuse every ping until it releases.
+  if (webManualBlocked) return;
 
   if (webManualHeld()) {                                 // already held: a fresh keep-alive extends it
     if (ping) webManualUntilMs = millis() + WEB_MANUAL_LEASE_MS;
@@ -3230,6 +3240,11 @@ void webManualTick() {
   else if (esp2Held)            why = "a fault is held";
   else if (fcPhase != FP_NONE)  why = "a forced run is armed";
   else if (pendingExercise.active || puPhase != PU_NONE) why = "a test is already running";
+  // Someone is USING the LCD. sysState alone does not catch this: Calibration and Sensor Diag both
+  // leave sysState == IDLE_STATE, so without this the web could seize control mid-calibration --
+  // freezing the operator's screen and swallowing their buttons while a prime pump ran under the
+  // dead-man. Exclusion has to work in both directions to be worth anything.
+  else if (uiMode != UI_DATA)   why = "someone is using the LCD";
   if (why) {
     strlcpy(webManualState, "refused", sizeof(webManualState));
     strlcpy(webManualWhy, why, sizeof(webManualWhy));
@@ -3249,8 +3264,9 @@ void webManualTick() {
 void webManualRevoke() {
   if (!webManualHeld()) return;
   if (puPhase != PU_NONE) pulseFinish(false, "web manual mode revoked at the LCD");
-  webManualUntilMs = 0; webManualSeq = -1;
+  webManualUntilMs = 0;
   wmPeek = false; wmChooser = false;
+  webManualBlocked = true;                     // do not re-grant until the page stops asking
   strlcpy(webManualState, "revoked", sizeof(webManualState));
   strlcpy(webManualWhy, "the rig operator took control", sizeof(webManualWhy));
   logEvent("ESP1", "ACT", "MANUAL|REVOKED|LCD");
@@ -5391,6 +5407,13 @@ static bool firebaseUploadLive() {
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
   meta["deviceOnline"] = true;
+  // Previous tick's pool usage against capacity. The payload has grown steadily and an overflow
+  // aborts the ENTIRE PUT (reported as http=-100, which reads like a network fault), so make the
+  // headroom a number you can watch rather than a cliff you discover. Previous tick, because
+  // measuring the current one would change what it measures.
+  static size_t lastDocUsed = 0;
+  meta["docUsed"] = (uint32_t)lastDocUsed;
+  meta["docCapacity"] = (uint32_t)doc.capacity();
   // Publish the cadence so the dashboard can compute its own staleness threshold and grey out the
   // control buttons when this snapshot goes cold. With remote e-stop in scope, a page that cannot
   // tell "idle" from "device offline" is the dangerous failure mode.
@@ -5666,6 +5689,7 @@ static bool firebaseUploadLive() {
 
   // Past every skip condition -- this tick is a real attempt, so count it before anything that can fail.
   fbAttempts++;
+  lastDocUsed = doc.memoryUsage();
   if (doc.overflowed()) { fbLastOk = false; fbLastHttp = -100; fbFailures++; return false; }  // never PUT truncated JSON
   String payload;
   serializeJson(doc, payload);
@@ -5713,6 +5737,13 @@ void firebaseRemoteExerciseDone(const char *status, const char *detail) {
  * browser stops refreshing and expires on its own. ESP1 keeps the deadline in millis(), so no clock
  * agreement with the browser is needed. */
 static void firebasePollManual() {
+  // Throttled to the same cadence as the command poll. netTask loops every 500 ms, so without this
+  // the hold node was fetched twice a SECOND -- roughly 173k requests a day, competing with the
+  // uploads on the same socket and keeping the radio awake on a battery rig. A 60 s lease pinged
+  // every 20 s needs nothing faster than this.
+  static unsigned long lastManualPollMs = 0;
+  if (millis() - lastManualPollMs < FIREBASE_COMMAND_POLL_MS) return;
+  lastManualPollMs = millis();
   String base; bool enabled;
   xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
   if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
