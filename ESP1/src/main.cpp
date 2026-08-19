@@ -333,6 +333,16 @@ const unsigned long ESP2_SLOW_RETRY_MS   = 1200000;  // then one gentle cycle ev
  * it powers ESP2 up on demand, sends EXERCISE,<pump>, and powers it back off.
  * A real irrigation/fertigation run also counts as exercise (resets the timer).  */
 const unsigned long PUMP_EXERCISE_INTERVAL_MS = 172800000UL;  // 2 days
+/* ---- Preventive pump exercise: operator switch + run length --------------- *
+ * The exercise exists to stop a pump seizing between runs, but it is not always wanted -- it spins
+ * the mixer in an empty tank, and on a battery rig every unnecessary AC start costs charge. Both
+ * settings are NVS-backed and reachable from the LCD (Settings > Pump Exercise) and the dashboard.
+ * The run length lives here rather than on ESP2 so one operator change covers every pump; it is sent
+ * with each EXERCISE command, and ESP2 clamps it again on arrival.                                 */
+bool exerciseEnabled = true;    // master on/off                                          [TBD]
+int  exerciseRunS    = 5;       // seconds per exercise, EX_RUN_MIN..EX_RUN_MAX           [TBD]
+const int EX_RUN_MIN = 1, EX_RUN_MAX = 10;
+void saveExercise();
 const unsigned long PUMP_EXERCISE_TIMEOUT_MS  = 20000;        // ESP2 boot + 5 s run + margin
 
 /* ---- GSM live-health poll (LCD PAGE_GSM, modeled on GSM-WITH-LCD bench) ---- */
@@ -777,6 +787,8 @@ struct FirebaseCommand       { char id[48]; char type[32]; char pump[16];
                                uint16_t delayS;      // FORCE_RUN start delay (s), 0..FORCE_MAX_DELAY_S
                                char arg[16];         // RECOVER action / REBOOT target / SET_COLUMN col / TEST_PULSE zone
                                int   seconds;        // TEST_PULSE duration
+                               int8_t exEnabled;     // SET_EXERCISE: -1 absent, 0 off, 1 on
+                               int   exSeconds;      // SET_EXERCISE: -1 absent
                                // SET_COLUMN, all optional: -1 means "field absent, leave unchanged".
                                char  colMode[14];    // "AUTO" | "IRRIGATION_ONLY" ("" = absent)
                                int8_t enabled, schedMode;
@@ -978,6 +990,8 @@ struct TelemetrySnapshot {
   uint8_t  holdRepeats;
   long     ackLeftS;              // >0 = operator asked to be re-prompted in this many seconds
   bool     actDisabled;
+  bool     exEnabled;      // preventive pump exercise on/off
+  int      exRunS;         // its run length, seconds
   // Armed forced run. secondsLeft is computed HERE: fcFireAtMs is a millis() value and means
   // nothing to a browser on a different clock.
   bool     fcArmed, fcWeb;
@@ -1136,9 +1150,9 @@ void setActuationsEnabled(bool on, const char *why);
 // Settings on a locked-out rig, "Enable Actuations" is the row already under the cursor. The LCD can
 // only RE-ENABLE, never disable: a stray button press must not be able to take the farm offline, so
 // disabling stays a deliberate web/SMS action. See setRowVisible/setRowAt.
-enum SetItem { SET_ENABLE, SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
+enum SetItem { SET_ENABLE, SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_EXERCISE, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
 // SET_WIFI and SET_SOFTAP show a live [ON]/[OFF] suffix via setRowLabel(); their base names here are placeholders.
-const char *SET_NAMES[SET_COUNT] = { "Enable Actuations", "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
+const char *SET_NAMES[SET_COUNT] = { "Enable Actuations", "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Pump Exercise", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
 // Row visibility + position<->item mapping, so the windowed 3-row render and the UP/DOWN wrap both
 // operate on what is actually on screen rather than on the raw enum.
 static bool setRowVisible(int i)  { return i != SET_ENABLE || actuationsDisabled; }
@@ -1884,6 +1898,8 @@ void loadConfig() {
   // Deliberately survives a reboot: see the actuationsDisabled comment. A power blip must not
   // re-arm the actuators behind the operator's back.
   actuationsDisabled = prefs.getBool("actdis", false);
+  exerciseEnabled    = prefs.getBool("exen", true);
+  exerciseRunS       = clampi(prefs.getInt("exrun", exerciseRunS), EX_RUN_MIN, EX_RUN_MAX);
   fbSkipCmdId = prefs.getString("rbcmd", "");     // remote-reboot bootloop guard (consumed once)
   // WiFi + ThingSpeak (Part A/B): creds + write keys persist in NVS.
   wifiEnabled = prefs.getBool("wifien", true);   // WiFi master switch (Settings > WiFi)
@@ -2080,6 +2096,11 @@ bool applyColumnTarget(int c, const String &keyIn, float v, String &err) {
   else if (key == "K") col[c].targetK = v;
   else { err = "unknown field " + key; return false; }
   return true;
+}
+void saveExercise() {
+  prefs.putBool("exen", exerciseEnabled);
+  prefs.putInt("exrun", exerciseRunS);
+  logEvent("ESP1", "CFG", String("EXERCISE|") + (exerciseEnabled ? "ON" : "OFF") + "|" + exerciseRunS + "s");
 }
 void saveThresholds() {
   prefs.putInt("sstart", soilStartPct);
@@ -3328,13 +3349,16 @@ void dispatchPendingExercise() {
   esp2WarmupMs = millis();                       // now timing the 5 s run -> DONE,EXERCISE
   // sendEsp2 logs the CMD,ESP2|EXERCISE intent line. START is logged only once ESP2 confirms receipt
   // (ACK,EXERCISE, handleEsp2Response), so the log reflects a genuine command reception, not just dispatch.
-  sendEsp2(String("EXERCISE,") + EX_NAME[pendingExercise.idx]);
+  // Carry the operator-set run length with the command so one setting covers every pump; ESP2
+  // clamps it again on arrival rather than trusting the wire.
+  sendEsp2(String("EXERCISE,") + EX_NAME[pendingExercise.idx] + "," + String(exerciseRunS * 1000));
 }
 
 // Preventive pump exercise (sec.14.9.1): when fully idle, if a pump has not run for
 // PUMP_EXERCISE_INTERVAL_MS, power ESP2 up and have it run that pump briefly. Lowest
 // priority -- controlTick runs first, so a due column always wins.
 void exerciseTick() {
+  if (!exerciseEnabled) return;           // operator switched the preventive exercise off
   if (actuationsDisabled) return;         // operator lockout: no preventive pump runs either
   if (sysState != IDLE_STATE) return;
   if (uiMode != UI_DATA) return;
@@ -4861,6 +4885,7 @@ void telemetryCollect() {
   telem.ackLeftS    = (faultAckUntilMs && (long)(faultAckUntilMs - millis()) > 0)
                     ? (long)((faultAckUntilMs - millis()) / 1000) : 0;
   telem.actDisabled = actuationsDisabled;
+  telem.exEnabled = exerciseEnabled; telem.exRunS = exerciseRunS;
   // Armed forced run: seconds resolved here, never a raw millis() deadline.
   telem.fcArmed = (fcPhase == FP_WAIT);
   telem.fcWeb   = fcFromWeb;
@@ -5376,6 +5401,10 @@ static bool firebaseUploadLive() {
     ra.add("hold"); ra.add("release"); ra.add("irrigate"); ra.add("normal");
   }
   dg["actuationsDisabled"] = t.actDisabled;
+  JsonObject dex = dg.createNestedObject("pumpExercise");
+  dex["enabled"] = t.exEnabled;
+  dex["seconds"] = t.exRunS;
+  dex["intervalHours"] = (int)(PUMP_EXERCISE_INTERVAL_MS / 3600000UL);
 
   // Armed forced run -- the operator's proof the rig received the request and is counting down.
   JsonObject dfc = dg.createNestedObject("forceArmed");
@@ -5604,6 +5633,7 @@ static void firebasePollCommands() {
   // filter is what bounds the parse buffer.
   pf["action"] = true; pf["target"] = true; pf["col"] = true; pf["zone"] = true;
   pf["seconds"] = true;
+  pf["exerciseEnabled"] = true; pf["exerciseSeconds"] = true;
   pf["mode"] = true; pf["enabled"] = true; pf["schedMode"] = true;
   pf["winStart"] = true; pf["winEnd"] = true;
   pf["targetN"] = true; pf["targetP"] = true; pf["targetK"] = true; pf["targetPH"] = true;
@@ -5682,6 +5712,8 @@ static void firebasePollCommands() {
     if (ja.isNull()) ja = req["payload"]["zone"];
     strlcpy(c.arg, ja.is<const char *>() ? ja.as<const char *>() : "", sizeof(c.arg));
     c.seconds = req["payload"]["seconds"] | 0;
+    c.exEnabled = req["payload"]["exerciseEnabled"].isNull() ? -1 : (req["payload"]["exerciseEnabled"] ? 1 : 0);
+    c.exSeconds = req["payload"]["exerciseSeconds"] | -1;
     // SET_COLUMN: -1 / "" mean "not supplied", so a partial update leaves the rest alone.
     strlcpy(c.colMode, req["payload"]["mode"] | "", sizeof(c.colMode));
     c.enabled   = req["payload"]["enabled"].isNull()   ? -1 : (req["payload"]["enabled"]   ? 1 : 0);
@@ -5903,6 +5935,26 @@ void firebaseCommandTick() {
       setState(TEST_MODE);                   // stops controlTick/exerciseTick starting a run underneath
       firebaseQueueStatus(c.id, "accepted", (String("pulse ") + c.arg + " for " + secs + "s").c_str());
       logEvent("FIREBASE", "CMD", String("PULSE|") + c.arg + "|" + secs + "s");
+      continue;
+    }
+
+    // ---- SET_EXERCISE: preventive pump exercise on/off + run length ---------------------------
+    // Config only, so it is allowed while held, stopped or locked out -- turning the exercise OFF is
+    // something you may well want to do precisely when the rig is misbehaving.
+    if (!strcmp(c.type, "SET_EXERCISE")) {
+      String changed;
+      if (c.exEnabled >= 0) { exerciseEnabled = (c.exEnabled == 1); changed += String("state=") + (exerciseEnabled ? "ON " : "OFF "); }
+      if (c.exSeconds >= 0) {
+        if (c.exSeconds < EX_RUN_MIN || c.exSeconds > EX_RUN_MAX) {
+          firebaseQueueStatus(c.id, "rejected",
+            (String("seconds must be ") + EX_RUN_MIN + "-" + EX_RUN_MAX).c_str()); continue;
+        }
+        exerciseRunS = c.exSeconds; changed += String("run=") + exerciseRunS + "s ";
+      }
+      if (!changed.length()) { firebaseQueueStatus(c.id, "rejected", "nothing to change"); continue; }
+      saveExercise();
+      changed.trim();
+      firebaseQueueStatus(c.id, "completed", (String("pump exercise: ") + changed).c_str());
       continue;
     }
 
@@ -7741,6 +7793,11 @@ void commitEditor() {
       saveColumn(editCol);
       logEvent("ESP1", "STATE", String("PRESET_SET|COL_") + COL_TAG[editCol]);
       break;
+    case SET_EXERCISE:
+      exerciseEnabled = (editTmp[0] != 0);
+      exerciseRunS    = clampi(editTmp[1], EX_RUN_MIN, EX_RUN_MAX);
+      saveExercise();
+      break;
     case SET_THRESH:
       if (editTmp[1] <= editTmp[0]) editTmp[1] = clampi(editTmp[0] + 1, 0, 100);   // stop > start
       soilStartPct = editTmp[0]; soilStopPct = editTmp[1]; fertGap = editTmp[2]; saveThresholds();
@@ -7800,6 +7857,7 @@ void enterEditor(int item) {
       editTmp[4] = (int)col[0].targetK; editTmp[5] = (int)(col[0].targetPH * 10);
       break;
     case SET_THRESH:   editTmp[0] = soilStartPct; editTmp[1] = soilStopPct; editTmp[2] = (int)fertGap; break;
+    case SET_EXERCISE: editTmp[0] = exerciseEnabled ? 1 : 0; editTmp[1] = exerciseRunS; break;
   }
   uiMode = UI_EDIT;
 }
@@ -8011,6 +8069,16 @@ void settingsButton(int i) {
         break;
       }
 
+        case SET_EXERCISE:
+          // field 0 = on/off, field 1 = seconds. The seconds field is still editable while OFF so
+          // the length can be set before switching it back on, rather than in two separate visits.
+          if (delta) {
+            if (editField == 0) editTmp[0] = !editTmp[0];
+            else                editTmp[1] = clampi(editTmp[1] + delta, EX_RUN_MIN, EX_RUN_MAX);
+          } else if (i == 2) {
+            if (++editField > 1) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
+          }
+          break;
       case SET_THRESH:
         if (delta) {
           if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, 0, 100);
@@ -8533,6 +8601,16 @@ void lcdRenderSettings() {
         lcd.print(l);
       }
       break;
+      case SET_EXERCISE:
+        lcd.setCursor(0, 0); lcd.print("Pump Exercise       ");
+        lcd.setCursor(0, 1);
+        snprintf(l, 21, "%cState    %-9s", editField==0?'>':' ', editTmp[0] ? "ON" : "OFF"); lcd.print(l);
+        lcd.setCursor(0, 2);
+        snprintf(l, 21, "%cRun each %2ds        ", editField==1?'>':' ', editTmp[1]); lcd.print(l);
+        lcd.setCursor(0, 3);
+        lcd.print(editTmp[0] ? "fires every 2 days  " : "disabled            ");
+        break;
+
     case SET_THRESH:
       lcd.setCursor(0, 0); lcd.print("Thresholds          ");
       lcd.setCursor(0, 1);

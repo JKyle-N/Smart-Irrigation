@@ -238,6 +238,19 @@
         <h2>Manual actuator tests</h2>
         <p class="hint">Each test runs for a set number of seconds and stops on its own. Where the output has a flow meter, the result reports how many pulses it saw — that is how you tell a working pump from a dead pump, a blocked line or a dead sensor, without walking to the rig.</p>
 
+        <article class="panel">
+          <div class="panel-heading">
+            <div><h3>Preventive pump exercise</h3><p>ESP1 runs each pump briefly every 2 days so it cannot seize between irrigations. Turning it off stops that entirely — useful on a battery rig, or when the mixer would otherwise spin in an empty tank.</p></div>
+            <span id="exState" class="device-status off">--</span>
+          </div>
+          <div class="control-grid">
+            <label>State<select id="exEnabled"><option value="1">On</option><option value="0">Off</option></select></label>
+            <label>Run each pump for (seconds)<input id="exSeconds" type="number" min="1" max="10" step="1" value="5"></label>
+            <button id="exSaveBtn" type="button">Save exercise setting</button>
+          </div>
+          <p id="exResult" class="control-result" aria-live="polite"></p>
+        </article>
+
         <h3>Five-second preventive exercises</h3>
         <p class="hint">The firmware’s own maintenance run: pump only, no valve, no destination.</p>
         <div class="control-grid">
