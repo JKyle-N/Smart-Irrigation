@@ -29,6 +29,7 @@
       <button class="tab active" data-view="dashboard">Live dashboard</button>
       <button class="tab" data-view="zones">Zone profiles</button>
       <button class="tab" data-view="manual">Controls</button>
+      <button class="tab" data-view="manualtest">Manual/Test</button>
       <button class="tab" data-view="diagnostics">Diagnostics</button>
     </nav>
     <div class="system-status" aria-live="polite">
@@ -141,31 +142,6 @@
     <section class="view" id="manual">
       <h2>Safe remote controls</h2>
       <p class="hint">ESP1 validates every request before it reaches ESP2, and refuses anything that arrives while the system is not safely idle. A “queued” badge is not confirmation that anything moved — wait for ESP1’s own status.</p>
-      <div class="control-grid">
-        <article class="control-card">
-          <h3>Transfer pump test</h3>
-          <p>ESP1 safe exercise: 5 seconds.</p>
-          <button id="transferPumpBtn" type="button">Start transfer test</button>
-        </article>
-        <article class="control-card">
-          <h3>Booster pump test</h3>
-          <p>ESP1 safe exercise: 5 seconds. The exercise has no destination — ESP1 runs the pump only, and does not open a distribution valve.</p>
-          <button id="boosterPumpBtn" type="button">Start booster test</button>
-        </article>
-        <article class="control-card">
-          <h3>Tank mixer test</h3>
-          <p>ESP1 safe exercise: 5 seconds. This dashboard does not change inverter settings.</p>
-          <button id="mixerBtn" type="button">Start mixer test</button>
-        </article>
-      </div>
-
-      <h3>Push to column (booster test with a destination)</h3>
-      <p class="hint">Opens the mixing valve, the column valve and the booster together for a fixed few seconds — the same combination the LCD Testing screen drives, but on a timer instead of a held button. ESP2 stops it on its own if this page or ESP1 goes silent, so a lost connection ends the pulse rather than leaving a pump running.</p>
-      <div class="control-grid">
-        <label>Destination<select id="pulseZone"><option value="A">Column A</option><option value="B">Column B</option><option value="C">Column C</option></select></label>
-        <label>Duration (seconds)<input id="pulseSeconds" type="number" min="1" max="15" step="1" value="5"></label>
-        <button id="pulseBtn" type="button">Run push pulse</button>
-      </div>
 
       <!-- Always reachable, unlike the copies in the fault banner: the banner only appears once
            something is already wrong, and disabling actuations is most useful *before* that. Both
@@ -233,6 +209,77 @@
         <h3>Distribution valves / solenoids</h3>
         <p>There are deliberately no Valve A/B/C buttons. ESP1 rejects a standalone remote solenoid request as “not a remotely safe control”, and there is no relay feedback to confirm what a valve actually did, so such a button would report success it cannot verify. Valves are opened only as part of a work order, where ESP2 sequences and closes them.</p>
       </article>
+    </section>
+
+    <!-- Manual/Test. Everything here energises a relay THE MOMENT it is pressed: no schedule, no
+         soil check, no work order. Hence the gate. Emergency stop deliberately stays on Controls --
+         a stop must never sit behind a warning that has to be dismissed first. -->
+    <section class="view" id="manualtest">
+      <div id="mtGate" class="danger-gate">
+        <p class="eyebrow">Direct hardware control</p>
+        <h2>This tab drives the hardware directly</h2>
+        <p class="fault-detail">
+          Every control here energises a relay immediately — pumps, valves and the mixer — with none of
+          the checks a scheduled run goes through. The pH pumps dispense <strong>corrosive adjuster</strong>
+          into the mixing tank, and the nutrient pumps dispense concentrate. Nothing here waits, and
+          nothing here asks a second time.
+        </p>
+        <p class="field-note">
+          ESP1 still refuses anything that arrives while the system is not idle, and ESP2 stops any pulse
+          on its own if this page or ESP1 goes quiet. Those are backstops, not permission.
+        </p>
+        <div class="fault-actions">
+          <button id="mtBack" class="gate-back" type="button">Back to Dashboard</button>
+          <button id="mtProceed" class="gate-proceed" type="button">Proceed</button>
+        </div>
+      </div>
+
+      <div id="mtControls" hidden>
+        <h2>Manual actuator tests</h2>
+        <p class="hint">Each test runs for a set number of seconds and stops on its own. Where the output has a flow meter, the result reports how many pulses it saw — that is how you tell a working pump from a dead pump, a blocked line or a dead sensor, without walking to the rig.</p>
+
+        <h3>Five-second preventive exercises</h3>
+        <p class="hint">The firmware’s own maintenance run: pump only, no valve, no destination.</p>
+        <div class="control-grid">
+          <button id="transferPumpBtn" type="button">Exercise transfer pump</button>
+          <button id="boosterPumpBtn" type="button">Exercise booster pump</button>
+          <button id="mixerBtn" type="button">Exercise tank mixer</button>
+        </div>
+
+        <h3>Timed pulses</h3>
+        <p class="hint">Drives the same relay combinations the LCD Testing screen offers, but on a timer rather than a held button. Transfer runs as the <em>fill</em> combination (reservoir valve + pump), because running that pump against a shut valve dead-heads it.</p>
+        <div class="control-grid">
+          <label>Target<select id="pulseTarget">
+            <option value="transfer">Transfer pump (fill: reservoir → mix)</option>
+            <option value="colA">Booster → Column A</option>
+            <option value="colB">Booster → Column B</option>
+            <option value="colC">Booster → Column C</option>
+            <option value="mixer">Tank mixer (no flow meter)</option>
+            <option value="nutA">Nutrient A pump</option>
+            <option value="nutB">Nutrient B pump</option>
+            <option value="nutC">Nutrient C pump</option>
+            <option value="nutD">Nutrient D pump</option>
+            <option value="phUp">pH UP pump (corrosive)</option>
+            <option value="phDn">pH DOWN pump (corrosive)</option>
+          </select></label>
+          <label>Duration (seconds)<input id="pulseSeconds" type="number" min="1" max="15" step="1" value="5"></label>
+          <button id="pulseBtn" type="button">Run pulse</button>
+        </div>
+        <p id="pulseVolumeNote" class="field-note"></p>
+        <p id="pulseResult" class="control-result" aria-live="polite">No pulse has been run in this session.</p>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div><h3>Flow meters</h3><p>All eight meters. ESP2 is powered down between runs, so these are read by a sweep rather than streamed — run one, then compare against a pulse.</p></div>
+            <span id="mtSweepState" class="device-status off">ESP2 IDLE</span>
+          </div>
+          <div class="control-grid">
+            <label>Sweep length (seconds)<input id="mtSweepSeconds" type="number" min="10" max="120" step="10" value="60"></label>
+            <button id="mtSweepBtn" type="button">Run flow sweep</button>
+          </div>
+          <div id="mtFlowGrid" class="diagnostics-grid"><p class="muted">No sweep has run in this session.</p></div>
+        </article>
+      </div>
     </section>
 
     <section class="view" id="diagnostics">

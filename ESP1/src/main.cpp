@@ -570,7 +570,41 @@ const uint8_t       TEST_ARM_MAX_TRIES  = 20;  // stop re-sending after this (li
 
 /* ---- Remote push-to-column pulse (dashboard counterpart to LCD Testing) ---- *
  * State only; the machine itself lives next to testHoldTick(), whose arming pattern it mirrors.   */
-enum PulsePhase { PU_NONE, PU_ARM, PU_RUN };
+/* Map a dashboard TEST_PULSE target name to the ESP2 TEST row it drives. -1 = unknown.
+ * Transfer maps to the FILL COMBO (16), not the bare transfer relay: running that pump against a
+ * shut reservoir valve dead-heads it. The push targets are the combos that open the mixing valve,
+ * the column valve and the booster together -- the same rows the LCD Testing screen offers. */
+static int pulseRowForTarget(const char *t) {
+  if (!strcmp(t, "colA"))     return 17;
+  if (!strcmp(t, "colB"))     return 18;
+  if (!strcmp(t, "colC"))     return 19;
+  if (!strcmp(t, "transfer")) return 16;   // Fill combo: inverter + reservoir valve + transfer pump
+  if (!strcmp(t, "mixer"))    return 8;
+  if (!strcmp(t, "nutA"))     return 9;
+  if (!strcmp(t, "nutB"))     return 10;
+  if (!strcmp(t, "nutC"))     return 11;
+  if (!strcmp(t, "nutD"))     return 12;
+  if (!strcmp(t, "phUp"))     return 13;
+  if (!strcmp(t, "phDn"))     return 14;
+  return -1;
+}
+// Litres-per-pulse divisor for the meter watching a TEST row, or 0 when that row has no meter.
+// Mirrors ESP2's flowPinForBit(); kept here so the pulse result can be reported as a volume.
+static float pulseKForRow(int row) {
+  switch (row) {
+    case 16: case 6:                     return calKResMix;
+    case 17: case 18: case 19: case 7:   return calKMixIrr;
+    case 9:  return calKNut[0];
+    case 10: return calKNut[1];
+    case 11: return calKNut[2];
+    case 12: return calKNutD;
+    case 13: return calKPhUp;
+    case 14: return calKPhDn;
+    default: return 0.0f;                // mixer, valves, inverter, cutoff -- no meter
+  }
+}
+
+enum PulsePhase { PU_NONE, PU_ARM, PU_RUN, PU_REPORT };
 PulsePhase    puPhase   = PU_NONE;
 int           puRow     = -1;              // ESP2 TEST row: 17 + column index
 int           puSeconds = 0;
@@ -578,6 +612,12 @@ unsigned long puEndMs = 0, puArmMs = 0, puLastSendMs = 0;
 char          puCmdId[48] = "";
 const int           PULSE_MAX_S          = 15;    // hard cap, well inside ESP2's own 30 s
 const unsigned long PULSE_ARM_TIMEOUT_MS = 14000; // ESP2 boot + TEST,ENTER ACK budget
+// After TEST,RELEASE, ESP2 answers TEST,FLOW,<bit>,<pulses>. Wait briefly for it so the pulse can be
+// reported as "fluid moved" or "nothing moved" -- the whole point of the test. Bounded: an ESP2 that
+// never answers must not leave the command unresolved.
+const unsigned long PULSE_REPORT_WAIT_MS = 800;
+bool          puFlowSeen = false;
+unsigned long puFlowPulses = 0, puReportMs = 0;
 void pulseTick();
 
 /* ---- Preventive pump exercise (ESP1-owned; sec.14.9.1) -------------------- *
@@ -889,7 +929,11 @@ volatile bool smsMute = false;                     // when set, sendSMS() drops 
 // operation). Declared here rather than with the rest of the diag globals because
 // TelemetrySnapshot below sizes its mirror array from DIAG_ESP2_N.
 const char *DIAG_ESP2_ID[] = { "PH", "EC", "ACS712", "PZEM_V", "PZEM_I", "PZEM_P",
-                               "FLOW_RESMIX", "FLOW_MIXIRR", "FLOW_NUTA", "FLOW_NUTB", "FLOW_NUTC" };
+                               "FLOW_RESMIX", "FLOW_MIXIRR", "FLOW_NUTA", "FLOW_NUTB", "FLOW_NUTC",
+                               // NUTD / pH up / pH down are wired but were never swept, so nothing
+                               // read them at all. Needed for the Manual/Test flow table to cover
+                               // every meter. ~3 s more per full sweep, well inside the 60 s window.
+                               "FLOW_NUTD", "FLOW_PHUP", "FLOW_PHDN" };
 const uint8_t DIAG_ESP2_N = sizeof(DIAG_ESP2_ID) / sizeof(DIAG_ESP2_ID[0]);
 
 // Inter-core telemetry snapshot: filled on core 1 (telemetryCollect, POD only -> spinlock),
@@ -2461,6 +2505,14 @@ void handleEsp2Response(const String &payload) {
     dispatchPendingWorkOrder();                                 // FORCE run parked in WO_PENDING
     if (pendingRun.active && !wo.active) dispatchPendingRun();  // scheduled-run warm-up complete
     if (pendingExercise.active && !pendingExercise.sent) dispatchPendingExercise();  // exercise warm-up done
+    return;
+  }
+  if (resp == "TEST") {                                   // TEST,FLOW,<bit>,<pulses> after a pulse release
+    if (arg.startsWith("FLOW,")) {
+      int c1 = arg.indexOf(',', 5);
+      if (c1 > 0) { puFlowPulses = (unsigned long)arg.substring(c1 + 1).toInt(); puFlowSeen = true; }
+    }
+    logEvent("ESP2", "RESP", payload);
     return;
   }
   if (resp == "STATUS") return;                                // heartbeat
@@ -5823,9 +5875,12 @@ void firebaseCommandTick() {
 
     // ---- TEST_PULSE: bounded booster-to-column push (the web answer to LCD Testing) -------------
     if (!strcmp(c.type, "TEST_PULSE")) {
-      int zi = (c.arg[0] == 'A') ? 0 : (c.arg[0] == 'B') ? 1 : (c.arg[0] == 'C') ? 2 : -1;
-      if (zi < 0 || zi >= NUM_COLUMNS) { firebaseQueueStatus(c.id, "rejected", "zone must be A, B or C"); continue; }
-      if (!COLUMN_ENABLED[zi])         { firebaseQueueStatus(c.id, "rejected", "that column is disabled"); continue; }
+      int row = pulseRowForTarget(c.arg);
+      if (row < 0) { firebaseQueueStatus(c.id, "rejected", "unknown pulse target"); continue; }
+      // A push-to-column combo on a disabled column would open a valve the rig does not service.
+      if (row >= 17 && row <= 19 && !COLUMN_ENABLED[row - 17]) {
+        firebaseQueueStatus(c.id, "rejected", "that column is disabled"); continue;
+      }
       int secs = (c.seconds > 0) ? c.seconds : 5;
       if (secs < 1 || secs > PULSE_MAX_S) {
         firebaseQueueStatus(c.id, "rejected", (String("seconds must be 1-") + PULSE_MAX_S).c_str()); continue;
@@ -5837,7 +5892,7 @@ void firebaseCommandTick() {
         firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
         logEvent("FIREBASE", "REJECT", "PULSE|NOT_IDLE"); continue;
       }
-      puRow = 17 + zi;                       // ESP2 combo rows: 17/18/19 = push to column A/B/C
+      puRow = row;
       puSeconds = secs;
       strlcpy(puCmdId, c.id, sizeof(puCmdId));
       esp2SetPower(true);                    // power ESP2 -> boot -> TEST,ENTER retries in pulseTick
@@ -5846,8 +5901,8 @@ void firebaseCommandTick() {
       puArmMs = millis();
       puPhase = PU_ARM;
       setState(TEST_MODE);                   // stops controlTick/exerciseTick starting a run underneath
-      firebaseQueueStatus(c.id, "accepted", (String("push to column ") + c.arg + " for " + secs + "s").c_str());
-      logEvent("FIREBASE", "CMD", String("PULSE|COL_") + COL_TAG[zi] + "|" + secs + "s");
+      firebaseQueueStatus(c.id, "accepted", (String("pulse ") + c.arg + " for " + secs + "s").c_str());
+      logEvent("FIREBASE", "CMD", String("PULSE|") + c.arg + "|" + secs + "s");
       continue;
     }
 
@@ -7994,12 +8049,34 @@ static void pulseFinish(bool ok, const char *why) {
   if (puPhase == PU_RUN) sendEsp2("TEST,RELEASE");     // belt: ESP2 would also time out on its own
   sendEsp2("TEST,EXIT");
   esp2TestArmed = false; testArmPending = false;
-  puPhase = PU_NONE; puRow = -1;
+  int  row = puRow;
+  bool sawFlow = puFlowSeen;
+  unsigned long pulses = puFlowPulses;
+  puPhase = PU_NONE; puRow = -1; puFlowSeen = false; puFlowPulses = 0;
   esp2SetPower(false);
   if (sysState == TEST_MODE) setState(IDLE_STATE);
-  logEvent("ESP1", "ACT", String("PULSE|") + (ok ? "DONE|" : "ABORT|") + why);
+
+  /* Turn the meter count into the answer the operator actually wants: did fluid move? A row with no
+   * meter (mixer, a bare valve) says so explicitly -- "no flow sensor" must never be mistaken for
+   * "nothing moved", which is a hardware fault. Volume is reported in mL below a litre because the
+   * dosing pumps deliver ~12 mL in a 15 s test and "0.01 L" tells you nothing. */
+  String detail = why;
+  float k = pulseKForRow(row);
+  if (ok) {
+    if (k <= 0.0f) {
+      detail += "; no flow sensor on this output";
+    } else if (!sawFlow) {
+      detail += "; no flow report from ESP2";
+    } else {
+      float litres = (float)pulses / k;
+      String vol = (litres < 1.0f) ? (String(litres * 1000.0f, 1) + " mL") : (String(litres, 2) + " L");
+      detail += pulses ? ("; FLOW OK " + String(pulses) + " pulses ~" + vol)
+                       : String("; NO FLOW - 0 pulses, check pump, line or sensor");
+    }
+  }
+  logEvent("ESP1", "ACT", String("PULSE|") + (ok ? "DONE|" : "ABORT|") + detail);
   if (puCmdId[0]) {
-    firebaseQueueStatus(puCmdId, ok ? "completed" : "failed", why);
+    firebaseQueueStatus(puCmdId, ok ? "completed" : "failed", detail.c_str());
     puCmdId[0] = '\0';
   }
 }
@@ -8033,8 +8110,19 @@ void pulseTick() {
     return;
   }
 
+  if (puPhase == PU_REPORT) {
+    // Waiting on ESP2's TEST,FLOW answer so the result can say whether fluid actually moved --
+    // the whole point of the test. Bounded, so a silent ESP2 cannot strand the command.
+    if (puFlowSeen || millis() - puReportMs > PULSE_REPORT_WAIT_MS) pulseFinish(true, "pulse complete");
+    return;
+  }
+
   // PU_RUN: keep-alive stream at 150 ms, comfortably inside ESP2's 400 ms release timeout.
-  if ((long)(millis() - puEndMs) >= 0) { pulseFinish(true, "pulse complete"); return; }
+  if ((long)(millis() - puEndMs) >= 0) {
+    sendEsp2("TEST,RELEASE");                  // ask for the meter count; ESP2 answers TEST,FLOW
+    puPhase = PU_REPORT; puReportMs = millis();
+    return;
+  }
   if (millis() - puLastSendMs >= 150) {
     puLastSendMs = millis();
     sendEsp2(String("TEST,HOLD,") + puRow);
