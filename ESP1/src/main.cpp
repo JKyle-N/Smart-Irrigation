@@ -629,6 +629,7 @@ const unsigned long PULSE_REPORT_WAIT_MS = 800;
 bool          puFlowSeen = false;
 unsigned long puFlowPulses = 0, puReportMs = 0;
 void pulseTick();
+static void pulseFinish(bool ok, const char *why);
 
 /* ---- Preventive pump exercise (ESP1-owned; sec.14.9.1) -------------------- *
  * lastPumpUseMs[]: last time each AC pump ran (real run OR exercise). Indices:
@@ -991,6 +992,9 @@ struct TelemetrySnapshot {
   long     ackLeftS;              // >0 = operator asked to be re-prompted in this many seconds
   bool     actDisabled;
   bool     exEnabled;      // preventive pump exercise on/off
+  bool     wmHeld;         // dashboard manual-mode hold
+  long     wmLeftS;
+  char     wmState[10], wmWhy[40];
   int      exRunS;         // its run length, seconds
   // Armed forced run. secondsLeft is computed HERE: fcFireAtMs is a millis() value and means
   // nothing to a browser on a different clock.
@@ -1041,6 +1045,33 @@ portMUX_TYPE  evtMux = portMUX_INITIALIZER_UNLOCKED;
 // Set when an event the operator should not wait for lands (fault / rejection). netTask uses it as
 // an extra upload trigger so an error surfaces in seconds instead of at the next 60 s tick.
 volatile bool fbPushNow = false;
+
+/* ---- Web manual-mode hold ------------------------------------------------- *
+ * While the dashboard's Manual/Test tab is open it holds the rig out of automatic, so a scheduled
+ * run cannot start underneath someone with their hands on the relays. Mutual exclusion is strict:
+ * nothing may start a run from ANY source while the hold is up -- including the LCD's own Force Run
+ * and SMS -- which is only safe because whoever is at the rig can revoke it (UP+DOWN on the banner).
+ *
+ * ESP1 owns the deadline; the page only proves it is still there. The page writes an increasing
+ * `seq` to /irrigation/manual and the lease is refreshed only when that value CHANGES -- so a stale
+ * want:true left behind by a closed browser stops refreshing and expires, which a plain boolean
+ * would not. 60 s outlives a network hiccup without stranding the rig out of automatic.            */
+unsigned long webManualUntilMs = 0;          // 0 = not held; else the millis() deadline
+const unsigned long WEB_MANUAL_LEASE_MS = 60000;
+long          webManualSeq   = -1;           // last seq seen from the page (-1 = none yet)
+char          webManualState[10] = "idle";   // idle | held | refused | revoked  (published)
+char          webManualWhy[40]   = "";       // why it was refused / revoked
+// core0 poll -> core1: what the page is asking for, and whether its keep-alive advanced this poll.
+// Core 1 owns every decision; core 0 only reports what it read.
+volatile bool webManualReq  = false;
+volatile bool webManualPing = false;
+static bool webManualHeld() { return webManualUntilMs && (long)(webManualUntilMs - millis()) > 0; }
+// LCD side of the hold: the banner owns the screen, UP+DOWN opens a two-item chooser, and "view
+// sensors" is a PEEK -- it hides the banner without releasing the hold.
+bool wmChooser = false;      // chooser open
+uint8_t wmSel  = 0;          // 0 = view sensors, 1 = interrupt web
+bool wmPeek    = false;      // operator is paging the data screens while the hold stands
+bool lcdInWebManual = false; // banner currently owns the screen (drives the clear-on-enter/exit)
 
 /* ---- Power (battery via opto-isolated ADC, polynomial-calibrated) --------- *
  * Battery V/I now come from GPIO35/34 through an optocoupler (nonlinear), fitted with a least-squares
@@ -1524,6 +1555,8 @@ void heartbeatTick();
 void nanoPaceTick();
 void deviceHealthTick();
 void netHealthTick();
+void webManualTick();
+void webManualRevoke();
 static bool i2cPresent(uint8_t addr);
 void saveLock();
 void saveWifiEn();
@@ -1713,6 +1746,7 @@ void loop() {
   g_lastStage = 'n'; nanoPaceTick();       // drive Nano ACTIVE/DAY/NIGHT interval (A2)
   g_lastStage = 'd'; deviceHealthTick();   // device-loss watchdog -> daily self-reset (Part C)
   g_lastStage = 'h'; netHealthTick();      // netTask liveness: core 0 has no task watchdog
+  g_lastStage = 'w'; webManualTick();      // grant/expire the dashboard's manual-mode hold
   g_lastStage = 'w'; telemetryCollect();   // snapshot for the WiFi/ThingSpeak uplink task (Part A)
   g_lastStage = 'U'; summaryTick();        // incremental SD parse for SUMMARY (bounded)
 
@@ -2749,6 +2783,7 @@ void sendWorkOrder(int c, bool fertigate) {
   // Last line of defence. controlTick() already gates, but this is the single function that can put
   // a run on the wire, so it refuses independently rather than trusting every future caller.
   if (actuationsDisabled) { logEvent("ESP1", "ACT", "WO|BLOCKED|ACTUATIONS_OFF"); return; }
+  if (webManualHeld())    { logEvent("ESP1", "ACT", "WO|BLOCKED|WEB_MANUAL"); return; }
   // Doses were computed once in runUiBegin() (so the pre-run receipt and the work order agree, and
   // calcDose's per-nutrient log lines are not emitted twice). Fall back if the run state is stale.
   float mL[3] = { 0, 0, 0 }, ceilS[3] = { 0, 0, 0 };
@@ -2826,6 +2861,7 @@ void forceTick() {
   if      (actuationsDisabled)                                  bad = "ACTUATIONS_OFF";
   else if (sysState != IDLE_STATE)                              bad = "NOT_IDLE";
   else if (uiMode != UI_DATA)                                   bad = "IN_MENU";
+  else if (webManualHeld())                                     bad = "WEB_MANUAL";
   else if (wo.active || pendingRun.active || pendingExercise.active) bad = "BUSY";
   else if (esp2Held)                                            bad = "HELD";
   else if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT)    bad = "RES_LOW";
@@ -2851,6 +2887,11 @@ void forceTick() {
  * `mask` may name several columns -- ESP2 opens them together, so `liters` is the TOTAL batch.
  * fbCmdId is echoed to the dashboard when the run finishes ("" for an SMS-initiated force). */
 void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const char *fbCmdId) {
+  if (webManualHeld()) {                             // web operator holds the rig -- no run may start
+    logEvent("ESP1", "ACT", "FORCE|BLOCKED|WEB_MANUAL");
+    if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "web manual mode is active");
+    return;
+  }
   if (actuationsDisabled) {                          // last line of defence, as in sendWorkOrder
     logEvent("ESP1", "ACT", "FORCE|BLOCKED|ACTUATIONS_OFF");
     if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "actuations are disabled");
@@ -3147,6 +3188,76 @@ void esp1SelfResetOncePerDay(const char *reason) {
 /* Core 1: watch netTask's heartbeat (see netBeat). Alarm first, and only self-reset when the rig is
  * IDLE -- rebooting mid-run would abandon a live work order to fix a problem that costs nothing
  * while the run finishes. ESP2 keeps executing either way, so waiting is free. */
+/* Core 1: own the manual-mode hold. Core 0 only reports what the page wrote; every decision --
+ * grant, refuse, expire, revoke -- is made here, on the core that owns the run state being
+ * protected. Each outcome sets fbPushNow so the page learns it in ~1 s instead of waiting up to a
+ * minute for the next scheduled snapshot. */
+void webManualTick() {
+  bool ping = webManualPing; webManualPing = false;
+
+  if (!webManualReq) {                                   // page released it (or never asked)
+    if (webManualUntilMs) {
+      webManualUntilMs = 0; webManualSeq = -1;
+      wmPeek = false; wmChooser = false;          // never resume a later hold mid-peek
+      strlcpy(webManualState, "idle", sizeof(webManualState)); webManualWhy[0] = '\0';
+      logEvent("ESP1", "ACT", "MANUAL|RELEASED|WEB");
+      fbPushNow = true;
+    }
+    return;
+  }
+
+  if (webManualHeld()) {                                 // already held: a fresh keep-alive extends it
+    if (ping) webManualUntilMs = millis() + WEB_MANUAL_LEASE_MS;
+    return;
+  }
+
+  // Not currently held. A repeat of the SAME seq must not re-ask: otherwise a page that was refused
+  // would hammer the gate every poll and refill the log. Only a new keep-alive re-evaluates.
+  if (!ping) {
+    if (!strcmp(webManualState, "held")) {               // lease ran out with the page gone
+      strlcpy(webManualState, "idle", sizeof(webManualState));
+      wmPeek = false; wmChooser = false;
+      logEvent("ESP1", "ACT", "MANUAL|EXPIRED");
+      fbPushNow = true;
+    }
+    return;
+  }
+
+  // Grant only from a genuinely idle rig -- the same gate the timed pulse uses. The reason is
+  // published so the page can say "wait for the run to finish" rather than a bare failure.
+  const char *why = NULL;
+  if      (sysState != IDLE_STATE || wo.active || pendingRun.active) why = "a run is in progress";
+  else if (esp2Held)            why = "a fault is held";
+  else if (fcPhase != FP_NONE)  why = "a forced run is armed";
+  else if (pendingExercise.active || puPhase != PU_NONE) why = "a test is already running";
+  if (why) {
+    strlcpy(webManualState, "refused", sizeof(webManualState));
+    strlcpy(webManualWhy, why, sizeof(webManualWhy));
+    logEvent("ESP1", "ACT", String("MANUAL|REFUSED|") + why);
+    fbPushNow = true;
+    return;
+  }
+  webManualUntilMs = millis() + WEB_MANUAL_LEASE_MS;
+  strlcpy(webManualState, "held", sizeof(webManualState)); webManualWhy[0] = '\0';
+  logEvent("ESP1", "ACT", "MANUAL|GRANTED|WEB");
+  wakeBacklight();                                       // the banner is about to appear
+  fbPushNow = true;
+}
+
+/* The person at the rig taking control back. Ends any pulse in flight through the normal path so a
+ * relay is never left energised by the takeover. */
+void webManualRevoke() {
+  if (!webManualHeld()) return;
+  if (puPhase != PU_NONE) pulseFinish(false, "web manual mode revoked at the LCD");
+  webManualUntilMs = 0; webManualSeq = -1;
+  wmPeek = false; wmChooser = false;
+  strlcpy(webManualState, "revoked", sizeof(webManualState));
+  strlcpy(webManualWhy, "the rig operator took control", sizeof(webManualWhy));
+  logEvent("ESP1", "ACT", "MANUAL|REVOKED|LCD");
+  sendSMS("ALERT,MIN,MANUAL_REVOKED,LCD");
+  fbPushNow = true;
+}
+
 void netHealthTick() {
   static uint32_t      lastBeat   = 0;
   static unsigned long lastBeatMs = 0;
@@ -3358,6 +3469,7 @@ void dispatchPendingExercise() {
 // PUMP_EXERCISE_INTERVAL_MS, power ESP2 up and have it run that pump briefly. Lowest
 // priority -- controlTick runs first, so a due column always wins.
 void exerciseTick() {
+  if (webManualHeld()) return;            // web operator holds the rig; nothing auto-starts
   if (!exerciseEnabled) return;           // operator switched the preventive exercise off
   if (actuationsDisabled) return;         // operator lockout: no preventive pump runs either
   if (sysState != IDLE_STATE) return;
@@ -4339,6 +4451,7 @@ static void ctrlNote(int c, const String &r) {
 }
 
 void controlTick() {
+  if (webManualHeld()) return;            // web operator holds the rig; no scheduled run may start
   if (actuationsDisabled) return;         // operator lockout: monitor only, never energize
   if (uiMode != UI_DATA) return;          // operator in Settings/Testing -> pause automation
   if (sysState != IDLE_STATE) return;     // only dispatch new work from IDLE
@@ -4886,6 +4999,10 @@ void telemetryCollect() {
                     ? (long)((faultAckUntilMs - millis()) / 1000) : 0;
   telem.actDisabled = actuationsDisabled;
   telem.exEnabled = exerciseEnabled; telem.exRunS = exerciseRunS;
+  telem.wmHeld  = webManualHeld();
+  telem.wmLeftS = telem.wmHeld ? (long)((webManualUntilMs - millis()) / 1000) : 0;
+  strlcpy(telem.wmState, webManualState, sizeof(telem.wmState));
+  strlcpy(telem.wmWhy,   webManualWhy,   sizeof(telem.wmWhy));
   // Armed forced run: seconds resolved here, never a raw millis() deadline.
   telem.fcArmed = (fcPhase == FP_WAIT);
   telem.fcWeb   = fcFromWeb;
@@ -5401,6 +5518,11 @@ static bool firebaseUploadLive() {
     ra.add("hold"); ra.add("release"); ra.add("irrigate"); ra.add("normal");
   }
   dg["actuationsDisabled"] = t.actDisabled;
+  JsonObject dwm = dg.createNestedObject("webManual");
+  dwm["state"] = t.wmState;
+  dwm["held"]  = t.wmHeld;
+  if (t.wmLeftS > 0) dwm["secondsLeft"] = t.wmLeftS;
+  if (t.wmWhy[0])    dwm["reason"] = t.wmWhy;
   JsonObject dex = dg.createNestedObject("pumpExercise");
   dex["enabled"] = t.exEnabled;
   dex["seconds"] = t.exRunS;
@@ -5582,6 +5704,34 @@ void firebaseRemoteExerciseDone(const char *status, const char *detail) {
 }
 
 // Core 0: fetch at most one queued command. One per poll keeps operation strictly sequential.
+/* Core 0: read the dashboard's manual-mode hold from a SINGLE node it overwrites with set().
+ * Deliberately not a queue entry -- a 20 s keep-alive through /irrigation/commands would grow that
+ * node without bound (the failure that once broke command delivery) and bury the real commands in
+ * the history the operator reads.
+ *
+ * The lease is refreshed only when `seq` CHANGES, so a stale want:true left behind by a closed
+ * browser stops refreshing and expires on its own. ESP1 keeps the deadline in millis(), so no clock
+ * agreement with the browser is needed. */
+static void firebasePollManual() {
+  String base; bool enabled;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
+  if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
+  if (!fbEnsureToken()) return;
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/manual.json"))) return;
+  int code = fbHttp.GET();
+  String resp = (code == 200) ? fbHttp.getString() : "";
+  fbHttp.end();
+  if (code == 401) { fbIdToken = ""; fbTokenExpiryMs = 0; return; }
+  if (code != 200 || resp.length() == 0 || resp == "null") return;
+
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, resp)) return;              // malformed -> leave the hold exactly as it is
+  long seq  = doc["seq"] | -1;
+  bool want = doc["want"] | false;
+  webManualReq = want;                                 // core 1 applies it (grant/refuse/release)
+  if (seq != webManualSeq) { webManualSeq = seq; webManualPing = true; }
+}
+
 static void firebasePollCommands() {
   if (millis() - fbLastCommandPollMs < FIREBASE_COMMAND_POLL_MS) return;
   fbLastCommandPollMs = millis();
@@ -6782,6 +6932,7 @@ void netTask(void *pv) {
     // socket as the upload above, so a 3 s poll costs one small GET, not a handshake.
     firebaseFlushStatus();                                 // results first: report before fetching more
     firebasePollCommands();
+    firebasePollManual();                                  // the Manual/Test tab's hold + keep-alive
 
     // Supabase CSV push: core 1 sets uploadReqStamp; do one attempt here and publish the result.
     if (uploadReqStamp != 0 && !uploadBusy) {
@@ -7597,6 +7748,46 @@ void handleButtons() {
     return;
   }
 
+  // ---- Web manual mode: the banner owns the screen ---------------------------
+  // Same shape as the run-lock branch below: swallow everything so nobody wanders into a menu while
+  // a remote operator has the relays, except UP+DOWN which opens the chooser. Sits ABOVE the run
+  // branch only in code order; it cannot both be true, because the banner render requires
+  // runPhase == RUN_NONE. MODE+BACK e-stop is handled higher up and always works.
+  if (webManualHeld() && !wmPeek && !esp2Held && sysState != EMERGENCY_STOP && runPhase == RUN_NONE) {
+    static bool wmComboLatch = false, wmEntLatch = false, wmBackLatch = false;
+    bool up = (digitalRead(BTN_UP) == LOW), dn = (digitalRead(BTN_DOWN) == LOW);
+    bool ent = (digitalRead(BTN_ENTER) == LOW), bk = (digitalRead(BTN_BACK) == LOW);
+
+    if (!wmChooser) {
+      if (up && dn) {                                     // UP+DOWN opens the options
+        if (!wmComboLatch) { wmComboLatch = true; wmChooser = true; wmSel = 0; wakeBacklight(); }
+      } else wmComboLatch = false;
+    } else {
+      if (up && !dn)      { if (!wmComboLatch) { wmComboLatch = true; wmSel ^= 1; wakeBacklight(); } }
+      else if (dn && !up) { if (!wmComboLatch) { wmComboLatch = true; wmSel ^= 1; wakeBacklight(); } }
+      else if (!up && !dn) wmComboLatch = false;
+      if (ent) {
+        if (!wmEntLatch) {
+          wmEntLatch = true; wmChooser = false; wakeBacklight();
+          if (wmSel == 0) { wmPeek = true; lcdPage = PAGE_HOME; logEvent("ESP1", "ACT", "MANUAL|PEEK|LCD"); }
+          else            webManualRevoke();
+        }
+      } else wmEntLatch = false;
+      if (bk) { if (!wmBackLatch) { wmBackLatch = true; wmChooser = false; wakeBacklight(); } }
+      else wmBackLatch = false;
+    }
+    for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]);   // swallow every other edge
+    return;
+  }
+  // Peeking at the sensors while the hold stands: BACK returns to the banner. Everything else falls
+  // through to the normal data-screen bindings, so the pages can be stepped as usual.
+  if (webManualHeld() && wmPeek) {
+    static bool peekBackLatch = false;
+    if (digitalRead(BTN_BACK) == LOW) {
+      if (!peekBackLatch) { peekBackLatch = true; wmPeek = false; wakeBacklight(); }
+    } else peekBackLatch = false;
+  }
+
   // ---- Service run in progress: the process is uninterruptable ----------------
   // Only two inputs are honored: UP+DOWN together RELEASES the screen (the run keeps going, it is not
   // an abort), and ENTER advances a receipt / error page. Everything else is swallowed so nobody can
@@ -7933,7 +8124,9 @@ void settingsButton(int i) {
         else { portalRequested = true; logEvent("ESP1", "CMD", "WIFI_PORTAL|START"); }   // netTask brings up the AP (banner)
       }
       else if (setSel == SET_FORCE) {                            // operator force run: idle-only
-        if (sysState != IDLE_STATE || wo.active || pendingRun.active || esp2Held) return;
+        // webManualHeld covers the race where the hold lands while the operator is already in the
+        // menu -- normally the banner has swallowed the buttons long before they get here.
+        if (sysState != IDLE_STATE || wo.active || pendingRun.active || esp2Held || webManualHeld()) return;
         fcField = 0; editItem = SET_FORCE; editDirty = false; uiMode = UI_EDIT;
       }
       else if (setSel == SET_CALIB) enterCal();                 // idle-only calibration (§A.6)
@@ -8300,6 +8493,27 @@ void lcdTick() {
   static bool lcdInForce = false;
   // Never mask a held fault or an E-stop prompt -- those carry choices the operator must answer.
   // Same guard the run UI uses below. forceTick() also refuses to fire in either state.
+  /* Web manual-mode banner. Sits below the run screen and the fault/E-stop screens in this ladder --
+   * a held fault or a stopped rig still outranks it, because those carry decisions the operator must
+   * answer. wmPeek lets them page the sensors without giving up the hold. */
+  if (webManualHeld() && !wmPeek && !esp2Held && sysState != EMERGENCY_STOP && runPhase == RUN_NONE) {
+    if (!lcdInWebManual) { lcd.clear(); lcdInWebManual = true; }
+    if (wmChooser) {
+      lcdRow(0, "WEB MANUAL: OPTIONS");
+      char b[21];
+      snprintf(b, 21, "%cView sensors", wmSel == 0 ? '>' : ' ');   lcdRow(1, b);
+      snprintf(b, 21, "%cInterrupt web", wmSel == 1 ? '>' : ' ');  lcdRow(2, b);
+      lcdRow(3, "ENT=pick BACK=back");
+    } else {
+      lcdRow(0, "MANUAL TEST AT WEB");
+      lcdRow(1, "Web operator has");
+      lcdRow(2, "control of the rig");
+      lcdRow(3, "UP+DOWN = options");
+    }
+    return;
+  }
+  if (lcdInWebManual) { lcd.clear(); lcdInWebManual = false; }
+
   if (fcPhase == FP_WAIT && !esp2Held && sysState != EMERGENCY_STOP) {
     if (!lcdInForce) { lcd.clear(); lcdInForce = true; }
     char fb[21];

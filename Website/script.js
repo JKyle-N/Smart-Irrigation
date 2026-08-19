@@ -462,6 +462,7 @@ function updateDashboard() {
   renderRawSensors();
   renderFlowMeters();
   renderExercise();
+  renderManualHold();
   updateFaultBanner();
   updateForceArmed();
   syncControlAvailability();
@@ -875,7 +876,10 @@ loginForm?.addEventListener("submit", async event => {
   }
 });
 
-document.getElementById("logoutBtn")?.addEventListener("click", () => auth?.signOut());
+document.getElementById("logoutBtn")?.addEventListener("click", () => { releaseManualHold(); auth?.signOut(); });
+// A closed tab or a backgrounded phone should hand the rig back at once, not 60 s later.
+window.addEventListener("pagehide", () => releaseManualHold());
+document.addEventListener("visibilitychange", () => { if (document.hidden) releaseManualHold(); });
 document.getElementById("transferPumpBtn")?.addEventListener("click", () => queueCommand("RUN_PUMP_TEST", { pump: "transfer" }));
 document.getElementById("boosterPumpBtn")?.addEventListener("click", () => queueCommand("RUN_PUMP_TEST", { pump: "booster" }));
 document.getElementById("mixerBtn")?.addEventListener("click", () => queueCommand("RUN_PUMP_TEST", { pump: "mixer" }));
@@ -919,6 +923,67 @@ document.getElementById("cancelForceBtn")?.addEventListener("click", () => queue
  * time you leave it. Emergency stop is deliberately NOT here -- it lives on Controls, because a stop
  * must never sit behind a warning that has to be dismissed first. */
 let mtArmed = false;
+
+/* Manual-mode hold. Opening Manual/Test takes the rig out of automatic so a scheduled run cannot
+ * start under the operator's hands. Written to a SINGLE node with set() -- never the command queue,
+ * which a 20 s keep-alive would grow without bound and fill with noise.
+ *
+ * ESP1 owns the deadline and only refreshes its lease when `seq` CHANGES, so a tab left open on a
+ * dead machine stops refreshing and the rig frees itself. Releasing on pagehide/visibilitychange as
+ * well as on tab-switch just makes that happen sooner than the 60 s lease. */
+let mtHoldTimer = null;
+
+function writeManualHold(want) {
+  if (!currentUserIsSignedIn()) return Promise.resolve(false);
+  return db.ref("irrigation/manual").set({ seq: Date.now(), want })
+    .catch(error => { setCommandStatus(`Could not reach the rig: ${error.message}`, "error"); return false; });
+}
+
+function requestManualHold() {
+  writeManualHold(true);
+  if (mtHoldTimer) clearInterval(mtHoldTimer);
+  // 20 s against a 60 s lease: two keep-alives may be lost before the rig takes the hold back.
+  mtHoldTimer = setInterval(() => writeManualHold(true), 20000);
+}
+
+function releaseManualHold() {
+  if (mtHoldTimer) { clearInterval(mtHoldTimer); mtHoldTimer = null; }
+  writeManualHold(false);
+}
+
+// Reflect what ESP1 decided. The controls stay hidden until it actually says "held" -- the gate's
+// Proceed button reveals them, but only once the rig has agreed to hand over control.
+function renderManualHold() {
+  const wm = liveData.diagnostics?.webManual || {};
+  const state = String(wm.state || "idle");
+  const note = document.getElementById("mtHoldNote");
+  const gate = document.getElementById("mtGate");
+  const proceed = document.getElementById("mtProceed");
+  const onTab = document.querySelector('#manualtest')?.classList.contains("active");
+
+  if (note) {
+    if (!onTab) note.textContent = "";
+    else if (state === "held")    note.textContent = `Manual mode active — the rig is out of automatic${wm.secondsLeft ? ` (renews, ${wm.secondsLeft}s left)` : ""}.`;
+    else if (state === "refused") note.textContent = `The rig refused manual mode: ${rawText(wm.reason, "not idle")}. Wait for it to finish, then reopen this tab.`;
+    else if (state === "revoked") note.textContent = "The rig operator took control at the LCD.";
+    else note.textContent = "Requesting manual control from the rig…";
+    note.className = (state === "held") ? "field-note" : "control-result error";
+  }
+  // Proceed only becomes usable once the rig has granted the hold.
+  if (proceed) {
+    proceed.disabled = (state !== "held");
+    proceed.title = (state === "held") ? "" : "The rig has not granted manual mode yet.";
+  }
+  // Revoked or refused while already inside: drop the controls and bounce out.
+  if (onTab && mtArmed && state !== "held") {
+    setManualTestArmed(false);
+    if (state === "revoked") {
+      setCommandStatus("Manual mode was revoked at the rig — the operator there took control.", "error");
+      document.querySelector('.tab[data-view="dashboard"]')?.click();
+    }
+  }
+  if (gate) gate.hidden = mtArmed;
+}
 
 function setManualTestArmed(on) {
   mtArmed = on;
@@ -1050,7 +1115,10 @@ document.getElementById("mtSweepBtn")?.addEventListener("click", () => queueComm
 document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => {
   // Leaving Manual/Test re-arms its gate, so you can never land back on live hardware controls
   // already unlocked from a previous visit.
-  if (tab.dataset.view !== "manualtest") setManualTestArmed(false);
+  // Entering Manual/Test asks the rig for the hold; leaving gives it straight back rather than
+  // waiting out the 60 s lease.
+  if (tab.dataset.view === "manualtest") requestManualHold();
+  else { setManualTestArmed(false); releaseManualHold(); }
   document.querySelectorAll(".tab").forEach(item => item.classList.toggle("active", item === tab));
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === tab.dataset.view));
 }));
