@@ -94,7 +94,7 @@
 // DS3231 0x68 and EEPROM 0x57 are auto-addressed by their libraries / unused.
 
 /* ---- GSM ----------------------------------------------------------------- */
-String PHONE_NUMBER = "";               // set at commissioning via SMS/portal -- never a real number in tracked source [CONFIRM]
+String PHONE_NUMBER = "09150424784";    // [CONFIRM] recipient for alerts/reports
 
 /* ---- Columns (spec sec.14.1.4.1) ----------------------------------------- */
 #define NUM_COLUMNS 3
@@ -572,10 +572,22 @@ unsigned long puFlowPulses = 0, puReportMs = 0;
 bool          puHoldMode = false;
 int64_t       testHoldSeq = -1;                    // last seq seen from the page, core 0 only
 unsigned long testHoldLastFreshMs = 0;
-// Must comfortably exceed FIREBASE_COMMAND_POLL_MS (3000ms): testHoldLastFreshMs only advances on a
-// POLL that sees a new seq, so a timeout set too close to the poll interval itself would false-trip
-// on nothing worse than one slow poll cycle even while the browser is still actively holding.
-const unsigned long TEST_HOLD_BROWSER_TIMEOUT_MS = 8000;  // no fresh want:true seen within this -> release
+// While a hold is running, testHold is polled every TEST_HOLD_POLL_MS (not the 3 s command cadence),
+// so a release or a vanished browser is noticed within ~1 s. The timeout must still comfortably exceed
+// that poll AND the page's own 1.2 s refresh: testHoldLastFreshMs only advances on a poll that sees a
+// new seq, so a timeout too close to either would false-trip while the browser is still holding.
+const unsigned long TEST_HOLD_POLL_MS            = 1000;
+const unsigned long TEST_HOLD_BROWSER_TIMEOUT_MS = 4000;  // no fresh want:true seen within this -> release
+// Hard cap on one continuous hold -- the same limit a Timed Pulse gets. A browser keeps refreshing
+// want:true for as long as the button is down (or the tab is wedged), so without a cap the keep-alive
+// alone could run a relay until ESP2's own 30 s TEST_HARD_CAP_MS.
+const unsigned long TEST_HOLD_MAX_MS = (unsigned long)PULSE_MAX_S * 1000UL;
+unsigned long testHoldRunMs = 0;                   // when the current hold entered PU_RUN (core 1)
+// Set whenever a hold ends for any reason other than an explicit want:false (cap, browser timeout,
+// safety abort). While set, further want:true refreshes are ignored -- otherwise the very next
+// keep-alive would arm a fresh hold and defeat the cap. Cleared only by a want:false (button up).
+// Core 1 only.
+bool          testHoldLatched = false;
 // Deep-scan finding (2026-09-10, HIGH, fixed): firebasePollTestHold() runs on core 0 (netTask) and
 // must NEVER call setState()/logEvent()/sendEsp2() itself -- those mutate core-1-owned state (the
 // logBuf String, the ESP2 UART, sysState/uiMode) with no lock, the exact bug class this file already
@@ -4881,7 +4893,15 @@ void loadBattCal() {
   // run is simply ignored now, same net effect as before (it was never applied to anything).
   p.end();
   battCalLoaded = battVCalLoaded;
-  Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS" : "using firmware defaults (calibrate!)");
+  // Coefficients pasted into calBattV from the bench tool are a real calibration too (CLAUDE.md
+  // documents both routes), so only the untouched placeholder -- degree 1, {0,1,0,0}, which just
+  // returns the raw ADC fraction -- keeps voltage unpublished.
+  bool placeholderV = (calBattV.degree == 1 && calBattV.coef[0] == 0.0 && calBattV.coef[1] == 1.0 &&
+                       calBattV.coef[2] == 0.0 && calBattV.coef[3] == 0.0);
+  if (!placeholderV) battVCalLoaded = true;
+  Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS"
+                                       : battVCalLoaded ? "using compiled coefficients"
+                                                        : "using placeholder defaults (calibrate!)");
 }
 /* ADS1115 in CONTINUOUS-conversion mode, so reading it costs ONE 2-byte I2C read and never waits.
  * A single-shot read would have to poll the OS bit for the ~7.8 ms conversion, and polling it with
@@ -6062,7 +6082,9 @@ static void firebasePollManual() {
  * uses for firebasePollManual()/webManualTick(). */
 static void firebasePollTestHold() {
   static unsigned long lastPollMs = 0;
-  if (millis() - lastPollMs < FIREBASE_COMMAND_POLL_MS) return;
+  // puHoldMode is a plain bool written by core 1; a stale read only shifts one poll by a cadence step.
+  unsigned long pollMs = puHoldMode ? TEST_HOLD_POLL_MS : FIREBASE_COMMAND_POLL_MS;
+  if (millis() - lastPollMs < pollMs) return;
   lastPollMs = millis();
   String base; bool enabled;
   xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
@@ -9011,6 +9033,7 @@ static void pulseFinish(bool ok, const char *why) {
   unsigned long pulses = puFlowPulses;
   bool wasHold = puHoldMode;
   puPhase = PU_NONE; puRow = -1; puFlowSeen = false; puFlowPulses = 0; puHoldMode = false;
+  if (wasHold) testHoldLatched = true;     // no re-arm until the page sends want:false (see its declaration)
   esp2SetPower(false);
   if (sysState == TEST_MODE) setState(IDLE_STATE);
 
@@ -9049,7 +9072,8 @@ void pulseTick() {
     testHoldReqFresh = false;
     if (!testHoldReqWant) {
       if (puHoldMode) pulseFinish(true, "web hold released");   // explicit release -- don't wait out the timeout
-    } else if (puPhase == PU_NONE) {
+      testHoldLatched = false;                                  // button is up: the next press may arm again
+    } else if (puPhase == PU_NONE && !testHoldLatched) {
       // Same idle/safety gate TEST_PULSE's own handler already uses, so a hold request is silently
       // ignored (not armed) unless the rig is genuinely free to take it -- there is no queued
       // command/status entry for this node the way there is for TEST_PULSE, so there is nothing to
@@ -9088,6 +9112,7 @@ void pulseTick() {
       puPhase = PU_RUN;
       if (puHoldMode) {
         testHoldLastFreshMs = millis();      // start the browser keep-alive clock fresh, not stale from PU_ARM
+        testHoldRunMs = millis();            // TEST_HOLD_MAX_MS counts from the relay actually running
         logEvent("ESP1", "ACT", String("TESTHOLD|RUN|") + testRowName(puRow));
       } else {
         puEndMs = millis() + (unsigned long)puSeconds * 1000UL;
@@ -9115,10 +9140,12 @@ void pulseTick() {
 
   // PU_RUN: keep-alive stream at 150 ms, comfortably inside ESP2's 400 ms release timeout.
   // Hold-mode has no fixed puEndMs -- it ends when the browser stops refreshing testHoldLastFreshMs
-  // (button released, tab closed, network dropped), bounded by TEST_HOLD_BROWSER_TIMEOUT_MS. Either
-  // way ESP2's OWN 400 ms dead-man is what actually protects the relay if ESP1 itself vanishes.
+  // (button released, tab closed, network dropped), bounded by TEST_HOLD_BROWSER_TIMEOUT_MS, and in
+  // any case by TEST_HOLD_MAX_MS of continuous running. Either way ESP2's OWN 400 ms dead-man is what
+  // actually protects the relay if ESP1 itself vanishes.
   bool timeUp = puHoldMode
-    ? (millis() - testHoldLastFreshMs > TEST_HOLD_BROWSER_TIMEOUT_MS)
+    ? (millis() - testHoldLastFreshMs > TEST_HOLD_BROWSER_TIMEOUT_MS ||
+       millis() - testHoldRunMs >= TEST_HOLD_MAX_MS)
     : ((long)(millis() - puEndMs) >= 0);
   if (timeUp) {
     sendEsp2("TEST,RELEASE");                  // ask for the meter count; ESP2 answers TEST,FLOW
