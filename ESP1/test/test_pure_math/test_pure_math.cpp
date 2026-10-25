@@ -193,6 +193,30 @@ void test_clampi(void) {
   TEST_ASSERT_EQUAL_INT(10, clampi(10, 0, 10));
 }
 
+/* ---- daysInMonth / isLeapYear --------------------------------------------- */
+
+void test_days_in_month_ordinary_year(void) {
+  TEST_ASSERT_EQUAL_INT(31, daysInMonth(2025, 1));
+  TEST_ASSERT_EQUAL_INT(28, daysInMonth(2025, 2));   // not a leap year
+  TEST_ASSERT_EQUAL_INT(30, daysInMonth(2025, 4));
+  TEST_ASSERT_EQUAL_INT(31, daysInMonth(2025, 12));
+}
+
+void test_days_in_month_leap_year_rules(void) {
+  // REGRESSION target: SET_CLOCK previously validated day-of-month as a flat 1..31 on every path
+  // (LCD editor + Firebase command), so "Feb 30" or "Feb 29" in a non-leap year could be set.
+  TEST_ASSERT_EQUAL_INT(29, daysInMonth(2024, 2));   // divisible by 4 -> leap
+  TEST_ASSERT_EQUAL_INT(28, daysInMonth(2100, 2));   // divisible by 100 but not 400 -> not leap
+  TEST_ASSERT_EQUAL_INT(29, daysInMonth(2000, 2));   // divisible by 400 -> leap
+}
+
+void test_is_leap_year(void) {
+  TEST_ASSERT_TRUE(isLeapYear(2024));
+  TEST_ASSERT_FALSE(isLeapYear(2025));
+  TEST_ASSERT_FALSE(isLeapYear(2100));
+  TEST_ASSERT_TRUE(isLeapYear(2000));
+}
+
 /* ---- policy invariant ---------------------------------------------------- */
 
 void test_npk_min_moisture_stays_below_irrigation_start(void) {
@@ -228,6 +252,9 @@ int main(int, char **) {
   RUN_TEST(test_pulse_row_maps_every_known_target);
   RUN_TEST(test_pulse_row_rejects_unknown_and_null);
   RUN_TEST(test_clampi);
+  RUN_TEST(test_days_in_month_ordinary_year);
+  RUN_TEST(test_days_in_month_leap_year_rules);
+  RUN_TEST(test_is_leap_year);
   RUN_TEST(test_npk_min_moisture_stays_below_irrigation_start);
   return UNITY_END();
 }

@@ -94,7 +94,7 @@
 // DS3231 0x68 and EEPROM 0x57 are auto-addressed by their libraries / unused.
 
 /* ---- GSM ----------------------------------------------------------------- */
-String PHONE_NUMBER = "09150424784";    // [CONFIRM] recipient for alerts/reports
+String PHONE_NUMBER = "";               // set at commissioning via SMS/portal -- never a real number in tracked source [CONFIRM]
 
 /* ---- Columns (spec sec.14.1.4.1) ----------------------------------------- */
 #define NUM_COLUMNS 3
@@ -235,6 +235,7 @@ const float BATT_EMPTY_V = 11.20f;
 /* ---- Timing / supervisory constants (spec sec.10.14) --------------------- */
 const unsigned long UART_ACK_TIMEOUT_MS   = 3000;    // ESP2 ACK wait
 const unsigned long UART_DONE_TIMEOUT_MS  = 600000;  // ESP2 sequence completion (10 min)
+const unsigned long RESUME_ACK_TIMEOUT_MS = 5000;    // recovery RESUME: bounded wait for ACK/INVALID
 const uint8_t       MAX_UART_RETRY        = 3;
 const unsigned long RECOVERY_COOLDOWN_MS  = 30000;
 const unsigned long STARTUP_SYNC_TIMEOUT_MS = 15000;
@@ -384,7 +385,7 @@ SoftwareSerial    nanoSerial(NANO_RX_PIN, NANO_TX_PIN);   // EspSoftwareSerial
 HardwareSerial    esp2Serial(1);
 HardwareSerial    simSerial(2);
 
-bool rtcOk = false, sdOk = false, inaOk = false;
+bool rtcOk = false, sdOk = false;
 
 /* ---- WDT reboot breadcrumb (survives SW_CPU_RESET in RTC RAM) -------------- *
  * g_lastStage holds a one-char marker of the loop section in progress. After a
@@ -560,6 +561,32 @@ const unsigned long PULSE_ARM_TIMEOUT_MS = 14000; // ESP2 boot + TEST,ENTER ACK 
 const unsigned long PULSE_REPORT_WAIT_MS = 800;
 bool          puFlowSeen = false;
 unsigned long puFlowPulses = 0, puReportMs = 0;
+// Web "hold-to-run" (2026-09-10, irrigation/testHold): press-and-hold from the Manual/Test tab,
+// mirrors the LCD's own dead-man testHoldTick() but driven by a periodically-refreshed Firebase flag
+// instead of a physical button, since a browser tab cannot hold a physical dead-man switch. Reuses
+// the EXACT same PU_ARM/PU_RUN/PU_REPORT machinery as TEST_PULSE (same ESP2 arming, same 150ms
+// TEST,HOLD keep-alive stream) -- puHoldMode just changes PU_RUN's stop condition from a fixed timer
+// (puEndMs) to "the browser stopped refreshing" (testHoldLastFreshMs). ESP2's OWN TEST_HOLD_TIMEOUT_MS
+// (400ms) is the real safety net either way, exactly as the block comment above pulseFinish() already
+// explains for TEST_PULSE.
+bool          puHoldMode = false;
+int64_t       testHoldSeq = -1;                    // last seq seen from the page, core 0 only
+unsigned long testHoldLastFreshMs = 0;
+// Must comfortably exceed FIREBASE_COMMAND_POLL_MS (3000ms): testHoldLastFreshMs only advances on a
+// POLL that sees a new seq, so a timeout set too close to the poll interval itself would false-trip
+// on nothing worse than one slow poll cycle even while the browser is still actively holding.
+const unsigned long TEST_HOLD_BROWSER_TIMEOUT_MS = 8000;  // no fresh want:true seen within this -> release
+// Deep-scan finding (2026-09-10, HIGH, fixed): firebasePollTestHold() runs on core 0 (netTask) and
+// must NEVER call setState()/logEvent()/sendEsp2() itself -- those mutate core-1-owned state (the
+// logBuf String, the ESP2 UART, sysState/uiMode) with no lock, the exact bug class this file already
+// paid to fix twice for fbAuthErrLog/fbPollErrLog (see their own comments). The fix mirrors
+// firebasePollManual()/webManualTick()'s own split exactly: core 0 writes only these three plain
+// scalars (a bool, a small fixed char buffer -- never a String across cores -- and a bool flag);
+// pulseTick() (core 1, called every loop() alongside testHoldTick() at the same call site) is the
+// ONLY place that reads them and performs the actual arm/release.
+bool          testHoldReqWant = false;
+char          testHoldReqBit[12] = {0};            // "transfer" is the longest target (8 chars + NUL)
+bool          testHoldReqFresh = false;
 void pulseTick();
 static void pulseFinish(bool ok, const char *why);
 
@@ -723,10 +750,15 @@ struct FirebaseCommand       { char id[48]; char type[32]; char pump[16];
                                int8_t exEnabled;     // SET_EXERCISE: -1 absent, 0 off, 1 on
                                int   exSeconds;      // SET_EXERCISE: -1 absent
                                // SET_COLUMN, all optional: -1 means "field absent, leave unchanged".
-                               char  colMode[14];    // "AUTO" | "IRRIGATION_ONLY" ("" = absent)
+                               char  colMode[20];    // "AUTO" | "IRRIGATION_ONLY" ("" = absent)
                                int8_t enabled, schedMode;
                                int   winStart, winEnd;
-                               float tgt[4]; };      // N, P, K, pH  (-1 = absent)
+                               float tgt[4];         // N, P, K, pH  (-1 = absent)
+                               char  preset[16];     // SET_COLUMN: crop preset name ("" = absent)
+                               // SET_CLOCK, all required together (not optional-absent like above).
+                               int16_t clkY; int8_t clkMo, clkD, clkH, clkMi;
+                               // SET_THRESH, all required together.
+                               int   thStart, thStop; float thGap; };
 // A forced run arms a countdown before it fires, so the operator can see the rig accepted it and
 // can still stop it. The default is deliberately non-zero: an immediate start leaves no window to
 // catch a mistyped volume. 0 is still allowed for a deliberate fire-now.
@@ -917,7 +949,13 @@ struct TelemetrySnapshot {
   bool     simOk, netReg;
   int      rssi, creg;
   bool     battLow, battCrit;
-  char     lastFault[24], lastFaultAt[20];
+  // lastFault was 24 bytes -- too small for several real lastFaultMsg values ("AUTO-CANCELLED ...",
+  // "Resume attempt got no reply - still held", "Resume already in progress - waiting for ESP2"),
+  // each truncated to a meaningless fragment (losing exactly the words that message existed to
+  // convey) right before publishing to the fault banner's own title. strlcpy is memory-safe either
+  // way, so the truncation was silent -- 96 gives real headroom without meaningfully affecting RAM.
+  char     lastFault[96], lastFaultAt[20];
+  char     heldClearReason[16];   // why esp2Held last cleared -- see lastHeldClearReason
   // Fault / recovery, so the dashboard can offer the same choices the LCD menu does.
   bool     held, steerRel;
   uint8_t  holdRepeats;
@@ -947,7 +985,7 @@ struct TelemetrySnapshot {
   long     sweepLeftS;
   // Validity/state mirrored here so the core-0 uploaders never touch core-1's `sensor`/`wo`/`sysState`
   // directly (a torn read there publishes e.g. tankValid against a half-updated level).
-  bool  envValid, tankValid, lightValid, inaValid;
+  bool  envValid, tankValid, lightValid, battVCalValid;
   SystemState state;
   bool  woActive;
   bool  valid;
@@ -990,9 +1028,13 @@ volatile bool fbPushNow = false;
  * would not. 60 s outlives a network hiccup without stranding the rig out of automatic.            */
 unsigned long webManualUntilMs = 0;          // 0 = not held; else the millis() deadline
 const unsigned long WEB_MANUAL_LEASE_MS = 60000;
-long          webManualSeq   = -1;           // last seq seen from the page. Written ONLY by core 0
+int64_t       webManualSeq   = -1;           // last seq seen from the page. Written ONLY by core 0
                                              // (firebasePollManual); core 1 must never reset it, or a
                                              // revoke would look like a fresh request on the next poll.
+                                             // MUST be 64-bit: the page sends JS Date.now() (~1.7e12
+                                             // today), which does not fit a 32-bit long -- ArduinoJson's
+                                             // `| default` idiom silently returns the default instead of
+                                             // truncating, so a 32-bit read here comes back -1 forever.
 // Latched by a revoke: the page keeps pinging until it notices, and without this the very next poll
 // would re-grant the hold within ~3 s -- silently undoing the operator override this feature exists
 // for. Cleared only when the page actually stops asking.
@@ -1019,8 +1061,14 @@ bool lcdInWebManual = false; // banner currently owns the screen (drives the cle
 struct AdcCal { int degree; double coef[4]; };
 // TODO: paste a0..a3 from the bench tool. Defaults are PLACEHOLDERS (raw fraction 0..1) until calibrated.
 AdcCal calBattV = { 1, { 0.0, 1.0, 0.0, 0.0 } };   // voltage channel (GPIO35)
-AdcCal calBattI = { 1, { 0.0, 1.0, 0.0, 0.0 } };   // current channel (GPIO34)
+// Audit fix (2026-09-08): the current channel's opto-ADC polynomial path (calBattI, GPIO34,
+// NVS "i" blob) was removed here -- current has come entirely from the ACS758-via-ADS1115 I2C path
+// (acsReadVolts(), see below) since that migration, so calBattI was loaded from NVS on boot and then
+// never read again by anything. An operator recalibrating "current" via the bench tool would see
+// "loaded from NVS" reported with zero actual effect -- a silent no-op that looked like a working
+// calibration.
 bool   battCalLoaded = false;                       // true once NVS "adccal" overrode the defaults
+bool   battVCalLoaded = false;                       // see loadBattCal() and the battery-publish gate below
 float battV = 0, battI = 0, battP = 0;
 bool  batteryLow = false, batteryCritical = false;
 unsigned long lastInaMs = 0;                         // ADC read throttle (kept name to avoid churn)
@@ -1098,6 +1146,12 @@ unsigned long lastBtnMs = 0;
 const unsigned long UI_IDLE_TIMEOUT_MS = 300000;   // 5 min
 String    lastFaultMsg = "none";
 String    lastFaultTime = "";        // RTC timestamp of the last fault (shown on the Fault page)
+// Why esp2Held most recently cleared -- set at each of the four clear sites (confirmed RESUME ACK,
+// EMERGENCY_STOP, cancelRun, the ESP2-restarted INVALID,NOT_HELD path). esp2Held itself only says
+// held/not-held; the website's fault banner otherwise can't tell "the rig confirmed recovery" from
+// "the safety circuit breaker gave up" from "an operator cancelled it" -- they all just look like the
+// banner disappearing. One of: "resumed" / "auto_cancelled" / "cancelled" / "estop" / "esp2_restarted".
+String    lastHeldClearReason = "";
 
 /* ---- Settings / Testing UI (MODE button, spec sec.18.10) ----------------- */
 enum UiMode { UI_DATA, UI_MENU, UI_EDIT, UI_TEST, UI_CAL, UI_DIAG };
@@ -1168,6 +1222,12 @@ const uint16_t FC_DELAY_MIN = 20, FC_DELAY_MAX = 300;
 enum ForcePhase { FP_NONE, FP_WAIT, FP_RUNNING };
 ForcePhase    fcPhase = FP_NONE;
 uint8_t       fcSlot  = 0;         // which slot is counting down / running
+// Race fix: the LCD's own Force Run entry used to arm unconditionally, silently overwriting an
+// already-armed run (web or LCD) with no notice. commitEditor()'s SET_FORCE case now checks
+// fcPhase first and, if blocked, flashes this instead of arming -- see the render block near the
+// existing "FORCE RUN ARMED" screen.
+bool          forceBlockedFlash   = false;
+unsigned long forceBlockedUntilMs = 0;
 unsigned long fcFireAtMs = 0;      // countdown deadline for FP_WAIT
 // A dashboard-initiated force run now arms this same countdown instead of dispatching immediately,
 // so the LCD "FORCE RUN ARMED" screen shows it, LCD BACK can abort it, and forceTick() re-checks the
@@ -1278,7 +1338,7 @@ bool          diagEsp2Streaming = false;   // sweep active (idle + ESP2 powered)
 // OFF at idle, so a remote sweep must be time-boxed and must hand the power back.
 unsigned long diagRemoteUntilMs = 0;
 const unsigned long DIAG_REMOTE_DEFAULT_MS = 60000, DIAG_REMOTE_MAX_MS = 120000;
-bool diagRemoteStart(unsigned long ms);
+bool diagRemoteStart(unsigned long ms, const char **why = nullptr);
 void diagRemoteTick();
 const unsigned long DIAG_ESP2_DWELL_MS = 900;    // per-id dwell before advancing the round-robin
 const unsigned long DIAG_ESP2_STALE_MS = 16000;  // full sweep ~10 s; mark a value stale a bit beyond
@@ -1322,6 +1382,12 @@ bool nanoSilent = false;        // one-shot latch so silence alerts/counts fire 
 
 /* ---- Reservoir-low latch (A1: one-shot, prevents fault/SMS storm) --------- */
 bool resLowLatched = false;     // raised once per low-reservoir episode; cleared on recovery
+// One-shot per column, same pattern as resLowLatched: calcDose()'s BATCH_LOW abort (dosing silently
+// no-ops to water-only) previously had no operator-visible signal beyond a quiet SD log line -- with
+// this project's shipped WATER_BUDGET_L/FLUSH_PCT/MIXING_TANK_SAFE_MIN combination it fires on EVERY
+// fertigation-eligible run for a column, so an un-latched alert would spam; latched, it fires once
+// until the underlying constants are retuned and it actually recovers.
+bool dosingBatchLowLatched[NUM_COLUMNS] = { false, false, false };
 
 /* ---- Control-decision trace: log WHY a column is/ isn't serviced (debug the "never irrigates") --- *
  * Logged on change (or re-emitted every 10 min) so the SD log explains itself without spamming.      */
@@ -1348,6 +1414,11 @@ int  estopSel = 0;              // recovery cursor: 0 = Return to normal, 1 = St
  *   STOP (hold/ack) | RELEASE (dump tank to its column) | IRRIGATE (water-only finish)
  *   | NORMAL (resume the paused sequence). Sent over SMS or chosen on the LCD.        */
 bool esp2Held = false;          // an ESP2 hard fault is held, awaiting user recovery
+// A RESUME was sent and we are waiting for ESP2's own ACK,RESUME (success) or INVALID,NOT_HELD
+// (rejected) reply before esp2Held actually clears (see issueRecovery/handleEsp2Response). Clearing
+// esp2Held on SEND instead of on CONFIRMATION used to make the rejection path unreachable.
+bool resumeAwaitingAck = false;
+unsigned long resumeSentMs = 0;
 int  faultRecovSel = 0;         // LCD recovery cursor: 0 Hold, 1 Release, 2 OnlyIrr, 3 Normal, 4 Cancel
 // "Cancel run" is the ABORT this menu previously lacked: Hold/Release/Irrigate/Normal all try to
 // CONTINUE the run, so a fault the rig cannot recover from (dead flow sensor) had no exit but a
@@ -1422,7 +1493,7 @@ void sendWorkOrder(int c, bool fertigate);
 void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const char *fbCmdId);
 void dispatchPendingWorkOrder();
 void handleEsp2Response(const String &payload);
-void esp2PowerCycle();
+bool esp2PowerCycle();
 void esp2ReinitUart();
 void esp2Escalate();
 void esp2CommRecovered();
@@ -1523,7 +1594,7 @@ void raiseFault(char tier, const char *code, const char *loc);
 void enterEmergencyStop(bool cutPower);
 void enterFaultHold(const char *code, const char *loc);
 void issueRecovery(int sel);
-void cancelRun(int mode, const char *why);
+void cancelRun(int mode, const char *why, bool isAuto = false);
 
 void logEvent(const char *source, const char *type, const String &detail);
 void logFlush(bool force);
@@ -1576,8 +1647,10 @@ void setup() {
   lcd.setCursor(0, 1); lcd.print("ESP1 booting...");
 
   // ---- Battery ADC (opto-isolated, polynomial-calibrated) ----
+  // Only the voltage channel (PIN_BATT_V) is actually read this way; current comes from the
+  // ACS758-via-ADS1115 I2C path (see acsReadVolts()), so PIN_BATT_I's attenuation config was
+  // removed here as dead setup for a channel nothing reads (audit fix, 2026-09-08).
   analogReadResolution(12);
-  analogSetPinAttenuation(PIN_BATT_I, ADC_11db);   // ~0..3.1 V full scale (clips above)
   analogSetPinAttenuation(PIN_BATT_V, ADC_11db);
   loadBattCal();                                   // NVS "adccal" overrides the hardcoded defaults if present
 
@@ -2053,19 +2126,27 @@ void saveColEnable(int c) {
 const float TGT_PPM_MAX = 2000.0f;      // well above any CROP_PRESETS value; catches typos, not use
 const float TGT_PH_MIN  = 3.0f, TGT_PH_MAX = 9.0f;
 
-// key: "N" | "P" | "K" | "PH" (case-insensitive). Returns false + a reason on a rejected value.
-bool applyColumnTarget(int c, const String &keyIn, float v, String &err) {
-  if (c < 0 || c >= NUM_COLUMNS) { err = "bad column"; return false; }
+// Pure range check, no mutation -- lets a caller validate every field in a multi-field command
+// BEFORE applying any of them, so a late-failing field can't leave earlier ones live-but-unsaved.
+static bool columnTargetInRange(const String &keyIn, float v, String &err) {
   String key = keyIn; key.toUpperCase();
   if (key == "PH") {
     if (!(v >= TGT_PH_MIN && v <= TGT_PH_MAX)) { err = "pH out of range 3.0-9.0"; return false; }
-    col[c].targetPH = v; return true;
+    return true;
   }
   if (!(v >= 0.0f && v <= TGT_PPM_MAX)) { err = key + " out of range 0-2000 ppm"; return false; }
-  if      (key == "N") col[c].targetN = v;
-  else if (key == "P") col[c].targetP = v;
-  else if (key == "K") col[c].targetK = v;
-  else { err = "unknown field " + key; return false; }
+  if (key == "N" || key == "P" || key == "K") return true;
+  err = "unknown field " + key; return false;
+}
+// key: "N" | "P" | "K" | "PH" (case-insensitive). Returns false + a reason on a rejected value.
+bool applyColumnTarget(int c, const String &keyIn, float v, String &err) {
+  if (c < 0 || c >= NUM_COLUMNS) { err = "bad column"; return false; }
+  if (!columnTargetInRange(keyIn, v, err)) return false;
+  String key = keyIn; key.toUpperCase();
+  if      (key == "N")  col[c].targetN  = v;
+  else if (key == "P")  col[c].targetP  = v;
+  else if (key == "K")  col[c].targetK  = v;
+  else if (key == "PH") col[c].targetPH = v;
   return true;
 }
 void saveExercise() {
@@ -2279,7 +2360,15 @@ bool classifyAndApply(const String &payload, const String &raw) {
       if (COLUMN_ENABLED[c] && broken) {
         if (!soilMissingLatched[c]) {
           soilMissingLatched[c] = true;
-          raiseFault('M', "SOIL_MISSING", c == 0 ? "COL_A" : c == 1 ? "COL_B" : "COL_C");
+          // Diagnostic enrichment (same pattern as holdFault()'s "|pulses=" for FLOW_FAIL): fold the
+          // specific broken-reason and the two raw probe values into loc so it reaches the dashboard
+          // and SMS, not just the local log -- "both probes read nothing" and "probes disagree, NPK
+          // covering" point at different physical checks, and the raw numbers save a Diagnostics-tab
+          // round trip.
+          const char *reason = (why == SB_NPK_FALLBACK) ? "PROBE_DIVERGE" : "NO_READING";
+          String locDetail = String(c == 0 ? "COL_A" : c == 1 ? "COL_B" : "COL_C") + "|" + reason +
+                              "|raw=" + String(rawTmp[c][0]) + "," + String(rawTmp[c][1]);
+          raiseFault('M', "SOIL_MISSING", locDetail.c_str());
         }
       } else if (!broken && tmp[c] >= 0) soilMissingLatched[c] = false;   // healthy again -> re-arm
     }
@@ -2404,17 +2493,44 @@ void pollESP2() {
           lastFaultMsg = "none"; lastFaultTime = "";
         }
         int s = raw.indexOf(FRAME_START), e = raw.indexOf(FRAME_END);
-        String payload = (s >= 0 && e > s) ? raw.substring(s + 7, e) : raw;
-        payload.trim();
-        if (payload.startsWith(",")) payload = payload.substring(1);
-        if (payload.endsWith(","))   payload = payload.substring(0, payload.length() - 1);
-        handleEsp2Response(payload);
+        // Require both markers, in order, within the accumulation cap -- mirrors pollNano()'s structural
+        // gate and the LOCKED rule "never execute a packet unless both START and END markers validate".
+        // Liveness bookkeeping above still counts a garbled line as evidence ESP2 is alive; only the
+        // dispatch below is gated, so a dropped/garbled frame can no longer be acted on as if it were real.
+        if (s < 0 || e <= s || raw.length() > 140) {
+          static unsigned long lastEsp2GarbageLogMs = 0;
+          if (millis() - lastEsp2GarbageLogMs > 1000) {
+            lastEsp2GarbageLogMs = millis();
+            logEvent("ESP2", "GARBAGE", "RAW=" + raw.substring(0, 64));
+          }
+        } else {
+          String payload = raw.substring(s + 7, e);
+          payload.trim();
+          if (payload.startsWith(",")) payload = payload.substring(1);
+          if (payload.endsWith(","))   payload = payload.substring(0, payload.length() - 1);
+          handleEsp2Response(payload);
+        }
       }
     } else if (line.length() < 140) line += c; else line = "";
   }
 
   // ACK / DONE timeout supervision (suspended while a fault is HELD -- ESP2 is paused, not hung)
-  if (esp2Held) return;
+  if (esp2Held) {
+    // A RESUME we sent may never get any reply at all (link glitch, ESP2 wedged) -- without this,
+    // the fault-hold menu would sit unchanged forever with no sign the button press did anything.
+    // Bounded, and deliberately does NOT itself clear esp2Held or resume anything: it only reports
+    // that this attempt got no answer, so the operator's next choice is still what actually recovers.
+    if (resumeAwaitingAck && millis() - resumeSentMs > RESUME_ACK_TIMEOUT_MS) {
+      resumeAwaitingAck = false;
+      logEvent("ESP1", "RESP", "RESUME|NO_REPLY");
+      sendSMS("ALERT,WARN,RESUME_NO_REPLY,still held - check the link and try again");
+      // Reuses the existing lastFaultMsg -> diagnostics.system.lastFault / diagnostics.fault.code
+      // plumbing (already rendered on the dashboard's Diagnostics tab) so the website has SOME way
+      // to distinguish "still held, last attempt got no reply" from a silently-stuck banner.
+      lastFaultMsg = "Resume attempt got no reply - still held";
+    }
+    return;
+  }
   if (wo.active && wo.stage == WO_SENT && millis() - wo.sentMs > UART_ACK_TIMEOUT_MS) {
     if (wo.retries < MAX_UART_RETRY) {
       wo.retries++;
@@ -2540,12 +2656,22 @@ void handleEsp2Response(const String &payload) {
     for (int i = 0; i <= (int)arg.length() && nt < 5; i++)
       if (i == (int)arg.length() || arg[i] == ',') { t[nt++] = arg.substring(st, i); st = i + 1; }
     if (nt >= 4) {
-      int dc = -1;
-      for (int j = 0; j < NUM_COLUMNS; j++) if (t[3] == String("COL_") + COL_TAG[j]) dc = j;
-      if (dc >= 0) nutrientUsedToday[dc] += t[2].toFloat();     // measured mL
+      float measuredMl = t[2].toFloat();
+      if (forceMask && __builtin_popcount(forceMask) > 1) {
+        // Same reasoning as the WATER split in the DONE handler below: one dosing pump, one measured
+        // volume, but a multi-column FORCE run's colLoc tag ("COL_AB") never matches this loop's
+        // single-letter comparison, so t[3] here never resolves to a column and the whole measured
+        // amount was silently dropped from nutrientUsedToday[] for every FORCE run touching 2+ columns.
+        int nc = __builtin_popcount(forceMask);
+        for (int b = 0; b < NUM_COLUMNS; b++) if (forceMask & (1 << b)) nutrientUsedToday[b] += measuredMl / nc;
+      } else {
+        int dc = -1;
+        for (int j = 0; j < NUM_COLUMNS; j++) if (t[3] == String("COL_") + COL_TAG[j]) dc = j;
+        if (dc >= 0) nutrientUsedToday[dc] += measuredMl;     // measured mL
+      }
       if (runPhase != RUN_NONE && t[0].length() >= 5) {         // NUT_A/B/C -> the post-run receipt
         int ni = t[0].charAt(4) - 'A';
-        if (ni >= 0 && ni < 3) run.doseGot[ni] = t[2].toFloat();
+        if (ni >= 0 && ni < 3) run.doseGot[ni] = measuredMl;   // per-nutrient for the whole run, not per-column -- not split
       }
       logEvent("ESP2", "DOSE", t[0] + "|" + t[1] + "|" + t[2] + "|" + t[3]);
     }
@@ -2561,6 +2687,24 @@ void handleEsp2Response(const String &payload) {
       pendingExercise.acked = true;                            // ESP2 confirmed receipt -> log START now (not at dispatch)
       logEvent("ESP1", "ACT", String("EXERCISE|START|") + (pendingExercise.idx >= 0 ? EX_NAME[pendingExercise.idx] : "?"));
     }
+    if (arg.startsWith("RESUME") && resumeAwaitingAck) {       // ESP2 actually confirmed the recovery RESUME
+      resumeAwaitingAck = false;
+      esp2Held = false;
+      lastHeldClearReason = "resumed";
+      String mode = arg.substring(arg.indexOf(',') + 1);
+      logEvent("ESP1", "ACT", String("RESUME|CONFIRMED|") + mode + "|COL_" +
+               (wo.colIdx >= 0 ? String(COL_TAG[wo.colIdx]) : String("?")));
+      sendSMS(String("ACK,RESUME,") + mode);
+      lastFaultMsg = "Resumed (" + mode + ") - confirmed by ESP2";   // see diagnostics.system.lastFault
+      setState(ACTIVE_STATE);                                  // supervising the resumed run again
+      // D-M2 fix: enterFaultHold() -> runUiAbort() forced runPhase to RUN_NONE when the fault was
+      // raised, so the dashboard's Run Progress panel (and the LCD run screen) went dark even though
+      // wo/ESP2 stayed mid-sequence the whole time. A confirmed RESUME means the same work order is
+      // live again, so re-arm the same phase runUiAdvance() would already be in (RUN_LIVE) WITHOUT
+      // touching run.* (targets/doses/step count) -- this is a resume, not a new run, so calling
+      // runUiBegin() here would wrongly reseed the doses and reset progress to "Starting".
+      if (runPhase == RUN_NONE && wo.active) { runPhase = RUN_LIVE; runPhaseMs = millis(); runLocked = true; }
+    }
     if (wo.active) { wo.stage = WO_ACKED; wo.sentMs = millis(); }
   } else if (resp == "DONE") {
     if (arg.startsWith("EXERCISE")) {                          // preventive exercise finished
@@ -2575,9 +2719,14 @@ void handleEsp2Response(const String &payload) {
       int c = wo.colIdx;
       if (c >= 0 && c < NUM_COLUMNS) {
         col[c].lastServicedStamp = currentDayStamp;
-        // B1: optional measured water volume reported as ...,WATER,<liters> on DONE.
+        // B1: optional measured water volume reported as ...,WATER,<liters>[,EST] on DONE. EST means
+        // ESP2 hit a flow-blind (timed, not metered) stage somewhere in this run -- String::toFloat()
+        // already safely stops at the trailing comma so `liters` itself is unaffected either way, but
+        // this distinction was previously read off the wire and then silently dropped: neither the
+        // log nor waterUsedToday[] ever recorded that a total was estimated rather than truly metered.
         int wi = payload.indexOf("WATER,");
         float liters = (wi >= 0) ? payload.substring(wi + 6).toFloat() : 0.0f;
+        bool waterEstimated = payload.indexOf(",EST") >= 0;
         if (forceMask && __builtin_popcount(forceMask) > 1) {
           // Multi-column FORCE run: one tank, one outlet, one flow meter. The measured litres are a
           // COMBINED total and the per-column split is set by plumbing resistance, not by us. Split
@@ -2591,13 +2740,13 @@ void handleEsp2Response(const String &payload) {
           }
           logEvent("ESP1", "ACT", String(wo.fertigate ? "FERTIGATION" : "IRRIGATION")
                                     + "|STOP|FORCE|COL_" + cols + "|W=" + String(liters, 2)
-                                    + "|SPLIT=EST/" + String(nc));
+                                    + "|SPLIT=EST/" + String(nc) + (waterEstimated ? "|TIMED" : ""));
         } else {
           if (wi >= 0) waterUsedToday[c] += liters;
           // Log the litres in the ACT row (|W=) so SUMMARY/FULL can recover per-day water totals.
           logEvent("ESP1", "ACT", String(wo.fertigate ? "FERTIGATION" : "IRRIGATION")
                                     + "|STOP|" + (forceMask ? "FORCE|" : "") + "COL_" + COL_TAG[c]
-                                    + "|W=" + String(liters, 2));
+                                    + "|W=" + String(liters, 2) + (waterEstimated ? "|TIMED" : ""));
         }
         if (forceCmdId[0]) {                       // report the run back to the dashboard
           firebaseQueueStatus(forceCmdId, "completed", (String("delivered ") + String(liters, 2) + " L").c_str());
@@ -2663,6 +2812,13 @@ void handleEsp2Response(const String &payload) {
     // and let the still-due column re-run normally -- ESP2 will fill only the remaining liters.
     if (esp2Held && arg.startsWith("NOT_HELD")) {
       esp2Held = false; wo.active = false; wo.stage = WO_IDLE;
+      lastHeldClearReason = "esp2_restarted";
+      resumeAwaitingAck = false;
+      // Same re-hold-guard reset cancelRun() and the normal DONE-success path already do -- this is
+      // one of the four documented esp2Held-clear sites but previously missed it, so an unrelated
+      // LATER fault that happens to share a code with whatever was held here would inherit a stale
+      // sameHoldN instead of starting its own count at 1.
+      lastHoldCode = ""; sameHoldN = 0; steerRelease = false;
       // Same release as the other abnormal endings: this work order is gone, so nothing may keep
       // waiting on it -- an armed A-then-B sequence or a dashboard command most of all.
       forceAbort("ESP2_RESTARTED");
@@ -2679,7 +2835,22 @@ void handleEsp2Response(const String &payload) {
 void calcDose(int c, float mL[3], float ceilS[3]) {
   for (int i = 0; i < 3; i++) { mL[i] = 0; ceilS[i] = 0; }
   float V = WATER_BUDGET_L[c] * (1.0f - FLUSH_PCT / 100.0f);   // planned batch volume this run (§1.1)
-  if (V < MIXING_TANK_SAFE_MIN) { logEvent("ESP1", "DOSE", "BATCH_LOW|water-only"); return; }
+  if (V < MIXING_TANK_SAFE_MIN) {
+    logEvent("ESP1", "DOSE", "BATCH_LOW|water-only");
+    // This is a commissioning/constant-tuning question (WATER_BUDGET_L vs. FLUSH_PCT vs.
+    // MIXING_TANK_SAFE_MIN) -- CLAUDE.md says do not invent final values here, so this does not
+    // change any of them. But the abort itself was previously silent beyond the log line above;
+    // one-shot alert so it's actually noticed rather than discovered later as "nutrients never dose."
+    if (!dosingBatchLowLatched[c]) {
+      dosingBatchLowLatched[c] = true;
+      // New-F9 (audit): same "diagnostic enrichment" pattern as the FLOW_FAIL/PWR_FAIL/etc fixes --
+      // V and MIXING_TANK_SAFE_MIN are both already in scope; include them instead of just the column.
+      String colLoc = String("COL_") + COL_TAG[c] + "|V=" + String(V, 2) + "|min=" + String(MIXING_TANK_SAFE_MIN, 2);
+      raiseFault('M', "DOSE_BATCH_LOW", colLoc.c_str());
+    }
+    return;
+  }
+  dosingBatchLowLatched[c] = false;   // recovered (constants retuned) -- allow it to alert again if it recurs
   if (V > MIXING_TANK_MAX_VOLUME) V = MIXING_TANK_MAX_VOLUME;
   // gaps (mg/kg); only positive gaps dose. A=N (gated), B=P, C=K (§3.2/3.3). dose_mL = gap*V/stock (§3.1).
   float gap[3]   = { col[c].targetN - SOIL_BASELINE_N, col[c].targetP - SOIL_BASELINE_P, col[c].targetK - SOIL_BASELINE_K };
@@ -2736,7 +2907,13 @@ void sendWorkOrder(int c, bool fertigate) {
   if (fertigate) {
     cmd += ",DOSE," + String(mL[0], 1) + "," + String(mL[1], 1) + "," + String(mL[2], 1);
     cmd += ",DCEIL," + String(ceilS[0], 0) + "," + String(ceilS[1], 0) + "," + String(ceilS[2], 0);  // 2x timed ceilings (s)
-    cmd += ",BATCHV," + String(WATER_BUDGET_L[c] * (1.0f - FLUSH_PCT / 100.0f), 1);                   // planned batch L (§1.1)
+    // Same MIXING_TANK_MAX_VOLUME ceiling calcDose() applies -- this recomputes the identical
+    // formula independently, and previously did so without the clamp, so a future WATER_BUDGET_L
+    // raised past ~62.5L would size the nutrient dose for one (capped) volume while telling ESP2 to
+    // target a larger (uncapped) one here, silently diluting the dose. Dormant today (5L << 50L).
+    float wireBatchV = WATER_BUDGET_L[c] * (1.0f - FLUSH_PCT / 100.0f);
+    if (wireBatchV > MIXING_TANK_MAX_VOLUME) wireBatchV = MIXING_TANK_MAX_VOLUME;
+    cmd += ",BATCHV," + String(wireBatchV, 1);                                                        // planned batch L (§1.1)
     cmd += ",EC," + String(EC_MIN, 1) + "," + String(EC_MAX, 1);
     cmd += ",PH," + String(PH_MIN, 1) + "," + String(PH_MAX, 1);
     cmd += ",MIX," + String(MIXING_DURATION_MS);
@@ -2839,6 +3016,18 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
   if (primary >= NUM_COLUMNS) return;
 
   bool fert = (doseMl[0] > 0.0f || doseMl[1] > 0.0f || doseMl[2] > 0.0f);
+  if (fert) {
+    float batchV = liters * (1.0f - FLUSH_PCT / 100.0f);
+    // Same floor calcDose() enforces for the scheduled path (MIXING_TANK_SAFE_MIN) -- previously
+    // unchecked on this path, so a FORCE run (dashboard, or the LCD editor which clamps down to
+    // 0.5L) could dose nutrient into a batch both firmwares' own constants call unsafe, with no
+    // refusal anywhere in the protocol.
+    if (batchV < MIXING_TANK_SAFE_MIN) {
+      logEvent("ESP1", "ACT", "FORCE|BLOCKED|BATCH_LOW");
+      if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "batch too small to dose safely -- raise liters or remove nutrients");
+      return;
+    }
+  }
   String cols;
   for (int b = 0; b < NUM_COLUMNS; b++) if (mask & (1 << b)) cols += (char)('A' + b);
 
@@ -2855,7 +3044,11 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
       float s = (doseMl[i] > 0.0f) ? doseMl[i] / PUMP_FLOWRATE_MLPM[i] * 60.0f * CEILING_MARGIN : 0.0f;
       cmd += String(s, 0) + (i < 2 ? "," : "");
     }
-    cmd += ",BATCHV," + String(liters * (1.0f - FLUSH_PCT / 100.0f), 1);
+    // Same MIXING_TANK_MAX_VOLUME ceiling as the scheduled path's calcDose() -- see the identical
+    // comment at sendWorkOrder's BATCHV. Dormant given FORCE_MAX_LITERS=20 << 50L today.
+    float wireBatchV = liters * (1.0f - FLUSH_PCT / 100.0f);
+    if (wireBatchV > MIXING_TANK_MAX_VOLUME) wireBatchV = MIXING_TANK_MAX_VOLUME;
+    cmd += ",BATCHV," + String(wireBatchV, 1);
     cmd += ",EC," + String(EC_MIN, 1) + "," + String(EC_MAX, 1);
     cmd += ",PH," + String(PH_MIN, 1) + "," + String(PH_MAX, 1);
     cmd += ",MIX," + String(MIXING_DURATION_MS);
@@ -2927,6 +3120,7 @@ void runUiBegin(int c, bool fert, float forceL, const float *forceDose) {
   float budget = (forceL >= 0.0f) ? forceL : WATER_BUDGET_L[c];
   run.waterTgt = budget;
   run.batchV   = budget * (1.0f - FLUSH_PCT / 100.0f);
+  if (run.batchV > MIXING_TANK_MAX_VOLUME) run.batchV = MIXING_TANK_MAX_VOLUME;   // same ceiling calcDose() applies
   if (fert) {
     if (forceDose) {
       // Mirror sendForceWorkOrder's DCEIL maths so the receipt and the work order agree.
@@ -3266,8 +3460,11 @@ void rtcDeadRebootTick() {
   ESP.restart();
 }
 
-void esp2PowerCycle() {
-  if (millis() - lastRecoveryMs < RECOVERY_COOLDOWN_MS) return;
+// Returns whether it actually cycled ESP2 (false = suppressed by cooldown). esp2Escalate() uses this so
+// a suppressed call can never be miscounted as one of the ESP2_MAX_FAST_CYCLES attempts, and can never
+// leave sysState stranded in RECOVERY_STATE re-triggering the escalate-timeout branch on every loop tick.
+bool esp2PowerCycle() {
+  if (millis() - lastRecoveryMs < RECOVERY_COOLDOWN_MS) return false;
   lastRecoveryMs = millis();
   esp2ReinitUart();                      // reset ESP1's UART too -- cycling ESP2 alone can't clear an ESP1 RX wedge
   esp2SoftResetTried = false;            // power-cycle ends the ladder; a future episode soft-resets first
@@ -3282,6 +3479,7 @@ void esp2PowerCycle() {
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
   firebaseRemoteExerciseDone("failed", "aborted by ESP2 power cycle");
   setState(STARTUP_SYNC);
+  return true;
 }
 
 // Capped escalation to the power-cycle (sec.18.9). Fast power-cycling ESP2 can't recover a broken link or
@@ -3298,8 +3496,14 @@ void esp2Escalate() {
     esp1SelfResetOncePerDay("ESP2_COMM_LOST");         // final escalation (no-op if already reset today)
     return;
   }
+  if (!esp2PowerCycle()) {
+    // Suppressed by cooldown: don't count it, and re-arm the soft-reset-timeout clock so RECOVERY_STATE's
+    // timeout branch (and its logEvent) waits another ESP2_SOFT_RESET_TIMEOUT_MS instead of re-firing on
+    // every loop tick until the cooldown clears on its own.
+    esp2RecoverMs = millis();
+    return;
+  }
   esp2FastCycles++;
-  esp2PowerCycle();
 }
 
 // ESP2 comm confirmed again (READY / STARTUP_SYNC validate): drop the episode counter and clear the latch.
@@ -3361,7 +3565,18 @@ void esp2PowerTick() {
   // plain comparison is immediately true -- cutting ESP2's power during the very minimum-on hold
   // that exists to stop it being cut before it can boot. Once per 49.7 days, and this rig is meant
   // to run unattended for months.
-  if (esp2OffPending && esp2Powered && (long)(millis() - esp2OffAt) >= 0) esp2SetPower(false);
+  if (esp2OffPending && esp2Powered && (long)(millis() - esp2OffAt) >= 0) {
+    // Something may have started using ESP2 during this deferred-off window -- controlTick(),
+    // sendForceWorkOrder(), and exerciseTick() all have an "already up, dispatch now" fast path that
+    // sends straight over the wire without going through esp2SetPower(true) (the only place that
+    // normally clears esp2OffPending). If that happened, cutting power now would be a raw,
+    // ungraceful GPIO4 cut mid-actuation that bypasses the fault-hold protocol entirely -- no P17
+    // drop through ESP2's own holdFault(), no mixTankL persistence -- reached with no fault involved
+    // at all. Cancel the stale deferred cut instead; every real completion path (DONE/exercise-done)
+    // already calls esp2SetPower(false) directly once the work genuinely finishes.
+    if (wo.active || pendingRun.active || pendingExercise.active || esp2Held) esp2OffPending = false;
+    else esp2SetPower(false);
+  }
   if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held || esp2CommLost) { esp2PollActive = false; return; }
   unsigned long interval = isNight() ? ESP2_IDLE_POLL_NIGHT_MS : ESP2_IDLE_POLL_DAY_MS;
   if (!esp2PollActive) {
@@ -3598,9 +3813,13 @@ void handleSms(const String &body) {
     // until re-provisioned; use this if the device is lost or the account is rotated.
     if (rest.equalsIgnoreCase("SIGNOUT")) {
       xSemaphoreTake(netMux, portMAX_DELAY);
-      fbPassword = ""; fbRefresh = ""; fbIdToken = "";
+      // fbUid/fbAuthErr moved inside this section too -- both are Strings also read/written from
+      // core 0 (netTask) without netMux (internally consistent there, single task), so writing them
+      // from this core-1 SMS handler unguarded was a genuine cross-core String data race (heap
+      // pointer/length), the exact hazard class this file's own comments warn about elsewhere.
+      fbPassword = ""; fbRefresh = ""; fbIdToken = ""; fbUid = ""; fbAuthErr = "";
       xSemaphoreGive(netMux);
-      fbTokenExpiryMs = 0; fbAuthOk = false; fbUid = ""; fbAuthErr = "";
+      fbTokenExpiryMs = 0; fbAuthOk = false;
       saveFbAuth();
       logEvent("ESP1", "CFG", "FBASE|SIGNOUT");
       sendSMS("ACK,FBASE,SIGNOUT");
@@ -3609,18 +3828,29 @@ void handleSms(const String &body) {
     // FBASE,STATUS -- why is it not connecting? Reports the blocking precondition, the last
     // Google error, and the UID. Safe to send: no secret is ever echoed.
     if (rest.equalsIgnoreCase("STATUS")) {
+      // netMux: these 7 Strings are also written from core-0 netTask (fbRefreshToken/
+      // fbPasswordSignIn/fbNoteAuthError/fbNoteAuthLocal/the portal admin form, etc.). Copy them
+      // under the lock first, then build the reply from the local copies -- fbUid/fbAuthErr
+      // especially: reading their live buffer content (not just .length()) while core 0 is
+      // concurrently reassigning either is a genuine use-after-free/torn-read hazard, not just a
+      // stale value. This block previously took no lock at all.
+      String uKey, uMail, uRefresh, uPass, uUrl, uUid, uErr;
+      xSemaphoreTake(netMux, portMAX_DELAY);
+      uKey = fbApiKey; uMail = fbEmail; uRefresh = fbRefresh; uPass = fbPassword;
+      uUrl = fbUrl; uUid = fbUid; uErr = fbAuthErr;
+      xSemaphoreGive(netMux);
       String m = "FB,";
       m += fbAuthOk ? "SIGNEDIN" : "NOAUTH";
       m += ",http=" + String(fbAuthHttp);
-      if (!firebaseEnabled)                                 m += ",OFF";
-      else if (fbApiKey.length() < 8)                       m += ",NOKEY";
-      else if (!fbEmail.length())                           m += ",NOMAIL";
-      else if (!fbRefresh.length() && !fbPassword.length()) m += ",NOPASS";
-      else if (!wifiConnected)                              m += ",NOWIFI";
-      else if (fbUrl.length() < 8)                          m += ",NOURL";
+      if (!firebaseEnabled)                     m += ",OFF";
+      else if (uKey.length() < 8)               m += ",NOKEY";
+      else if (!uMail.length())                 m += ",NOMAIL";
+      else if (!uRefresh.length() && !uPass.length()) m += ",NOPASS";
+      else if (!wifiConnected)                  m += ",NOWIFI";
+      else if (uUrl.length() < 8)               m += ",NOURL";
       m += fbPinCa ? ",TLS=pin" : ",TLS=insecure";
-      if (fbUid.length())     m += ",uid=" + fbUid;
-      if (fbAuthErr.length()) m += "," + fbAuthErr.substring(0, 60);
+      if (uUid.length()) m += ",uid=" + uUid;
+      if (uErr.length()) m += "," + uErr.substring(0, 60);
       sendSMS(m);
       return;
     }
@@ -3682,7 +3912,8 @@ void handleSms(const String &body) {
       DateTime y = rtc.now() - TimeSpan(1, 0, 0, 0);
       stamp = dayStamp(y);
     }
-    if (supaUrl.length() == 0) { sendSMS("ERR,UPLOAD,NOCREDS"); return; }
+    xSemaphoreTake(netMux, portMAX_DELAY); bool suHave = supaUrl.length() > 0; xSemaphoreGive(netMux);
+    if (!suHave) { sendSMS("ERR,UPLOAD,NOCREDS"); return; }
     if (stamp <= 0)                    { sendSMS("ERR,UPLOAD,DAY"); return; }
     if (rtcOk && stamp == currentDayStamp) { sendSMS("ERR,UPLOAD,TODAY"); return; }  // never the open file
     char path[16]; snprintf(path, sizeof(path), "/%08ld.CSV", stamp);
@@ -3737,6 +3968,15 @@ void handleSms(const String &body) {
       SumMode mode = isFull ? SUM_FULL : SUM_SHORT;
       const char *ackName = isFull ? "FULLSUMMARY" : "SUMMARY";
       if (sysState == ACTIVE_STATE || portalActive) {   // portal owns the SD -> defer, run when it closes
+        if (summaryPending) {
+          // A request is already queued and waiting for the system to idle. summaryReplyTo/
+          // pendingSumMode/pendingSumTarget are single, non-queued globals -- a second request here
+          // used to silently overwrite the first one, so the first requester's report simply never
+          // arrived, with no error, and both requests got an ACK,BUSY that looked like a queued
+          // success.
+          sendSMS(String("ACK,BUSY,") + ackName + ",ALREADY_QUEUED");
+          return;
+        }
         sendSMS(String("ACK,BUSY,") + ackName);
         summaryReplyTo = replyTarget;
         pendingSumMode = mode; pendingSumTarget = target;
@@ -3802,13 +4042,21 @@ void handleSms(const String &body) {
       sendSMS("ERR,PRESET"); return;
     }
     // explicit: SET,COL_A,N,150,P,40,K,200,pH,5.8  (key/value pairs)
-    // Shares applyColumnTarget() with the dashboard's SET_COLUMN, so both reject the same values.
-    // Previously this assigned unchecked -- a mistyped target went straight into NVS and calcDose().
+    // Shares applyColumnTarget()/columnTargetInRange() with the dashboard's SET_COLUMN, now via the
+    // same two-pass validate-then-apply shape too (Pass 1: every field checked, nothing mutated;
+    // Pass 2: apply, only reached if all passed). Previously this validated-and-mutated one field at
+    // a time via applyColumnTarget() alone, so a late-failing field (e.g. N valid, P out of range)
+    // left N already live in RAM from the earlier successful iteration -- unpersisted (saveColumn()
+    // never reached on the error return) and silently reverting on next reboot, while the ERR reply
+    // implied nothing had changed at all.
     String err;
     for (int i = 2; i + 1 < n; i += 2) {
-      if (!applyColumnTarget(c, tok[i], tok[i + 1].toFloat(), err)) {
+      if (!columnTargetInRange(tok[i], tok[i + 1].toFloat(), err)) {
         sendSMS(String("ERR,SET,") + err); return;
       }
+    }
+    for (int i = 2; i + 1 < n; i += 2) {
+      applyColumnTarget(c, tok[i], tok[i + 1].toFloat(), err);   // already validated -- cannot fail here
     }
     saveColumn(c);
     sendSMS(String("ACK,SET,COL_") + COL_TAG[c]);
@@ -3820,10 +4068,16 @@ void handleSms(const String &body) {
     if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
     // WIFI,ON / WIFI,OFF -- master switch (mirrors the Settings > WiFi toggle). Checked before the
     // ssid/pass parse; a real SSID of literally "ON"/"OFF" with no password is not a valid pair anyway.
-    if (n == 2 && (tok[1] == "ON" || tok[1] == "OFF")) {
-      wifiEnabled = (tok[1] == "ON"); saveWifiEn();
-      sendSMS(String("ACK,WIFI,") + tok[1]);
-      return;
+    // Audit fix (2026-09-08): compare against an uppercased copy, not the raw token -- tok[] is built
+    // from the un-uppercased body, unlike k0, so "WIFI,on"/"WIFI,off" previously fell through to the
+    // ssid/pass parser and silently returned ERR,WIFI instead of toggling.
+    if (n == 2) {
+      String t1u = tok[1]; t1u.toUpperCase();
+      if (t1u == "ON" || t1u == "OFF") {
+        wifiEnabled = (t1u == "ON"); saveWifiEn();
+        sendSMS(String("ACK,WIFI,") + t1u);
+        return;
+      }
     }
     int p1 = b.indexOf(','), p2 = (p1 >= 0) ? b.indexOf(',', p1 + 1) : -1;
     if (p1 < 0 || p2 < 0) { sendSMS("ERR,WIFI"); return; }
@@ -3837,7 +4091,11 @@ void handleSms(const String &body) {
   // phone, browse to the AP IP, pick a network + type the password, Save. (Part B)
   if (k0 == "WIFIPORTAL") {
     if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
-    if (n >= 2 && tok[1] == "STOP") { portalCancel = true; sendSMS("ACK,WIFIPORTAL,STOP"); return; }
+    // Audit fix (2026-09-09): same case-sensitivity bug class as the WIFI,ON/OFF fix -- tok[] is
+    // built from the un-uppercased body, so "WIFIPORTAL,stop" previously fell through to the
+    // (re-)start branch below instead of stopping the portal, replying with the AP's default
+    // password as if a stop had never been requested.
+    if (n >= 2) { String t1u = tok[1]; t1u.toUpperCase(); if (t1u == "STOP") { portalCancel = true; sendSMS("ACK,WIFIPORTAL,STOP"); return; } }
     portalRequested = true;
     sendSMS(String("ACK,WIFIPORTAL,join ") + AP_SSID + " pw " + AP_PASS + " -> http://192.168.4.1");
     return;
@@ -3848,6 +4106,12 @@ void handleSms(const String &body) {
     if (n < 3) { sendSMS("ERR,TSKEY"); return; }
     int ch = tok[1].toInt(); String key = tok[2];
     if (ch < 1 || ch > 3) { sendSMS("ERR,TSCH"); return; }
+    // Same alnum-only check the portal's /tskey route already enforces -- this SMS path had none, so
+    // a key containing '&' (e.g. "ABC&status=x") would inject extra query parameters into the
+    // outbound ThingSpeak GET (tsUpload() concatenates it unescaped into the URL).
+    bool badKey = (key.length() == 0);
+    for (unsigned ki = 0; ki < key.length(); ki++) if (!isalnum((unsigned char)key[ki])) badKey = true;
+    if (badKey) { sendSMS("ERR,TSKEY_CHARS"); return; }
     xSemaphoreTake(netMux, portMAX_DELAY);
     if (ch == 1) tsKey1 = key; else if (ch == 2) tsKey2 = key; else tsKey3 = key;
     xSemaphoreGive(netMux);
@@ -4058,7 +4322,16 @@ static void summaryParseLine(const String &ln) {
     else return;
     { String f[4]; int nf = splitPipe(detail, f, 4); if (nf >= 2) sumAddError(f[1], hhmm); }  // dedup code
     code = "F:" + detail;
-  } else if (type == "RESET") { sumRst++; { String f[4]; int nf = splitPipe(detail, f, 4); if (nf >= 1) sumAddError(String("RST_") + f[0], hhmm); } code = "R:" + detail; }
+  } else if (type == "RESET") {
+    sumRst++;
+    // Was keyed on f[0] alone (just the device, e.g. "ESP2") -- every distinct reset REASON for the
+    // same device (UART_REINIT, SLOW_RETRY, HW|POWERCYCLE, SOFT|RESET_SELF, ...) collapsed into one
+    // dedup bucket, so FULL SUMMARY's ERR list showed only the day's FIRST ESP2 reset, silently
+    // swallowing every later, possibly-unrelated one. f[1] (the reason) is now part of the key too.
+    String f[4]; int nf = splitPipe(detail, f, 4);
+    if (nf >= 1) sumAddError(String("RST_") + f[0] + (nf >= 2 ? ("_" + f[1]) : ""), hhmm);
+    code = "R:" + detail;
+  }
   else if   (type == "DOSE")  {                      // NUT_A|target|measured|COL_A
     sumDose++;
     String f[4]; int nf = splitPipe(detail, f, 4);
@@ -4429,6 +4702,16 @@ void controlTick() {
       ctrlNote(c, "OUTSIDE_WINDOW|now=" + hhmm(mod) + "|win=" + hhmm(ws) + "-" + hhmm(we));
       continue;
     }
+    // Whole-Nano-link staleness: sensor.soil[c]/npkValid[c] only reflect the last successfully parsed
+    // packet -- neither is automatically invalidated by the LINK going down (only a per-field -1
+    // sentinel is caught below), so a Nano outage previously let the schedule irrigate/fertigate on
+    // arbitrarily old data for as long as the outage lasted. heartbeatTick's NANO_SILENCE alert is
+    // informational only and nothing here gated on it. Same NANO_STALE_MS threshold npkMoistPct()
+    // already uses for the analogous per-sensor case.
+    if (!sensor.lastNanoMs || millis() - sensor.lastNanoMs > NANO_STALE_MS) {
+      ctrlNote(c, "NANO_STALE");
+      continue;
+    }
     if (sensor.soil[c] < 0) { ctrlNote(c, "SOIL_INVALID"); continue; }   // invalid soil (faulted elsewhere)
     if (sensor.soil[c] >= soilStartPct) {                          // not dry enough
       ctrlNote(c, "NOT_DRY|soil=" + String(sensor.soil[c]) + ">=" + String(soilStartPct));
@@ -4461,7 +4744,12 @@ void controlTick() {
 bool decideFertigate(int c) {
   if (col[c].mode == MODE_IRRIGATION_ONLY) return false;
   if (!sensor.npkValid[c]) {
-    raiseFault('M', "NPK_FAULT", c == 0 ? "COL_A" : c == 1 ? "COL_B" : "COL_C");
+    // New-F10 (audit): sensor.npkReason[c] (TIMEOUT/BADADDR/BADLEN/BADCRC, set at the SOIL/NPK packet
+    // parse) already distinguishes "dead sensor/wiring" from "bus noise" for the LCD health line a few
+    // hundred lines below -- it was never carried into this fault, unlike every other enrichment fixed
+    // this pass series.
+    String npkLoc = String(c == 0 ? "COL_A" : c == 1 ? "COL_B" : "COL_C") + "|reason=" + sensor.npkReason[c];
+    raiseFault('M', "NPK_FAULT", npkLoc.c_str());
     // Fertigation-capable column falls back to irrigation-only because NPK is invalid. Log the DOWNGRADE
     // as its own event so the thesis dataset can tell "fertigated" from "watered only" (sec.M-3); the
     // NPK_FAULT above marks the sensor, this marks the decision consequence.
@@ -4586,12 +4874,13 @@ void loadBattCal() {
   Preferences p; p.begin("adccal", true);
   CalRec r;
   if (p.getBytes("v", &r, sizeof(r)) == sizeof(r) && r.magic == CAL_MAGIC && r.degree >= 1 && r.degree <= 3) {
-    calBattV.degree = r.degree; for (int k = 0; k < 4; k++) calBattV.coef[k] = r.coef[k]; battCalLoaded = true;
+    calBattV.degree = r.degree; for (int k = 0; k < 4; k++) calBattV.coef[k] = r.coef[k]; battVCalLoaded = true;
   }
-  if (p.getBytes("i", &r, sizeof(r)) == sizeof(r) && r.magic == CAL_MAGIC && r.degree >= 1 && r.degree <= 3) {
-    calBattI.degree = r.degree; for (int k = 0; k < 4; k++) calBattI.coef[k] = r.coef[k]; battCalLoaded = true;
-  }
+  // The "i" (current-channel) NVS blob is intentionally no longer read here -- see the calBattV
+  // comment above (audit fix, 2026-09-08). A pre-existing "i" blob from an older firmware/bench-tool
+  // run is simply ignored now, same net effect as before (it was never applied to anything).
   p.end();
+  battCalLoaded = battVCalLoaded;
   Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS" : "using firmware defaults (calibrate!)");
 }
 /* ADS1115 in CONTINUOUS-conversion mode, so reading it costs ONE 2-byte I2C read and never waits.
@@ -4785,7 +5074,12 @@ void uploadTick() {
   }
 
   if (uploadReqStamp != 0 || uploadBusy) return;                 // an attempt is in flight
-  if (supaUrl.length() == 0 || supaKey.length() == 0) return;    // not configured
+  // netMux: this runs on core 1 nearly every loop() iteration; supaUrl/supaKey are also written
+  // from core-0 netTask (handleSms's SUPA command, portalHandleSupa()).
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  bool suConfigured = supaUrl.length() > 0 && supaKey.length() > 0;
+  xSemaphoreGive(netMux);
+  if (!suConfigured) return;    // not configured
   if (!wifiConnected) return;
   unsigned long wait = (attempts > 0) ? BACKOFF[attempts < 4 ? attempts - 1 : 3] : 5000UL;
   if (millis() - lastAttemptMs < wait) return;                   // backoff / gentle SD-scan throttle
@@ -4922,7 +5216,7 @@ void telemetryCollect() {
   telem.tankEC = tankEC; telem.tankPH = tankPH;
   // Mirror the per-group validity + coarse system state so core-0 uploaders read only from the snapshot.
   telem.envValid = sensor.envValid; telem.tankValid = sensor.tankValid; telem.lightValid = sensor.lightValid;
-  telem.inaValid = inaOk;
+  telem.battVCalValid = battVCalLoaded;
   telem.state = sysState; telem.woActive = wo.active;
   // Diagnostics mirror. Ages are computed HERE (core 1) rather than published as raw millis(),
   // which is meaningless to a browser on a different clock.
@@ -4938,6 +5232,7 @@ void telemetryCollect() {
   telem.battLow = batteryLow; telem.battCrit = batteryCritical;
   strlcpy(telem.lastFault,   lastFaultMsg.c_str(),  sizeof(telem.lastFault));
   strlcpy(telem.lastFaultAt, lastFaultTime.c_str(), sizeof(telem.lastFaultAt));
+  strlcpy(telem.heldClearReason, lastHeldClearReason.c_str(), sizeof(telem.heldClearReason));
   // Fault / recovery + lockout.
   telem.held        = esp2Held;
   telem.steerRel    = steerRelease;
@@ -5045,14 +5340,18 @@ static void tsUpload() {
   }
   if (k2.length()) {                                  // Channel 2: system
     String url = "http://" + String(TS_HOST) + "/update?api_key=" + k2;
-    url += "&field1=" + String(t.temp, 1);
-    url += "&field2=" + String(t.hum, 1);
-    url += "&field3=" + String(t.lux, 0);
-    url += "&field4=" + String(t.resLevel, 1);
-    url += "&field5=" + String(t.mixLevel, 1);
-    url += "&field6=" + String(t.battV, 2);
-    url += "&field7=" + String(t.battP, 1);
-    url += "&field8=" + String(t.flow, 1);
+    // Audit fix (2026-09-09): this upload previously wrote every field unconditionally, unlike the
+    // Firebase live snapshot which gates each on its own validity flag (envValid/tankValid/
+    // lightValid/battVCalValid). A field simply omitted from the URL is left untouched on the
+    // ThingSpeak channel for that update (fields are addressed by name, not position), matching
+    // Firebase's "absent, not fabricated" behavior instead of graphing a placeholder/stale number
+    // as if it were real -- battV especially, which ships with an explicit placeholder polynomial
+    // until the bench calibration is actually performed.
+    if (t.envValid)   { url += "&field1=" + String(t.temp, 1); url += "&field2=" + String(t.hum, 1); }
+    if (t.lightValid) url += "&field3=" + String(t.lux, 0);
+    if (t.tankValid)  { url += "&field4=" + String(t.resLevel, 1); url += "&field5=" + String(t.mixLevel, 1); url += "&field8=" + String(t.flow, 1); }
+    if (t.battVCalValid) url += "&field6=" + String(t.battV, 2);
+    if (t.battVCalValid && t.acsOk_) url += "&field7=" + String(t.battP, 1);   // power needs both V and I valid
     ok = tsGet(url) || ok;
   }
   if (k3.length()) {                                  // Channel 3: chemistry (per-column EC + pH)
@@ -5068,7 +5367,7 @@ static void tsUpload() {
     // Battery current (ACS758) rides Ch3 because Ch2 "System" has all 8 fields used.
     // CONSTRAINT: the loop above consumes 2 fields per ENABLED column -- 4 today with A and B.
     // Enabling column C would take fields 1-6 and collide with field 5. Move this constant if so.
-    url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
+    if (t.acsOk_) url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
     ok = tsGet(url) || ok;
   }
   lastTsOk = ok; lastTsUploadMs = millis();
@@ -5120,7 +5419,12 @@ static bool fbBegin(const String &url) {
 // Single seam for the RTDB path + auth. Every request carries the device account's ID token;
 // lock the RTDB rules to that UID or the token buys you nothing.
 static String fbBuildUrl(const String &base, const char *path) {
-  return base + path + "?auth=" + fbIdToken;
+  // netMux: fbIdToken is also written from core-1's FBASE,SIGNOUT SMS handler -- the same
+  // cross-core String race already guarded at the FBASE,STATUS handler and fbEnsureToken(), just
+  // not previously extended to this read site (audit fix, 2026-09-08).
+  String tok;
+  xSemaphoreTake(netMux, portMAX_DELAY); tok = fbIdToken; xSemaphoreGive(netMux);
+  return base + path + "?auth=" + tok;
 }
 
 /* ---- Token lifecycle -------------------------------------------------------
@@ -5156,7 +5460,12 @@ static void fbNoteAuthError(int code, const String &resp) {
   else if (reason.startsWith("TOKEN_EXPIRED")
         || reason.startsWith("USER_NOT_FOUND"))          hint = " -> refresh token no longer valid; re-enter the password to re-provision";
   else if (code < 0)                                     hint = " -> no TLS/TCP to Google: check WiFi, DNS, and try FBASE,TLS,OFF to rule out cert pinning";
+  // netMux: fbAuthErr is read (buffer content, not just .length()) from core-1's FBASE,STATUS
+  // handler -- an unlocked write here raced that read (use-after-free/torn-read hazard, not just
+  // a stale value).
+  xSemaphoreTake(netMux, portMAX_DELAY);
   fbAuthErr = reason + hint;
+  xSemaphoreGive(netMux);
   fbAuthErrMs = millis();
   Serial.print(F("[FIREBASE] auth failed: ")); Serial.println(fbAuthErr);
   // Hand the reason to core 1 for the SD log. Without this the only witness is the serial
@@ -5170,8 +5479,12 @@ static void fbNoteAuthError(int code, const String &resp) {
 // rejection, because "FAIL|http=0|n=0" with no reason is exactly the dead end this avoids.
 // Deduped: these conditions persist for many ticks and must not flood the CSV.
 static void fbNoteAuthLocal(const char *why) {
-  if (fbAuthErr == why) return;
-  fbAuthErr = why;
+  // netMux covers the compare-and-set together, same reasoning as fbNoteAuthError above.
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  bool same = (fbAuthErr == why);
+  if (!same) fbAuthErr = why;
+  xSemaphoreGive(netMux);
+  if (same) return;
   fbAuthErrMs = millis();
   Serial.print(F("[FIREBASE] auth blocked: ")); Serial.println(fbAuthErr);
   strlcpy(fbAuthErrLog, fbAuthErr.c_str(), sizeof(fbAuthErrLog));
@@ -5184,8 +5497,8 @@ static bool fbStoreToken(const String &idToken, const String &refresh, unsigned 
   xSemaphoreTake(netMux, portMAX_DELAY);
   fbIdToken = idToken;
   if (refresh.length()) fbRefresh = refresh;
-  xSemaphoreGive(netMux);
   fbAuthErr = "";
+  xSemaphoreGive(netMux);
   // Renew 5 min early so a slow link never uses an expired token mid-request.
   fbTokenExpiryMs = millis() + ((expSec > 300 ? expSec - 300 : 60) * 1000UL);
   fbAuthFails = 0; fbAuthNextTryMs = 0; fbAuthOk = true;
@@ -5218,7 +5531,7 @@ static bool fbRefreshToken(const String &apiKey, const String &refresh) {
   DeserializationError de = deserializeJson(r, resp);
   if (de) { fbNoteAuthLocal((String("refresh parse: ") + de.c_str() + " (body " + resp.length() + "B)").c_str()); return false; }
   String uid = r["user_id"] | "";
-  if (uid.length()) fbUid = uid;
+  if (uid.length()) { xSemaphoreTake(netMux, portMAX_DELAY); fbUid = uid; xSemaphoreGive(netMux); }
   return fbStoreToken(r["id_token"] | "", r["refresh_token"] | "", (r["expires_in"] | String("3600")).toInt());
 }
 
@@ -5244,13 +5557,15 @@ static bool fbPasswordSignIn(const String &apiKey, const String &email, const St
   // localId is the account's UID. The firmware never needs it (the token carries it, and rules
   // compare auth.uid server-side) but you need it to WRITE those rules -- so surface it.
   String uid = r["localId"] | "";
-  if (uid.length()) fbUid = uid;
+  if (uid.length()) { xSemaphoreTake(netMux, portMAX_DELAY); fbUid = uid; xSemaphoreGive(netMux); }
   return fbStoreToken(r["idToken"] | "", r["refreshToken"] | "", (r["expiresIn"] | String("3600")).toInt());
 }
 
 // Core 0: guarantee a usable ID token, or fail fast under backoff. Called before every request.
 static bool fbEnsureToken() {
-  if (fbIdToken.length() && (long)(millis() - fbTokenExpiryMs) < 0) return true;   // still valid
+  // netMux: fbIdToken is also cleared from core-1's FBASE,SIGNOUT SMS handler (audit fix, 2026-09-08).
+  String curTok; xSemaphoreTake(netMux, portMAX_DELAY); curTok = fbIdToken; xSemaphoreGive(netMux);
+  if (curTok.length() && (long)(millis() - fbTokenExpiryMs) < 0) return true;   // still valid
   if (fbAuthNextTryMs && (long)(millis() - fbAuthNextTryMs) < 0) return false;     // backing off
 
   String apiKey, email, pass, refresh;
@@ -5280,7 +5595,7 @@ static bool fbEnsureToken() {
     // token, so there is no credential to exchange. Previously this fell straight into the
     // backoff and reported nothing at all.
     if (!tried) fbNoteAuthLocal("have API key but no password and no refresh token");
-    fbIdToken = "";                                                                // don't reuse a dead token
+    xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); // don't reuse a dead token
     // Escalate: 30 s -> 2 m -> 8 m -> 30 m. Retrying a wrong password every poll is
     // credential hammering and Google will rate-limit or lock the account.
     fbAuthNextTryMs = millis() + FB_AUTH_BACKOFF[fbAuthFails < 4 ? fbAuthFails : 3];
@@ -5302,11 +5617,18 @@ static bool firebaseUploadLive() {
   // The diagnostics node reports whether each service is CONFIGURED, never the credential itself.
   // Derived here, under the lock that owns those strings -- not read bare from the payload builder.
   bool credsCfg, tsCfg, supaCfg;
+  // signedIn/authErr: also read here (audit fix, 2026-09-08) -- fbIdToken/fbAuthErr are written
+  // from core-1's FBASE,SIGNOUT SMS handler, so the two unguarded reads further below (previously
+  // bare fbIdToken.length()/fbAuthErr.length()) were the same cross-core String race already fixed
+  // elsewhere in this file.
+  bool signedIn; String authErr;
   xSemaphoreTake(netMux, portMAX_DELAY);
   base = fbUrl; enabled = firebaseEnabled;
   credsCfg = fbApiKey.length() > 0 && (fbRefresh.length() > 0 || fbPassword.length() > 0);
   tsCfg    = tsKey1.length() > 0 || tsKey2.length() > 0 || tsKey3.length() > 0;
   supaCfg  = supaUrl.length() > 0 && supaKey.length() > 0;
+  signedIn = fbIdToken.length() > 0;
+  authErr  = fbAuthErr;
   xSemaphoreGive(netMux);
   if (!enabled || base.length() < 8) { fbLastOk = false; return false; }
 
@@ -5359,12 +5681,21 @@ static bool firebaseUploadLive() {
   // The dashboard has a Power Source tile; without this key it reads "--". The rig runs from the
   // battery bank, with the inverter raised only for AC pumps during a run.
   system["powerSource"] = t.woActive ? "Battery + inverter (run)" : "Battery";
+  // For the new Set Clock control: show the operator what ESP1 currently reads before they decide
+  // to change it. Reuses the exact same tsString()/rtcOk the LCD's own clock page and every log
+  // timestamp already use -- no new time source.
+  system["rtcOk"] = rtcOk;
+  system["deviceTime"] = tsString();
 
   JsonObject sensors = doc.createNestedObject("sensors");
   if (t.tankValid)  { sensors["reservoirLevel"] = t.resLevel; sensors["mixingLevel"] = t.mixLevel; sensors["flowRate"] = t.flow; }
   if (t.envValid)   { sensors["temperature"] = t.temp; sensors["humidity"] = t.hum; }
   if (t.lightValid) sensors["lightLevel"] = t.lux;
-  if (t.inaValid) {
+  // Voltage/percent only publish once a REAL calibration has been loaded for that channel -- until
+  // then there is no honest way to tell "sensor not installed" from "installed but uncalibrated,
+  // reading noise", so this correctly shows Unavailable rather than a meaningless polynomial-of-noise
+  // number. Current is gated on acsOk_, the ADS1115/ACS758's own live I2C health.
+  if (t.battVCalValid) {
     sensors["batteryVoltage"] = t.battV;
     // Percent from resting voltage. BATT_LOW_V/BATT_CRIT_V are alarm points, not endpoints, so the
     // scale uses its own full/empty pair. Clamped, and only published when the reading is valid --
@@ -5372,6 +5703,8 @@ static bool firebaseUploadLive() {
     float pct = (t.battV - BATT_EMPTY_V) * 100.0f / (BATT_FULL_V - BATT_EMPTY_V);
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     sensors["batteryPercent"] = (int)(pct + 0.5f);
+  }
+  if (t.acsOk_) {
     sensors["batteryCurrent"] = t.battI;                 // ACS758, magnitude (see readBatteryAdc)
   }
   // Mixing-tank chemistry from ESP2's TELE. Only ever measured during a run, so this is the last
@@ -5401,12 +5734,12 @@ static bool firebaseUploadLive() {
   dfb["enabled"]        = enabled;
   dfb["urlConfigured"]  = base.length() >= 8;
   dfb["deviceCredentialsConfigured"] = credsCfg;
-  dfb["signedIn"]       = fbIdToken.length() > 0;
+  dfb["signedIn"]       = signedIn;
   dfb["attempts"]       = fbAttempts;
   dfb["lastUploadOk"]   = fbLastOk;
   dfb["lastHttp"]       = fbLastHttp;
   dfb["tlsValidationEnabled"] = fbPinCa;
-  if (fbAuthErr.length()) dfb["lastAuthError"] = fbAuthErr;   // Google's reason string, never a secret
+  if (authErr.length()) dfb["lastAuthError"] = authErr;   // Google's reason string, never a secret
 
   JsonObject dts = dg.createNestedObject("thingspeak");
   dts["configured"]   = tsCfg;
@@ -5424,6 +5757,8 @@ static bool firebaseUploadLive() {
   dsy["pendingRun"]      = t.pendRun;
   if (t.lastFault[0])   dsy["lastFault"]     = t.lastFault;
   if (t.lastFaultAt[0]) dsy["lastFaultTime"] = t.lastFaultAt;
+  // Read-only Lock Screen status (Part 2, item M) -- no write path is exposed for this on purpose.
+  dsy["lcdLocked"] = lcdLocked;
 
   JsonObject de2 = dg.createNestedObject("esp2");
   de2["available"]         = t.esp2Avail;
@@ -5460,6 +5795,7 @@ static bool firebaseUploadLive() {
   dfa["state"] = stateLabel(t.state, t.actDisabled);
   if (t.lastFault[0])   dfa["code"] = t.lastFault;
   if (t.lastFaultAt[0]) dfa["at"]   = t.lastFaultAt;
+  if (t.heldClearReason[0]) dfa["lastClearReason"] = t.heldClearReason;
   if (t.ackLeftS > 0)   dfa["ackSecondsLeft"] = t.ackLeftS;   // "do nothing" snooze still running
   if (t.held) {
     // Surface the re-hold guard: after 3 identical FLOW_FAIL holds the firmware steers toward
@@ -5566,8 +5902,19 @@ static bool firebaseUploadLive() {
 
   JsonObject zones = sensors.createNestedObject("zones");
   for (int c = 0; c < NUM_COLUMNS; c++) {
-    if (!COLUMN_ENABLED[c]) continue;
+    // Column Mode website parity: every column gets an entry now, even a disabled one, so the
+    // dashboard can show real enabled/disabled + mode/schedule/target state for all 3 physical
+    // columns (previously a disabled column had no entry at all here). Sensor readings below are
+    // still gated on COLUMN_ENABLED -- unchanged behaviour for every already-published field.
     JsonObject z = zones.createNestedObject(String(COL_TAG[c]));
+    z["enabled"]   = COLUMN_ENABLED[c];
+    z["mode"]      = (col[c].mode == MODE_AUTO) ? "AUTO" : "IRRIGATION_ONLY";
+    z["schedMode"] = colSchedMode[c];
+    z["winStart"]  = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_START[c] : DEF_WIN_START[c];
+    z["winEnd"]    = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_END[c]   : DEF_WIN_END[c];
+    z["targetN"]   = col[c].targetN; z["targetP"] = col[c].targetP;
+    z["targetK"]   = col[c].targetK; z["targetPH"] = col[c].targetPH;
+    if (!COLUMN_ENABLED[c]) continue;                   // no sensor data for a disabled column
     if (t.soil[c] >= 0) z["moisture"] = t.soil[c];
     if (t.npkValid[c]) {
       z["nitrogen"] = t.npkN[c]; z["phosphorus"] = t.npkP[c]; z["potassium"] = t.npkK[c];
@@ -5632,7 +5979,7 @@ static bool firebaseUploadLive() {
   fbLastHttp = code;
   fbLastOk = (code >= 200 && code < 300);
   if (!fbLastOk) fbFailures++;
-  if (code == 401) { fbIdToken = ""; fbTokenExpiryMs = 0; }  // token rejected -> force a renew next tick
+  if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; }  // token rejected -> force a renew next tick
   return fbLastOk;
 }
 
@@ -5683,15 +6030,64 @@ static void firebasePollManual() {
   int code = fbHttp.GET();
   String resp = (code == 200) ? fbHttp.getString() : "";
   fbHttp.end();
-  if (code == 401) { fbIdToken = ""; fbTokenExpiryMs = 0; return; }
+  if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
   if (code != 200 || resp.length() == 0 || resp == "null") return;
 
   StaticJsonDocument<192> doc;
   if (deserializeJson(doc, resp)) return;              // malformed -> leave the hold exactly as it is
-  long seq  = doc["seq"] | -1;
+  // Must read as int64_t, not long/int: `doc["seq"] | -1` returns the literal default whenever the
+  // stored value does not fit the requested type (ArduinoJson's is<T>()-gated `|` operator, not a
+  // truncating cast) -- and a JS Date.now() value never fits a 32-bit long, so a 32-bit read here
+  // silently came back exactly -1 on every single poll, so `seq` always equalled the initial
+  // webManualSeq and webManualPing was never set, leaving webManualTick() stuck taking its "not
+  // held, no new ping" early return forever. This is why
+  // Proceed never lit up even though the page's write to /irrigation/manual was correct the whole time.
+  int64_t seq = doc["seq"] | (int64_t)-1;
   bool want = doc["want"] | false;
   webManualReq = want;                                 // core 1 applies it (grant/refuse/release)
   if (seq != webManualSeq) { webManualSeq = seq; webManualPing = true; }
+}
+
+/* Web hold-to-run (2026-09-10, Website Manual/Test tab, mousedown/mouseup) -- irrigation/testHold =
+ * {seq, bit, want}. Mirrors firebasePollManual()'s own seq/want polling exactly. A browser cannot
+ * hold a physical dead-man switch, so it refreshes this node every ~1.2s while the button is held
+ * instead; TEST_HOLD_BROWSER_TIMEOUT_MS is ESP1's own "the browser vanished" timeout (checked in
+ * pulseTick()'s PU_RUN branch for hold-mode) -- ESP2's OWN 400ms dead-man is what actually protects
+ * the relay if ESP1 itself goes away, exactly as it already does for TEST_PULSE.
+ * Deep-scan finding (2026-09-10, HIGH, fixed): this runs on core 0 (netTask) and must ONLY ever write
+ * the three plain scalars declared above (testHoldReqWant/Bit/Fresh) -- never call setState()/
+ * logEvent()/sendEsp2()/pulseFinish() from here. Those mutate core-1-owned state (the logBuf String,
+ * the ESP2 UART, sysState/uiMode) with no lock; pulseTick() (core 1, runs every loop()) is the only
+ * place that reads these scalars and performs the actual arm/release -- same split this file already
+ * uses for firebasePollManual()/webManualTick(). */
+static void firebasePollTestHold() {
+  static unsigned long lastPollMs = 0;
+  if (millis() - lastPollMs < FIREBASE_COMMAND_POLL_MS) return;
+  lastPollMs = millis();
+  String base; bool enabled;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
+  if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
+  if (!fbEnsureToken()) return;
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/testHold.json"))) return;
+  int code = fbHttp.GET();
+  String resp = (code == 200) ? fbHttp.getString() : "";
+  fbHttp.end();
+  if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
+  if (code != 200 || resp.length() == 0 || resp == "null") return;
+
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, resp)) return;
+  int64_t seq = doc["seq"] | (int64_t)-1;
+  bool want = doc["want"] | false;
+  const char *bit = doc["bit"] | "";
+  if (seq == testHoldSeq) return;                      // no new write since last poll -- nothing to do
+  testHoldSeq = seq;
+
+  if (want) testHoldLastFreshMs = millis();   // plain unsigned long, same cross-core convention as esp2WarmupMs etc.
+  testHoldReqWant = want;
+  strncpy(testHoldReqBit, bit, sizeof(testHoldReqBit) - 1);
+  testHoldReqBit[sizeof(testHoldReqBit) - 1] = '\0';
+  testHoldReqFresh = true;                    // pulseTick() (core 1) picks this up next loop() iteration
 }
 
 static void firebasePollCommands() {
@@ -5719,7 +6115,7 @@ static void firebasePollCommands() {
   int code = fbHttp.GET();
   String resp = (code == 200) ? fbHttp.getString() : "";
   fbHttp.end();
-  if (code == 401) { fbIdToken = ""; fbTokenExpiryMs = 0; return; }
+  if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
   if (code != 200 || resp.length() == 0 || resp == "null") return;
 
   // Filter: we only ever read these four fields, so ArduinoJson can skip the rest of the
@@ -5749,6 +6145,9 @@ static void firebasePollCommands() {
   pf["mode"] = true; pf["enabled"] = true; pf["schedMode"] = true;
   pf["winStart"] = true; pf["winEnd"] = true;
   pf["targetN"] = true; pf["targetP"] = true; pf["targetK"] = true; pf["targetPH"] = true;
+  pf["preset"] = true;                             // SET_COLUMN: crop preset name
+  pf["clkY"] = true; pf["clkMo"] = true; pf["clkD"] = true; pf["clkH"] = true; pf["clkMi"] = true;
+  pf["thStart"] = true; pf["thStop"] = true; pf["thGap"] = true;
 
   // A filter that did not fit would silently drop keys; say so loudly instead of mis-parsing.
   if (filter.overflowed()) {
@@ -5836,6 +6235,17 @@ static void firebasePollCommands() {
     c.tgt[1]    = req["payload"]["targetP"]  | -1.0f;
     c.tgt[2]    = req["payload"]["targetK"]  | -1.0f;
     c.tgt[3]    = req["payload"]["targetPH"] | -1.0f;
+    strlcpy(c.preset, req["payload"]["preset"] | "", sizeof(c.preset));
+    // SET_CLOCK: all required together; -1/0 sentinels simply fail the range check if omitted.
+    c.clkY  = req["payload"]["clkY"]  | -1;
+    c.clkMo = req["payload"]["clkMo"] | -1;
+    c.clkD  = req["payload"]["clkD"]  | -1;
+    c.clkH  = req["payload"]["clkH"]  | -1;
+    c.clkMi = req["payload"]["clkMi"] | -1;
+    // SET_THRESH: all required together.
+    c.thStart = req["payload"]["thStart"] | -1;
+    c.thStop  = req["payload"]["thStop"]  | -1;
+    c.thGap   = req["payload"]["thGap"]   | -1.0f;
     FirebaseCommandStatus ack = {};
     strlcpy(ack.id, c.id, sizeof(ack.id));
     // Mark it non-"queued" immediately, so the next poll cannot hand the same request to
@@ -5872,7 +6282,7 @@ static void firebaseFlushStatus() {
     fbHttp.addHeader("Content-Type", "application/json");
     int code = fbHttp.PATCH(json);
     fbHttp.end();
-    if (code == 401) { fbIdToken = ""; fbTokenExpiryMs = 0; return; }
+    if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
     if (code < 200 || code >= 300) return;                 // keep it queued and retry later
     xQueueReceive(fbStatusQueue, &u, 0);                   // confirmed delivered -> drop it
   }
@@ -5909,10 +6319,26 @@ void firebaseCommandTick() {
         logEvent("FIREBASE", "REJECT", "FORCE|DOSE_RANGE"); continue;
       }
       // Same hardware gate the local UI honours. Schedule/soil are deliberately NOT checked.
+      // actuationsDisabled/webManualHeld() were previously missing here: forceTick()/
+      // sendForceWorkOrder() both re-check them at fire time so no work order is actually sent
+      // while locked out, but without this the dashboard was told "accepted, armed" for the full
+      // countdown (up to 300s) before silently failing -- directly contradicting the disabled-
+      // actuations banner's own claim that forced runs are blocked immediately. Checking here too
+      // gives an honest, immediate rejection instead.
       if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
-          pendingExercise.active || esp2Held || fbRemoteExerciseId[0]) {
-        firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
-        logEvent("FIREBASE", "REJECT", "FORCE|NOT_IDLE"); continue;
+          pendingExercise.active || esp2Held || fbRemoteExerciseId[0] ||
+          actuationsDisabled || webManualHeld()) {
+        // Named reason, not a flat "not idle" -- mirrors webManualTick()'s own wording so the two
+        // gates describe the same conditions the same way instead of one being specific and the
+        // other opaque.
+        const char *why = (sysState != IDLE_STATE || wo.active || pendingRun.active) ? "a run is in progress"
+                         : esp2Held ? "a fault is held"
+                         : (pendingExercise.active || fbRemoteExerciseId[0]) ? "a test is already running"
+                         : actuationsDisabled ? "actuations are disabled"
+                         : webManualHeld() ? "the Manual/Test tab has direct control"
+                         : "someone is using the LCD";
+        firebaseQueueStatus(c.id, "rejected", why);
+        logEvent("FIREBASE", "REJECT", String("FORCE|NOT_IDLE|") + why); continue;
       }
       if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT) {
         firebaseQueueStatus(c.id, "rejected", "reservoir too low");
@@ -6009,9 +6435,10 @@ void firebaseCommandTick() {
       unsigned long ms = (c.seconds > 0) ? (unsigned long)c.seconds * 1000UL : DIAG_REMOTE_DEFAULT_MS;
       if (ms > DIAG_REMOTE_MAX_MS) ms = DIAG_REMOTE_MAX_MS;
       if (diagRemoteUntilMs) { firebaseQueueStatus(c.id, "rejected", "a sweep is already running"); continue; }
-      if (!diagRemoteStart(ms)) {
-        firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
-        logEvent("FIREBASE", "REJECT", "DIAG_SWEEP|NOT_IDLE"); continue;
+      const char *dsWhy = "the controller is not idle";
+      if (!diagRemoteStart(ms, &dsWhy)) {
+        firebaseQueueStatus(c.id, "rejected", dsWhy);
+        logEvent("FIREBASE", "REJECT", String("DIAG_SWEEP|NOT_IDLE|") + dsWhy); continue;
       }
       firebaseQueueStatus(c.id, "completed", (String("sweeping esp2 sensors for ") + (ms / 1000) + "s").c_str());
       continue;
@@ -6033,8 +6460,13 @@ void firebaseCommandTick() {
       if (puPhase != PU_NONE) { firebaseQueueStatus(c.id, "rejected", "a pulse is already running"); continue; }
       if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
           pendingExercise.active || esp2Held || fcPhase != FP_NONE || fbRemoteExerciseId[0]) {
-        firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
-        logEvent("FIREBASE", "REJECT", "PULSE|NOT_IDLE"); continue;
+        const char *why = (sysState != IDLE_STATE || wo.active || pendingRun.active) ? "a run is in progress"
+                         : esp2Held ? "a fault is held"
+                         : (fcPhase != FP_NONE) ? "a forced run is armed"
+                         : (pendingExercise.active || fbRemoteExerciseId[0]) ? "a test is already running"
+                         : "someone is using the LCD";
+        firebaseQueueStatus(c.id, "rejected", why);
+        logEvent("FIREBASE", "REJECT", String("PULSE|NOT_IDLE|") + why); continue;
       }
       puRow = row;
       puSeconds = secs;
@@ -6078,18 +6510,30 @@ void firebaseCommandTick() {
       if (ci < 0 || ci >= NUM_COLUMNS) {
         firebaseQueueStatus(c.id, "rejected", "col must be A, B or C"); continue;
       }
-      String changed, err;
-      bool touchedCol = false, touchedSched = false, touchedEn = false;
+      String err;
+
+      // ---- Pass 1: validate every supplied field WITHOUT mutating anything. A command that has
+      // one bad field must reject cleanly, not leave earlier fields applied-live-but-unsaved
+      // (review-fix: SET_COLUMN used to mutate col[]/COLUMN_ENABLED[]/schedule in place field-by-field,
+      // so a late failure stranded the earlier fields live in RAM with none of it persisted to NVS).
+      uint8_t  newMode  = col[ci].mode;          bool setMode  = false;
+      bool     newEn    = COLUMN_ENABLED[ci];    bool setEn    = false;
+      uint8_t  newSched = colSchedMode[ci];      bool setSched = false;
+      uint16_t newWs    = COL_WIN_START[ci];
+      uint16_t newWe    = COL_WIN_END[ci];       bool setWin   = false;
+      static const char *TGT_KEY[4] = { "N", "P", "K", "PH" };
+      float newTgt[4] = { col[ci].targetN, col[ci].targetP, col[ci].targetK, col[ci].targetPH };
+      bool  setTgt[4] = { false, false, false, false };
 
       if (c.colMode[0]) {
-        if      (!strcmp(c.colMode, "AUTO"))            { col[ci].mode = MODE_AUTO;            changed += "mode=AUTO "; touchedCol = true; }
-        else if (!strcmp(c.colMode, "IRRIGATION_ONLY")) { col[ci].mode = MODE_IRRIGATION_ONLY; changed += "mode=IRRIGATION_ONLY "; touchedCol = true; }
+        if      (!strcmp(c.colMode, "AUTO"))            { newMode = MODE_AUTO;            setMode = true; }
+        else if (!strcmp(c.colMode, "IRRIGATION_ONLY")) { newMode = MODE_IRRIGATION_ONLY; setMode = true; }
         else { firebaseQueueStatus(c.id, "rejected", "mode must be AUTO or IRRIGATION_ONLY"); continue; }
       }
-      if (c.enabled >= 0)   { COLUMN_ENABLED[ci] = (c.enabled == 1); changed += String("enabled=") + (c.enabled ? "1 " : "0 "); touchedEn = true; }
+      if (c.enabled >= 0) { newEn = (c.enabled == 1); setEn = true; }
       if (c.schedMode >= 0) {
         if (c.schedMode > 1) { firebaseQueueStatus(c.id, "rejected", "schedMode must be 0 (auto) or 1 (manual)"); continue; }
-        colSchedMode[ci] = (uint8_t)c.schedMode; changed += String("sched=") + (c.schedMode ? "MANUAL " : "AUTO "); touchedSched = true;
+        newSched = (uint8_t)c.schedMode; setSched = true;
       }
       // Minutes-of-day. Start == end would be a zero-length window that never opens, so reject it
       // rather than quietly disabling the column's schedule.
@@ -6099,28 +6543,117 @@ void firebaseCommandTick() {
         if (ws < 0 || ws > 1439 || we < 0 || we > 1439) {
           firebaseQueueStatus(c.id, "rejected", "window minutes must be 0-1439"); continue;
         }
-        if (ws == we) { firebaseQueueStatus(c.id, "rejected", "window start and end cannot be equal"); continue; }
-        COL_WIN_START[ci] = (uint16_t)ws; COL_WIN_END[ci] = (uint16_t)we;
-        changed += "win=" + String(ws) + "-" + String(we) + " "; touchedSched = true;
+        // Audit fix (2026-09-09): controlTick()'s window check (`mod < ws || mod > we`) has no
+        // midnight-wraparound support -- ws > we would be true for every minute of the day, silently
+        // and permanently disabling the column with only a routine, non-alerting OUTSIDE_WINDOW log
+        // line. Reject it here rather than let it through, same reasoning as the ws==we check.
+        if (ws >= we) { firebaseQueueStatus(c.id, "rejected", "window start must be before window end"); continue; }
+        newWs = (uint16_t)ws; newWe = (uint16_t)we; setWin = true;
       }
-      static const char *TGT_KEY[4] = { "N", "P", "K", "PH" };
-      bool bad = false;
-      for (int t = 0; t < 4; t++) {
-        if (c.tgt[t] < 0) continue;                       // absent
-        if (!applyColumnTarget(ci, TGT_KEY[t], c.tgt[t], err)) {
-          firebaseQueueStatus(c.id, "rejected", err.c_str()); bad = true; break;
+      // Preset (additive): resolve against the real firmware preset table BEFORE the explicit
+      // per-field loop below, so an explicit targetN/P/K/PH sent in the SAME command can still
+      // override one field of the preset -- same precedence a human filling in the form after
+      // picking a preset would expect. Website-only crop database is a separate concept and never
+      // reaches here.
+      String presetApplied;
+      if (c.preset[0]) {
+        String pn = c.preset; pn.toUpperCase();
+        bool found = false;
+        for (int p = 0; p < NUM_PRESETS; p++) {
+          if (pn == CROP_PRESETS[p].name) {
+            newTgt[0] = CROP_PRESETS[p].N; newTgt[1] = CROP_PRESETS[p].P;
+            newTgt[2] = CROP_PRESETS[p].K; newTgt[3] = CROP_PRESETS[p].pH;
+            setTgt[0] = setTgt[1] = setTgt[2] = setTgt[3] = true;
+            presetApplied = CROP_PRESETS[p].name;
+            found = true; break;
+          }
         }
-        changed += String(TGT_KEY[t]) + "=" + String(c.tgt[t], 1) + " "; touchedCol = true;
+        if (!found) { firebaseQueueStatus(c.id, "rejected", "unknown preset name"); continue; }
       }
-      if (bad) continue;
-      if (!changed.length()) { firebaseQueueStatus(c.id, "rejected", "no recognised field to change"); continue; }
+      // Exact-sentinel check, not "< 0": the parser's absent-field default is exactly -1.0f (see
+      // firebasePollCommands), and no valid N/P/K/pH value is ever negative -- so a genuinely bad
+      // value like -5 must still reach the real range check below instead of being read as "absent".
+      bool tgtBad = false;
+      for (int t = 0; t < 4; t++) {
+        if (c.tgt[t] == -1.0f) continue;                  // absent
+        if (!columnTargetInRange(TGT_KEY[t], c.tgt[t], err)) {
+          firebaseQueueStatus(c.id, "rejected", err.c_str()); tgtBad = true; break;
+        }
+        newTgt[t] = c.tgt[t]; setTgt[t] = true;
+      }
+      if (tgtBad) continue;
+      if (!(setMode || setEn || setSched || setWin || setTgt[0] || setTgt[1] || setTgt[2] || setTgt[3])) {
+        firebaseQueueStatus(c.id, "rejected", "no recognised field to change"); continue;
+      }
 
+      // ---- Pass 2: every field validated -- apply and persist together.
+      String changed;
+      if (presetApplied.length()) changed += "preset=" + presetApplied + " ";
+      bool touchedCol = false, touchedSched = false, touchedEn = false;
+      if (setMode)  { col[ci].mode = newMode; changed += (newMode == MODE_AUTO) ? "mode=AUTO " : "mode=IRRIGATION_ONLY "; touchedCol = true; }
+      if (setEn)    { COLUMN_ENABLED[ci] = newEn; changed += String("enabled=") + (newEn ? "1 " : "0 "); touchedEn = true; }
+      if (setSched) { colSchedMode[ci] = newSched; changed += String("sched=") + (newSched ? "MANUAL " : "AUTO "); touchedSched = true; }
+      if (setWin)   { COL_WIN_START[ci] = newWs; COL_WIN_END[ci] = newWe; changed += "win=" + String(newWs) + "-" + String(newWe) + " "; touchedSched = true; }
+      for (int t = 0; t < 4; t++) {
+        if (!setTgt[t]) continue;
+        applyColumnTarget(ci, TGT_KEY[t], newTgt[t], err);   // already validated -- cannot fail here
+        changed += String(TGT_KEY[t]) + "=" + String(newTgt[t], 1) + " ";
+        touchedCol = true;
+      }
       if (touchedCol)   saveColumn(ci);                   // only write the NVS blocks we touched
       if (touchedSched) saveSchedule(ci);
       if (touchedEn)    saveColEnable(ci);
       changed.trim();
       logEvent("FIREBASE", "CFG", String("COL_") + COL_TAG[ci] + "|" + changed);
       firebaseQueueStatus(c.id, "completed", (String("COL_") + COL_TAG[ci] + ": " + changed).c_str());
+      continue;
+    }
+
+    // ---- SET_CLOCK: set the RTC, the same call the LCD's own Set Clock editor makes. No NVS --
+    // the DS3231's own battery-backed register is the only store, same as the local path.
+    if (!strcmp(c.type, "SET_CLOCK")) {
+      if (!rtcOk) { firebaseQueueStatus(c.id, "rejected", "RTC not present"); continue; }
+      // Audit fix (2026-09-08): day-of-month was previously validated as a flat 1..31 regardless of
+      // month/leap-year (e.g. "Feb 30" could be set), which the DS3231 has no validation of its own
+      // to catch -- it would silently store the impossible date.
+      if (c.clkY < 2020 || c.clkY > 2099 || c.clkMo < 1 || c.clkMo > 12 || c.clkD < 1 ||
+          c.clkD > daysInMonth(c.clkY, c.clkMo) ||
+          c.clkH < 0 || c.clkH > 23 || c.clkMi < 0 || c.clkMi > 59) {
+        firebaseQueueStatus(c.id, "rejected", "clock fields out of range"); continue;
+      }
+      rtc.adjust(DateTime((uint16_t)c.clkY, (uint8_t)c.clkMo, (uint8_t)c.clkD, (uint8_t)c.clkH, (uint8_t)c.clkMi, 0));
+      logEvent("ESP1", "STATE", "CLOCK_SET");
+      firebaseQueueStatus(c.id, "completed", (String("clock set to ") + tsString()).c_str());
+      continue;
+    }
+
+    // ---- SET_THRESH: same fields, same clamps, same save function as the LCD Thresholds editor
+    // and the SMS THRESH command.
+    if (!strcmp(c.type, "SET_THRESH")) {
+      // Audit fix (2026-09-09): thGap uses the same -1 absent-field sentinel as thStart/thStop (set
+      // at parse time), but was previously only clamped, never rejected when missing/negative -- a
+      // partial payload silently zeroed fertGap instead of being refused, turning "fertigate only
+      // past a meaningful shortfall" into "fertigate on any positive shortfall at all" with no log
+      // distinction from a deliberate 0. Now rejected exactly like thStart/thStop.
+      if (c.thStart < 0 || c.thStop < 0 || c.thGap < 0.0f) { firebaseQueueStatus(c.id, "rejected", "missing threshold fields"); continue; }
+      int s  = clampi(c.thStart, 0, 100);
+      int st = clampi(c.thStop, 0, 100);
+      if (st <= s) st = clampi(s + 1, 0, 100);              // stop must exceed start, same bump as LCD/SMS
+      float g = (c.thGap > 500.0f) ? 500.0f : c.thGap;
+      soilStartPct = s; soilStopPct = st; fertGap = g;
+      saveThresholds();
+      logEvent("FIREBASE", "CFG", String("THRESH|start=") + s + "|stop=" + st + "|gap=" + String(g, 1));
+      firebaseQueueStatus(c.id, "completed",
+        (String("thresholds: start=") + s + " stop=" + st + " gap=" + String(g, 1)).c_str());
+      continue;
+    }
+
+    // ---- RESTORE_DEFAULTS: idle-only, same gate as the LCD, calls the same reset function directly.
+    if (!strcmp(c.type, "RESTORE_DEFAULTS")) {
+      if (sysState != IDLE_STATE) { firebaseQueueStatus(c.id, "rejected", "system must be idle"); continue; }
+      restoreDefaults();
+      logEvent("FIREBASE", "CMD", "RESTORE_DEFAULTS");
+      firebaseQueueStatus(c.id, "completed", "defaults restored");
       continue;
     }
 
@@ -6167,11 +6700,24 @@ void firebaseCommandTick() {
       continue;
     }
     // Same gate the local exerciseTick() honours, plus the UI modes: never preempt a run,
-    // a held fault, Testing/Calibration, or another in-flight remote test.
+    // a held fault, Testing/Calibration, or another in-flight remote test. actuationsDisabled and
+    // fcPhase mirror TEST_PULSE's own gate. Deliberately NOT checking webManualHeld() here, unlike
+    // FORCE_RUN/sendWorkOrder: the website's transferPumpBtn/boosterPumpBtn/mixerBtn (the ONLY UI
+    // path that ever sends this command) live inside the Manual/Test tab's #mtControls, which is
+    // only reachable once ESP1 has already granted that exact hold -- so requiring !webManualHeld()
+    // here made this command permanently unreachable through the only client that sends it. (Traced
+    // and confirmed via a full DOM audit before removing this -- see the plan file's L2/M1 findings.)
     if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
-        pendingExercise.active || esp2Held || fbRemoteExerciseId[0]) {
-      firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
-      logEvent("FIREBASE", "REJECT", "NOT_IDLE");
+        pendingExercise.active || esp2Held || fbRemoteExerciseId[0] ||
+        actuationsDisabled || fcPhase != FP_NONE) {
+      const char *why = (sysState != IDLE_STATE || wo.active || pendingRun.active) ? "a run is in progress"
+                       : esp2Held ? "a fault is held"
+                       : (pendingExercise.active || fbRemoteExerciseId[0]) ? "a test is already running"
+                       : actuationsDisabled ? "actuations are disabled"
+                       : fcPhase != FP_NONE ? "a forced run is armed"
+                       : "someone is using the LCD";
+      firebaseQueueStatus(c.id, "rejected", why);
+      logEvent("FIREBASE", "REJECT", String("NOT_IDLE|") + why);
       continue;
     }
 
@@ -6223,7 +6769,11 @@ void firebaseLogTick() {
   // netMux: the core-0 admin form may be rewriting these while this core-1 tick reads them.
   // Unconfigured/disabled is not a failure -- don't log a FAIL line for a feature that is simply off.
   bool configured;
-  xSemaphoreTake(netMux, portMAX_DELAY); configured = (firebaseEnabled && fbUrl.length() >= 8); xSemaphoreGive(netMux);
+  const char *urlLabel;   // captured under the same lock so the log line below needs no second read
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  configured = (firebaseEnabled && fbUrl.length() >= 8);
+  urlLabel = (fbUrl.length() >= 8) ? "set" : "unset";
+  xSemaphoreGive(netMux);
   if (!configured) { lastState = -1; return; }      // re-arm so the first real result still logs
   int now = fbLastOk ? 1 : 0;
   if (now == lastState) return;
@@ -6233,10 +6783,60 @@ void firebaseLogTick() {
   // always upstream of the request, and it is one of these two.
   logEvent("ESP1", "FBASE", String(now ? "OK" : "FAIL") + "|http=" + String(fbLastHttp) +
                             "|auth=" + String(fbAuthOk ? "ok" : "no") +
-                            "|url=" + String(fbUrl.length() >= 8 ? "set" : "unset") +
+                            "|url=" + String(urlLabel) +
                             "|heap=" + String(fbLastHeap) + "|netstk=" + String(stackFree) +
                             "|n=" + String(fbAttempts) + "|fail=" + String(fbFailures));
 }
+
+/* ISRG Root X1 (Let's Encrypt's root; https://letsencrypt.org/certs/isrgrootx1.pem, valid to
+ * 2035-06-04) -- extracted live from supabase.co's own TLS chain during the 2026-09-05 security
+ * audit (leaf CN=supabase.co -> Let's Encrypt R-series intermediate -> this root), not typed from
+ * memory.
+ *
+ * NOT currently wired in (see setInsecure() below, not setCACert(SUPA_ROOT_CA)) -- kept here,
+ * unused, for a future pass. Final pre-flash review (2026-09-07) could not verify this chain
+ * against this project's OWN <ref>.supabase.co storage subdomain: that hostname lives only in NVS,
+ * set by SMS/portal, never in source, so there was nothing to test against from this environment.
+ * Pinning a guessed root on a one-shot flash risks silently breaking the Supabase upload outright
+ * (any mismatch = every upload fails TLS verification, not a graceful fallback) for a feature
+ * (optional SD-log cloud backup) that has zero effect on irrigation/fertigation safety either way --
+ * so this reverts to the same setInsecure() the currently-flashed firmware has always used here,
+ * rather than trade a real, working, unauthenticated upload for a maybe-broken authenticated one.
+ * To safely enable later: read the device's actual configured Supabase URL (LCD/portal/NVS dump),
+ * open a TLS connection to that exact host, print the chain it presents, confirm it matches this
+ * constant (or replace it with whatever the real chain is), THEN switch the call below. */
+const char SUPA_ROOT_CA[] = R"EOF(-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)EOF";
 
 /* =============================================================================
  *  SUPABASE STORAGE UPLOAD  (core 0 / netTask)  --  stream a completed daily CSV to a private bucket.
@@ -6257,7 +6857,7 @@ bool supaUploadFile(const char *path, const char *objName) {
   size_t len = f.size();
 
   WiFiClientSecure client;
-  client.setInsecure();                                            // encrypted; no cert pinning (thesis) [HARDENING TODO]
+  client.setInsecure();   // encrypted, unauthenticated -- see the SUPA_ROOT_CA comment above for why
   client.setTimeout(15000);
   HTTPClient http;
   String url = base + "/storage/v1/object/" + SUPA_BUCKET + "/" + objName;
@@ -6451,9 +7051,15 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
       for (File e = root.openNextFile(); e; e = root.openNextFile()) {
         String nm = String(e.name()); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
         String up = nm; up.toUpperCase();
-        if (up.endsWith(".CSV"))
-          o += "<tr><td>" + nm + "</td><td align=right>" + String((uint32_t)e.size()) + "B</td>"
-               "<td><a href='/view?f=" + nm + "'>view</a> &middot; <a href='/download?f=" + nm + "'>get</a></td></tr>";
+        if (up.endsWith(".CSV")) {
+          // htmlEscape() everywhere this is rendered, matching every other dynamic string in this
+          // portal -- '&' and '\'' are valid FAT filename characters (unlike '<'/'>'/'"'), so a
+          // crafted on-card filename like "x' onmouseover='..." could otherwise break out of the
+          // href attribute. This was the one gap; every other rendered string here already escapes.
+          String enm = htmlEscape(nm);
+          o += "<tr><td>" + enm + "</td><td align=right>" + String((uint32_t)e.size()) + "B</td>"
+               "<td><a href='/view?f=" + enm + "'>view</a> &middot; <a href='/download?f=" + enm + "'>get</a></td></tr>";
+        }
       }
       root.close();
     }
@@ -6467,17 +7073,30 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
   o += "<h3>Change admin PIN</h3><form method=POST action=/pin>"
        "<p><input name=pin type=password placeholder='new PIN (4-12)' style='width:100%;padding:8px'></p>"
        "<p><button type=submit style='width:100%;padding:10px'>Change PIN</button></p></form>";
+  // netMux: supaUrl/supaKey are also written from core-1 handleSms(); this admin page runs on
+  // core 0. Copy once, use the locals for all three reads below.
+  String suUrl, suKey;
+  xSemaphoreTake(netMux, portMAX_DELAY); suUrl = supaUrl; suKey = supaKey; xSemaphoreGive(netMux);
   o += "<h3>Supabase cloud logs</h3><form method=POST action=/supa>"
-       "<p>Project URL<br><input name=url style='width:100%' placeholder='https://<ref>.supabase.co' value='" + htmlEscape(supaUrl) + "'></p>"
-       "<p>Service key (service_role JWT)<br><textarea name=key rows=3 style='width:100%' placeholder='" + String(supaKey.length() ? "(set - leave blank to keep)" : "paste the full key") + "'></textarea></p>"
+       "<p>Project URL<br><input name=url style='width:100%' placeholder='https://<ref>.supabase.co' value='" + htmlEscape(suUrl) + "'></p>"
+       "<p>Service key (service_role JWT)<br><textarea name=key rows=3 style='width:100%' placeholder='" + String(suKey.length() ? "(set - leave blank to keep)" : "paste the full key") + "'></textarea></p>"
        "<p><button type=submit style='width:100%;padding:10px'>Save Supabase creds</button></p></form>";
   o += "<form method=POST action=/upload>"
-       "<p>Push yesterday's CSV to cloud storage" + String(supaUrl.length() ? "" : " (set the URL + key above first)") + ".</p>"
+       "<p>Push yesterday's CSV to cloud storage" + String(suUrl.length() ? "" : " (set the URL + key above first)") + ".</p>"
        "<p><button type=submit style='width:100%;padding:10px'>Upload logs now</button></p></form>";
+  // netMux: fbUrl/fbApiKey/fbEmail/fbPassword/fbRefresh/fbAuthErr/fbUid are also written from
+  // core-1's FBASE,... SMS handlers (SIGNOUT clears several of them) while this admin page render
+  // runs on core 0 -- the same cross-core String race already guarded at the FBASE,STATUS SMS
+  // handler, just not previously extended to this render path (audit fix, 2026-09-08).
+  String fUrl, fApiKey, fEmail, fPass, fRefresh, fAuthErr, fUid;
+  xSemaphoreTake(netMux, portMAX_DELAY);
+  fUrl = fbUrl; fApiKey = fbApiKey; fEmail = fbEmail; fPass = fbPassword;
+  fRefresh = fbRefresh; fAuthErr = fbAuthErr; fUid = fbUid;
+  xSemaphoreGive(netMux);
   o += "<h3>Firebase live dashboard</h3><form method=POST action=/fbase>"
-       "<p>RTDB URL<br><input name=url style='width:100%' placeholder='https://<ref>-default-rtdb.<region>.firebasedatabase.app' value='" + htmlEscape(fbUrl) + "'></p>"
+       "<p>RTDB URL<br><input name=url style='width:100%' placeholder='https://<ref>-default-rtdb.<region>.firebasedatabase.app' value='" + htmlEscape(fUrl) + "'></p>"
        "<p><label><input type=checkbox name=en value=yes" + String(firebaseEnabled ? " checked" : "") + "> Enabled (live snapshot + remote commands)</label></p>"
-       "<p>Last upload: " + String(fbUrl.length() == 0 ? "not configured"
+       "<p>Last upload: " + String(fUrl.length() == 0 ? "not configured"
                                    : (fbLastUploadMs == 0 ? "none yet"
                                       : String((millis() - fbLastUploadMs) / 1000) + " s ago, " + (fbLastOk ? "OK" : "FAILED"))) + "</p>"
        "<p><button type=submit style='width:100%;padding:10px'>Save Firebase settings</button></p></form>";
@@ -6485,13 +7104,13 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
   // refresh token exists it is no longer needed at all (Forget password below).
   o += "<h3>Firebase device account</h3><form method=POST action=/fbauth>"
        "<p>Web API key<br><input name=key style='width:100%' placeholder='" +
-         String(fbApiKey.length() ? "(set - leave blank to keep)" : "AIza...") + "'></p>"
-       "<p>Device email<br><input name=email style='width:100%' value='" + htmlEscape(fbEmail) + "'></p>"
+         String(fApiKey.length() ? "(set - leave blank to keep)" : "AIza...") + "'></p>"
+       "<p>Device email<br><input name=email style='width:100%' value='" + htmlEscape(fEmail) + "'></p>"
        "<p>Device password<br><input name=pass type=password style='width:100%' placeholder='" +
-         String(fbPassword.length() ? "(set - leave blank to keep)" : "used once, then discardable") + "'></p>"
+         String(fPass.length() ? "(set - leave blank to keep)" : "used once, then discardable") + "'></p>"
        "<p>Token: <b>" + String(fbAuthOk ? "signed in" : "NOT signed in") + "</b>" +
          String(fbAuthHttp ? " (HTTP " + String(fbAuthHttp) + ")" : "") +
-         " &middot; refresh token " + String(fbRefresh.length() ? "stored" : "none") +
+         " &middot; refresh token " + String(fRefresh.length() ? "stored" : "none") +
          " &middot; TLS handshakes " + String(fbHandshakes) + "</p>";
   // Blocked-reason readout. Without this the page just says "not signed in" and gives you
   // nothing to act on -- which is exactly the state that makes provisioning feel broken.
@@ -6505,18 +7124,18 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
          "Auth failures are also written to the SD log as <code>FBASE,AUTH|...</code>.</small></p>";
     String why;
     if (!firebaseEnabled)           why = "Firebase is disabled (tick Enabled above)";
-    else if (fbApiKey.length() < 8) why = "no Web API key set";
-    else if (!fbEmail.length())     why = "no device email set";
-    else if (!fbRefresh.length() && !fbPassword.length()) why = "no password and no refresh token";
-    else if (fbUrl.length() < 8)    why = "no RTDB URL set -- sign-in will work, but nothing will publish";
+    else if (fApiKey.length() < 8)  why = "no Web API key set";
+    else if (!fEmail.length())      why = "no device email set";
+    else if (!fRefresh.length() && !fPass.length()) why = "no password and no refresh token";
+    else if (fUrl.length() < 8)     why = "no RTDB URL set -- sign-in will work, but nothing will publish";
     if (why.length())      o += "<p style='color:#c33'>Blocked: " + htmlEscape(why) + "</p>";
-    if (fbAuthErr.length()) {
+    if (fAuthErr.length()) {
       o += "<p style='color:#c33'>Last error (" + String((millis() - fbAuthErrMs) / 1000) + " s ago): "
-           + htmlEscape(fbAuthErr) + "</p>";
+           + htmlEscape(fAuthErr) + "</p>";
     }
-    if (fbUid.length())
-      o += "<p>Device UID: <code>" + htmlEscape(fbUid) + "</code><br>"
-           "<small>Use this in your RTDB rules, e.g. <code>\".write\": \"auth.uid === '" + htmlEscape(fbUid) + "'\"</code>. "
+    if (fUid.length())
+      o += "<p>Device UID: <code>" + htmlEscape(fUid) + "</code><br>"
+           "<small>Use this in your RTDB rules, e.g. <code>\".write\": \"auth.uid === '" + htmlEscape(fUid) + "'\"</code>. "
            "The firmware itself never needs the UID.</small></p>";
   }
   o += "<p><label><input type=checkbox name=pin value=yes" + String(fbPinCa ? " checked" : "") + "> "
@@ -6602,11 +7221,20 @@ static int portalRmrf(const String &dir, int depth) {
   if (!d) return 0;
   const int MAXN = 48;
   String child[MAXN]; bool isdir[MAXN]; int cnt = 0;
-  for (File e = d.openNextFile(); e && cnt < MAXN; e = d.openNextFile()) {
+  // Was a C-style for-loop (`for (File e = ...; e && cnt < MAXN; e = d.openNextFile())`) -- the
+  // increment clause runs BEFORE the condition is re-checked, so once cnt reached MAXN the loop
+  // still opened one more (49th) File before the condition failed and the loop exited, and that
+  // File was never closed (the body, with its e.close(), never ran for it). A >48-entry directory
+  // is a realistic outcome after ~7 weeks of daily logging, and Format SD calls this in a loop
+  // specifically to walk large directories, so this was reachable in normal long-term use. Rewritten
+  // to never call openNextFile() again once the buffer is full.
+  for (File e = d.openNextFile(); e; ) {
     String nm = String(e.name());                             // normalize to basename (core may return a full path)
     int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
-    if (nm.length()) { child[cnt] = (dir == "/") ? "/" + nm : dir + "/" + nm; isdir[cnt] = e.isDirectory(); cnt++; }
+    if (nm.length() && cnt < MAXN) { child[cnt] = (dir == "/") ? "/" + nm : dir + "/" + nm; isdir[cnt] = e.isDirectory(); cnt++; }
     e.close();
+    if (cnt >= MAXN) break;
+    e = d.openNextFile();
   }
   d.close();
   for (int i = 0; i < cnt; i++) {
@@ -6704,7 +7332,8 @@ static void portalHandleSupa() {                              // POST /supa -- s
   if (!url.startsWith("http")) {
     portalServer.send(200, "text/html", portalAdminHtml("URL must start with https://")); return;
   }
-  bool keepKey = (key.length() == 0 && supaKey.length() > 0);  // blank key + one already stored -> URL-only edit
+  xSemaphoreTake(netMux, portMAX_DELAY); bool haveKey = supaKey.length() > 0; xSemaphoreGive(netMux);
+  bool keepKey = (key.length() == 0 && haveKey);  // blank key + one already stored -> URL-only edit
   if (!keepKey && key.length() < 20) {                          // a service_role JWT is ~200+ chars
     portalServer.send(200, "text/html", portalAdminHtml("Paste the full service key (or leave blank to keep the current one).")); return;
   }
@@ -6866,7 +7495,12 @@ void netTask(void *pv) {
     wifiConnected = true;
     wifiRssiVal = WiFi.RSSI();
 
-    unsigned long interval = (sysState == ACTIVE_STATE) ? TS_UPLOAD_ACTIVE_MS : TS_UPLOAD_IDLE_MS;
+    // t.state, not raw sysState: this runs on core 0 and the telemMux-guarded snapshot is the only
+    // sanctioned view of core-1 state here -- same principle firebaseUploadLive() already documents
+    // for itself (this cadence check just hadn't been updated to match when that was written).
+    SystemState netState;
+    { TelemetrySnapshot t; portENTER_CRITICAL(&telemMux); t = telem; portEXIT_CRITICAL(&telemMux); netState = t.state; }
+    unsigned long interval = (netState == ACTIVE_STATE) ? TS_UPLOAD_ACTIVE_MS : TS_UPLOAD_IDLE_MS;
     if (millis() - lastUpload >= interval) { lastUpload = millis(); tsUpload(); }
 
     // Firebase live snapshot for the web dashboard. Same core-0 cadence discipline as tsUpload above:
@@ -6884,7 +7518,7 @@ void netTask(void *pv) {
       if (fbOn) fbEnsureToken();
     }
 
-    unsigned long fbInterval = (sysState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
+    unsigned long fbInterval = (netState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
     // An error should not sit unseen for up to a minute, so core 1 can force a push out of band.
     // Rate-limited: a burst of rejections must not turn into a burst of TLS uploads on a battery.
     bool urgent = fbPushNow && (millis() - fbLastUploadMs >= FB_PUSH_MIN_GAP_MS);
@@ -6895,6 +7529,7 @@ void netTask(void *pv) {
     firebaseFlushStatus();                                 // results first: report before fetching more
     firebasePollCommands();
     firebasePollManual();                                  // the Manual/Test tab's hold + keep-alive
+    firebasePollTestHold();                                // the Manual/Test tab's hold-to-run buttons
 
     // Supabase CSV push: core 1 sets uploadReqStamp; do one attempt here and publish the result.
     if (uploadReqStamp != 0 && !uploadBusy) {
@@ -6951,8 +7586,12 @@ void raiseFault(char tier, const char *code, const char *loc) {
     diagStopStream(); esp2SetPower(false);
   }
   // Non-critical faults wait BEHIND an open confirm dialog (companion spec §B.3.1); Critical
-  // force-dismisses (handled in enterEmergencyStop below).
-  if (tier == 'C' || !(editConfirm || restoreConfirm)) { uiMode = UI_DATA; lcdPage = PAGE_FAULT; }
+  // force-dismisses (handled in enterEmergencyStop below). resetConfirm (the Reboot-ESP1 double-
+  // confirm) is handled identically to restoreConfirm everywhere else in settingsButton() and is
+  // force-cleared alongside it on a Critical fault / fault-hold -- it belongs in this condition too,
+  // or a non-critical fault preempts the screen without clearing it, and the stale dialog silently
+  // reappears out of context the next time Settings is reopened.
+  if (tier == 'C' || !(editConfirm || restoreConfirm || resetConfirm)) { uiMode = UI_DATA; lcdPage = PAGE_FAULT; }
   wakeBacklight();
 
   // GSM alert for all tiers (sec.12.1.1)
@@ -6966,6 +7605,11 @@ void enterEmergencyStop(bool cutPower) {
   esp2Serial.print(FRAME_START); esp2Serial.print(",STOP_ALL,"); esp2Serial.println(FRAME_END);
   logEvent("ESP1", "CMD", "ESP2|STOP_ALL");
   esp2Held = false;                                // a hard E-stop supersedes any held-fault recovery
+  lastHeldClearReason = "estop";
+  // One of the four documented esp2Held-clear sites; previously the only one (besides the
+  // ESP2-restarted branch, now also fixed) that left the re-hold guard stale for a later,
+  // unrelated fault sharing the same code to inherit.
+  lastHoldCode = ""; sameHoldN = 0; steerRelease = false;
   wo.active = false; wo.stage = WO_IDLE;
   pendingRun.active = false; pendingRun.colIdx = -1;
   pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
@@ -7009,7 +7653,11 @@ void enterFaultHold(const char *code, const char *loc) {
   if (sameHoldN >= HOLD_AUTOCANCEL_N) {
     logEvent("ESP1", "FAULT", String("CRIT|") + code + "|" + loc + "|AUTOCANCEL|after=" + String(sameHoldN));
     sendSMS(String("ALERT,CANCEL,") + code + "," + colS + ",repeated holds - run cancelled, column snoozed 30m");
-    cancelRun(1, code);                                // 30-min snooze; clears the hold + stops ESP2
+    // Overwrite the plain fault line above with the actual outcome: esp2Held is about to go false and
+    // the banner will simply disappear, so this is the only trace (besides SMS) of "the rig gave up on
+    // its own" vs. a real operator-confirmed recovery -- see diagnostics.system.lastFault.
+    lastFaultMsg = String("AUTO-CANCELLED ") + code + " " + loc + " " + colS + " (repeated " + sameHoldN + "x, snoozed 30m)";
+    cancelRun(1, code, true);                          // 30-min snooze; clears the hold + stops ESP2; isAuto
     return;
   }
   steerRelease = (sameHoldN >= 3 && String(code) == "FLOW_FAIL");
@@ -7026,7 +7674,7 @@ void enterFaultHold(const char *code, const char *loc) {
  * the only way to stop the pumps.
  *   mode 0 = turn the column OFF (persistent)   1 = snooze 30 min   2 = snooze 10 min
  * Safe to call whether or not ESP2 is currently held. */
-void cancelRun(int mode, const char *why) {
+void cancelRun(int mode, const char *why, bool isAuto) {
   int c = (wo.colIdx >= 0) ? wo.colIdx : pendingRun.colIdx;      // whichever run we are aborting
 
   // STOP_ALL is what actually kills the pumps: on ESP2 it clears faultHeld, the work order, the
@@ -7036,6 +7684,7 @@ void cancelRun(int mode, const char *why) {
   wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
   pendingRun.active = false; pendingRun.colIdx = -1;
   esp2Held = false;
+  lastHeldClearReason = isAuto ? "auto_cancelled" : "cancelled";
   // A cancelled FORCE run must not leave the dashboard sitting on "accepted", nor let a later
   // scheduled run inherit this one's column mask.
   if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", why); forceCmdId[0] = 0; }
@@ -7077,13 +7726,28 @@ void issueRecovery(int sel) {
     return;
   }
   const char *mode = (sel == 1) ? "RELEASE" : (sel == 2) ? "IRRIGATE" : "NORMAL";
+  // A RESUME already sent is still awaiting ESP2's reply -- don't send a second one on top of it.
+  // A duplicate (double button press, a retried SMS) racing the first would make ESP2 correctly
+  // reject the second as INVALID,NOT_HELD once the first has already been accepted, which used to
+  // make ESP1 wrongly conclude "ESP2 restarted, lost the sequence" even though ESP2 was still
+  // executing the successfully-resumed run. resumeAwaitingAck already clears on ACK, on a rejected
+  // INVALID,NOT_HELD, and on the RESUME_ACK_TIMEOUT_MS no-reply timeout below, so this can't wedge.
+  if (resumeAwaitingAck && millis() - resumeSentMs <= RESUME_ACK_TIMEOUT_MS) {
+    lastFaultMsg = "Resume already in progress - waiting for ESP2";
+    return;
+  }
   sendEsp2(String("RESUME,") + mode);                  // ESP2 re-energizes P17 and resumes/rewrites the run
-  logEvent("ESP1", "ACT", String("RESUME|") + mode + "|COL_" +
+  logEvent("ESP1", "ACT", String("RESUME|SENT|") + mode + "|COL_" +
            (wo.colIdx >= 0 ? String(COL_TAG[wo.colIdx]) : String("?")));
-  sendSMS(String("ACK,RESUME,") + mode);
-  esp2Held = false;
-  if (wo.active) { wo.stage = WO_ACKED; wo.sentMs = millis(); }   // restart the DONE-timeout supervision
-  setState(ACTIVE_STATE);                              // supervising the resumed run again
+  // Do NOT clear esp2Held (or restart DONE-timeout supervision, or claim success by SMS) here --
+  // that must wait for ESP2's actual reply: ACK,RESUME (handleEsp2Response, confirmed) or
+  // INVALID,NOT_HELD (rejected). Clearing esp2Held on SEND instead of on CONFIRMATION used to make
+  // the INVALID,NOT_HELD rejection handler unreachable, silently re-arming the 10-min DONE-timeout
+  // supervision and escalating to an unexplained Emergency Stop ~10 minutes later. The fault-hold UI
+  // (and this menu) now stays up until ESP2 actually confirms one way or the other, or the bounded
+  // RESUME_ACK_TIMEOUT_MS wait in pollESP2() reports that nothing came back at all.
+  resumeAwaitingAck = true;
+  resumeSentMs = millis();
 }
 
 /* =============================================================================
@@ -7248,7 +7912,14 @@ void calButton(int i) {
 
   if (t.kind == CK_FLOW) {
     if (calStep == 0) {                            // run step: ENTER held = pump (calHoldTick); UP = proceed
-      if (i == 0) { calFlowPulses = (calRxValid ? (unsigned long)calRxRaw : 0); calStep = 1; }
+      // Require an actual sample before letting UP advance -- previously a missing/no-reading-yet
+      // case silently substituted 0 pulses and still proceeded, same class of gap as the generic
+      // capture path above (see its comment). A genuine "0 pulses so far, pump just started" reading
+      // still has calRxValid true, so this only blocks the "never got a reading at all" case.
+      if (i == 0) {
+        if (!calRxValid) { calMsg = "no reading yet"; return; }
+        calFlowPulses = (unsigned long)calRxRaw; calStep = 1;
+      }
     } else if (calStep == 1) {                      // volume entry for this run
       if (i == 0) calVolL += 0.01f;
       else if (i == 1) { calVolL -= 0.01f; if (calVolL < 0.0f) calVolL = 0.0f; }
@@ -7275,7 +7946,10 @@ void calButton(int i) {
 
   if (t.kind == CK_OFFSET) {
     if (calStep == 0) {                            // capture the raw sensor reading
-      if (i == 2) { if (calRxValid) calCap[0] = calRxRaw; calVolL = calCap[0]; calStep = 1; }
+      if (i == 2) {
+        if (!calRxValid) { calMsg = "no reading yet"; return; }
+        calCap[0] = calRxRaw; calVolL = calCap[0]; calStep = 1;
+      }
     } else {                                        // enter the true reference reading -> offset
       if (i == 0) calVolL += 0.1f;
       else if (i == 1) calVolL -= 0.1f;
@@ -7299,7 +7973,10 @@ void calButton(int i) {
 
   if (t.kind == CK_FLOW_RES) {                    // Nano reservoir flow: manual external fill, no pump
     if (calStep == 0) {                            // watch pulses climb during the fill; UP = done
-      if (i == 0) { calFlowPulses = (calRxValid ? (unsigned long)calRxRaw : 0); calStep = 1; }
+      if (i == 0) {
+        if (!calRxValid) { calMsg = "no reading yet"; return; }
+        calFlowPulses = (unsigned long)calRxRaw; calStep = 1;
+      }
     } else {                                        // volume entry
       if (i == 0) calVolL += 0.01f;
       else if (i == 1) { calVolL -= 0.01f; if (calVolL < 0.0f) calVolL = 0.0f; }
@@ -7311,8 +7988,14 @@ void calButton(int i) {
   // capture kinds: ENTER captures current raw; 2-pt (soil/pH/EC) needs 2, others 1
   int needed = (t.kind == CK_PH || t.kind == CK_EC || t.kind == CK_SOIL) ? 2 : 1;
   if (i == 2) {
+    // Was: capture if calRxValid, but advance calStep unconditionally either way -- pressing ENTER
+    // before the first raw sample has streamed back from the Nano/ESP2 (calRxValid is explicitly
+    // reset false on calOpenTarget()) silently captured a stale/zero value and still advanced the
+    // wizard. The LCD does show "--" for a stale reading as a visual cue, but nothing blocked the
+    // advance itself. Now requires an actual reading before this step counts.
+    if (!calRxValid) { calMsg = "no reading yet"; return; }
     calMsg = "";
-    if (calRxValid) calCap[calStep] = calRxRaw;
+    calCap[calStep] = calRxRaw;
     if (++calStep >= needed) {
       if (calCommit()) calCloseTarget();
       else { calStep = 0; calMsg = "pts too close"; }   // degenerate pH/EC -> recapture (§B audit fix)
@@ -7466,8 +8149,15 @@ void exitDiag() {
  * runs whenever EITHER the LCD Sensor Diag screen is open or this window is live, so there is one
  * implementation rather than two that can disagree. Bounded: it powers ESP2 up, sweeps, and hands
  * it back, because ESP2 is normally OFF at idle and must not be left running by a browser. */
-bool diagRemoteStart(unsigned long ms) {
-  if (sysState != IDLE_STATE || wo.active || esp2Held || uiMode != UI_DATA) return false;
+bool diagRemoteStart(unsigned long ms, const char **why) {
+  // New-F1 (audit): split out so DIAG_SWEEP's Firebase rejection can name which condition actually
+  // failed, matching the FORCE_RUN/TEST_PULSE idle-gates instead of the one flat "not safely idle"
+  // string this used to leave the caller with. Order picks the most specific/actionable reason first
+  // when more than one is true at once. Behaviour (when this returns false) is unchanged.
+  if (esp2Held)               { if (why) *why = "a fault is held";                  return false; }
+  if (wo.active)              { if (why) *why = "a run is in progress";             return false; }
+  if (uiMode != UI_DATA)      { if (why) *why = "someone is using the LCD";         return false; }
+  if (sysState != IDLE_STATE) { if (why) *why = "the controller is not idle";       return false; }
   for (int k = 0; k < DIAG_ESP2_N; k++) { diagEsp2Raw[k] = 0; diagEsp2Valid[k] = false; diagEsp2Ms[k] = 0; }
   diagEsp2Idx = -1; diagEsp2DwellMs = 0; diagEsp2Streaming = false;
   diagRemoteUntilMs = millis() + ms;
@@ -7956,6 +8646,15 @@ void commitEditor() {
       logEvent("ESP1", "STATE", "THRESH_SET");
       break;
     case SET_FORCE:
+      // Race fix: refuse to clobber an already-armed/running Force Run (web-armed or LCD-armed) --
+      // fcPhase is the one shared authoritative state; the Firebase FORCE_RUN handler already
+      // checks it, this was the missing side.
+      if (fcPhase != FP_NONE) {
+        logEvent("ESP1", "STATE", "FORCE_BLOCKED|ALREADY_ARMED");
+        forceBlockedFlash = true; forceBlockedUntilMs = millis() + 3000;
+        uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
+        break;
+      }
       // ARM, don't run. forceTick() fires it after the countdown and re-checks safety THEN, because
       // conditions can change during a delay of up to 5 minutes. Return to UI_DATA so automation
       // (and the fire check, which requires uiMode == UI_DATA) is live while the clock runs.
@@ -7987,7 +8686,12 @@ void restoreDefaults() {
     COL_WIN_START[c] = DEF_WIN_START[c]; COL_WIN_END[c] = DEF_WIN_END[c];
     saveColumn(c); saveSchedule(c);
   }
-  soilStartPct = 35; soilStopPct = 45; fertGap = 20.0f; saveThresholds();
+  // Audit fix (2026-09-10): restoreDefaults() is documented as "reset to compiled defaults" -- this
+  // was hardcoding 20.0f while the actual compiled global default (line 134, FERTIGATE_TRIGGER_GAP)
+  // is 30.0f. soilStartPct/soilStopPct here already match their own compiled defaults; fertGap was
+  // the one silent outlier, making Restore Defaults leave a materially more aggressive fertigation
+  // trigger than the function's own contract promises.
+  soilStartPct = 35; soilStopPct = 45; fertGap = 30.0f; saveThresholds();
   logEvent("ESP1", "RESET", "CONFIG|DEFAULTS|kept cal+cols+wifi");
 }
 
@@ -8125,7 +8829,16 @@ void settingsButton(int i) {
       else if (i == 1) confirmSel = (confirmSel + 1) % 3;
       else if (i == 3) editConfirm = false;                    // BACK on dialog = CANCEL (stay)
       else if (i == 2) {
-        if (confirmSel == 0)      { commitEditor(); editConfirm = false; editDirty = false; uiMode = UI_MENU; editItem = -1; }  // SAVE
+        if (confirmSel == 0) {                                  // SAVE
+          // SET_FORCE's own commitEditor() case sets uiMode=UI_DATA itself, specifically so
+          // forceTick()'s fire-time gate (which requires UI_DATA) doesn't spuriously abort the
+          // just-armed run. Every other editor relies on THIS generic dialog to set uiMode, so
+          // the blanket UI_MENU below must not stomp on that one case's own choice.
+          bool wasForce = (editItem == SET_FORCE);
+          commitEditor();
+          editConfirm = false; editDirty = false; editItem = -1;
+          if (!wasForce) uiMode = UI_MENU;
+        }
         else if (confirmSel == 1) { editConfirm = false; editDirty = false; uiMode = UI_MENU; editItem = -1; }                  // DISCARD
         else                      { editConfirm = false; }                                                                     // CANCEL -> stay
       }
@@ -8149,6 +8862,11 @@ void settingsButton(int i) {
           else if (editField == 2) editTmp[2] = clampi(editTmp[2] + delta, 1, 31);
           else if (editField == 3) editTmp[3] = clampi(editTmp[3] + delta, 0, 23);
           else if (editField == 4) editTmp[4] = clampi(editTmp[4] + delta, 0, 59);
+          // Audit fix (2026-09-08): day-of-month was clamped to a flat 1..31 regardless of the
+          // year/month also being edited here, so e.g. Feb 30 could be dialed in and committed
+          // straight to the DS3231, which has no validation of its own to catch it.
+          if (editField == 0 || editField == 1 || editField == 2)
+            editTmp[2] = clampi(editTmp[2], 1, daysInMonth(editTmp[0], editTmp[1]));
         } else if (i == 2) {                                    // ENTER advances / commits
           if (++editField > 4) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
@@ -8163,6 +8881,24 @@ void settingsButton(int i) {
           else if (editField == 3) editTmp[2] = clampi(editTmp[2] + delta, 0, 59);
           else if (editField == 4) editTmp[3] = clampi(editTmp[3] + delta, 0, 23);
           else if (editField == 5) editTmp[4] = clampi(editTmp[4] + delta, 0, 59);
+          // Audit fix (2026-09-09): controlTick()'s window check (`mod < ws || mod > we`) has no
+          // midnight-wraparound support, so a start>=end window silently and permanently disables
+          // the column with no error surfaced on this 3-line display. Auto-correct in real time
+          // (same approach as the SET_CLOCK day/month re-clamp above) rather than let an invalid
+          // window ever be committed.
+          if (editField >= 2 && editField <= 5) {
+            int startMin = editTmp[1] * 60 + editTmp[2];
+            int endMin   = editTmp[3] * 60 + editTmp[4];
+            if (startMin >= endMin) {
+              if (editField == 2 || editField == 3) {          // start just edited -> push end forward
+                int e = clampi(startMin + 1, 0, 1439);
+                editTmp[3] = e / 60; editTmp[4] = e % 60;
+              } else {                                          // end just edited -> pull start back
+                int s = clampi(endMin - 1, 0, 1439);
+                editTmp[1] = s / 60; editTmp[2] = s % 60;
+              }
+            }
+          }
         } else if (i == 2) {
           int lastField = (editTmp[0] == SCHED_MANUAL) ? 5 : 1;
           if (++editField > lastField) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
@@ -8273,7 +9009,8 @@ static void pulseFinish(bool ok, const char *why) {
   int  row = puRow;
   bool sawFlow = puFlowSeen;
   unsigned long pulses = puFlowPulses;
-  puPhase = PU_NONE; puRow = -1; puFlowSeen = false; puFlowPulses = 0;
+  bool wasHold = puHoldMode;
+  puPhase = PU_NONE; puRow = -1; puFlowSeen = false; puFlowPulses = 0; puHoldMode = false;
   esp2SetPower(false);
   if (sysState == TEST_MODE) setState(IDLE_STATE);
 
@@ -8295,7 +9032,7 @@ static void pulseFinish(bool ok, const char *why) {
                        : String("; NO FLOW - 0 pulses, check pump, line or sensor");
     }
   }
-  logEvent("ESP1", "ACT", String("PULSE|") + (ok ? "DONE|" : "ABORT|") + detail);
+  logEvent("ESP1", "ACT", String(wasHold ? "TESTHOLD|" : "PULSE|") + (ok ? "DONE|" : "ABORT|") + detail);
   if (puCmdId[0]) {
     firebaseQueueStatus(puCmdId, ok ? "completed" : "failed", detail.c_str());
     puCmdId[0] = '\0';
@@ -8303,6 +9040,39 @@ static void pulseFinish(bool ok, const char *why) {
 }
 
 void pulseTick() {
+  // Web hold-to-run hand-off (2026-09-10): firebasePollTestHold() (core 0) only ever writes
+  // testHoldReqWant/Bit/Fresh; this function runs on core 1 (called from loop(), same call site as
+  // testHoldTick()), so THIS is the safe place to actually arm/release -- setState()/logEvent()/
+  // pulseFinish() must never be called from core 0. Checked before the PU_NONE early-return below,
+  // since a fresh start request arrives exactly while puPhase IS PU_NONE.
+  if (testHoldReqFresh) {
+    testHoldReqFresh = false;
+    if (!testHoldReqWant) {
+      if (puHoldMode) pulseFinish(true, "web hold released");   // explicit release -- don't wait out the timeout
+    } else if (puPhase == PU_NONE) {
+      // Same idle/safety gate TEST_PULSE's own handler already uses, so a hold request is silently
+      // ignored (not armed) unless the rig is genuinely free to take it -- there is no queued
+      // command/status entry for this node the way there is for TEST_PULSE, so there is nothing to
+      // reject "into"; the website's own UI only offers this button once its normal freshness/
+      // approval checks already pass.
+      int row = pulseRowForTarget(testHoldReqBit);
+      if (row >= 0 && !(row >= 17 && row <= 19 && !COLUMN_ENABLED[row - 17]) &&
+          !actuationsDisabled && sysState == IDLE_STATE && uiMode == UI_DATA && !wo.active &&
+          !pendingRun.active && !pendingExercise.active && !esp2Held && fcPhase == FP_NONE && !fbRemoteExerciseId[0]) {
+        puRow = row; puHoldMode = true; puCmdId[0] = '\0';
+        esp2SetPower(true);
+        esp2TestArmed = false; testArmPending = false; testArmTries = 0; lastTestArmMs = 0;
+        esp2WarmupMs = millis();
+        puArmMs = millis();
+        puPhase = PU_ARM;
+        setState(TEST_MODE);
+        logEvent("FIREBASE", "CMD", String("TESTHOLD|START|") + testHoldReqBit);
+      }
+    }
+    // else: already holding (or something else is running) -- this was just a keep-alive refresh, or
+    // a start-request arriving while busy; ignored either way, same as before.
+  }
+
   if (puPhase == PU_NONE) return;
 
   // Anything that makes actuation unsafe ends the pulse immediately. Checked every tick, not just
@@ -8316,9 +9086,14 @@ void pulseTick() {
     // relay power-up, so re-send TEST,ENTER until ESP2 ACKs.
     if (esp2TestArmed) {
       puPhase = PU_RUN;
-      puEndMs = millis() + (unsigned long)puSeconds * 1000UL;
+      if (puHoldMode) {
+        testHoldLastFreshMs = millis();      // start the browser keep-alive clock fresh, not stale from PU_ARM
+        logEvent("ESP1", "ACT", String("TESTHOLD|RUN|") + testRowName(puRow));
+      } else {
+        puEndMs = millis() + (unsigned long)puSeconds * 1000UL;
+        logEvent("ESP1", "ACT", String("PULSE|START|") + testRowName(puRow) + "|" + puSeconds + "s");
+      }
       puLastSendMs = 0;
-      logEvent("ESP1", "ACT", String("PULSE|START|") + testRowName(puRow) + "|" + puSeconds + "s");
       return;
     }
     if (millis() - puArmMs > PULSE_ARM_TIMEOUT_MS) { pulseFinish(false, "ESP2 never entered test mode"); return; }
@@ -8339,7 +9114,13 @@ void pulseTick() {
   }
 
   // PU_RUN: keep-alive stream at 150 ms, comfortably inside ESP2's 400 ms release timeout.
-  if ((long)(millis() - puEndMs) >= 0) {
+  // Hold-mode has no fixed puEndMs -- it ends when the browser stops refreshing testHoldLastFreshMs
+  // (button released, tab closed, network dropped), bounded by TEST_HOLD_BROWSER_TIMEOUT_MS. Either
+  // way ESP2's OWN 400 ms dead-man is what actually protects the relay if ESP1 itself vanishes.
+  bool timeUp = puHoldMode
+    ? (millis() - testHoldLastFreshMs > TEST_HOLD_BROWSER_TIMEOUT_MS)
+    : ((long)(millis() - puEndMs) >= 0);
+  if (timeUp) {
     sendEsp2("TEST,RELEASE");                  // ask for the meter count; ESP2 answers TEST,FLOW
     puPhase = PU_REPORT; puReportMs = millis();
     return;
@@ -8474,6 +9255,22 @@ void lcdTick() {
   }
   if (lcdInWebManual) { lcd.clear(); lcdInWebManual = false; }
 
+  // Race-fix feedback: briefly shown instead of arming when the LCD's own Force Run entry was
+  // blocked because a run (web- or LCD-armed) is already armed/running. Auto-clears after 3 s and
+  // falls through to whatever screen is actually current (e.g. the still-armed web run below).
+  if (forceBlockedFlash) {
+    if ((long)(millis() - forceBlockedUntilMs) < 0) {
+      if (!lcdInForce) { lcd.clear(); lcdInForce = true; }
+      char fb[21];
+      snprintf(fb, 21, "%-20s", "FORCE RUN BLOCKED");   lcd.setCursor(0, 0); lcd.print(fb);
+      snprintf(fb, 21, "%-20s", "A run is already");    lcd.setCursor(0, 1); lcd.print(fb);
+      snprintf(fb, 21, "%-20s", "armed/running.");      lcd.setCursor(0, 2); lcd.print(fb);
+      snprintf(fb, 21, "%-20s", "");                    lcd.setCursor(0, 3); lcd.print(fb);
+      return;
+    }
+    forceBlockedFlash = false;
+  }
+
   if (fcPhase == FP_WAIT && !esp2Held && sysState != EMERGENCY_STOP) {
     if (!lcdInForce) { lcd.clear(); lcdInForce = true; }
     char fb[21];
@@ -8570,7 +9367,11 @@ void lcdTick() {
         unsigned long fbAge = fbLastUploadMs ? (millis() - fbLastUploadMs) / 1000 : 0;
         if (tsAge > 999) tsAge = 999;
         if (fbAge > 999) fbAge = 999;
-        const char *fbTag = (fbUrl.length() == 0 || !firebaseEnabled) ? "--" : (fbLastOk ? "ok" : "!!");
+        // netMux: fbUrl is written from core-0 netTask (portal admin form); this LCD tick runs on
+        // core 1. .length()-only, so the risk was a torn/stale glyph for one refresh, not memory
+        // unsafety -- fixed anyway since every other fbUrl access in the file is correctly locked.
+        xSemaphoreTake(netMux, portMAX_DELAY); bool fbUrlSet = (fbUrl.length() != 0); xSemaphoreGive(netMux);
+        const char *fbTag = (!fbUrlSet || !firebaseEnabled) ? "--" : (fbLastOk ? "ok" : "!!");
         snprintf(l, 21, "TS:%s%3lus FB:%s%3lus", lastTsOk ? "ok" : "--", tsAge, fbTag, fbAge);
         lcdRow(3, l);
       }
@@ -8833,7 +9634,9 @@ static bool webWorthy(const char *type, const String &d) {
     // Testing from BOTH surfaces. TEST| is the LCD dead-man and PULSE| the dashboard push-to-column,
     // but the dashboard's plain "Test pump (5 sec)" button runs the preventive exercise -- so
     // EXERCISE| is website testing too, and omitting it left that button invisible here.
-    if (d.startsWith("TEST|") || d.startsWith("PULSE|") || d.startsWith("EXERCISE|")) return true;
+    // TESTHOLD| is the dashboard's own press-and-hold dead-man (2026-09-10) -- omitting it left every
+    // arm/finish/abort of that feature invisible here too, the same gap EXERCISE| was added to close.
+    if (d.startsWith("TEST|") || d.startsWith("PULSE|") || d.startsWith("EXERCISE|") || d.startsWith("TESTHOLD|")) return true;
     // Operator decisions and anything refused: "why did nothing happen?" is the question this
     // panel exists to answer, so the BLOCKED refusals matter as much as the actions.
     if (d.startsWith("ACTUATION|") || d.startsWith("FORCE|") || d.startsWith("WO|BLOCKED") ||
