@@ -15,6 +15,15 @@ Test Code.zip
 # a Firebase web config is public by design and is protected by Auth + database rules, not secrecy.)
 Firebase infos.txt
 
+# Downloaded Firebase Admin SDK service-account keys -- full admin credentials (bypass every rule,
+# can create/delete/impersonate any Auth user), never source. Added after the 2026-09-05 audit found
+# a real one sitting in "New folder/" uncovered by any rule, so a plain `git add .` could have
+# published it; excluded here defense-in-depth against it (or one like it) recurring anywhere.
+New folder/
+*firebase-adminsdk*.json
+*serviceaccount*.json
+*service-account*.json
+
 # Field logs: large rotating CSVs, and they are rig data rather than source.
 Logs/
 

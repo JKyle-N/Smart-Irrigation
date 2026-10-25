@@ -1,0 +1,106 @@
+================================================================================
+ WEBSITE FULL SCAN -- script.js / index.html / style.css / firebase-rules.json /
+ firebase-config.js / delete-user-api
+ Date: 2026-09-10
+================================================================================
+
+SCOPE AND METHOD
+--------------------------------------------------------------------------------
+Read every file in Website/ (and the linked delete-user-api Vercel function) start
+to finish, fresh, in full -- not excerpts, not a diff against memory of earlier
+sessions:
+  - script.js        2622 lines (an early line-count command misreported 2474 and
+                      briefly looked like the file might be truncated -- re-checked
+                      directly with `(Get-Content script.js).Count` and a tail read;
+                      the file is intact, complete, and ends correctly. False alarm,
+                      noted here only because it's exactly the kind of thing this
+                      project's own docs warn to double-check rather than assume.)
+  - index.html        497 lines
+  - style.css         322 lines
+  - firebase-rules.json  72 lines (re-read after tonight's own edits)
+  - firebase-config.js, delete-user-api/api/delete-user.js -- re-confirmed clean,
+    no changes since their last audit.
+Cross-checked every DOM id script.js reads/writes against index.html, every CSS
+class script.js toggles against style.css, and every command payload field
+script.js sends against firebase-rules.json's validators.
+
+RESULT: ONE BUG FOUND, ALREADY FIXED (reported separately, repeated here for a
+complete record) -- NO NEW BUGS FOUND on this full pass beyond it.
+================================================================================
+
+1. [FIXED] Temp-access grant used the browser's clock instead of Firebase's
+--------------------------------------------------------------------------------
+This is the PERMISSION_DENIED bug you hit granting 1h access -- already root-
+caused and fixed earlier this session, included here for a complete record.
+  Cause: grantTempAccess() computed `Date.now() + 1 hour` using THIS machine's
+  system clock, which is running ~18.5 hours behind real time (confirmed against
+  an external HTTPS server's Date header). That landed the value ~17.5 hours in
+  the past relative to Firebase's own (correct) server clock, which the rules'
+  server-relative validate window correctly rejected -- for both operator
+  accounts identically, since it's a machine-clock problem, not an account
+  problem.
+  Fix (script.js, grantTempAccess()): no longer trusts Date.now() at all. Writes
+  Firebase's own ServerValue.TIMESTAMP sentinel first, reads back what the
+  server actually resolved it to, then writes server_time + 1 hour from that.
+  Both writes are anchored to Firebase's clock, so this cannot fail this way
+  again regardless of any future operator's machine clock accuracy.
+  Status: DONE. No Firebase rules change was needed (the rule was correct all
+  along -- it was correctly rejecting a genuinely invalid value).
+
+================================================================================
+FULL-PASS FINDINGS (this scan specifically) -- NONE
+================================================================================
+Deliberately checked, and confirmed correct/consistent, rather than skipped:
+
+- Every access-control gate reviewed for order-of-operations bugs (the exact
+  class of thing that produces "looks disabled but isn't" or "looks safe but
+  isn't"): syncControlAvailability()'s hold-to-run gate, the Proceed-gate
+  relaxation's revoke/refuse condition (re-verified narrowed to actual
+  revoke/refuse, not "not yet held" -- confirmed still correct), canAccess-
+  PrivilegedTabs()'s approval re-check, writeManualHold()/writeTestHold()'s
+  acquire-vs-release asymmetry, attachUserStatusListener()'s approval-loss path
+  (confirmed it already reaches mtHoldStop() via syncControlAvailability(), no
+  separate call needed).
+- Every hold-to-run release path traced end-to-end: mouseup/touchend/mouseleave,
+  window blur, browser-tab hidden, pagehide, sign-out, leaving the Manual/Test
+  nav tab, and losing approval/freshness mid-press -- all correctly call
+  mtHoldStop(true); none can leave a press "stuck" believing it's still active.
+  ESP2's own 400 ms hardware dead-man remains the real backstop regardless.
+- grantTempAccess()'s two-step server-anchored write re-verified line-by-line
+  against the exact live tempAccessUntil .write/.validate rule text: both the
+  transient ServerValue.TIMESTAMP write and the real +1h write satisfy the
+  rule's bounds at the instant each is evaluated.
+- XSS surface: every user-supplied string reaching innerHTML (user name/email/
+  registration date in User Management, zone names) goes through escapeHtml();
+  every other display path uses textContent. No new sink introduced by tonight's
+  additions (hold-to-run buttons are static markup with no interpolated user
+  data).
+- CSS [hidden] overrides: confirmed .hold-btn needed none (it's never toggled
+  via .hidden, only via the .holding class + the disabled attribute), and every
+  existing [hidden]-needs-!important-style override (.login-card, .fault-
+  actions, .fault-banner, .danger-gate, .force-row) is still present and
+  unbroken.
+- Command payload validation coverage: cross-checked every field every command
+  type sends against firebase-rules.json's payload validators. Confirmed doseMl
+  is now covered (tonight's fix). Remaining unvalidated fields (columns, action,
+  pump, exerciseEnabled/Seconds, target, seconds, clkY/Mo/D/H/Mi, thStart/Stop/
+  Gap, col/mode/enabled/schedMode/winStart/winEnd) are the SAME set already
+  reviewed and explicitly accepted as deliberate scope in an earlier session
+  audit ("ESP1 firmware is the only remaining backstop") -- re-confirmed, not
+  re-flagged as new findings, since nothing changed about that risk tonight.
+- delete-user-api/api/delete-user.js: re-read in full, still clean (operator-
+  only, can't delete itself/ESP1/the other operator, generic error on token-
+  verification failure, checkRevoked=true).
+- firebase-config.js: projectId still matches the project rules were deployed
+  to (smart-irrigation-web2) -- ruled out as a possible cause of the grant bug
+  before landing on the clock-skew explanation.
+
+================================================================================
+NOTHING ELSE TO FIX RIGHT NOW
+================================================================================
+This was a genuinely fresh, full read of every file in Website/, not a targeted
+re-check of just the newest changes -- and it turned up nothing beyond the one
+bug already fixed. Deploy/publish status is unchanged from the last report:
+Firebase rules are live; script.js/index.html/style.css/firebase-rules.json/
+README.md still need your own publish step to reach the live site.
+================================================================================

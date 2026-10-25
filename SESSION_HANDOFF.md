@@ -3,38 +3,43 @@
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 
-Last updated: **2026-08-19**, at `main` = `988ce53`.
+Last updated: **2026-10-26**, after merging Sugian's 2026-09 work (branch `merge/sugian-2026-09`).
 
 ---
 
 ## 1. The single most important fact
 
-**Nothing in the last ~71 commits has been flashed to hardware.** The rig is running firmware from
-around the `pre-firebase-baseline` tag (`bc571a8`, 2026-07-10). Everything since — the Firebase
-dashboard, the force-run fix, fault recovery, the NPK blending, the Manual/Test tab, the manual-mode
-hold — exists only in the repository.
+**Nothing in the backlog has been flashed to hardware.** The rig is running firmware from around the
+`pre-firebase-baseline` tag (`bc571a8`, 2026-07-10). Everything since — the Firebase dashboard, fault
+recovery, NPK blending, the Manual/Test tab, the manual-mode hold, and all of Sugian's 2026-09 fixes
+and features merged on 2026-10-26 — exists only in the repository.
 
 Every audit run against that backlog has found real defects in the newest code. Treat unflashed work
 as unproven no matter how carefully it was reviewed, and do not describe any of it to the user as
-"working" — it compiles and it is reasoned, that is all.
+"working" — it compiles, the host tests pass, and it is reasoned; that is all.
 
 `Commissioning_Flash_Plan.md` stages the testing (A–G, each with an abort condition). Follow it
-rather than inventing an order.
+rather than inventing an order. Stage C (ESP2's own 400 ms dead-man dropping a relay when ESP1 loses
+power mid-hold) and Stage F (Manual/Test, including the web hold-to-run cap) must not be skipped.
 
 ---
 
-## 2. Blocking action the user must take
+## 2. State of the cloud side (shared Firebase project `smart-irrigation-web2`)
 
-**Publish the Firebase RTDB rules.** `Website/firebase-rules.json` → Firebase Console → Realtime
-Database → Rules → Publish.
-
-Until this happens, `/irrigation/manual` has no rule, RTDB denies by default where no rule matches,
-and **the entire Manual/Test tab is non-functional** — the page's write and ESP1's read are both
-rejected, the hold is never granted, and Proceed stays disabled. Stage F of the commissioning plan
-cannot be tested.
-
-This is a console change; only the user can do it. Ask whether it has been done before spending time
-on anything that depends on the manual hold.
+- **RTDB rules are LIVE** and identical to `Website/firebase-rules.json` (Sugian deployed them
+  2026-09-10/11). They include `irrigation/manual`, `irrigation/testHold`, `presence`, `activity`,
+  `users`, and the command-type whitelist with privileged-tier gating.
+- **Operators are hardcoded UIDs** in the rules and in `delete-user-api/api/delete-user.js`:
+  `espoperator32@gmail.com` and Sugian's own account. The user's account is **not** an operator; it
+  needs approval by one of them, or a rules edit + redeploy to add it. The user chose to adopt the
+  website as-is (2026-10-25).
+- **The live website** is served from Sugian's repo `Jmhatake123/Website`
+  (https://jmhatake123.github.io/Website/). Pushing `Website/` to `JKyle-N/Smart-Irrigation` does
+  **not** publish anything.
+- **`delete-user-api`** is deployed on Vercel (`DELETE_USER_API_URL` in `firebase-config.js`). Its
+  `.env.local` and `.vercel/` are deliberately untracked — never commit them.
+- **Before assuming ESP1 is reachable**, check `irrigation/live/meta.updatedAt` freshness first — a
+  past session lost time blaming the rules when ESP1 simply was not connected.
 
 ---
 
@@ -46,52 +51,66 @@ on anything that depends on the manual hold.
 | **Host compiler** | MinGW-w64 g++ 14.2.0 is installed and on the *persisted* PATH. A shell opened before the install still fails with "gcc is not recognized" — open a new one, do not debug it |
 | **`platformio.ini` (ESP1, ESP2)** | Both have the **skip-worktree** bit set. Git silently ignores your edits to them. Check with `git ls-files -v -- '*platformio.ini'` (an `S` means skip-worktree) |
 | **Why that bit exists** | To keep the local `upload_port = COM5` from overwriting the committed `COM8`. Preserve both: clear the bit, commit with `COM8`, restore `COM5` locally, re-set the bit |
-| **`Firebase infos.txt`** | Gitignored. Holds the RTDB URL, device UID, and the device password `research123`. Never commit or transmit it |
+| **`Firebase infos.txt`** | Gitignored. Holds the RTDB URL, device UID, and the device password. Never commit or transmit it |
 | **`Logs/`** | Gitignored |
 | **Shell** | PowerShell is primary; a Bash tool exists too. They take different syntax — do not mix them |
+| **Sugian's copies** | Sugian works on another machine (`C:\Users\johnm\...`) with only `Website/` under git. Their docs' paths and "no compiler" notes describe that machine, not this one |
 
 ## Build and test commands
 
 ```bash
-# firmware (a bare `pio run` builds only esp32dev, thanks to default_envs)
+# firmware (a bare `pio run` builds only the default env)
 cd ESP1 && pio run
 cd ESP2 && pio run
+cd Nano && pio run
 
-# host unit tests -- ~1 second each, no hardware needed
-cd ESP1 && pio test -e native     # 24 cases
+# host unit tests -- ~10 seconds each, no hardware needed
+cd ESP1 && pio test -e native     # 27 cases
 cd ESP2 && pio test -e native     #  7 cases
 
 # website
 node --check Website/script.js
+node --check delete-user-api/api/delete-user.js
+node -e "JSON.parse(require('fs').readFileSync('Website/firebase-rules.json','utf8'))"
+firebase deploy --only database --dry-run   # validates rules WITHOUT deploying (run from Website/)
 ```
 
-Known-good build sizes at `988ce53` — a sharp deviation means something unintended was picked up:
+Known-good build sizes after the 2026-10-26 merge — a sharp deviation means something unintended
+was picked up:
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 23.6 % (77,176 B) | 40.8 % (1,283,709 B) |
-| ESP2 | 7.1 % (23,104 B) | 25.5 % (334,829 B) |
+| ESP1 | 23.6 % (77,304 B) | 41.2 % (1,297,133 B) |
+| ESP2 | 7.1 % (23,228 B) | 25.8 % (337,705 B) |
+| Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
-## 4. What the last session added
+## 4. What the last sessions added
 
-Four workstreams, merged as `3cbfd98` plus `988ce53`:
+**2026-10-26 — Sugian merge.** Sugian's copy forked `main` at `de4b079` (2026-08-19). It was merged
+as reference, not source of truth, in reviewable pairs ("port as-is", then "adjust"):
 
-- **`Website/firebase-rules.json`** — the full ruleset, now version-controlled, including the
-  previously missing `/irrigation/manual` rule. ESP1 only *reads* that node (`firebasePollManual()`,
-  `ESP1/src/main.cpp:5682`) and answers through `/irrigation/live` as `diagnostics.webManual`
-  (`:5475`), so the rule needs no device-write clause; it validates the page's write shape instead.
-- **Crop profiles now reach the rig.** "Fill targets from crop profile" resolves `cropDatabase`
-  crop+stage to N/P/K/pH, fills the column-settings inputs, and deliberately does *not* send — the
-  operator reviews and presses the existing "Send to ESP1", reusing the validated `SET_COLUMN` path.
-  No firmware change. `irrigation/config` keeps its existing dashboard-only job.
-- **Host-testable seam.** Pure maths moved (not copied) into `ESP1/include/pure_math.h` and
-  `ESP2/include/flow_math.h`, with calibration passed as arguments instead of read from globals.
-  `main.cpp` keeps thin wrappers, so no call site changed. `imap()` reproduces Arduino `map()`'s
-  truncation exactly. 31 Unity cases, all passing, and **mutation-checked** — removing the `kSane()`
-  guard fails exactly the two cases written for it.
-- **`Calibration_Worksheet.md`** and **`Commissioning_Flash_Plan.md`**.
+- Nano, ESP2, ESP1 and the website were taken as-is, then adjusted:
+  - **ESP2:** PZEM checks on EXERCISE / AC prime / SEQ_MIX wait for `INVERTER_WARMUP_MS`. Without
+    this they false-trip on a ramping inverter.
+  - **ESP1 hold-to-run** is capped at 15 s, polled at 1 s during a hold, with a 4 s browser timeout
+    and a re-arm latch. Sugian's version had a 3 s poll and an 8 s timeout, with no cap.
+  - **ESP1 `PHONE_NUMBER`** keeps its compiled default; Sugian had blanked it.
+  - **ESP1 battery voltage** publishes for pasted `calBattV` coefficients too, not only for NVS.
+- User decisions (2026-10-25): website as-is; hold-to-run with tighter limits; remote SET_CLOCK /
+  SET_THRESH / RESTORE_DEFAULTS all allowed; owner number kept in source.
+- Not taken: Sugian's blanked phone numbers in `Test Code/` and `Calibration_Worksheet.md`,
+  `Firmware_Snapshot_2026-09-11/` (a duplicate), `New folder/`, `Website/.agents`, `.claude`,
+  `skills-lock.json`, and every credential file.
+- Sugian's dated reports are archived in **`Reports/Sugian_2026-09/`** (`START_HERE_Final_Status_2026-09-11.txt`
+  is their summary; `HoldToRun_And_DeepScan_Fixes_Report_2026-09-10.txt` and
+  `FINAL_DeepScan_Report_2026-09-11.txt` hold the most detail). They are history, not a to-do list.
+
+**2026-08-19** — RTDB rules version-controlled, crop profiles reach the rig via `SET_COLUMN`, pure
+maths in `ESP1/include/pure_math.h` / `ESP2/include/flow_math.h` with host tests,
+`Calibration_Worksheet.md`, `Commissioning_Flash_Plan.md`. **2026-10-17** — A7670C SMS test
+sketches under `Test Code/`.
 
 ---
 
@@ -99,18 +118,24 @@ Four workstreams, merged as `3cbfd98` plus `988ce53`:
 
 Roughly in priority order.
 
-1. **`PUMP_FLOWRATE_MLPM` is still a guess** (`ESP1/src/main.cpp:348`, `50` mL/min). It sets both a
+1. **`PUMP_FLOWRATE_MLPM` is still a guess** (`ESP1/src/main.cpp`, `50` mL/min). It sets both a
    dose's run time and its timeout ceiling, and unlike the flow K-factors it has **no calibration
    tool** — it needs a jug and a stopwatch. Wrong here means silently wrong doses with no alarm.
 2. **61 calibration constants** still carry `[MEASURE]` / `[TBD]` / `[CONFIRM]`. See
    `Calibration_Worksheet.md`, which ranks them by damage and marks which are genuine measurements
-   versus agronomic decisions or datasheet lookups.
+   versus agronomic decisions or datasheet lookups. `INVERTER_WARMUP_MS` (now 5 s) belongs on that list.
 3. **Values duplicated across firmwares with nothing checking them at runtime** — `WATER_BUDGET_L`
    (ESP1 + ESP2) and `COLUMN_ENABLED` (all three). Drift is silent.
-4. **`research123` has never been rotated.**
+4. **The device password (see `Firebase infos.txt`) has never been rotated.**
 5. **SMS Summary/Status** was specified but never implemented.
 6. Test coverage stops at the pure functions. The FSMs, and anything touching `millis()`, are
    untested — that was a deliberate scope limit, not an oversight.
+7. **`mixTankL` can go stale-low if an emergency stop (GPIO4 cut) interrupts `SEQ_FILL`/`SEQ_DOSE`**
+   — documented as a known gap in `CLAUDE.md`'s P17/fault-hold section, deliberately left open pending
+   a design decision.
+8. **Website operators** — decide whether the user's own account should be an operator; that is a
+   rules + `delete-user-api` edit and a redeploy, and needs explicit approval.
+9. **Nothing has been flashed or hardware-validated** (§1).
 
 ---
 
@@ -119,18 +144,28 @@ Roughly in priority order.
 - **The user's standing constraint:** work only in
   `C:\Users\johnb\OneDrive\Documents\1RESEARCH\CLAUDE\Claude Code` and the repo
   `https://github.com/JKyle-N/Smart-Irrigation`. Commit and push authority is standing.
+- **Sugian's folders are reference, not source of truth.** Find the fork commit first (diff against
+  historical blobs, ignoring CR), then port in "as-is" + "adjust" commit pairs, and ask the user
+  before adopting anything that changes the architecture or a locked policy.
 - **Plan before non-trivial edits** — `CLAUDE.md` requires it, and the architecture was deliberately
   reasoned. Do not silently make architectural choices.
-- **`sed`/`perl` surgery on `main.cpp` and `script.js` has corrupted files twice** — once prepending
-  a replacement to line 1, once appending a block to EOF and dropping the last line. `script.js` also
-  has `${...}` template literals that `perl` eats. Use the Edit tool for in-place edits to those two
-  files; heredocs are fine for whole new files. Always anchor on a verified-unique line.
+- **Deploying rules or flashing hardware** needs its own explicit approval every time. Flashing is
+  always the user's own action.
+- **Firebase RTDB rules have no comment syntax.** A bare non-dot key (e.g. `"_comment"`) parses as an
+  invalid child-node definition. `.write` cascades permissively from ancestors; `.validate` never
+  cascade-skips, so every touched node's `.validate` must pass on multi-field `.update()` calls.
+- **`sed`/`perl` surgery on `main.cpp` and `script.js` has corrupted files before** — prepending a
+  replacement to line 1, appending a block to EOF and dropping the last line, and `perl` eating
+  `${...}` template literals. Use the Edit tool for in-place edits to those two files; anchor on a
+  verified-unique line.
 - **After any structural edit, check hunk headers and head/tail against HEAD**, not just that the
   build passes.
+- **Cross-core rule (ESP1):** core 0 (`netTask`) may only stage plain scalars or queue entries for
+  core 1. It must never call `setState()`, `logEvent()` or `sendEsp2()`, or touch a core-1 String
+  without `netMux`. This has been violated, found and fixed several times.
 - **Verify before asserting.** Several confident claims in past sessions turned out to be wrong when
-  checked against the source — an empty ArduinoJson filter object keeping nothing, a dry-soil gate
-  reading the blended value it was meant to bypass, and the assumption that ESP1 wrote the manual
-  node when it only reads it. Read the code; do not reason from memory of it.
+  checked against the source. Read the code; do not reason from memory of it. For relay safety,
+  reuse the vetted target lists and dead-man paths (`pulseRowForTarget()`, ESP2 `TEST,HOLD`).
 - Line numbers in older docs (notably `CSV_Logging_Handoff_Prompt.md`) refer to old commits and have
   shifted. Locate code by symbol name.
 
@@ -144,9 +179,10 @@ Roughly in priority order.
 | `Smart_Irrigation_System_Reference_FINAL.md` | Full system specification |
 | `Commissioning_Flash_Plan.md` | Stages A–G for putting the backlog on hardware |
 | `Calibration_Worksheet.md` | Every untuned constant, ranked by damage |
-| `Operator_Manual.md` | How the rig is operated day to day |
-| `Website/README.md` | RTDB node layout and the rules workflow |
+| `Operator_Manual.md` | How the rig is operated day to day, including the website (§8) |
+| `Website/README.md` | RTDB node layout, access tiers and the rules workflow |
 | `Calibration/README.md` | Per-sensor bench calibration tools |
 | `Settings_Calibration_and_Safe_Edit_Spec.md` | §A — the calibration methods |
 | `Nutrient_Dosing_Firmware_Spec.md` | The dosing maths |
 | `ESP2_Recovery_Resume_Plan.md` | Fault hold and resume behaviour |
+| `Reports/Sugian_2026-09/` | Sugian's audit and fix reports, 2026-09-05 → 09-11 |

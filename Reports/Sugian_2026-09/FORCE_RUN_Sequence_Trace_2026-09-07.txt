@@ -1,0 +1,307 @@
+DIAGNOSIS: FORCE_RUN SEQUENCE -- TRANSFER/BOOSTER OVERLAP HYPOTHESIS (read-only trace)
+================================================================================
+
+CONTEXT
+-------
+Follow-up to the PWR_FAIL_VOLTAGE trace (PWR_FAIL_VOLTAGE_Trace_2026-09-07.txt, same folder). The
+user's new hypothesis: PWR_FAIL VOLTAGE only appears during full FORCE IRRIGATION/FERTIGATION runs,
+and the Transfer pump and Booster pump APPEAR to start at the same time. This traces the complete
+FORCE_RUN execution sequence through the current ESP1 and ESP2 source to determine whether that is
+actually possible in firmware, or whether something else explains the observation. Nothing has been
+modified -- read-only investigation only, per explicit instruction.
+
+
+THE SEQUENCE ENGINE (ESP2) -- ARCHITECTURE FIRST, BECAUSE IT ANSWERS MOST OF THE QUESTIONS AT ONCE
+-----------------------------------------------------------------------------------------------------
+
+  ESP2/src/main.cpp:322-325:
+  enum SeqStep {
+    SEQ_NONE, SEQ_FILL, SEQ_DOSE, SEQ_MIX, SEQ_ECPH,
+    SEQ_DELIVER, SEQ_FLUSH_FILL, SEQ_FLUSH_DELIVER
+  };
+
+`step` is declared as a SINGLE SeqStep VARIABLE (not a bitmask/array) -- ESP2's entire run state is
+"which one of these 8 values am I in right now." `runSequence()` (:1143) is a single switch on
+`step`; only one `case` body executes per loop iteration. Likewise `sgPump` (the "current stage's
+active relay bit") is a SINGLE int, and `attachFlow()`/`detachFlow()` explicitly manage "one active
+flow sensor at a time" (confirmed in the earlier PWR_FAIL_VOLTAGE trace). This is a fully sequential,
+single-active-pump state machine BY CONSTRUCTION -- there is no code path in this design that
+represents "two stages active simultaneously."
+
+
+ANSWERS TO THE NUMBERED QUESTIONS
+-----------------------------------
+
+1. WHAT HAPPENS FIRST WHEN FORCE_RUN STARts:
+   ESP1 arms a countdown (already covered in the prior report), then at fire time sends the work
+   order to ESP2, which calls startWorkOrder() (ESP2/src/main.cpp:974-984):
+     wo.active = true; faultHeld = false; doseIdx = 0; ...
+     cutoffEnergize();              // re-energizes P17, the master actuator-power cutoff
+     goStep(SEQ_FILL);
+   So literally the first thing energized is P17 (master cutoff, restoring bank power) -- not any
+   pump yet. goStep(SEQ_FILL) then sets step=SEQ_FILL, stepInit=false, and reports
+   "STAGE,1,<n>,Transfer Water" to ESP1 (drives the LCD/website progress display).
+
+   On the VERY NEXT pass through runSequence()'s SEQ_FILL case (:1155-1185), since !stepInit:
+     pcfOn(OUT_RES_VALVE);
+     stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
+   stageBegin() (:1019-1027) itself does NOT turn the pump on yet -- it only does
+   `if (isAC) pcfOn(OUT_INVERTER);` and resets sgPumpOn=false, sgT0=millis(). So the actual order is:
+   P17 cutoff -> reservoir valve OPEN -> AC inverter ON -> (wait) -> transfer pump ON.
+
+2. WHICH ACTUATOR IS ENERGIZED FIRST:
+   Non-pump: P17 (master cutoff) then the reservoir valve (OUT_RES_VALVE), then the shared AC
+   inverter (OUT_INVERTER). The first PUMP to actually energize is the TRANSFER pump (OUT_TRANSFER)
+   -- but only after a deliberate warm-up delay (see Q5below).
+
+3. CAN TRANSFER AND BOOSTER ACTUALLY BE ENERGIZED SIMULTANEOUSLY? NO -- ruled out architecturally,
+   not just by absence of a code path that does it, but by three independent, mutually-reinforcing
+   facts:
+     a. `step` (SEQ_FILL vs SEQ_DELIVER) is a single enum value; only one case's logic runs.
+     b. When SEQ_FILL completes, the transfer pump is turned OFF synchronously, BEFORE the state
+        transitions to SEQ_DELIVER (see Q4/Q5 below) -- there is no "turn new one on, then turn old
+        one off" ordering anywhere.
+     c. ESP1's own displayed "which pump is running" flags are derived by STRING COMPARISON against
+        a single stage-name variable (see Q7 below) -- provably cannot show both at once either.
+
+4. DOES ESP1 SEND BOTH COMMANDS SIMULTANEOUSLY, OR DOES ESP2 ACTIVATE THEM TOGETHER? Neither. ESP1
+   sends ONE work order at the start of the whole run; it does not separately command each stage.
+   ESP2's own internal sequence engine decides when to advance from SEQ_FILL to SEQ_DELIVER (see the
+   SEQ_FILL case below) -- ESP1 is not "sending" a second command mid-run at all; it only receives
+   STAGE/PROG status updates and issues the fault-recovery menu if something goes wrong.
+
+5. EXACT FUNCTIONS/LINES:
+     ESP2/src/main.cpp:1155-1185 (SEQ_FILL case):
+       case SEQ_FILL: {
+         if (!stepInit) {
+           ...
+           pcfOn(OUT_RES_VALVE);
+           stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
+           sgTankSign = +1;
+           ...
+         }
+         int r = stagePoll();
+         if (r == 1)      { endMeteredStage(); pcfOff(OUT_RES_VALVE); goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); }
+         else if (r == -1){ endMeteredStage(); pcfOff(OUT_RES_VALVE); holdFault("FLOW_FAIL", "TRANSFER"); }
+         break;
+       }
+     endMeteredStage() (:1032-1041) calls stageEnd() (:1065-1069):
+       void stageEnd() {
+         if (sgPump >= 0) pcfOff(sgPump);     // <-- transfer pump OFF, synchronously, right here
+         detachFlow();
+         sgPump = -1; sgPumpOn = false;
+       }
+     Only AFTER that returns does goStep(SEQ_DELIVER) run (just sets step/stepInit -- no relay I/O).
+     The booster pump doesn't get touched until the NEXT call to runSequence() reaches the SEQ_DELIVER
+     case (ESP2/src/main.cpp:1277-1300):
+       case SEQ_DELIVER: {
+         if (!stepInit) {
+           if (mixTankL < TANK_EPS_L) { finishOk(); break; }
+           pcfOn(OUT_MIX_VALVE); colValves(wo.colMask, true);
+           stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
+           sgTankSign = -1;
+           ...
+         }
+         ...
+       }
+     And, critically, stagePoll() (:1042-1064) gates the actual pcfOn(sgPump) behind a timed wait:
+       int stagePoll() {
+         if (!sgPumpOn) {
+           if (millis() - sgT0 >= (sgIsAC ? INVERTER_WARMUP_MS : VALVE_SWITCH_MS)) {
+             attachFlow(sgFlow); pcfOn(sgPump); sgPumpOn = true; sgT0 = millis();
+           }
+           return 0;
+         }
+         ...
+       }
+     With INVERTER_WARMUP_MS = 2000 (ESP1... no, ESP2/src/main.cpp:166) -- A FULL 2 SECONDS. Since
+     both Transfer and Booster are AC pumps (isAC=true), the booster relay cannot physically energize
+     until at least 2 seconds after SEQ_DELIVER's own stageBegin() call, which itself only happens at
+     least one full loop iteration after the transfer pump was already turned off. THE CURRENT
+     FIRMWARE ALREADY ENFORCES A >=2-SECOND DEAD-TIME BETWEEN THE TWO PUMPS.
+
+6. IS THE FILL STAGE SUPPOSED TO COMPLETE BEFORE THE DELIVER/PUSH STAGE? YES, confirmed exactly --
+   that is the entire point of the goStep() transition: SEQ_FILL only calls
+   goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER) once stagePoll() returns 1 (target volume reached)
+   or -1 (flow fail, which instead holds the fault and does NOT advance). There is no path to
+   SEQ_DELIVER except through SEQ_FILL completing (or a fertigation run's SEQ_DOSE/SEQ_MIX/SEQ_ECPH
+   chain completing first).
+
+7. DOES THE WORK-ORDER STATE MACHINE ALREADY CONTAIN SEPARATE STAGES, WITH THE WEBSITE/DISPLAY JUST
+   MAKING THEM LOOK SIMULTANEOUS? This was the most important question to verify precisely, and the
+   answer is a clean NO -- the display cannot show overlap either. Traced exactly:
+
+     ESP1/src/main.cpp:5240-5245 (built fresh every telemetry cycle):
+       bool live = (runPhase == RUN_PRE || runPhase == RUN_LIVE);
+       telem.pumpTransfer = live && (!strcmp(run.stage, "Transfer Water") || !strcmp(run.stage, "Flush Fill"));
+       telem.pumpBooster  = live && (!strcmp(run.stage, "Release")        || !strcmp(run.stage, "Flush Release"));
+       telem.pumpMixer    = live && !strcmp(run.stage, "Mixing");
+
+   `run.stage` is a single fixed-size char array (ESP1/src/main.cpp:2590:
+   `strncpy(run.stage, t[2].c_str(), ...)`, filled from ESP2's single "STAGE,<ord>,<total>,<Name>"
+   message using the single-active-stage SEQ_NAME string). A single string cannot simultaneously
+   equal both "Transfer Water" and "Release" -- `telem.pumpTransfer` and `telem.pumpBooster` are
+   PROVABLY MUTUALLY EXCLUSIVE by simple string comparison. These feed directly into the published
+   Firebase fields the website reads (ESP1/src/main.cpp:5633-5634:
+   `act["transferRunning"] = t.pumpTransfer; act["boosterRunning"] = t.pumpBooster;`). So this is not
+   a display-lag bug either -- the website literally cannot be shown both flags true at once, because
+   the underlying data can't represent that state.
+
+8. IS ANY OVERLAP INTENTIONAL? No overlap of Transfer+Booster exists anywhere in this design, and
+   none is intended. (One DIFFERENT, unrelated form of "simultaneity" IS intentional and by design:
+   an operator FORCE run can target multiple columns at once, and `colValves(wo.colMask, true)`
+   opens MULTIPLE COLUMN VALVES together during a single SEQ_DELIVER stage, per the code comment at
+   ESP2/src/main.cpp:1127-1129: "an operator FORCE run may set several, delivering one batch into
+   them simultaneously." That is valves, not pumps, and is a completely separate concept from the
+   Transfer/Booster question -- worth noting only so it isn't confused with the hypothesis being
+   tested.)
+
+9. COULD SIMULTANEOUS LOAD PLAUSIBLY CONTRIBUTE TO PZEM UNDERVOLTAGE? Yes, in principle, IF genuine
+   simultaneous load ever occurred -- two AC motors drawing inrush/running current from the same
+   supply at once is a textbook way to sag supply voltage. But per everything traced above, firmware
+   cannot command that overlap. Two important nuances:
+     a. SEQUENTIAL operation alone can already stress a marginal AC supply: each stage's motor
+        inrush current (the moment OUT_TRANSFER, then later OUT_BOOSTER, each individually switches
+        on) is exactly when a weak inverter/generator/wiring run would sag hardest. PWR_FAIL_VOLTAGE
+        does not need any overlap hypothesis at all to be fully explained by sequential operation on
+        a marginal supply.
+     b. If a HARDWARE fault exists (e.g., a stuck/welded relay contact, or a slow-to-release AC
+        contactor) such that the Transfer pump's relay does not actually physically open when
+        commanded off, the pump could keep drawing current into the Booster stage even though
+        firmware believes it is off -- this is NOT visible to firmware (there is no relay-position
+        feedback anywhere in this design, only PZEM's aggregate current/voltage on the shared AC
+        bus) and WOULD plausibly explain both a real physical overlap and a voltage sag from the
+        combined load. This is the most important physical-inspection hypothesis this trace surfaces.
+
+10. CAN THE PZEM PWR_FAIL CHECK TRIGGER "DURING THE OVERLAP"? Given firmware-level overlap cannot
+    occur, rephrase as: can PZEM PWR_FAIL trigger during either stage's transition/inrush moment?
+    Yes -- safetyMonitor() (traced in the prior report) runs throughout SEQ_FILL and SEQ_DELIVER
+    alike, any time `sgPumpOn` is true for an AC pump, polled every 500ms, with no special exemption
+    for the moment right after a pump switches on (no inrush grace period beyond the fixed 2-second
+    INVERTER_WARMUP_MS pre-pump-on delay itself). If the AC supply sags hardest at switch-on inrush,
+    that is exactly a moment this check is already watching.
+
+11. DOES FLOW_FAIL LOGIC DEPEND ON THE TRANSFER PUMP BEING ACTIVE ALONE? Not for its own correctness
+    -- FLOW_FAIL for SEQ_FILL only reads pulses from FLOW_RES_MIX (GPIO26 on ESP2), a physically
+    different sensor from SEQ_DELIVER's FLOW_MIX_IRR (GPIO5), and the single-active-flow-sensor
+    architecture (attachFlow/detachFlow) means only one of the two is ever being counted at a given
+    moment regardless. A genuine physical overlap (per the stuck-relay hypothesis above) would not
+    corrupt FLOW_RES_MIX's pulse count directly, but COULD disturb the hydraulic assumptions the tank
+    bookkeeping (mixTankL, sgTankSign) relies on (sequential fill-then-drain) if water were actually
+    moving through both paths at once -- a plumbing/hydraulic concern, not a firmware logic bug.
+
+12. WOULD CHANGING THE SEQUENCE BREAK FLOW MEASUREMENT / VALVE LOGIC / MIXER LOGIC / DOSING / SAFETY
+    INTERLOCKS? This is somewhat moot since the proposed staged sequence already exists (see below),
+    but for completeness: deliberately making Transfer and Booster run CONCURRENTLY (which is NOT
+    being recommended) would require rearchitecting several load-bearing assumptions at once: the
+    single shared flow-pulse ISR/counter (one active sensor at a time), the single `step`/`sgPump`
+    state variables (no representation of two simultaneous stages), safetyMonitor()'s implicit
+    assumption that the observed AC current corresponds to one known pump, and the tank
+    bookkeeping's sequential fill-then-drain model. That would be a substantial, risky rewrite --
+    and is not needed, because the goal (no overlap, with a settling gap) is already met.
+
+
+CURRENT vs. PROPOSED DESIGN -- COMPARISON
+--------------------------------------------
+
+PROPOSED:
+  Stage 1: Transfer ON, Reservoir valve OPEN, Booster OFF -- wait for completion.
+  Stage 2: Transfer OFF, Reservoir valve CLOSED, Booster ON, column/mix valve OPEN.
+
+CURRENT (as traced above):
+  SEQ_FILL:    Reservoir valve OPEN, (inverter ON), Transfer ON after a 2s settle, runs until target
+               volume/flow-fail, then Transfer OFF + Reservoir valve CLOSED (synchronously, before
+               any transition).
+  [state transitions to SEQ_DOSE/SEQ_DELIVER -- Booster is not touched yet]
+  SEQ_DELIVER: Mix valve OPEN, column valve(s) OPEN, Booster ON after its own 2s settle from when
+               this stage begins, runs until tank empty/flow-fail.
+
+These are the same design. The current firmware IS ALREADY a staged, non-overlapping sequence with
+a real (2-second minimum) dead-time between the two pumps. There is nothing to "implement" here --
+the proposed architecture already exists in ESP2/src/main.cpp.
+
+IS THE STAGED SEQUENCE SAFE AND COMPATIBLE WITH THE CURRENT ARCHITECTURE? Yes -- it not only would
+be, it already is the architecture.
+
+
+IMPLEMENTATION LOCATION (A/B/C/D)
+------------------------------------
+Given the proposed design is already implemented, none of A/B/C/D are needed to build it. If the
+goal is instead to WIDEN the existing dead-time for extra margin (e.g., because of a suspected slow
+relay/contactor release), that would be:
+  - C. ESP2 firmware change only -- a single constant, `INVERTER_WARMUP_MS` (ESP2/src/main.cpp:166,
+    currently 2000). Note this constant is SHARED by every AC-pump stage transition (Transfer,
+    Booster, and Mixer all use the same isAC=true path in stagePoll()), so increasing it adds settle
+    time everywhere uniformly, not just between Transfer and Booster specifically -- a reasonable,
+    low-risk, narrow change if ever wanted, but not currently recommended without a physical finding
+    that motivates it (see below).
+  - Not A (website/Firebase) -- the sequencing and dead-time live entirely in ESP2's local state
+    machine; nothing about it is expressed in Firebase or the website, so a website-only change
+    could not affect real relay timing at all.
+  - Not B (ESP1 firmware) -- ESP1 has no role in the pump-to-pump timing; it only arms the initial
+    work order and displays status.
+  - Not D (both) -- follows from the above.
+
+SHOULD A SHORT DEAD-TIME EXIST BETWEEN STAGES? Yes, and one already does (2 seconds, via
+INVERTER_WARMUP_MS) -- this is a real, enforced, code-level guarantee, not a hope or a convention.
+
+
+SUMMARY BLOCK (AS REQUESTED)
+------------------------------
+
+CURRENT FORCE-RUN SEQUENCE:      SEQ_FILL (Transfer pump + Reservoir valve, metered by FLOW_RES_MIX)
+                                  runs to completion (or FLOW_FAIL) and is fully de-energized BEFORE
+                                  SEQ_DELIVER (Booster pump + Mix valve + column valve(s), metered by
+                                  FLOW_MIX_IRR) begins; a mandatory >=2-second settle
+                                  (INVERTER_WARMUP_MS) precedes the Booster pump actually energizing.
+
+TRANSFER + BOOSTER SIMULTANEOUS?  NO. Ruled out by: (a) a single-valued sequence-step state machine,
+                                  (b) the old pump is turned off synchronously before the state
+                                  transitions to the new stage, (c) a mandatory 2-second warm-up
+                                  delay before the new stage's pump energizes, and (d) the website's
+                                  own "which pump is running" flags are derived by string comparison
+                                  against a single stage-name variable and are provably mutually
+                                  exclusive.
+
+POSSIBLE CAUSE OF PWR_FAIL:       UNKNOWN (not "simultaneous pumps," per the above) -- but two
+                                  concrete hardware hypotheses are now on the table:
+                                    (1) Sequential operation ALONE can already sag a marginal AC
+                                        supply at either pump's switch-on inrush moment -- no overlap
+                                        needed to explain PWR_FAIL_VOLTAGE.
+                                    (2) A stuck/slow-to-release relay or contactor on the Transfer
+                                        pump's output could cause a REAL physical (hardware-level,
+                                        not firmware-commanded) overlap invisible to firmware (no
+                                        relay-position feedback exists anywhere in this design) --
+                                        this would independently explain both the user's visual
+                                        observation and a voltage sag from the combined load.
+
+STAGED OPERATION:                SAFE? YES -- it already exists and is exactly what's running today.
+
+FIRMWARE CHANGES REQUIRED:       NONE required. Optional-only: ESP2 (widen INVERTER_WARMUP_MS for
+                                  extra margin), but only if a physical finding motivates it.
+
+WEBSITE-ONLY FIX:                NO -- not applicable; nothing about this timing is expressed in the
+                                  website/Firebase layer to begin with.
+
+RECOMMENDED NEXT STEP:           Physically observe one Force Run end-to-end at the panel/pump
+                                  enclosure: confirm the Transfer pump audibly/visibly stops (and its
+                                  relay/contactor is heard to click open) BEFORE the Booster pump
+                                  starts, watching specifically across the ~2-second transition
+                                  window. If the Transfer pump appears to keep running (or its
+                                  contactor stays engaged) after the firmware has moved on to
+                                  SEQ_DELIVER, that points at a stuck/slow relay or contactor as the
+                                  hardware root cause of both the overlap observation and the
+                                  PWR_FAIL_VOLTAGE undervoltage. Separately, measure the AC supply
+                                  voltage under load at the moment each pump starts (inrush) to see
+                                  whether sequential operation alone is already enough to dip below
+                                  215V, independent of any overlap question.
+
+
+HOW TO VERIFY
+--------------
+Every citation is file:line against the current working tree. Key ones to check directly:
+ESP2/src/main.cpp:322-325 (SeqStep enum), :974-984 (startWorkOrder), :1019-1027 (stageBegin),
+:1042-1064 (stagePoll, the 2s gate), :1065-1069 (stageEnd), :1155-1185 (SEQ_FILL),
+:1277-1300 (SEQ_DELIVER), :165-166 (VALVE_SWITCH_MS/INVERTER_WARMUP_MS);
+ESP1/src/main.cpp:2584-2596 (STAGE message parsing into run.stage), :5240-5245 (pumpTransfer/
+pumpBooster derivation), :5631-5635 (published actuators.transferRunning/boosterRunning).

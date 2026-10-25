@@ -1,0 +1,8 @@
+{
+  "name": "delete-user-api",
+  "description": "Operator-only Vercel serverless function for deleting a Firebase Auth user account -- the one privileged operation the Website/ static site cannot do client-side.",
+  "private": true,
+  "dependencies": {
+    "firebase-admin": "^12.1.0"
+  }
+}

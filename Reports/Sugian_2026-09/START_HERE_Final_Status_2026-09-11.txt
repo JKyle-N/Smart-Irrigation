@@ -1,0 +1,152 @@
+================================================================================
+ START HERE -- FINAL STATUS AND INSTRUCTIONS
+ Date: 2026-09-11
+================================================================================
+This is the one document to work from. It supersedes nothing else in this
+folder (the other reports are still accurate history of what was found and
+fixed, in case you ever need to know why something is the way it is) -- it
+just consolidates "what's the current state" and "what do I actually do now"
+into one place, since this may be the last conversation on this project.
+
+================================================================================
+PART 1 -- WHAT THIS FINAL PASS DID
+================================================================================
+You asked for one more deep scan with everything fixed. Given the previous
+round had JUST found and fixed a real HIGH-severity bug (see Part 2), this pass
+was NOT another "read everything from scratch" sweep -- it was a targeted,
+skeptical re-verification of exactly the riskiest, most-recently-changed code,
+specifically hunting for anything the previous fix might have introduced, plus
+a check for whether the same bug class existed anywhere else undiscovered.
+
+What was actually done:
+  - Traced ESP1's cross-core hold-to-run fix by hand, line by line: confirmed
+    the new hand-off scalars are correct, confirmed pulseTick() (core 1)
+    correctly consumes them, confirmed no lost-update risk given the timing
+    margins involved (browser refreshes every ~1.2s, ESP1 polls every 3s,
+    pulseTick() runs every loop() iteration -- orders of magnitude faster than
+    either), confirmed the int64_t seq handling has no truncation risk.
+  - Read EVERY core-0 (netTask) Firebase function in the whole file --
+    firebasePollCommands(), firebaseFlushStatus(), firebasePollManual(), and
+    the fixed firebasePollTestHold() -- and confirmed each one follows the
+    same "core 0 only ever stages data via a FreeRTOS queue or plain scalars;
+    core 1 does every actual mutation" discipline. This was the ONE place that
+    discipline had been violated (see Part 2); it is not violated anywhere
+    else in the file.
+  - Re-read (not just re-ran) every one of the 4 website/Vercel fixes from the
+    previous round to confirm each is actually present and correctly formed,
+    not just assumed correct because a comment says so.
+  - Rebuilt all three firmware images fresh, one more time, for a single
+    unified final confirmation snapshot (results in Part 3).
+  - Re-ran every website/rules/Vercel-function validation command fresh.
+
+RESULT: no new issues found. Every fix from the previous round holds up.
+
+================================================================================
+PART 2 -- WHAT WAS ACTUALLY WRONG AND FIXED (this session's last two rounds)
+================================================================================
+For the full history of everything found and fixed across the WHOLE session,
+see FINAL_DeepScan_Report_2026-09-11.txt and the other dated report files in
+this folder. The two things worth knowing by name, because they were the most
+serious:
+
+1. ESP1 -- a genuine cross-core race condition (HIGH severity). The new
+   "hold-to-run" feature's Firebase-polling function was calling functions
+   that mutate core-1-owned state (a global String log buffer, the ESP2 UART)
+   directly from core 0. Two FreeRTOS tasks on two physical cores touching the
+   same unlocked String is a real heap-corruption risk -- the exact bug class
+   this file had already been fixed for, twice, elsewhere. Found by an
+   independent fresh audit, verified by hand (traced which core every related
+   function actually runs on), and fixed by splitting the function into a
+   pure core-0 data hand-off with all the actual logic moved to code that
+   already runs safely on core 1.
+   A second bug was self-caught while implementing that fix, before it ever
+   reached a build: the hand-off buffer was sized for 8 bytes, but the longest
+   valid input ("transfer") needs 9 -- would have silently broken that one
+   button's requests via a truncated string comparison.
+
+2. Website/Firebase -- a rule/client mismatch (medium severity). The
+   hold-to-run feature's release write (letting go of a held button) required
+   the same privileged-tier check as acquiring it, when it should have been
+   let through unconditionally like the equivalent /irrigation/manual rule
+   already does -- an operator withdrawing someone's access mid-press could
+   have gotten a server-side permission error on release instead of a clean
+   stop. (Physical safety was never actually at risk here either way -- ESP2's
+   own 400ms hardware dead-man and ESP1's own timeout are both completely
+   independent of this Firebase flag.)
+
+Plus 3 more low-severity items (a client-side privilege check one layer deeper
+than it needed to be, a DOM-node cleanup edge case in the new toast
+notifications, and an error-handling nuance in the account-delete function) --
+all fixed, all detailed in FINAL_DeepScan_Report_2026-09-11.txt.
+
+================================================================================
+PART 3 -- CURRENT STATE OF EVERY COMPONENT, RIGHT NOW
+================================================================================
+
+  Component          | Code state        | Deployed/live?         | Your action
+  -------------------|-------------------|------------------------|------------
+  ESP1 firmware       | Builds clean       | NOT flashed             | Flash when ready
+  ESP2 firmware       | Builds clean       | NOT flashed             | Flash when ready
+  Nano firmware       | Builds clean       | NOT flashed             | Flash when ready
+  Firebase RTDB rules | Validated clean    | LIVE (deployed)         | None needed
+  Vercel function     | Validated clean    | LIVE (deployed)         | None needed
+  Website files       | Validated clean    | NOT published           | Publish yourself
+
+Build sizes, confirmed fresh one more time just now (a sharp deviation from
+these next time you build would mean something unintended crept in):
+  ESP1: RAM 23.6% (77,304 B / 327,680 B)   Flash 41.2% (1,296,881 B / 3,145,728 B)
+  ESP2: RAM  7.1% (23,228 B / 327,680 B)   Flash 25.8% (337,637 B / 1,310,720 B)
+  Nano: RAM 52.0% (1,064 B / 2,048 B)      Flash 48.2% (14,792 B / 30,720 B)
+
+Website/rules/Vercel validation, all re-run fresh:
+  node --check script.js                          -> exit 0
+  JSON.parse firebase-rules.json                   -> JSON OK
+  firebase deploy --only database --dry-run        -> rules syntax valid
+  node --check delete-user-api/api/delete-user.js  -> exit 0
+
+================================================================================
+PART 4 -- WHAT TO ACTUALLY DO NOW, IN ORDER
+================================================================================
+
+STEP 1 -- Publish the website (only remaining un-deployed piece of code).
+  You do this yourself, as agreed all session. Changed files: README.md,
+  firebase-rules.json, index.html, script.js, style.css (all in Website/).
+  This project auto-deploys via GitHub Pages on push to `main` -- last time,
+  that took about 9-10 minutes from push to actually going live, so wait a
+  few minutes and do a hard refresh (Ctrl+Shift+R) before testing, or you'll
+  be looking at the previous version.
+
+STEP 2 -- Flash the firmware, in this order (per CLAUDE.md's own locked build
+  order: Nano -> ESP32 #1 -> ESP32 #2), using the exact commands and port
+  notes in Flash_Instructions_2026-09-10.txt. Short version:
+    - PlatformIO isn't on PATH; use the full path:
+      %USERPROFILE%\.platformio\penv\Scripts\pio.exe
+    - Both ESP1/platformio.ini and ESP2/platformio.ini hardcode COM8 --
+      plug in ONE board at a time, check Device Manager for its real port,
+      and either edit the .ini or pass --upload-port COM<N> on the command
+      line.
+    - cd Nano; <pio> run --target upload --upload-port COM<N>
+    - cd ../ESP1; <pio> run --target upload --upload-port COM<N>
+    - cd ../ESP2; <pio> run --target upload --upload-port COM<N>
+
+STEP 3 -- Follow Commissioning_Flash_Plan.md's staged A-G process. Do NOT
+  skip straight to normal operation. In particular:
+    - Stage A: flash with actuations DISABLED first, confirm telemetry/LCD/
+      web tabs all agree before doing anything else.
+    - Stage C (do not skip this one): start a hold (either a Timed Pulse or
+      the new hold-to-run button), then cut ESP1's power mid-hold. Confirm
+      ESP2's OWN 400ms hardware dead-man drops the relay with NO help from
+      ESP1. This is the actual proof that the new hold-to-run feature is safe
+      -- not this scan, not the code review, this physical test.
+    - Stage F specifically exercises the Manual/Test tab end to end, including
+      the new hold-to-run buttons and the Proceed-gate behavior on a stale
+      snapshot -- both described in that file's own updated checklist.
+
+That's the whole path from here to a running rig. Everything upstream of
+"flip the actual switch on a real board" has been checked as thoroughly as
+code review and compilation can check it, several times over, by independent
+fresh reviews that did find and fix real bugs along the way -- which is exactly
+what that process is for. The staged commissioning plan is what turns "the
+code looks right" into "the system IS right," and that part was always going
+to be yours to run, on your own schedule, with your own hands on the hardware.
+================================================================================

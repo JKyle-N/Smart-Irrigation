@@ -1,0 +1,148 @@
+================================================================================
+ FLASHING INSTRUCTIONS -- ESP1 / ESP2 / Nano
+ Date: 2026-09-10
+================================================================================
+
+STATUS
+--------------------------------------------------------------------------------
+All three builds are fresh and verified clean right now (rebuilt moments ago on
+this machine):
+
+  Board   RAM used              Flash used              Result
+  ------  --------------------  ----------------------  -------
+  ESP1    23.6% (77,288 B)      41.2% (1,296,885 B)      SUCCESS
+  ESP2     7.1% (23,228 B)      25.8% (337,637 B)        SUCCESS
+  Nano    52.0% (1,064 B)       48.2% (14,792 B)         SUCCESS
+
+These match the project's own known-good reference sizes in
+Commissioning_Flash_Plan.md (no unexpected growth). Firebase rules for the
+new features are ALREADY DEPLOYED LIVE as of this session -- that part is
+done, you don't need to do anything for it.
+
+WHAT ACTUALLY CHANGED IN EACH BOARD'S CODE THIS SESSION
+--------------------------------------------------------------------------------
+  ESP1  -- CHANGED. New "hold-to-run" wire protocol (irrigation/testHold),
+           several deep-scan fixes from earlier in this session (SET_THRESH
+           validation, ThingSpeak validity gating, WIFIPORTAL,STOP case-
+           sensitivity, schedule start>end validation). NEEDS REFLASHING.
+
+  ESP2  -- CHANGED. Independent of tonight's hold-to-run work: a mixer PZEM-
+           protection fault-storm fix, an EXERCISE inverter-warmup timing fix,
+           a TEST,ENTER-discards-in-flight-EXERCISE silent-drop fix, and a
+           MIX,0 "use default" fix. NEEDS REFLASHING. (ESP2's firmware needed
+           NO changes for the hold-to-run feature itself -- it already had
+           the TEST,HOLD/TEST,RELEASE dead-man ESP1 now drives for that.)
+
+  Nano  -- UNCHANGED all session. Every fresh audit this session found it
+           clean (sensor-hub-only design intact). Reflash it only if it is
+           not already running this exact build -- there is nothing new in
+           it to gain from reflashing otherwise, but it is harmless either
+           way since the code is identical to the last known-good version.
+
+BUILD ORDER (per this project's own CLAUDE.md): Nano -> ESP32 #1 -> ESP32 #2.
+
+================================================================================
+HOW TO FLASH (PlatformIO CLI)
+================================================================================
+PlatformIO is not on this machine's PATH, so use the full path to pio.exe (or
+your own IDE's Upload button, which works the same either way):
+
+  %USERPROFILE%\.platformio\penv\Scripts\pio.exe
+
+Each project already has upload_port = COM8 hardcoded in its platformio.ini
+(both platformio.ini files carry the "skip-worktree" bit, so git will not show
+edits to them -- editing the file itself for the port is fine, it just won't
+show as a git change). Only ONE board can be plugged in at a time if they
+share COM8's number after being connected -- Windows assigns the COM number
+per-USB-port/per-device, not per-project, so:
+
+  1. Plug in ONLY the board you're about to flash.
+  2. Check Device Manager > Ports (COM & LPT) for the actual port it enumerated
+     as. (On this machine, checked just now with nothing plugged in, only
+     COM1 was present -- so whatever new number appears after you plug a
+     board in is almost certainly it.)
+  3. Either edit that project's platformio.ini upload_port to match, OR leave
+     the file alone and pass the port on the command line with
+     --upload-port, e.g.:
+
+       cd Nano
+       %USERPROFILE%\.platformio\penv\Scripts\pio.exe run --target upload --upload-port COM<N>
+
+       cd ..\ESP1
+       %USERPROFILE%\.platformio\penv\Scripts\pio.exe run --target upload --upload-port COM<N>
+
+       cd ..\ESP2
+       %USERPROFILE%\.platformio\penv\Scripts\pio.exe run --target upload --upload-port COM<N>
+
+  4. Unplug that board, plug in the next one, repeat.
+
+A build-only sanity check first (no hardware needed, safe to run anytime):
+       %USERPROFILE%\.platformio\penv\Scripts\pio.exe run
+   (run from inside Nano/, ESP1/, or ESP2/ -- already done for all three just
+   now, all SUCCESS, so this is optional, just here for your own re-check.)
+
+================================================================================
+AFTER FLASHING -- FOLLOW THE PROJECT'S OWN STAGED COMMISSIONING PLAN
+================================================================================
+Do NOT go straight to normal operation. This project's own
+Commissioning_Flash_Plan.md exists specifically because a binary can't be
+half-flashed -- it stages TESTING, not flashing. Follow its stages in order,
+each with its own abort condition (full detail in that file):
+
+  Stage A -- Flash with actuations DISABLED first. Check telemetry, LCD, and
+             all 5 web tabs agree with each other. Abort if any relay clicks
+             on its own, or if meta.docUsed is near meta.docCapacity.
+
+  Stage B -- ESP2 metering guards: confirm flow pulses count correctly per
+             meter; send a deliberately out-of-range K-factor and confirm
+             ESP2 rejects it.
+
+  Stage C -- *** DO NOT SKIP THIS ONE. *** Start a TEST_PULSE (or, now, a
+             hold-to-run press), cut ESP1's power mid-hold, and confirm ESP2's
+             OWN 400ms dead-man drops the relay with NO instruction from
+             ESP1. This is the actual physical safety guarantee behind
+             tonight's new hold-to-run feature -- prove it for real before
+             trusting it. Abort everything if the relay stays energised.
+
+  Stage D -- Re-enable actuations; forced irrigation on one column; confirm a
+             forced run started while ESP2 is powered down queues correctly
+             instead of vanishing or double-firing.
+
+  Stage E -- Lockout/fault/recovery from both the LCD and the website;
+             confirm Emergency Stop is NEVER blocked during a run.
+
+  Stage F -- Manual/Test hold from the website specifically: LCD banner
+             timing, scheduled-run skip during a hold, ~60s lease expiry on a
+             lost browser, Force Run refusing during an active hold. This is
+             also where you should exercise the NEW Proceed-gate fix (open
+             Manual/Test with a stale snapshot, confirm it lets you in but
+             keeps every button disabled) and the new hold-to-run buttons
+             themselves (including the pH confirm-then-hold flow).
+
+  Stage G -- NPK blending with water only first, then real dosing; weigh/
+             measure actual output against what the firmware reports before
+             trusting it for real dosing.
+
+If any stage fails and the cause isn't obvious, Commissioning_Flash_Plan.md
+has a bisect list of tagged commits to narrow it down.
+
+================================================================================
+WHAT I ALREADY DID vs WHAT'S LEFT FOR YOU
+================================================================================
+  DONE (this session):
+    [x] All code changes (hold-to-run feature, Proceed-gate fix, 5 deep-scan
+        fixes) written and verified (builds/syntax/rules dry-run all clean).
+    [x] Firebase database rules deployed live to production.
+
+  YOURS (as agreed):
+    [ ] Publish the website (index.html/script.js/style.css/firebase-
+        rules.json all changed locally, not yet committed/pushed).
+    [ ] Live-test the website changes against the CURRENTLY-flashed firmware
+        (Proceed-gate fix and the 4 access-control fixes don't need the new
+        firmware at all; hold-to-run buttons will just do nothing useful
+        until ESP1 is reflashed).
+    [ ] Flash Nano / ESP1 / ESP2 using the steps above, in that order.
+    [ ] Work through Commissioning_Flash_Plan.md's staged A-G process,
+        especially Stage C, before relying on the new hold-to-run feature for
+        anything real.
+================================================================================

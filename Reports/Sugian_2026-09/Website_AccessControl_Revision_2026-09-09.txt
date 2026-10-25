@@ -1,0 +1,369 @@
+SMART IRRIGATION & FERTIGATION SYSTEM
+Website Access-Control Revision — Final Report
+Date: 2026-09-09
+
+Scope executed: Website only (ESP1/ESP2 untouched this pass — confirmed by rebuild, see #21/#22).
+Nano: untouched, not built, not flashed. No hardware flashed. No PlatformIO upload command run.
+
+
+====================================================================
+1. ROOT CAUSE — pending-user control exposure
+====================================================================
+`isApprovedUser()` (script.js) already correctly returned false for pending/restricted/rejected/
+disabled accounts, and `queueCommand()`/`writeZoneProfile()`/`writeManualHold()` already correctly
+rejected their writes server-side-equivalently. The gap was entirely in the UI layer: `renderZonesUI()`
+rendered the FULL "Firmware settings" editing block (quick-action buttons, dropdowns, N/P/K/pH
+inputs, preset selector, Send to ESP1) unconditionally for every account, regardless of
+`isApprovedUser()`. A pending user saw every control fully rendered and clickable; clicking any of
+them queued a real Firebase write that `queueCommand()` then rejected after the fact with an error
+message — exactly the "clickable button simply expected to fail" pattern the spec prohibits.
+
+The System tab (`data-view="system"`) and Manual/Test tab (`data-view="manualtest"`) had an
+analogous but distinct gap: neither tab was gated at all — not even by `isApprovedUser()`, let alone
+by operator status. Any signed-in user, including pending, could open either tab and see every
+control (Set Clock/Thresholds/Restore Defaults; Pump Exercise/Timed Pulses/Testing).
+
+
+====================================================================
+2. ROOT CAUSE — restricted-user control exposure
+====================================================================
+Identical root cause to #1. `isApprovedUser()` treats "restricted" and "pending" identically (both
+evaluate to `false`), so every gap above applied equally to both statuses. No separate code path
+existed for "restricted" specifically — which is exactly why the fix for #1 also fixes this without
+needing a second mechanism.
+
+
+====================================================================
+3. FINAL ACCESS MODEL
+====================================================================
+No new role system was created. Two existing, orthogonal boolean checks now drive 100% of the
+gating, exactly matching the spec's four-tier-plus-blocked model:
+
+  isOperator()      -- auth.currentUser.uid is one of the two fixed OPERATOR_UIDS (main + creator/
+                       backup). Already existed, unchanged. Gates: User Management (existing),
+                       System tab (new), Manual/Test tab (new), and now specific commands
+                       (RUN_PUMP_TEST, SET_EXERCISE, TEST_PULSE, the Manual/Test flow sweep,
+                       SET_CLOCK, SET_THRESH, RESTORE_DEFAULTS) via a new `operatorOnly` option on
+                       queueCommand().
+  isApprovedUser()  -- isOperator() || myAccountStatus === "approved". Already existed, unchanged.
+                       Gates: Zone Profile editing, Force Run, Cancel Force, Reboot, general Controls,
+                       Diagnostics sweep, Emergency Stop/Recovery, and (unchanged) every other command.
+
+  PENDING / RESTRICTED  = !isApprovedUser()  -> read-only (identical treatment, by design)
+  NORMAL APPROVED       = isApprovedUser() && !isOperator()
+  MAIN / CREATOR        = isOperator()  (implies isApprovedUser() too)
+  BLOCKED (status "disabled") = pre-existing full-screen #blockedScreen takeover, unchanged, sees
+                       nothing else on the page at all.
+
+This is precisely PART 20's "capability model" mapped onto the existing data model with zero new
+Firebase fields, zero new UID lists, zero new role framework.
+
+
+====================================================================
+4. EXACT ACCESS MATRIX (as implemented)
+====================================================================
+| Capability                        | Pending | Restricted | Normal Approved | Main/Creator |
+|------------------------------------|---------|------------|------------------|--------------|
+| Live Dashboard, telemetry          | Yes     | Yes        | Yes              | Yes          |
+| Zone Profiles -- view (sensors,    | Yes     | Yes        | Yes              | Yes          |
+|   current config summary)          |         |            |                  |              |
+| Zone Profiles -- edit (mode/sched/  | No      | No         | Yes              | Yes          |
+|   window/targets/preset/quick-btns)|         |            |                  |              |
+| Force Run / Cancel Force           | No      | No         | Yes              | Yes          |
+| Emergency Stop / Recovery          | No      | No         | Yes              | Yes          |
+| Enable/Disable actuations          | No      | No         | Yes              | Yes          |
+| Reboot Nano/ESP2/ESP1              | No      | No         | Yes              | Yes          |
+| Diagnostics (view + ESP2 sweep)    | view    | view       | Yes (+sweep)     | Yes (+sweep) |
+| Manual/Test tab (visibility)       | No      | No         | No               | Yes          |
+| Pump Exercise / Timed Pulses /     | No      | No         | No               | Yes          |
+|   Manual/Test flow sweep           |         |            |                  |              |
+| System tab (visibility)            | No      | No         | No               | Yes          |
+| Set Clock / Thresholds / Restore   | No      | No         | No               | Yes          |
+|   Defaults                        |         |            |                  |              |
+| User Management tab                | No      | No         | No               | Yes          |
+| Blocked (status=disabled)          | full-screen lockout, supersedes every row above           |
+
+
+====================================================================
+5. EXISTING MAIN-OPERATOR UID MECHANISM
+====================================================================
+`const OPERATOR_UIDS = ["KaiqrwlOHeVdebbokPxZfcFLZiu2", "C8V39t4EDgUgjOt9GA6OeMukMsw2"];` and
+`function isOperator() { return Boolean(auth?.currentUser && OPERATOR_UIDS.includes(auth.currentUser.uid)); }`
+(script.js). Reused verbatim, unchanged. Same UIDs the Firebase rules independently check server-side
+for `/users` writes.
+
+
+====================================================================
+6. EXISTING CREATOR/BACKUP UID MECHANISM
+====================================================================
+`const BACKUP_OPERATOR_UID = "C8V39t4EDgUgjOt9GA6OeMukMsw2";` -- already the second entry in
+`OPERATOR_UIDS` above, so `isOperator()` already treats main and creator/backup identically. No
+change was needed or made; this constant exists as a named reference for other code (e.g. the User
+Management self-exclusion logic) but the access-control gating itself just uses `OPERATOR_UIDS`.
+
+
+====================================================================
+7. EXACT FILES MODIFIED
+====================================================================
+- Website/index.html -- added `id="systemTab" hidden` and `id="manualtestTab" hidden` to the two tab
+  buttons (previously no id, no hidden attribute at all).
+- Website/script.js -- see #8 below for the itemized changes.
+No firmware files modified. No Firebase rules modified this pass (see #20). No Vercel changes (not
+needed, per #18 of the spec -- confirmed, nothing here touches delete-user-api).
+
+
+====================================================================
+8. EXACT UI GATING CHANGES (script.js)
+====================================================================
+1. `refreshOperatorUI()` extended: now also toggles `#systemTab`/`#manualtestTab` hidden based on
+   `isOperator()`, and redirects to the dashboard tab if the user is currently on either view and
+   loses operator status (same click-the-dashboard-tab pattern already used for `#usersTab`).
+2. `queueCommand(type, payload, options)` gained a new `options.operatorOnly` flag, checked
+   immediately after the existing `isApprovedUser()` check: `if (options.operatorOnly && !isOperator())`
+   rejects with "This control is limited to the main/creator operator account." Applied to exactly
+   the 6 command types that are Manual/Test- or System-exclusive: RUN_PUMP_TEST (all 3 buttons),
+   SET_EXERCISE, TEST_PULSE, the Manual/Test tab's flow-sweep DIAG_SWEEP call (NOT the Diagnostics
+   tab's own sweep, which sends the identical command type but must stay Normal-Operator-accessible
+   -- these are the same command type from two different UI surfaces, so this distinction can only
+   ever be enforced client-side, never by the Firebase rules), SET_CLOCK, SET_THRESH,
+   RESTORE_DEFAULTS.
+3. `writeManualHold(want)` gained an operator check on the ACQUIRE path only:
+   `if (want && !isOperator()) return Promise.resolve(false);` -- releasing a hold (want=false) stays
+   available regardless of role, since that direction only ever hands control back to automation and
+   must never be blocked by a permission check.
+4. `renderZonesUI()` restructured to branch on `const canEdit = isApprovedUser()` computed once per
+   render: the sensor-reading matrix-grid and the live "Current configuration" summary paragraph are
+   identical in both variants; the crop/growth-stage selectors become plain read-only text (no
+   `<select>`, no change listener, no `writeZoneProfile()` trigger) when `!canEdit`; the entire
+   "Firmware settings" block (quick-action buttons, mode/enabled/schedule dropdowns, window inputs,
+   N/P/K/pH inputs, preset selector, Fill-from-crop and Send-to-ESP1 buttons) is replaced by a
+   3-line read-only block (heading, the `#cfgCurrent` summary, and an explicit "Read-only access —
+   editing firmware settings requires operator approval." notice) when `!canEdit`. All the editing
+   wiring (event listeners, option population, form-state restore, window-visibility toggling) is
+   now inside `if (canEdit) { ... }`.
+5. New `lastZoneEditCapability` + `syncZoneEditCapability()` (declared next to `isApprovedUser()`):
+   tracks the last-rendered edit capability and calls `renderZonesUI()` only on an actual flip, so
+   Zone Profiles updates live when an operator approves/restricts/blocks the account mid-session
+   without re-rendering on every routine 15s/live-data tick. Wired into both branches of
+   `attachUserStatusListener()`'s status callback, and reset to `undefined` on sign-out (in
+   `onAuthStateChanged`'s `!user` branch) so a fresh sign-in always re-evaluates rather than skipping
+   a render because the boolean happens to match a previous session's value.
+
+
+====================================================================
+9-14. BEHAVIOR BY TIER
+====================================================================
+9. PENDING -- sees Live Dashboard, telemetry, all 3 zone cards' sensor readings and current-
+   configuration summary, Diagnostics (view + sweep is blocked by the existing approved-only gate,
+   view stays). Does not see the Manual/Test or System tabs at all (hidden). Zone Profiles shows no
+   editing controls of any kind -- crop/stage are plain text, the whole Firmware Settings form is
+   replaced by a read-only notice. Every command button elsewhere (Force Run, Reboot, Enable/Disable
+   Actuations, Emergency Stop) is present but disabled via the existing `syncControlAvailability()`
+   (unchanged) and would additionally be rejected by `queueCommand()`'s `isApprovedUser()` check if
+   somehow triggered.
+10. RESTRICTED -- byte-for-byte identical behavior to Pending (both fail `isApprovedUser()`
+    identically; no separate code path exists or was created).
+11. NORMAL APPROVED OPERATOR -- full Zone Profiles editing (mode, enabled, schedule, window, N/P/K/
+    pH, preset, quick-action buttons, Send to ESP1), Force Run/Cancel Force, Emergency Stop/Recovery,
+    Enable/Disable Actuations, Reboot (Nano/ESP2/ESP1), Diagnostics including the ESP2 sweep. Manual/
+    Test and System tabs are hidden; even if reached via devtools, every command inside either is
+    refused by the new `operatorOnly` check.
+12. MAIN OPERATOR -- everything above, plus Manual/Test tab (Pump Exercise, Timed Pulses, ESP2 flow
+    sweep) and System tab (Set Clock, Thresholds, Restore Defaults, LCD Lock read-only status), plus
+    the pre-existing User Management tab.
+13. CREATOR/BACKUP OPERATOR -- identical to Main Operator; `isOperator()`/`OPERATOR_UIDS` never
+    distinguished between the two UIDs for capability purposes, so no separate implementation was
+    needed.
+14. BLOCKED -- unchanged pre-existing behavior: `renderBlockedScreen()`'s full-screen `#blockedScreen`
+    takeover fires as soon as `myAccountStatus === "disabled"`, hiding the entire dashboard including
+    every tab; sign-out is the only action offered.
+
+
+====================================================================
+15. SYSTEM TAB ACCESS IMPLEMENTATION
+====================================================================
+`index.html`: `<button ... data-view="system" id="systemTab" hidden>System</button>`.
+`script.js` `refreshOperatorUI()`: `systemTab.hidden = !isOperator()`, plus a redirect-to-dashboard if
+the tab is currently active and the user loses operator status. Called on every auth-state change
+(sign-in/sign-out) -- sufficient because `isOperator()` depends only on the signed-in UID, which
+cannot change without a sign-in/out.
+
+
+====================================================================
+16. MANUAL/TEST TAB ACCESS IMPLEMENTATION
+====================================================================
+Same mechanism as #15, applied to `id="manualtestTab"`/`data-view="manualtest"`. Additionally,
+`writeManualHold()`'s acquire path (`want=true`) now independently checks `isOperator()` (see #8.3),
+so even a stray/manual call to `requestManualHold()` (the function the tab-click handler calls) is
+refused for a non-operator regardless of whether the tab was somehow made visible.
+
+
+====================================================================
+17. ZONE PROFILES READ-ONLY IMPLEMENTATION
+====================================================================
+See #8.4 above for the exact mechanism. Confirmed via direct read of the resulting template that a
+non-approved account's rendered card contains ZERO `<select>`, `<input>`, or actuating `<button>`
+elements anywhere in the "Firmware settings" region or the crop/stage selectors -- only `<strong>`
+text nodes and the two always-present read-only paragraphs (`#cfgCurrent{id}` and the new read-only
+notice). `updateZoneConfigDisplay()` (unchanged) continues to work identically in both variants since
+`#cfgCurrent{zone.id}` exists in both.
+
+
+====================================================================
+18. DIRECT-NAVIGATION PROTECTION
+====================================================================
+Audited the app's actual navigation mechanism: there is no hash-routing, no query-parameter routing,
+and no other JS-driven view-switching path besides the single delegated click handler on
+`document.querySelectorAll(".tab")`, which toggles `.active` on the clicked tab and the matching
+`.view` section by `data-view`/`id` match. There is no alternate "reveal a view" entry point in this
+codebase to protect against -- the ONLY way to make a hidden tab visible or force a view active
+without going through that one click handler is direct DOM manipulation via browser devtools, which
+no client-side JavaScript can prevent for a technical user with access to their own browser. This is
+stated plainly rather than glossed over, per the spec's explicit instruction not to claim security
+that isn't real: hiding the tab is a UI convenience only. What actually stops an unauthorized action
+even if the view is forced visible is that every command the newly-visible view could send is
+independently checked by `queueCommand()`'s `isApprovedUser()`/`operatorOnly` gates (or
+`writeManualHold()`'s own `isOperator()` check), which do not care whether the view is visible --
+confirmed by tracing every command path in #8/#19 below. Likewise for Zone Profiles: forcing the
+read-only variant's container to somehow contain edit controls would require injecting new DOM
+nodes with devtools (this codebase offers no code path that would do it), and even then
+`quickSetColumnMode()`/`submitColumnConfig()`/`writeZoneProfile()` all still funnel through the same
+`isApprovedUser()`-gated functions.
+
+
+====================================================================
+19. COMMAND-SIDE AUTHORIZATION VERIFICATION
+====================================================================
+Every `queueCommand()` call site in script.js, verified by direct grep (21 call sites, matching the
+dashboard-contract comment's inventory):
+  SET_COLUMN (x2), FORCE_RUN, EMERGENCY_STOP, RECOVER, ESTOP_RECOVER, ENABLE_ACTUATIONS,
+  DISABLE_ACTUATIONS, REBOOT (x3), ACK_FAULT, CANCEL_FORCE  -- approved-only (isApprovedUser()),
+  unchanged, matches Normal-Approved-Operator-and-above per the spec.
+  RUN_PUMP_TEST (x3), SET_EXERCISE, TEST_PULSE, SET_CLOCK, SET_THRESH, RESTORE_DEFAULTS, and the
+  Manual/Test tab's DIAG_SWEEP call -- operatorOnly: true, newly added, matches Main/Creator-only per
+  the spec.
+  The Diagnostics tab's own DIAG_SWEEP call -- approved-only, deliberately NOT operatorOnly (see #8.2
+  for why this specific command type can only be split client-side).
+Two non-queueCommand write paths, both traced: `writeZoneProfile()` (isApprovedUser()-gated, pre-
+existing) and `writeManualHold()` (isApprovedUser() + operatorOnly-on-acquire, see #8.3). The
+User-Management-only writes (kick/approve/reject/block/restrict, `db.ref('users/{uid}').update(...)`)
+are reachable only from rows rendered exclusively for `isOperator()` sessions AND are independently
+enforced by the pre-existing Firebase `/users/{uid}` write rule, which already required the writer's
+own `auth.uid` be one of the two operator UIDs -- this is the one write path in the whole file where
+the Firebase rules themselves already draw the operator/non-operator line, not just approved/non-
+approved.
+
+
+====================================================================
+20. FIREBASE RULES STATUS -- FLAGGED CONFLICT, NOT SILENTLY FIXED (per the Final Stop Condition)
+====================================================================
+firebase-rules.json was inspected but NOT modified this pass. Here is the conflict the Final Stop
+Condition asked to be surfaced rather than silently resolved:
+
+The six `operatorOnly` command types added in #8.2 (RUN_PUMP_TEST, SET_EXERCISE, TEST_PULSE,
+SET_CLOCK, SET_THRESH, RESTORE_DEFAULTS) are currently authorized at the Firebase-rules level for
+ANY approved account -- the rules' `commands/$commandId/type` whitelist and the general
+`isApprovedUser()`-equivalent write condition do not distinguish operator from normal-approved for
+these types (or for any type). This means: the UI hides these controls from a normal-approved
+account, and `queueCommand()`'s new client-side check refuses them too -- but a normal-approved
+(non-operator) account with real Firebase Auth credentials could, with enough technical effort
+(opening their browser's devtools and calling the Firebase SDK directly, bypassing this page's own
+JavaScript entirely), still successfully queue one of these six command types, because the RULES
+would still accept it.
+
+This is a genuine gap between "hidden and client-refused" and "provably enforced server-side" for
+these six command types specifically -- everything else in the access matrix (Zone Profile edits,
+Force Run, Reboot, etc.) was ALREADY correctly rules-enforced at the approved/non-approved boundary
+before this pass, and remains so. Per PART 17 ("only change rules if technically necessary") and the
+Final Stop Condition, I did not attempt to close this by tightening firebase-rules.json myself this
+pass -- that would mean adding operator-UID checks to specific command types in a ruleset that has
+already caused one live regression this session (the RUN_PUMP_TEST whitelist omission), and is a
+distinct decision from "make the UI honest," which is what was unambiguously specified.
+
+**Smallest safe solution, if you want this closed at the rules level too**: add an explicit
+`auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2'`
+condition to the `type` (or a new nested) validator specifically for these six command name
+literals, leaving every other command type's existing approved-only rule untouched. This is a small,
+scoped change, but it is still a live-production-rules edit and deserves your explicit go-ahead
+given today's earlier near-miss, so I'm asking rather than doing it.
+
+
+====================================================================
+21. ESP1 BUILD RESULT
+====================================================================
+No ESP1 source changes were made this pass (out of scope per the spec -- "keep" the listed baseline).
+Rebuilt anyway to confirm nothing regressed and to give you a real number, not an assumption:
+`pio run` in ESP1/ -- SUCCESS, 0 errors, 0 warnings. RAM 23.6% (77,272 B), Flash 41.2% (1,295,597 B) --
+identical to the last verified build this session. Confirmed by direct grep that `char  colMode[20];`
+(line 727) and the Force-Run race-fix machinery (`forceBlockedFlash`, `SET_CLOCK`/`SET_THRESH`/
+`RESTORE_DEFAULTS` handlers, 25 occurrences) are all still present and unmodified.
+
+
+====================================================================
+22. ESP2 BUILD RESULT
+====================================================================
+No ESP2 source changes were made this pass. Rebuilt to confirm: `pio run` in ESP2/ -- SUCCESS, 0
+errors, 0 warnings. RAM 7.1% (23,220 B), Flash 25.7% (337,381 B) -- identical to the last verified
+build. Confirmed by direct grep that `const unsigned long INVERTER_WARMUP_MS = 5000;` (line 166) is
+still present and unmodified, and is still the value actually read at its one use site (line 1063,
+the inverter/valve settle check in `stagePoll()`).
+
+
+====================================================================
+23. WEBSITE SYNTAX-CHECK RESULT
+====================================================================
+`node --check Website/script.js` -- exit code 0, no syntax errors (run twice: once after the
+`queueCommand`/`renderZonesUI`/`refreshOperatorUI` changes, once more after the `writeManualHold`
+addition). `index.html`'s structure was inspected by direct read after editing -- both new `id`
+attributes sit on well-formed, still-balanced `<button>` tags; no other markup was touched.
+
+
+====================================================================
+24. BROWSER TEST RESULT
+====================================================================
+No browser is available in this environment. Static verification only was performed: full read of
+every modified function, a direct grep-based trace of every `queueCommand()`/`writeZoneProfile()`/
+`writeManualHold()` call site against its gate, and a syntax check. **Live browser testing across the
+six account tiers (pending, restricted, normal-approved, main operator, creator/backup, blocked),
+including the six PART 6/22/23/24 dynamic-transition scenarios (pending->approved, pending->
+restricted, approved->restricted, approved->blocked, sign-out, operator sign-out) still needs to
+happen in a real browser before this is considered fully validated.** This is exactly the kind of
+gap the spec asked to be stated plainly rather than glossed over.
+
+
+====================================================================
+25. NANO CONFIRMATION
+====================================================================
+Nano/Nano.ino was not read, not modified, not built, not flashed this pass. No PlatformIO command
+targeting the Nano environment was run.
+
+
+====================================================================
+26. NO HARDWARE FLASHED
+====================================================================
+Confirmed: no `pio run --target upload`, no serial upload, no device-flashing command of any kind was
+run for ESP1, ESP2, or Nano at any point this pass. The two `pio run` invocations in #21/#22 were
+plain builds only (no `--target upload`), and both firmware sources were unmodified.
+
+
+====================================================================
+27. LIMITATIONS
+====================================================================
+- The Firebase-rules gap in #20 is real and unresolved pending your decision.
+- No live browser testing was possible (#24) -- static/structural verification only.
+- Direct-navigation "protection" (#18) is UI convenience, not a real barrier against a technical user
+  with devtools access to their own browser session -- stated plainly, not oversold.
+- `writeManualHold()`'s new operator check only gates the ACQUIRE direction; this was a deliberate,
+  reasoned choice (see #8.3), not an oversight, but worth being aware of.
+
+
+====================================================================
+28. STILL REQUIRING PHYSICAL SITE / LIVE TESTING
+====================================================================
+- All six PART 6 dynamic-transition scenarios, in an actual browser, with real test accounts at each
+  tier (pending, restricted, normal-approved, main operator, creator/backup, blocked).
+- Confirming the redirect-to-dashboard behavior actually feels correct in the browser when a tab is
+  forcibly vacated mid-use (e.g. an operator using Manual/Test who gets un-operatored -- not a
+  realistic scenario since operator status is UID-fixed, but worth a sanity click-through).
+- Everything already queued from prior sessions: the full Commissioning_Flash_Plan.md staged A-G
+  hardware validation, once you're ready to flash -- unaffected and unchanged by this pass.

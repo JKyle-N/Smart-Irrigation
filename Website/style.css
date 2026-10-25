@@ -28,27 +28,52 @@
   --shadow: 0 14px 36px rgb(30 64 100 / .10);
 }
 
+/* Type system (2026-09-11): IBM Plex Sans/Mono, chosen for an instrumentation-panel character --
+   this is telemetry from real sensors, so the numbers get a real monospace/tabular face (.card p,
+   .diagnostic-card dd) rather than the body font just getting bigger. Scale widens h1->h2->h3
+   deliberately (they used to sit within .25rem of each other at max width) using weight as well as
+   size, since Plex's weight range is wide enough to carry real hierarchy on its own. */
+/* Quality floor: every transition/animation on this page (button hover, toast enter/leave, the
+   fault-banner reveal) collapses to effectively instant for a viewer who's asked for less motion,
+   without deleting the rules themselves -- so nothing needs a parallel no-motion code path. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}
+
 * { box-sizing: border-box; }
 html { color-scheme: dark; }
 html[data-theme="light"] { color-scheme: light; }
-body { min-height: 100vh; margin: 0; background: var(--bg); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+body { min-height: 100vh; margin: 0; background: var(--bg); color: var(--text); font-family: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
 button, input, select { font: inherit; }
-button { min-height: 42px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text); font-weight: 700; cursor: pointer; transition: border-color .15s ease, background .15s ease, transform .15s ease; }
+button { min-height: 42px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text); font-weight: 600; cursor: pointer; transition: border-color .15s ease, background .15s ease, transform .15s ease; }
 button:hover:not(:disabled) { border-color: var(--accent); transform: translateY(-1px); }
 button:disabled { cursor: not-allowed; opacity: .48; }
 input, select { width: 100%; min-height: 42px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-muted); color: var(--text); }
-label { display: grid; gap: 7px; color: var(--muted); font-size: .88rem; font-weight: 700; }
+label { display: grid; gap: 7px; color: var(--muted); font-size: .88rem; font-weight: 600; }
 h1, h2, h3, h4, p { margin-top: 0; }
-h1 { margin-bottom: 0; font-size: clamp(1.4rem, 2vw, 2rem); }
-h2 { margin-bottom: 8px; font-size: clamp(1.35rem, 2vw, 1.75rem); }
-h3 { margin-bottom: 7px; }
+h1 { margin-bottom: 0; font-size: clamp(1.5rem, 2.4vw, 2.35rem); font-weight: 700; letter-spacing: -.01em; }
+h2 { margin-bottom: 8px; font-size: clamp(1.2rem, 1.7vw, 1.5rem); font-weight: 600; }
+h3 { margin-bottom: 7px; font-size: 1rem; font-weight: 600; }
 small, .muted, .hint, .field-note { color: var(--muted); }
-.eyebrow { margin-bottom: 7px; color: var(--accent); font-size: .72rem; font-weight: 850; letter-spacing: .11em; text-transform: uppercase; }
-.hint { max-width: 880px; margin-bottom: 20px; line-height: 1.55; }
+.eyebrow { margin-bottom: 7px; color: var(--accent); font-size: .72rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.hint { max-width: 80ch; margin-bottom: 20px; line-height: 1.55; }
+/* Live telemetry gets a monospace/tabular face -- these update in place, so digits should hold their
+   width instead of the line reflowing as a reading changes; it also just reads as instrumentation
+   rather than prose, which is the point for a sensor readout. */
+.card p, .diagnostic-card dd, .command-badge, .device-status {
+  font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
 
 .login-screen { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 24px; background: var(--bg); }
 .login-screen[hidden] { display: none; }
 .login-card { display: grid; gap: 12px; width: min(100%, 410px); padding: 30px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow); }
+/* Without this, the plain `display:grid` above wins over the browser's own [hidden]{display:none}
+   UA-stylesheet rule (same gotcha already fixed elsewhere in this file for .fault-actions/
+   .fault-banner/.login-screen/.danger-gate) -- so showAuthForm()'s signup.hidden=true had no visual
+   effect at all once a second .login-card (the sign-up form) existed, and both forms rendered at
+   once regardless of which was actually .hidden. */
+.login-card[hidden] { display: none; }
 .login-card p { color: var(--muted); line-height: 1.5; }
 .login-card button { border-color: var(--accent); background: var(--accent); color: white; }
 .login-error { min-height: 1.2em; margin: 0; color: var(--danger) !important; font-size: .85rem; }
@@ -123,6 +148,12 @@ small, .muted, .hint, .field-note { color: var(--muted); }
 .emergency-panel { display: flex; align-items: center; justify-content: space-between; gap: 22px; margin-top: 22px; padding: 20px; border: 1px solid rgb(239 98 98 / .6); border-radius: 13px; background: rgb(239 98 98 / .07); }
 .emergency-panel > div { max-width: 760px; }
 button.danger { min-width: 200px; border-color: var(--danger); background: var(--danger); color: white; }
+/* Hold-to-run buttons (Manual/Test): a visible "energised" state while pressed/held, mirroring the
+   LCD Testing screen's own button. touch-action:none stops the browser turning a held touch into a
+   scroll/zoom gesture partway through, which would otherwise fire pointerup and drop the relay. */
+.hold-btn { touch-action: none; user-select: none; }
+.hold-btn.holding { border-color: var(--success); background: var(--success); color: #05231a; font-weight: 800; }
+.hold-btn.danger.holding { border-color: var(--danger); background: var(--danger); color: white; }
 .forced-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .form-card { display: grid; align-content: start; gap: 12px; padding: 20px; }
 .form-card h4 { font-size: 1.08rem; }
@@ -137,6 +168,13 @@ button.danger { min-width: 200px; border-color: var(--danger); background: var(-
 .forced-section > h3 { margin-bottom: 8px; }
 .force-form { display: grid; gap: 14px; padding: 22px; border: 1px solid var(--border); border-left: 5px solid var(--warning); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
 .force-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 14px; }
+/* Without this, the plain `display:grid` above wins over the browser's own [hidden]{display:none}
+   (equal specificity, author rule wins regardless of order) -- same gotcha already fixed for
+   .login-card/.fault-actions above. Reverification fix (2026-09-09): the zone Window start/end row
+   (#cfgWinRow, toggled by updateWindowVisibility()) uses this class and was always visible even when
+   Schedule was left at Automatic -- cosmetic only (submitColumnConfig() still only sends winStart/
+   winEnd while Manual is actually selected), but contradicted the adjacent field-note text. */
+.force-row[hidden] { display: none; }
 .force-form button[type="submit"] { border-color: var(--warning); background: var(--warning); color: #14203a; }
 .dose-fieldset { display: grid; gap: 14px; margin: 0; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
 .dose-fieldset legend { padding: 0 7px; color: var(--muted); font-size: .74rem; font-weight: 850; letter-spacing: .08em; text-transform: uppercase; }
@@ -145,7 +183,14 @@ button.danger { min-width: 200px; border-color: var(--danger); background: var(-
 
 /* Fault / lockout banner. Above the tabs, because a held fault is not a "diagnostics tab" concern.
    Danger-toned by default; a lockout is a calmer state and gets the warning colour instead. */
+/* The one deliberate motion moment on this page (2026-09-11): everywhere else stays still on
+   purpose, so THIS reveal -- the single most safety-relevant state change the dashboard can show --
+   is the one place a person's eye gets pulled on purpose. Plays once on the hidden->visible edge
+   (setting .hidden=false again while already visible is a no-op, so this never re-fires on every
+   15s/live-data tick while a fault stays active) then settles to a plain static state. */
+@keyframes faultBannerIn { from { opacity: 0; transform: translateY(-10px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
 .fault-banner { margin-bottom: 26px; padding: 20px; border: 1px solid rgb(239 98 98 / .65); border-left: 6px solid var(--danger); border-radius: 13px; background: rgb(239 98 98 / .08); box-shadow: var(--shadow); }
+.fault-banner:not([hidden]) { animation: faultBannerIn .45s cubic-bezier(.16, 1, .3, 1); }
 .fault-banner[hidden] { display: none; }
 .fault-banner.lockout-only { border-color: color-mix(in srgb, var(--warning) 65%, var(--border)); border-left-color: var(--warning); background: rgb(242 174 73 / .08); }
 .fault-banner.snoozed { opacity: .82; }
@@ -154,6 +199,13 @@ button.danger { min-width: 200px; border-color: var(--danger); background: var(-
 .fault-detail { margin-bottom: 0; color: var(--muted); line-height: 1.5; max-width: 900px; }
 .fault-steer { margin: 14px 0 0; padding: 11px 13px; border-left: 4px solid var(--warning); border-radius: 8px; background: var(--surface-muted); color: var(--text); font-size: .88rem; line-height: 1.5; }
 .fault-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+/* Without this, the plain `display:flex` above wins over the browser's own [hidden]{display:none}
+   UA-stylesheet rule (page rules beat UA rules regardless of specificity), so script.js setting
+   rec.hidden=true on #faultRecovery didn't actually hide it -- the 4 recovery buttons (including
+   "Resume normal") stayed visible and clickable during a plain EMERGENCY_STOP or a lockout-only
+   banner, not just the held-fault state they're meant for. Matches the same fix already applied to
+   .fault-banner/.login-screen/.danger-gate above/elsewhere in this file. */
+.fault-actions[hidden] { display: none; }
 .fault-actions button { flex: 0 1 auto; }
 button.warn { border-color: var(--warning); color: var(--warning); }
 /* Subordinate action sitting beside a primary one. Transparent rather than surface-muted, because
@@ -223,3 +275,115 @@ dialog a { color: var(--accent); }
 button.gate-back { border-color: var(--success); background: var(--success); color: #05231a; font-weight: 800; }
 button.gate-proceed { border-color: var(--border); background: var(--surface-muted); color: var(--muted); }
 button.gate-proceed:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
+
+/* Info icons. One shared popover (#infoPopover in index.html), repositioned per click, backs every
+   ".info-icon" button on the page -- see initInfoIcons() in script.js. Purely additive UI: never
+   nested inside an actuating button (kept as a sibling via .btn-with-info / .label-row instead), so
+   it cannot itself trigger a pump/valve/relay click, and it adds no vertical space to a card since
+   it sits inline with the heading/label text it explains. */
+.info-icon {
+  position: relative;
+  display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center;
+  width: 13px; height: 13px; min-height: 0; margin-left: 6px; padding: 0;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface-muted);
+  color: var(--muted); font-size: .58rem; font-style: italic; font-weight: 800; line-height: 1;
+  vertical-align: middle; transform: translateY(-1px);
+}
+/* The visible circle stays small (~13px, per spec) but the actual tappable area is expanded via this
+   invisible pseudo-element -- a small icon with only its own box as the hit target is hard to tap
+   accurately on a phone. inset:-7px gives roughly a 27x27px target without growing what's drawn. */
+.info-icon::after { content: ""; position: absolute; inset: -7px; }
+.info-icon:hover, .info-icon:focus-visible, .info-icon[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); background: var(--surface); }
+.info-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+h2 .info-icon, h3 .info-icon, h4 .info-icon { transform: translateY(-1px); }
+
+/* Groups logically-related buttons tighter than the surrounding .control-grid/.config-actions gap
+   (10-16px), so e.g. the 3 reboot buttons read as one cluster distinct from disable/enable, instead
+   of every button in a panel sitting in one undifferentiated row. Layout-only -- no id/class/handler
+   changes to the buttons themselves. */
+.control-cluster { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+/* Wraps an actuating button + its info icon as one inline group without changing the button's own
+   click target -- used wherever the icon would otherwise have to sit inside the button itself. */
+.btn-with-info { display: inline-flex; align-items: center; gap: 8px; }
+/* Keeps a label's leading text + icon on the SAME grid row as each other (labels on this page are
+   `display:grid`, text over control) instead of the icon becoming its own row under the control. */
+.label-row { display: inline-flex; align-items: center; }
+
+.info-popover {
+  position: fixed; z-index: 30; width: min(320px, calc(100vw - 24px));
+  padding: 16px 18px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--surface); color: var(--text); box-shadow: var(--shadow);
+  font-size: .86rem; line-height: 1.55;
+}
+.info-popover[hidden] { display: none; }
+.info-popover-title { margin: 0 28px 6px 0; color: var(--accent); font-size: .74rem; font-weight: 850; letter-spacing: .06em; text-transform: uppercase; }
+.info-popover-text { margin: 0; color: var(--text); }
+.info-popover-close { position: absolute; top: 8px; right: 8px; width: 26px; height: 26px; min-height: 0; padding: 0; border-radius: 999px; }
+
+/* Sign in <-> Sign up switch link under each auth form. */
+.auth-switch { margin: 2px 0 0; font-size: .85rem; color: var(--muted); }
+/* The base `button` rule fills every button with a solid background + border box -- without
+   resetting those here too, "Create account"/"Sign in"/"Back to Sign In" rendered as a bordered
+   pill instead of plain inline link text. */
+.auth-switch .link-button { display: inline; width: auto; min-height: 0; padding: 0; margin: 0; border: none; background: none; font-weight: 700; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.auth-switch .link-button:hover { color: var(--text); border-color: transparent; transform: none; }
+
+/* Own-account approval status. Same visual family as .fault-banner (danger-toned, above the tabs)
+   but a separate class -- this reflects /users/{myUid}, not ESP1's telemetry, and the two must not
+   be conflated by sharing one class that updateFaultBanner() also toggles. */
+.account-banner { margin-bottom: 26px; padding: 20px; border: 1px solid rgb(242 174 73 / .65); border-left: 6px solid var(--warning); border-radius: 13px; background: rgb(242 174 73 / .08); box-shadow: var(--shadow); }
+.account-banner[hidden] { display: none; }
+.account-banner h2 { margin-bottom: 6px; }
+
+/* User Management (operator-only). */
+.user-list { display: grid; gap: 12px; }
+.user-row { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+.user-row-info { display: grid; gap: 2px; flex: 1 1 220px; min-width: 0; }
+.user-row-info strong { overflow-wrap: anywhere; }
+.user-row-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.user-action { min-height: 36px; padding: 7px 12px; font-size: .84rem; }
+/* button.danger/button.warn are styled for standalone full-size buttons (200px min-width, 100% width
+   on mobile) -- neither makes sense for a small action button sitting in a row of siblings. */
+.user-action.danger, .user-action.warn { min-width: 0; width: auto; }
+/* Recent activity (operator-only, see renderUserManagement()/activity/.read in firebase-rules.json).
+   <details>/<summary> so the up-to-15 list is collapsed to one line by default -- open/closed state
+   is tracked in expandedActivityUids (script.js) and reapplied via the `open` attribute, since this
+   whole row's HTML is rebuilt on every presence/activity update and would otherwise forget it. */
+.user-activity { margin-top: 4px; font-size: .84rem; color: var(--muted); }
+.user-activity summary { cursor: pointer; overflow-wrap: anywhere; }
+.user-activity summary:hover { color: var(--text); }
+.user-activity-list { display: grid; gap: 2px; margin: 4px 0 0; padding: 0; list-style: none; }
+.user-activity-list li { color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
+
+/* Toast notifications (2026-09-10, see showToast() in script.js) -- fed by setCommandStatus() and the
+   User Management action handler, so this covers essentially every one-off result across the site
+   without hunting down each call site individually.
+   --toast-enter is the offset a toast animates FROM on the way in and TO on the way out (a mirror-
+   image appear/disappear) -- positive (from below) for the bottom-anchored desktop stack, negative
+   (from above) once the mobile breakpoint flips the stack to the top of the screen. */
+:root { --toast-enter: 18px; }
+.toast-stack {
+  position: fixed; z-index: 40; right: 20px; bottom: 20px;
+  display: flex; flex-direction: column; gap: 10px;
+  width: min(360px, calc(100vw - 32px));
+  pointer-events: none;   /* clicks pass through the gaps between toasts; each toast re-enables itself */
+}
+.toast {
+  pointer-events: auto; cursor: pointer;
+  padding: 13px 16px; border: 1px solid var(--border); border-left: 4px solid var(--muted);
+  border-radius: 10px; background: var(--surface); color: var(--text); box-shadow: var(--shadow);
+  font-size: .88rem; line-height: 1.45; overflow-wrap: anywhere;
+  opacity: 0; transform: translateY(var(--toast-enter));
+  transition: opacity .25s ease, transform .25s ease;
+}
+.toast.toast-in { opacity: 1; transform: translateY(0); }
+.toast.toast-leaving { opacity: 0; transform: translateY(var(--toast-enter)); }
+.toast-error { border-left-color: var(--danger); }
+.toast-pending { border-left-color: var(--warning); }
+.toast-completed { border-left-color: var(--success); }
+
+@media (max-width: 600px) {
+  :root { --toast-enter: -18px; }
+  .toast-stack { top: 14px; right: 14px; bottom: auto; left: 14px; width: auto; flex-direction: column-reverse; }
+}

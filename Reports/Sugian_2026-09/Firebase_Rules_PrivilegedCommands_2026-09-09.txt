@@ -1,0 +1,166 @@
+SMART IRRIGATION & FERTIGATION SYSTEM
+Firebase Rules — Privileged Command Authorization Gap Closed
+Date: 2026-09-09
+
+Scope executed: Website/firebase-rules.json ONLY. Not deployed (per explicit instruction — the
+local file was edited and validated, but the live production rules are unchanged until you approve
+a deploy). No website UI/JS logic touched. No ESP1/ESP2/Nano firmware touched. No hardware flashed.
+
+
+====================================================================
+AUDIT (before editing)
+====================================================================
+Read the full current file. The relevant node's exact prior shape:
+
+  irrigation/commands/$commandId/.write =
+    (auth != null && (approved-or-operator) && !data.exists()
+       && newData.child('source').val() === 'dashboard'
+       && newData.child('status').val() === 'queued')
+    || (auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')   // ESP1's own device UID
+
+Two OR-branches: the first is the dashboard's CREATE path (any approved account, any command type
+in the whitelist below); the second is ESP1's own STATUS-UPDATE path (ESP1 writing back status/
+result on a command that already exists). The `type` field has its own separate `.validate` — a
+17-entry allow-list of exact command-name strings, unconditional (does not check who's writing).
+`payload/*` has separate range validators on 6 numeric fields, also unconditional.
+
+Critical design point that shaped the fix: the CREATE branch and ESP1's STATUS-UPDATE branch are
+already cleanly separated by the existing OR. Any new operator-only restriction had to be scoped
+to the CREATE branch only — adding it to the shared `type` validator instead would have also
+applied to ESP1's own status-update writes (since `.validate` re-evaluates on every write to the
+path, using the CURRENT request's `auth`, not the original creator's), which would have made ESP1
+unable to ever report back status/completion on a privileged-type command it already validly
+started, since ESP1's device UID is not one of the two operator UIDs. Scoping the check inside the
+CREATE branch specifically avoids this.
+
+
+====================================================================
+1. EXACT RULE CHANGE
+====================================================================
+File: Website/firebase-rules.json. One line changed: `irrigation/commands/$commandId/.write`.
+Nothing else in the file was touched — confirmed by `git diff` showing only this single line.
+
+BEFORE:
+  "(auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' ||
+  auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') &&
+  !data.exists() && newData.child('source').val() === 'dashboard' && newData.child('status').val()
+  === 'queued') || (auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')"
+
+AFTER:
+  "(auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' ||
+  auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') &&
+  !data.exists() && newData.child('source').val() === 'dashboard' && newData.child('status').val()
+  === 'queued' && ((newData.child('type').val() === 'RUN_PUMP_TEST' || newData.child('type').val()
+  === 'SET_EXERCISE' || newData.child('type').val() === 'TEST_PULSE' || newData.child('type').val()
+  === 'SET_CLOCK' || newData.child('type').val() === 'SET_THRESH' || newData.child('type').val() ===
+  'RESTORE_DEFAULTS') ? (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid ===
+  'C8V39t4EDgUgjOt9GA6OeMukMsw2') : true)) || (auth != null && auth.uid ===
+  '6hNg56ldAaSmpnodG1Xla0vn61O2')"
+
+Everything before "&& ((newData.child('type')..." is byte-for-byte identical to the original —
+only one clause was appended to the CREATE branch's existing AND-chain: a ternary that says "if
+the type being created is one of the six privileged names, require the writer's own auth.uid to be
+one of the two operator UIDs; otherwise (any of the other 11 command types), no additional
+requirement — behavior for those stays exactly as it was." The ESP1 status-update branch
+(`|| (auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')`) is completely untouched.
+
+The `type` field's own `.validate` (the 17-entry name whitelist) and every `payload/*` range
+validator are unchanged — this fix is entirely inside `.write`, not `.validate`, precisely so it
+only ever applies to the CREATE path, never to ESP1's status-update writes.
+
+
+====================================================================
+2. EXACT COMMAND TYPES PROTECTED
+====================================================================
+RUN_PUMP_TEST, SET_EXERCISE, TEST_PULSE, SET_CLOCK, SET_THRESH, RESTORE_DEFAULTS — exactly the six
+named in your instruction, and exactly the six the website's own `queueCommand()` already marks
+`operatorOnly: true` client-side (from the prior pass). No other command type was touched: FORCE_RUN,
+EMERGENCY_STOP, RECOVER, ESTOP_RECOVER, ENABLE_ACTUATIONS, DISABLE_ACTUATIONS, CANCEL_FORCE,
+ACK_FAULT, SET_COLUMN, REBOOT, DIAG_SWEEP all keep their exact prior behavior (any approved account,
+operator or not).
+
+
+====================================================================
+3. EXACT PRIVILEGED UIDS USED
+====================================================================
+`KaiqrwlOHeVdebbokPxZfcFLZiu2` (main operator) and `C8V39t4EDgUgjOt9GA6OeMukMsw2` (creator/backup
+operator) — the same two literal UIDs already used everywhere else in this file (the `/users` node's
+own operator-only branches, the existing approved-or-operator clause, etc.). No new UID, no new
+constant, no new list — these are copied verbatim from the existing approved-or-operator clause
+immediately to their left in the same expression.
+
+
+====================================================================
+4. WHY A DIRECT WRITE FROM A NORMAL APPROVED (NON-OPERATOR) ACCOUNT IS NOW REJECTED
+====================================================================
+For a normal-approved account attempting to create a command of one of the six privileged types:
+the outer clause `(root.child('users')...status... === 'approved' || auth.uid === OP1 || auth.uid
+=== OP2)` still evaluates true (their status IS "approved"), and `!data.exists()`/`source`/`status`
+all still pass exactly as before — but the NEW inner ternary now also has to pass: since
+`newData.child('type').val()` matches one of the six privileged names, the ternary evaluates its
+"then" branch, `(auth.uid === OP1 || auth.uid === OP2)` — which is FALSE for any UID that isn't one
+of the two literal operator UIDs. The whole CREATE branch's AND-chain therefore evaluates to FALSE.
+The ESP1 branch is also FALSE (their UID isn't ESP1's device UID either). With both OR-branches
+false, Firebase's default-deny takes over and the write is rejected — regardless of whether the
+request came through this website's own JavaScript or a hand-crafted request straight to the
+Realtime Database REST/SDK using that same account's valid ID token. This is what makes it a real
+server-side boundary rather than a UI convenience: the rejection happens in Google's own rules
+engine, before the write ever reaches storage, with no dependency on this website's client code
+running at all.
+
+
+====================================================================
+5. CONFIRMATION — the two privileged UIDs are the ONLY ones that pass for the six protected types
+====================================================================
+Traced every possible writer of a NEW command in the CREATE branch's inner ternary:
+  - `auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2'` -> true -> ALLOWED for all 17 types including the 6.
+  - `auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2'` -> true -> ALLOWED for all 17 types including the 6.
+  - Any other `auth.uid` (a normal-approved account, a pending/restricted/rejected/disabled account,
+    or an unauthenticated request) -> the ternary's "then" branch is false whenever the type is one
+    of the six -> that specific write is rejected. For the OTHER 11 command types, or for reads, or
+    for any node outside `irrigation/commands/$commandId`, behavior is completely unaffected by this
+    change.
+  - ESP1's own device UID (`6hNg56ldAaSmpnodG1Xla0vn61O2`) never needs to satisfy the CREATE
+    branch at all — it has its own separate, untouched OR-branch for status-update writes on
+    commands that already exist, regardless of their type.
+No other UID or condition can satisfy the privileged-type ternary. Confirmed by direct re-reading
+of the final expression (reproduced in full in section 1 above) rather than inferred.
+
+
+====================================================================
+6. VALIDATION RESULT
+====================================================================
+- `ConvertFrom-Json` on the edited file: succeeded — structurally valid JSON.
+- `firebase deploy --only database --dry-run`: Firebase's own rules compiler reported "rules syntax
+  for database smart-irrigation-web2-default-rtdb is valid" and the command stopped after that
+  syntax check with "Dry run complete!" — critically, no "releasing rules" / "released successfully"
+  line appeared, confirming the dry-run validated against Firebase's real compiler WITHOUT deploying
+  anything. This is the CLI's own documented dry-run behavior ("Validates your changes... without
+  deploying"), used here specifically because you asked for local/static checks without a deploy.
+- `git diff` confirms exactly one line changed in the whole repo this turn (the `.write` value
+  above) — no other rule, no website JS/HTML, no firmware file was touched.
+
+
+====================================================================
+BEHAVIOR SUMMARY (as requested)
+====================================================================
+- Normal approved operator: unchanged for all 11 non-privileged command types (Force Run, Set
+  Column, Reboot, Emergency Stop, Recovery, Enable/Disable Actuations, Cancel Force, Ack Fault,
+  Diagnostics sweep) — still writable. The six privileged types are now rejected at the database
+  level even via a direct/bypassing write, not just hidden/refused by the website's own JS (which
+  already refused them from the prior pass).
+- Pending / restricted / blocked: unchanged — already rejected for everything (their `approved-or-
+  operator` clause was already false before this change), and remain so for the six privileged
+  types too, for the same pre-existing reason plus the new explicit check.
+- Privileged operator (main or creator/backup UID): fully unchanged — every command type, privileged
+  or not, still writable exactly as before.
+
+
+====================================================================
+CONFIRMATION — NO FIRMWARE/HARDWARE TOUCHED
+====================================================================
+ESP1/src/main.cpp, ESP2/src/main.cpp, and Nano/Nano.ino were not read, not modified, not rebuilt, and
+not flashed this turn. No PlatformIO command of any kind was run. Only Website/firebase-rules.json
+was edited. The edit has NOT been deployed — the live Firebase rules remain exactly as they were
+before this message, pending your explicit go-ahead to run `firebase deploy --only database` for
+real.

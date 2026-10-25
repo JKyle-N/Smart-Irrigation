@@ -12,17 +12,24 @@
  *  UART PROTOCOL (spec sec.9.9): framed, UPPERCASE, comma-separated, <=128 bytes
  *      Outbound (Nano -> ESP32 #1):
  *        <START>,ENV,<temp>,<hum>,<END>
- *        <START>,TANK,<res%>,<mix%>,<flowLpm>,<END>
+ *        <START>,TANK,<resCm>,<mixCm>,<flowLpm>,<END>  (reservoir/mixing-tank RAW distance in cm --
+ *              ESP32 #1 maps to % using the stored empty/full geometry + zero offset, per Calibration
+ *              Mode's RAW-streaming convention below; flowLpm is the only already-scaled field here)
  *        <START>,SOIL,<COL>,<p1>,<p2>,...,<END>      (tag + 2 raw probes per enabled column; disabled omitted)
  *        <START>,LIGHT,<lux>,<END>
  *        <START>,NPK,<COL>,<moist>,<temp>,<EC>,<pH>,<N>,<P>,<K>,<reason>,<END>  (one per enabled column;
  *              reason = OK|TIMEOUT|BADADDR|BADLEN|BADCRC -- OK carries values, the rest carry -1s)
  *        <START>,STATUS,NANO,OK,<END>                (heartbeat, spec sec.10.8.2)
+ *        <START>,CAL,<id>,<raw>,<END>                (Calibration Mode raw stream while CAL_START is
+ *              active, ~cadence per calStreamTick(); <raw> is a real -1 on a failed/out-of-range read,
+ *              never a plausible-looking value -- see calReadRaw())
  *      Inbound (ESP32 #1 -> Nano, spec sec.9.7.1.1):
  *        <START>,ACTIVE,<END>     fast interval (10 s)
  *        <START>,DAY,<END>        day-idle interval (20 min)
  *        <START>,NIGHT,<END>      night-idle interval (1 hr)
  *        <START>,RESET_REQ,<END>  clean software self-reset (short-timeout WDT)
+ *        <START>,CAL_START,<id>,<END>  begin raw stream for one sensor id (Calibration Mode, idle-only)
+ *        <START>,CAL_STOP,<id>,<END>   end it
  *
  *  RECOVERY LADDER (spec sec.17.4.1 / CLAUDE.md) -- the Nano owns step 1 only:
  *      1. Internal ATmega328 WDT, petted in loop()  <-- primary self-recovery
@@ -118,6 +125,9 @@ const unsigned long HB_INTERVAL_NIGHT_MS  = 120000UL;    // 2 min
  * Must comfortably exceed the worst-case single loop iteration (a full sensor
  * cycle, dominated by NPK Modbus timeouts). WDTO_4S leaves a wide margin.      */
 #define WDT_TIMEOUT  WDTO_4S
+const unsigned long WDT_TIMEOUT_MS = 4000;   // must match WDT_TIMEOUT above (WDTO_4S) -- kept as a
+                                              // plain number too so NPK_RESPONSE_TIMEOUT_MS below can
+                                              // be checked against it at compile time
 
 /* ---- One-time sensor settle (setup() only) ------------------------------- */
 const unsigned long SENSOR_SETTLE_MS = 2000;   // DHT22 warm-up + ultrasonic settle
@@ -157,8 +167,17 @@ const uint8_t  NPK_FUNCTION  = 0x03;            // 0x03 read-holding (some use 0
 const uint16_t NPK_REG_START = 0x0000;          // first register               [CONFIRM]
 const uint16_t NPK_REG_COUNT = 7;               // moist,temp,EC,pH,N,P,K        [CONFIRM]
 const unsigned long NPK_RESPONSE_TIMEOUT_MS = 1000;  // bounded wait for reply (proven test value)
+// Coupled to WDT_TIMEOUT_MS: this wait, plus loop()'s other per-iteration work (ENV/TANK/SOIL/LIGHT
+// reads + UART writes), all happen between one wdt_reset() and the next. A future edit that raises
+// this in isolation (e.g. to accommodate a slower NPK sensor) could erode that margin without
+// anything flagging the coupling -- catches the most obvious case (this wait alone approaching the
+// WDT period) at compile time; doesn't replace hand-verifying the full worst-case chain.
+static_assert(NPK_RESPONSE_TIMEOUT_MS * 2 < WDT_TIMEOUT_MS,
+              "NPK_RESPONSE_TIMEOUT_MS leaves too little WDT margin -- see WDT_TIMEOUT_MS");
 // Print precision per field (decimals) for the RAW register outbound packet (moist,temp,EC,pH,N,P,K).
-const uint8_t NPK_PREC[7]  = { 1, 1, 0, 1, 0, 0, 0 };
+// Sized off NPK_REG_COUNT (not a bare 7) so a future commissioning change to that [CONFIRM]ed count
+// can't desync this array -- or the two loop bounds below -- from it and read past a shrunk buffer.
+const uint8_t NPK_PREC[NPK_REG_COUNT]  = { 1, 1, 0, 1, 0, 0, 0 };
 /* ---- end NPK editable block ---------------------------------------------- */
 
 /* =============================================================================
@@ -356,9 +375,12 @@ void handleLine(char *line) {
     // A FLOW calibration accumulates pulses without consuming them, and computeFlowLpm() has been
     // returning 0 (not touching lastFlowCalcMs) for the whole run. Zero both here, or the first
     // normal TANK packet afterwards divides a full calibration's pulses by a stale interval and
-    // reports one spurious flow value.
-    noInterrupts(); flowPulseCount = 0; interrupts();
-    lastFlowCalcMs = millis();
+    // reports one spurious flow value. Scoped to FLOW specifically, matching CAL_START's own
+    // equivalent reset above -- this used to fire unconditionally for every sensor's CAL_STOP.
+    if (!strcmp(calId, "FLOW")) {
+      noInterrupts(); flowPulseCount = 0; interrupts();
+      lastFlowCalcMs = millis();
+    }
     calActive = false; calId[0] = '\0';
   }
   // else: ignore
@@ -445,13 +467,13 @@ void sendNpk() {
   for (uint8_t c = 0; c < NUM_COLUMNS; c++) {
     if (!COLUMN_ENABLED[c]) continue;               // skip disabled columns entirely
     wdt_reset();                                    // longest read -- keep WDT happy
-    float vals[7];
+    float vals[NPK_REG_COUNT];
     uint8_t rc = readNpkColumn(NPK_ADDR[c], vals);
     bool ok = (rc == NPK_OK);
     startPkt("NPK");
     tag[0] = COLUMN_TAG[c];
     pktAddRaw(tag);
-    for (uint8_t i = 0; i < 7; i++) {
+    for (uint8_t i = 0; i < NPK_REG_COUNT; i++) {
       pktAddFloatOrInvalid(vals[i], NPK_PREC[i], ok);
     }
     pktAddRaw(npkReasonStr(rc));                     // trailing reason token (OK on success, else why it failed)
@@ -499,6 +521,7 @@ bool calReadRaw(float &raw) {
   if (!strncmp(calId, "SOIL_", 5)) {
     int col = calId[5] - 'A';                      // A/B/C
     if (col < 0 || col >= NUM_COLUMNS) return false;
+    if (!COLUMN_ENABLED[col]) return false;          // a disabled column's pins float -- don't read them
     if (calId[6] == '\0') {                         // "SOIL_A" -> column AVERAGE (ESP1 calibrates the 2-probe avg)
       raw = (float)((analogRead(SOIL_PINS[col][0]) + analogRead(SOIL_PINS[col][1])) / 2);
       return true;
@@ -511,16 +534,17 @@ bool calReadRaw(float &raw) {
   if (!strncmp(calId, "NPK_", 4)) {                 // raw N register for that column (display-only, §A.3)
     int col = calId[4] - 'A';
     if (col < 0 || col >= NUM_COLUMNS) return false;
+    if (!COLUMN_ENABLED[col]) return false;          // no sensor physically present on a disabled column
     float vals[7];
     if (readNpkColumn(NPK_ADDR[col], vals) != NPK_OK) return false;
     raw = vals[4];                                  // N (index 4) raw register
     return true;
   }
-  if (!strcmp(calId, "ULTRA_RES")) { raw = readDistanceCm(PIN_TRIG_RES, PIN_ECHO_RES); return true; }
-  if (!strcmp(calId, "ULTRA_MIX")) { raw = readDistanceCm(PIN_TRIG_MIX, PIN_ECHO_MIX); return true; }
+  if (!strcmp(calId, "ULTRA_RES")) { float v = readDistanceCm(PIN_TRIG_RES, PIN_ECHO_RES); if (v < 0.0f) return false; raw = v; return true; }
+  if (!strcmp(calId, "ULTRA_MIX")) { float v = readDistanceCm(PIN_TRIG_MIX, PIN_ECHO_MIX); if (v < 0.0f) return false; raw = v; return true; }
   if (!strcmp(calId, "DHT_T")) { float t = dht.readTemperature(); if (isnan(t)) return false; raw = t; return true; }
   if (!strcmp(calId, "DHT_H")) { float h = dht.readHumidity();    if (isnan(h)) return false; raw = h; return true; }
-  if (!strcmp(calId, "LUX"))   { raw = readLux(); return true; }
+  if (!strcmp(calId, "LUX"))   { float v = readLux(); if (v < 0.0f) return false; raw = v; return true; }
   if (!strcmp(calId, "FLOW")) {                    // reservoir flow: accumulated raw pulses
     noInterrupts(); unsigned long p = flowPulseCount; interrupts();
     raw = (float)p; return true;
@@ -534,7 +558,7 @@ void calStreamTick() {
   unsigned long cadence = (strncmp(calId, "DHT", 3) == 0 || strncmp(calId, "NPK", 3) == 0) ? 2000UL : CAL_STREAM_MS;
   if ((unsigned long)(millis() - lastCalMs) < cadence) return;
   lastCalMs = millis();
-  float raw;
+  float raw = -1.0f;
   bool ok = calReadRaw(raw);
   startPkt("CAL");
   pktAddRaw(calId);
@@ -576,7 +600,7 @@ const char *npkReasonStr(uint8_t rc) {
 }
 
 uint8_t readNpkColumn(uint8_t addr, float out[7]) {
-  for (uint8_t i = 0; i < 7; i++) out[i] = -1.0f;
+  for (uint8_t i = 0; i < NPK_REG_COUNT; i++) out[i] = -1.0f;
 
   uint8_t q[8];
   q[0] = addr;
@@ -620,7 +644,7 @@ uint8_t readNpkColumn(uint8_t addr, float out[7]) {
       highByte(rcrc) != resp[expected - 1])       return NPK_BADCRC;     // corrupted (bus noise/EMI)
 
   // RAW 16-bit registers (companion spec §A): ESP32 #1 applies NPK_SCALE + per-element offset.
-  for (uint8_t i = 0; i < 7; i++) {
+  for (uint8_t i = 0; i < NPK_REG_COUNT; i++) {
     uint16_t raw = ((uint16_t)resp[3 + 2 * i] << 8) | resp[4 + 2 * i];
     out[i] = (float)raw;
   }
@@ -642,34 +666,46 @@ uint16_t modbusCRC(const uint8_t *buf, uint8_t len) {
 /* =============================================================================
  *  PACKET BUILDER  (frames <START>,...,<END>, enforces <=128 bytes)
  * ========================================================================== */
+// Bounded concatenation: plain strcat() has no way to know pkt[]'s capacity, so an oversized field
+// could write past the 140-byte buffer and silently corrupt adjacent globals -- unlike endPkt()'s own
+// strlen(pkt)<=128 check below, which only runs AFTER every strcat() that built the string has
+// already executed, so it can't prevent an earlier overflow. Hand-computed worst-case packet sizes
+// never come close to 140 given the value ranges this code can currently produce (defense-in-depth,
+// not a live bug today) -- but it's cheap insurance against a future field/constant change reopening it.
+static void safeCat(const char *s) {
+  size_t used = strlen(pkt);
+  if (used >= sizeof(pkt) - 1) return;
+  strncat(pkt, s, sizeof(pkt) - used - 1);
+}
+
 void startPkt(const char *cmd) {
   strcpy(pkt, "<START>,");
-  strcat(pkt, cmd);
+  safeCat(cmd);
 }
 
 void pktAddRaw(const char *s) {
-  strcat(pkt, ",");
-  strcat(pkt, s);
+  safeCat(",");
+  safeCat(s);
 }
 
 void pktAddIntOrInvalid(long v, bool valid) {
-  strcat(pkt, ",");
-  if (!valid) { strcat(pkt, "-1"); return; }
+  safeCat(",");
+  if (!valid) { safeCat("-1"); return; }
   char t[12];
   ltoa(v, t, 10);
-  strcat(pkt, t);
+  safeCat(t);
 }
 
 void pktAddFloatOrInvalid(float v, uint8_t prec, bool valid) {
-  strcat(pkt, ",");
-  if (!valid) { strcat(pkt, "-1"); return; }
+  safeCat(",");
+  if (!valid) { safeCat("-1"); return; }
   char t[16];
   dtostrf(v, 0, prec, t);
-  strcat(pkt, t);
+  safeCat(t);
 }
 
 void endPkt() {
-  strcat(pkt, ",<END>");
+  safeCat(",<END>");
   if (strlen(pkt) <= 128) {
     Serial.println(pkt);            // \r\n terminator; framing markers bound the payload
   }

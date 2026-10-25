@@ -1,0 +1,287 @@
+FINAL FLASH DECISION — Smart Irrigation & Fertigation System
+Generated 2026-09-07. Read-only investigation + the fixes/builds described below only — nothing
+flashed, uploaded, deployed, or pushed.
+
+================================================================================
+FINAL FLASH DECISION
+================================================================================
+
+ESP1: FLASH
+ESP2: FLASH
+NANO: DO NOT FLASH
+
+--------------------------------------------------------------------------------
+BUILD STATUS:
+ESP1: PASS
+ESP2: PASS
+NANO: NOT VERIFIED (no compiler available in this environment -- see below; this is an
+      environment limitation, not a code defect)
+
+COMPATIBILITY:
+NEW ESP1 <-> OLD ESP2:  PASS
+NEW ESP1 <-> OLD NANO:  PASS
+NEW ESP2 <-> OLD ESP1:  PASS
+
+SECURITY: PASS *  (* one unrelated, pre-existing item outside the firmware -- see section 7)
+SAFETY REVIEW: PASS
+TLS REVIEW: UNVERIFIED -> RESOLVED THIS ROUND (reverted to the same behavior OLD firmware already
+            uses for this one optional, non-safety feature; see section 3)
+--------------------------------------------------------------------------------
+
+Why ESP1/ESP2 = FLASH and NANO = DO NOT FLASH, in short: ESP1 and ESP2 both compiled successfully
+just now with PlatformIO's real ESP32 toolchain (not a static approximation), every safety gate was
+re-verified intact, and every protocol-compatibility question was checked in both directions with no
+mismatch found. Nano's *source* has no functional change and its protocol is confirmed identical to
+what's already flashed -- but this environment has no Arduino/PlatformIO toolchain able to compile a
+.ino file, so its compile status is genuinely unverified, not just "probably fine." Per your own
+one-shot rule, an unresolved item means DO NOT FLASH for that device specifically. Recommendation:
+leave the Nano exactly as it is this round (zero downside -- nothing depends on it changing) and, if
+you want it updated later, open Nano/Nano.ino in the Arduino IDE and click Verify (not Upload) first --
+if you have Arduino IDE installed, that takes under a minute and would resolve this cleanly.
+
+================================================================================
+1. FIXES MADE THIS ROUND
+================================================================================
+
+Only one code change was made -- everything else your list asked me to "fix" (items A, B, C, D, E, F
+in your request) was already correct in the dev tree from earlier rounds this engagement, re-verified
+fresh below rather than assumed.
+
+  Supabase TLS pin reverted (ESP1/src/main.cpp, supaUploadFile(), ~line 6633)
+  -----------------------------------------------------------------------------
+  Before: client.setCACert(SUPA_ROOT_CA)  -- a certificate pin verified against supabase.co itself,
+          but NOT against this project's actual <ref>.supabase.co storage endpoint (that hostname
+          lives only in the device's NVS, set by SMS/portal, never in any file this environment can
+          read -- grepped the entire project tree again this round specifically looking for it,
+          found nothing).
+  After:  client.setInsecure()  -- the exact behavior the CURRENTLY FLASHED firmware has always used
+          for this one feature. A wrong pin doesn't degrade gracefully -- it fails every upload
+          outright -- so on a one-shot flash, "no worse than today" beats "maybe better, maybe
+          broken" for a feature (optional SD-log cloud backup) with zero connection to irrigation or
+          fertigation safety. SUPA_ROOT_CA stays in source, unused, with a comment explaining exactly
+          how to safely turn it on later (read the device's real configured URL, verify that chain,
+          then flip the one call).
+  This is the fix your section 3 asked for: I could not conclusively verify the endpoint, so per your
+  own instruction I did not claim it was verified, and left this optional path unchanged from today's
+  behavior rather than risk introducing a working-but-untested pin.
+
+================================================================================
+2. RE-VERIFIED ALREADY CORRECT (your items A, B, C, D, E, F -- no change needed)
+================================================================================
+
+A. Manual/Test int64_t sequence number
+   ESP1/src/main.cpp:1000   int64_t webManualSeq = -1;
+   ESP1/src/main.cpp:5947   int64_t seq = doc["seq"] | (int64_t)-1;
+   ESP1/src/main.cpp:5950   if (seq != webManualSeq) { webManualSeq = seq; webManualPing = true; }
+   int64_t compared against int64_t -- no truncation, Date.now()-scale values (~1.7e12) fit safely.
+
+B. FORCE_RUN generic-message fix
+   ESP1/src/main.cpp:6174-6188 -- the arm-time gate now names one of six specific reasons ("a run is
+   in progress" / "a fault is held" / "a test is already running" / "actuations are disabled" /
+   "the Manual/Test tab has direct control" / "someone is using the LCD") instead of one flat string.
+   Every original condition in the gate is still present -- nothing was removed to make this work.
+
+C. FORCE_RUN missing arm-time checks
+   Same block, same lines: `actuationsDisabled` and `webManualHeld()` are both present in the arm-time
+   condition list. The independent fire-time re-check (forceTick(), ~line 2930) is untouched and still
+   re-validates everything again immediately before anything actually fires.
+
+D. Resumed-run dashboard state (D-M2)
+   ESP1/src/main.cpp, the confirmed ACK,RESUME handler -- `runPhase` is restored to RUN_LIVE (mirroring
+   what a fresh run's own state machine would already do) only when a fault-hold resume is CONFIRMED
+   by ESP2, not merely sent -- so a rejected resume can't leave the dashboard falsely claiming a run
+   is live. Fault/recovery logic itself (esp2Held, the RESUME/INVALID,NOT_HELD handling) is untouched.
+
+E. Fault diagnostics (DOSE_BATCH_LOW, NPK_FAULT)
+   Both carry real, already-computed values -- DOSE_BATCH_LOW reports the actual computed batch volume
+   and the actual configured safe minimum; NPK_FAULT reports the Nano's own already-tracked failure
+   reason (TIMEOUT/BADADDR/BADLEN/BADCRC). Nothing invented -- every value traces to a variable that
+   already existed at the call site before this engagement touched it.
+
+F. Website explanations
+   Website/script.js's explainFaultCode()/explainNotSafelyIdle() only decode literal strings the
+   firmware actually emits (each regex is keyed to an exact fault-message format ESP1/ESP2 produce) --
+   nothing claims a capability the firmware doesn't have.
+
+================================================================================
+3. REAL BUILD RESULTS (PlatformIO, actual ESP32 toolchain -- not a static approximation)
+================================================================================
+
+Command run (build only -- "pio run", never "pio run -t upload"; no port was ever touched):
+  & "C:\Users\johnm\.platformio\penv\Scripts\pio.exe" run -d "<repo>\ESP1"
+  & "C:\Users\johnm\.platformio\penv\Scripts\pio.exe" run -d "<repo>\ESP2"
+
+ESP1 -- SUCCESS, 29.15s
+  Platform:  Espressif 32 (7.0.1), ESP32 Dev Module, Arduino framework
+  Libraries: LiquidCrystal_I2C 1.1.4, RTClib 2.1.4, EspSoftwareSerial 8.2.0, INA226 0.6.6,
+             ArduinoJson 6.21.6 (+ DNSServer/HTTPClient/Preferences/SD/SPI/WebServer/WiFi/
+             WiFiClientSecure/Wire from the ESP32 core) -- all resolved, none missing.
+  RAM:   23.6% used (77,296 / 327,680 bytes)   -- known-good baseline was 77,176 B (+120 B)
+  Flash: 41.0% used (1,290,653 / 3,145,728 bytes) -- known-good baseline was 1,283,709 B (+6,944 B)
+  Warnings: none printed by the compiler in this build.
+  The size deltas are exactly what this engagement's edits would be expected to add (a handful of new
+  strings and one extra condition check) -- nothing resembling a sudden bloat or a missing-optimization
+  regression.
+
+ESP2 -- SUCCESS, 5.33s
+  Platform:  same toolchain as ESP1.
+  Libraries: PZEM-004T-v30 1.1.2 (+ Preferences/Wire from the core; PCF8575 is raw I2C, no library) --
+             all resolved.
+  RAM:   7.1% used (23,112 / 327,680 bytes)    -- known-good baseline was 23,104 B (+8 B)
+  Flash: 25.7% used (336,345 / 1,310,720 bytes) -- known-good baseline was 334,829 B (+1,516 B)
+  Warnings: none printed by the compiler in this build.
+
+NANO -- NOT COMPILED
+  There is no PlatformIO environment for Nano (only ESP1 and ESP2 have platformio.ini -- Nano is a
+  plain Arduino IDE sketch) and this environment has no arduino-cli installed (checked, not found).
+  Separately attempted the project's native host unit tests (pio test -e native, pure-math logic only,
+  unrelated to Nano specifically) to get some extra compiler confidence -- these also could not run:
+  this PowerShell session cannot see gcc/g++ on PATH, which SESSION_HANDOFF.md already documents as a
+  known quirk of this environment ("a shell opened before the [MinGW] install still fails... open a
+  new one"). Both are environment gaps, not evidence of a code problem, but per your own instruction I
+  am reporting them as unverified rather than assuming they would have passed.
+
+================================================================================
+4. COMPATIBILITY (both directions, with evidence)
+================================================================================
+
+Does NEW ESP1 require NEW ESP2?  NO.
+  Every ESP1 change this engagement is either purely internal (idle-gate reason text, runPhase
+  bookkeeping, which integer type parses Manual/Test's seq, ESP1's own outbound Supabase/Firebase TLS
+  handling) or tolerant of whatever ESP2 sends back. Evidence: handleEsp2Response() splits an incoming
+  line on only the FIRST comma and passes the remainder through generically to raiseFault()/
+  enterFaultHold() -- it never pattern-matches an exact expected length or field count. NEW ESP1 was
+  re-confirmed this round to still build the exact same work-order frame to ESP2 as OLD ESP1 does
+  (sendForceWorkOrder(), unchanged).
+
+Does NEW ESP1 require NEW Nano?  NO.
+  Grepped the OLD (currently flashed) Nano's full command set again this round: outbound
+  ENV/TANK/SOIL/LIGHT/NPK/STATUS/CAL and inbound ACTIVE/DAY/NIGHT/RESET_REQ/CAL_START/CAL_STOP are
+  byte-identical to the dev tree's. OLD Nano already supports Calibration Mode raw streaming (checked
+  directly -- calActive/CAL_START/calReadRaw are all present in the currently-flashed Nano.ino, not a
+  new-Nano-only feature as I nearly assumed before checking).
+
+Does NEW ESP2 require NEW ESP1?  NO.
+  Every ESP2 change this pass series is strictly "more text appended after an existing comma/pipe" in
+  a reply ESP1 already knew how to receive (FLOW_FAIL's pulse count, PWR_FAIL/SAFE_STOP/DOSE_TIMEOUT/
+  PH_FAIL/EC_FAIL/SENSOR_FAIL's measured-value detail). OLD ESP1's identical generic-passthrough parsing
+  (same evidence as above) handles a longer string exactly as well as a short one.
+
+Does NEW Nano require NEW ESP1/ESP2?  NO.
+  Nano's command set is unchanged (see above) -- nothing on either ESP1 or ESP2 depends on any new
+  Nano behavior because there isn't any.
+
+Conclusion: the three firmwares are compatible in every direction, old or new, in any combination.
+Nano can stay on its current (OLD) firmware indefinitely with zero functional loss and zero risk to
+ESP1/ESP2, new or old.
+
+================================================================================
+5. SECURITY CHECK
+================================================================================
+
+  - No service-account JSON inside the ESP1/ESP2/Nano/Website source trees:                CONFIRMED
+  - No Firebase Admin private key in Website/:                                              CONFIRMED
+  - No hardcoded phone number/password in firmware (removed earlier this engagement,
+    re-grepped this round -- PHONE_NUMBER is blank, set at commissioning):                  CONFIRMED
+  - No accidentally restored secrets in any file touched this round:                        CONFIRMED
+  - Vercel delete-user-api reads credentials only from environment variables, never a file,
+    and verifyIdToken() now checks token revocation (fixed two rounds ago):                 CONFIRMED
+  - No new security regression from this round's one edit (a TLS pin -> setInsecure() revert
+    for a non-authentication, non-credential-adjacent upload path):                          CONFIRMED
+
+  ONE OUTSTANDING ITEM, NOT PART OF THE FIRMWARE, NOT NEW THIS ROUND:
+  New folder\smart-irrigation-web2-firebase-adminsdk-fbsvc-0ac886f735.json is STILL PRESENT on disk.
+  This is the same file flagged twice in earlier rounds; you reported deleting it once, but it was
+  still there when checked immediately after, and it is still there now. It is not read by, compiled
+  into, or flashed to any device -- it has no bearing on the ESP1/ESP2/NANO decision above -- but it
+  is a live credential-hygiene item you should close out (delete it, and confirm in the Firebase
+  Console whether the key it contains is the already-rotated one or still active) before you consider
+  this engagement's security posture fully resolved.
+
+================================================================================
+6. HARDWARE SAFETY REVIEW
+================================================================================
+
+Every gate below was re-read this round to confirm this engagement's changes never touched its
+actual logic -- only, in a few cases, the TEXT of the message reported when it fires.
+
+  FORCE_RUN safety gate:        intact -- arm-time AND fire-time both re-verified (section 2, B/C).
+  Manual/Test safety gate:      intact -- int64_t fix only changes what value is compared, not the
+                                 comparison or the gate logic itself (section 2, A).
+  Emergency stop:                untouched by any change this engagement.
+  Fault hold (P17 cutoff, tank-aware pause/resume): untouched except the D-M2 dashboard-display fix,
+                                 which reads state after a fault, never decides whether to hold one.
+  Actuator disable:              untouched.
+  Reservoir-low protection:      untouched.
+  Flow-failure protection:       untouched -- FLOW_FAIL's trigger condition and timeout are identical;
+                                 only the reported message grew a pulse count (already-existing
+                                 pattern, re-confirmed present, not re-added this round).
+  ESP2 communication failure handling: untouched.
+  Recovery logic (STOP/RELEASE/IRRIGATE/NORMAL): untouched.
+  Reboot behavior:               untouched.
+
+No hardware protection was weakened, removed, or bypassed to make any build or check pass.
+
+================================================================================
+7. TLS REVIEW
+================================================================================
+
+VERIFIED: NO (for the pin itself -- the actual project endpoint's certificate chain was never
+          available to check from this environment, and that has not changed).
+RESOLVED FOR THIS FLASH: YES -- rather than ship an unverified pin, the upload now uses the same
+          setInsecure() behavior the currently-flashed firmware already uses for this exact feature.
+          Nothing about this flash makes Supabase upload security better OR worse than what's running
+          today. Firebase's own separate TLS handling (fbClient) was checked in an earlier round and
+          is unaffected -- it already pins a verified, real Google root certificate by default,
+          unrelated to this Supabase-specific finding.
+
+================================================================================
+8. REMAINING LIMITATIONS (true regardless of this flash decision)
+================================================================================
+
+  - PUMP_FLOWRATE_MLPM and 61 other calibration constants remain [MEASURE]/[TBD]/[CONFIRM] guesses --
+    a commissioning task, not a code defect, and not changed by anything in this engagement.
+  - The documented, deliberately-deferred CLAUDE.md gap: mixTankL can under-report after an
+    ESP2_DONE_TIMEOUT or MODE+BACK e-stop interrupts SEQ_FILL/SEQ_DOSE. Present identically in OLD and
+    NEW firmware -- this flash does not change that risk in either direction.
+  - Website changes (Force-Run pre-flight block, fault-message decoders) only take effect once
+    Website/ is published -- independent of anything flashed to a controller.
+  - You must personally confirm each board's actual COM port before flashing -- both platformio.ini
+    files currently say upload_port = COM8 for two different physical boards, and the project's own
+    history notes this exact field has silently diverged from a local COM5 before. Nothing in this
+    environment can tell you which port either board enumerates as today.
+
+================================================================================
+9. FLASH PACKAGE (only relevant for ESP1 and ESP2, per the decision above)
+================================================================================
+
+A. Folder:  ESP1 -> C:\Users\johnm\Documents\RESAERCH PROJECT CAP2\Smart-Irrigation-main\ESP1
+            ESP2 -> C:\Users\johnm\Documents\RESAERCH PROJECT CAP2\Smart-Irrigation-main\ESP2
+B. Source:  ESP1/src/main.cpp  |  ESP2/src/main.cpp
+C. PlatformIO environment: esp32dev (both)
+D. Board:   esp32dev (ESP32 Dev Module), framework = arduino (both)
+E. Upload port: both platformio.ini currently say COM8 -- CONFIRM YOUR ACTUAL PORTS YOURSELF before
+   flashing (see limitation above); do not assume COM8 is correct for either board without checking.
+F. Binary produced this round:
+   ESP1: ESP1\.pio\build\esp32dev\firmware.bin  (built just now, matches current source exactly)
+   ESP2: ESP2\.pio\build\esp32dev\firmware.bin  (built just now, matches current source exactly)
+G. Does ESP2 also need flashing? Yes, if you flash ESP1 -- not because the protocol requires it
+   (section 4: it doesn't), but because ESP2 carries its own genuine fixes with no reason to leave
+   them behind, and this project's own convention has always been to flash the pair together.
+H. Does Nano also need flashing? No -- per the decision above, DO NOT FLASH Nano this round.
+I. Order: Nano is not being flashed this round. Between ESP1 and ESP2, either order is safe (protocol
+   is tolerant of a brief old/new mismatch during the changeover) -- this project's own convention is
+   ESP1 before ESP2.
+J. Post-flash verification sequence (from Commissioning_Flash_Plan.md, Stage A): boot with actuations
+   DISABLED first; confirm telemetry reaches the dashboard, the LCD pages normally, and both
+   controllers' sensor diagnostics show the same raw values on the web and the LCD, BEFORE re-enabling
+   actuations or attempting any run.
+K. Recovery if ESP1 fails to boot: the ESP32 bootloader is independent of whatever application
+   firmware is/was on the chip, so it can be re-flashed again over the same USB link regardless of
+   whether the current image boots. Back up the currently-running binaries (or note the exact commit/
+   state they came from) before you reflash, exactly as Commissioning_Flash_Plan.md's "Before you
+   start" section says, so reverting is one flash command, not a rebuild from memory.
+
+================================================================================
+Nothing has been flashed, uploaded, deployed, or pushed. This is a decision document for your review.
+================================================================================

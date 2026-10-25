@@ -1,0 +1,301 @@
+PLAN: ESP1/ESP2 FIRMWARE REVISION + WEBSITE PARITY WITH LCD SYSTEM MENU
+================================================================================
+Status: PLAN / AUDIT ONLY -- nothing in Part 2 (website parity) has been implemented yet.
+Nothing has been flashed. This is the design for review before any code is written.
+
+
+CONTEXT
+-------
+Two firmware changes were already agreed and ARE ALREADY IMPLEMENTED AND BUILT (re-verified
+present on disk this session):
+  - ESP1/src/main.cpp:727   char colMode[14] -> char colMode[20]
+  - ESP2/src/main.cpp:166   INVERTER_WARMUP_MS 2000 -> 5000
+Nothing has been flashed to hardware.
+
+The new ask is much larger: give the website remote equivalents of the 15 functions in ESP1's
+physical LCD Settings menu, ONLY where they don't already exist and ONLY where it's actually safe,
+reusing the existing Firebase-command architecture rather than inventing a new one, with an
+audit-first mapping table before any code changes. A full audit (3 parallel read-only investigations
+across ESP1, ESP2, and the website source) is now complete. This document is that audit's output
+plus the resulting design.
+
+ARCHITECTURE DECISION FROM THE AUDIT (applies to every new item below):
+A "Firebase command -> replay through handleSms()" bridge is documented in
+Web_Dashboard_Firebase_Plan.md but was NEVER BUILT -- every currently-shipped Firebase command
+(SET_COLUMN, SET_EXERCISE, REBOOT, etc.) instead does direct field mutation + calls the same
+saveXxx()/NVS function the LCD calls. New commands below follow that SAME established pattern
+(lowest risk, zero architecture change, consistent with 15 existing precedents) rather than building
+the bigger, never-built bridge. Confirmed (twice, independently, by two separate audits) that
+firebase-rules.json's irrigation/commands/$commandId rule does not inspect "type" or payload shape
+at all -- EVERY NEW COMMAND TYPE BELOW NEEDS ZERO FIREBASE RULES CHANGES.
+
+
+FULL MAPPING TABLE (ALL 15 LCD FUNCTIONS)
+--------------------------------------------
+
+#1  SET CLOCK
+    Existing website function: none
+    Verdict: NEW
+    Communication path: new "SET_CLOCK" command -> rtc.adjust()
+    Safety notes: No NVS persistence today (DS3231 coin-cell hardware register only); a wrong or
+    dead clock silently breaks scheduling (minuteOfDay() returns 0 if RTC is dead, which makes every
+    column permanently "outside window" -- irrigation simply never fires, with no alarm).
+
+#2  SCHEDULE
+    Existing website function: Zone Profiles (schedMode / winStart / winEnd fields)
+    Verdict: REUSE -- already complete
+    Communication path: existing "SET_COLUMN" command
+    Safety notes: none -- confirmed identical variables + the same saveSchedule() call on both the
+    LCD path and the Firebase path. One shared source of truth, verified in source.
+
+#3  COLUMN MODE
+    Existing website function: Zone Profiles (mode dropdown)
+    Verdict: REUSE -- already complete (plus the buffer fix already done)
+    Communication path: existing "SET_COLUMN" command
+    Safety notes: none -- confirmed one source of truth. Minor ergonomic difference (not a bug): the
+    LCD's 3-state editor always forces enabled=true when setting AUTO/IRRIGATION_ONLY in one step;
+    the Firebase path treats mode and enabled as independent optional fields.
+
+#4  PRESET
+    Existing website function: "Fill targets from crop profile" -- THIS IS A DIFFERENT FEATURE.
+    It is a client-side-only convenience that fills the N/P/K/pH form fields from the website's OWN
+    7-crop cropDatabase and deliberately never sends anything on its own; the operator still has to
+    press Send.
+    Verdict: NEW (small, additive)
+    Communication path: extend the EXISTING "SET_COLUMN" command with one new optional field
+    ("preset")
+    Safety notes: Must not be confused with the website's own cropDatabase. This implements access to
+    firmware's REAL, separate 4-entry CROP_PRESETS table (PECHAY, TOMATO_S1, TOMATO_S2, TOMATO_S3),
+    resolved server-side exactly like the existing SMS command "SET,COL_x,PRESET,<NAME>" already
+    does. Reject unknown names, exactly like every other bad-field case already does today.
+
+#5  THRESHOLDS
+    Existing website function: none
+    Verdict: NEW
+    Communication path: new "SET_THRESH" command -> existing saveThresholds()
+    Safety notes: Must reuse firmware's EXACT existing clamps (start/stop clamped 0-100 with a
+    stop-must-exceed-start bump, gap clamped 0-500) -- do not weaken these. saveThresholds() itself
+    already contains a further safety warning (NPK_MIN_MOIST_PCT floor check) that stays untouched.
+
+#6  PUMP EXERCISE
+    Existing website function: Manual/Test tab (On/Off + seconds field, 3 manual-fire buttons)
+    Verdict: REUSE -- already complete
+    Communication path: existing "SET_EXERCISE" / "RUN_PUMP_TEST" commands
+    Safety notes: Cosmetic-only nuance found: the "five-second exercise" buttons actually run for
+    whatever exerciseRunS is CURRENTLY CONFIGURED, not literally 5 seconds, if the operator changed
+    that field. Not a functional problem, just a label that can go stale. No code change required.
+
+#7  FORCE RUN
+    Existing website function: Controls tab -- full existing implementation (arm/countdown, cancel,
+    idle-gate reason decoding, limits mirrored from firmware)
+    Verdict: REUSE -- already thorough
+    Communication path: existing "FORCE_RUN" / "CANCEL_FORCE" commands
+    Safety notes: DISCOVERED BUT NOT FIXED (see dedicated section below) -- the LCD's own Force Run
+    entry can silently override/cancel a web-armed run with no notice ever reaching the dashboard.
+    Also noted: a web-armed run can legally fire with 0 seconds' delay, vs. the LCD's enforced 20-
+    second minimum -- likely intentional (the web submission is already a deliberate act) but worth
+    knowing.
+
+#8  SENSOR DIAG
+    Existing website function: Diagnostics tab, "Raw sensor readings" panel + sweep button
+    Verdict: REUSE -- already complete, and the website is actually a SUPERSET of what the LCD itself
+    can show
+    Communication path: existing "DIAG_SWEEP" command
+    Safety notes: none. Confirmed this drives the exact same underlying round-robin the LCD's own
+    Sensor Diag screen uses (one shared implementation, not two that could disagree). The website
+    even displays 3 flow-meter channels (Nutrient D, pH up, pH down) that the physical LCD's own
+    Sensor Diag page has no room left to display.
+
+#9  TESTING
+    Existing website function: Manual/Test tab, "Timed pulses" (10 named targets)
+    Verdict: REUSE -- already correctly and deliberately scoped
+    Communication path: existing "TEST_PULSE" command
+    Safety notes: DO NOT add the 9 LCD-only relay rows that have no backend path today (bare
+    reservoir/column/mix valves, bare inverter, bare transfer pump alone, bare booster pump alone,
+    and the master actuator cutoff) -- each is excluded for a real, already-documented reason
+    (dead-heading a pump against a shut valve, no valve-position feedback to confirm success, or in
+    the cutoff's case, remotely killing all actuator power with nobody physically present to see it).
+    DO NOT add Nutrient D either -- it has a backend path already but is excluded by a LOCKED project
+    policy (the physical dosing pump for it is wired but intentionally never driven).
+
+#10 WIFI [ON/OFF]
+    Existing website function: read-only status already shown (WiFi enabled / connected / signal
+    strength, in the Diagnostics tab)
+    Verdict: RECOMMEND -- DO NOT ADD A WRITE CONTROL
+    Communication path: n/a
+    Safety notes: Turning WiFi off via a Firebase command races its own acknowledgement over the very
+    radio link it is about to sever -- there is a real, traced risk that the "completed" reply for the
+    command that disables WiFi never reaches Firebase at all, leaving the dashboard showing the
+    command stuck at "queued" forever with the device now unreachable by any remote means (only
+    physical LCD access or a text message could turn it back on). The one existing feature that faces
+    this exact hazard class, Reboot, has a specific safeguard for it (reply first, then act, with a
+    bounded wait) -- no equivalent exists for WiFi today, and building one is a bigger change than
+    this batch of work. A "WiFi ON" button would also be a practical non-starter, since it could only
+    ever be reachable while WiFi is already on.
+
+#11 SETUP AP [ON/OFF]
+    Existing website function: none
+    Verdict: RECOMMEND -- DO NOT IMPLEMENT
+    Communication path: n/a
+    Safety notes: Same self-disconnect hazard class as WiFi above. It is somewhat less dangerous
+    because it self-heals (the portal auto-closes after 10 minutes with no intervention needed), but
+    critically, the device stops even checking for new Firebase commands the entire time the portal
+    is open -- so a "turn it back off" command sent from the website could not even be received while
+    the portal is running. Setup AP's whole purpose (a phone joining a local access point and browsing
+    to a fixed local address) is also an inherently on-site, phone-in-hand workflow with no real
+    remote use case.
+
+#12 RESTORE DEFAULTS
+    Existing website function: none
+    Verdict: NEW
+    Communication path: new "RESTORE_DEFAULTS" command -> existing restoreDefaults()
+    Safety notes: Idle-state gated, matching the LCD's own gate exactly. This is irreversible (wipes
+    per-column tuning back to factory values with no undo), so the website control requires a strong,
+    explicit confirmation before sending, same as required.
+
+#13 LOCK SCREEN
+    Existing website function: none
+    Verdict: NEW -- READ-ONLY DISPLAY ONLY, no write control
+    Communication path: one new small telemetry field published by ESP1 (no command, nothing sent
+    from the website)
+    Safety notes: A WRITE control is intentionally not offered. This feature exists to protect a
+    physical bystander scenario -- someone standing at the unit fumbling with the buttons -- and
+    confirmed independent of the Force-Run "someone is using the LCD" safety gate (locking the screen
+    does not affect that gate at all, and vice versa). Setting or clearing it FROM a website, where by
+    definition nobody local is being protected from anything, serves no real workflow and could only
+    ever inconvenience a future local operator who has to guess an unlock combo for a lock they never
+    set. A simple read-only "LCD Lock: ON/OFF" status tile is still worth adding, since it can explain
+    to a remote operator why the physical unit might seem unresponsive to local input.
+
+#14 REBOOT ESP1
+    Existing website function: already fully implemented (existing reboot button(s) in the Controls
+    tab)
+    Verdict: REUSE -- complete, nothing to add
+    Communication path: existing "REBOOT" command
+    Safety notes: none -- already uses a safe pattern (it replies "completed" and only actually
+    restarts once that reply has had a chance to reach Firebase, or after a bounded ~10 second wait,
+    so the dashboard is not left guessing whether the command worked).
+
+#15 EXIT
+    Existing website function: n/a
+    Verdict: NOT APPLICABLE
+    Communication path: n/a
+    Safety notes: Confirmed this is purely local menu navigation, functionally identical to pressing
+    Back, with no state change and nothing worth exposing remotely.
+
+
+SUMMARY: 7 of 15 are pure reuse (nothing to build). 4 are new, low-risk, additive Firebase commands.
+1 is new but read-only display only. 2 are recommended against, with reasoning, exactly per the
+instruction to report rather than force an unsafe implementation if one can't be done safely. 1 is
+not applicable.
+
+
+NEW ESP1 FIRMWARE WORK (ALL ADDITIVE -- NO EXISTING BRANCH OR LOGIC IS TOUCHED)
+-----------------------------------------------------------------------------------
+Add 4 new command-type branches to the existing Firebase command dispatcher (firebaseCommandTick()),
+placed alongside the 15 branches already there, following the exact same validate-then-apply style
+every existing branch already uses:
+
+1. SET_CLOCK -- new fields for year/month/day/hour/minute. Validate each is in a sane range and that
+   the RTC hardware is actually present before calling rtc.adjust() (the same function the LCD path
+   calls); reject with a clear reason otherwise. Logged the same way the LCD path already logs it.
+
+2. SET_COLUMN + a new optional "preset" field -- if supplied, look it up (case-insensitive) against
+   the firmware's real 4-entry preset table and apply its N/P/K/pH numbers; reject the whole command
+   if the name doesn't match, exactly like every other invalid-field case already does. Zero change
+   to the existing mode / enabled / schedule / target-value logic already in this command.
+
+3. SET_THRESH -- new fields for start%, stop%, and the fertigation gap. Reuse the exact same
+   validation the SMS THRESH command already performs (same clamps, same stop-must-exceed-start
+   rule), then call the existing save function -- no new threshold logic invented.
+
+4. RESTORE_DEFAULTS -- gated on the system being fully idle (rejected otherwise, matching the LCD's
+   own gate), then calls the existing restore-to-defaults function directly. No new reset logic.
+
+Plus 2 small READ-ONLY telemetry additions (no control-plane change, nothing new that can be
+written to):
+  - Publish the device's current date/time and RTC-health flag, so the website's Set Clock control
+    can show "ESP1 currently reads: ..." before an operator decides whether to change it.
+  - Publish the LCD-lock state, for the new read-only status tile.
+
+NOT CHANGING: any existing command branch, any safety gate, any threshold or calibration constant,
+relay mapping, the pump sequence, FLOW_FAIL/PWR_FAIL logic, or the Nano firmware at all.
+
+
+WEBSITE WORK
+---------------
+Every new control reuses the site's existing single command-sending function (which already enforces
+that only an approved, signed-in operator can send anything) -- no new login/role logic anywhere,
+matching how every existing command, including the already-destructive Reboot and Disable-Actuations
+buttons, is gated today. The audit confirmed no finer permission tier exists or is used anywhere else
+in the app, so none is being introduced just for these new items either.
+
+Add one new "System" tab (next to the existing Diagnostics tab, following the exact same tab pattern
+already used for every other section) containing:
+  - Set Clock: a read-only "ESP1 currently reads: <date> <time> (RTC: OK/Not OK)" line, a date/time
+    picker, and a Send button.
+  - Thresholds: start%/stop%/gap fields with the same range hints as the firmware clamp (a UX
+    convenience only -- the real safety check stays server-side), and a Send button.
+  - Restore Defaults: a button behind a strong confirmation dialog warning that per-column tuning
+    will be wiped with no undo, disabled unless the dashboard currently reports the system as idle
+    (matching the LCD's own gate).
+  - Lock Screen: a read-only status tile ("LCD Lock: ON / OFF"). No button.
+
+Preset is placed in the EXISTING Zone Profiles tab instead (right beside the existing mode/target
+fields), since it is genuinely a per-column setting, not new page real estate -- a dropdown of the
+firmware's 4 real presets, sent through the existing column-settings Send action with one added
+field.
+
+Reboot ESP1: no new button added anywhere -- the existing one in the Controls tab is left exactly
+where it is, not duplicated.
+
+WiFi / Setup AP: no new controls added at all. The existing read-only WiFi status already in
+Diagnostics is left as-is and judged sufficient.
+
+
+DISCOVERED BUT INTENTIONALLY NOT FIXED (OUTSIDE THIS TASK'S APPROVED SCOPE)
+-------------------------------------------------------------------------------
+The audit found a real, pre-existing inter-surface race condition: the LCD's own Force Run entry has
+no check for "is a web-armed run already counting down," unlike the Firebase path, which explicitly
+refuses to arm a second run on top of an existing one. This means an operator standing at the
+physical panel can silently overwrite or cancel a run that was armed from the website, with no
+"cancelled" status ever reaching the dashboard -- the armed-run countdown panel would just start
+reflecting different numbers with no explanation. This is a pre-existing firmware behavior, unrelated
+to the two approved changes or to any of the 15 website-parity items requested. Per the instruction
+not to make unnecessary changes, this plan does NOT fix it -- it is flagged here as a separate,
+future decision for you to make.
+
+
+BUILD / VALIDATION PLAN (AFTER ANY EDITS ARE APPROVED AND MADE)
+--------------------------------------------------------------------
+1. Build both ESP1 and ESP2 via PlatformIO -- confirm success, 0 errors, 0 new warnings. (ESP2 has no
+   further code changes this round beyond the already-built INVERTER_WARMUP_MS value; it would be
+   rebuilt anyway so both binaries are a freshly matched pair.)
+2. Run the project's own website syntax-check command, plus a manual read-through of the new tab's
+   markup for structural correctness -- this is a static site with no bundler, so a syntax check plus
+   serving it locally is the correct equivalent of "the website builds."
+3. Re-run a static safety audit against the checklist in the request: confirm no edit touched
+   FLOW_FAIL / PWR_FAIL / PZEM thresholds / emergency-stop / relay mappings / the pump sequence;
+   confirm each of the 4 new Firebase branches is purely additive next to the untouched existing
+   ones; confirm IRRIGATION_ONLY still round-trips correctly (already verified this session);
+   confirm every new command still requires the same approved-operator gate as everything else.
+4. Do NOT flash ESP1, ESP2, or the Nano. Do not touch the Nano's source at all.
+
+
+WHEN THIS IS APPROVED AND BUILT, THE FINAL REPORT WILL COVER
+-----------------------------------------------------------------
+Files modified; the exact old-to-new / newly-added content for each of the 4 new commands and 2
+telemetry fields; explicit confirmation nothing else changed; this full mapping table (already
+existing vs. newly added vs. intentionally not added, with reasons for each); confirmation that no
+Firebase rules changes were needed and why; ESP1, ESP2, and website build/check results; the exact
+generated firmware binary locations; confirmation nothing was flashed; the WiFi/Setup-AP
+non-implementation called out clearly as an intentional limitation with its reasoning; the discovered
+LCD/web Force-Run race flagged again as a follow-up decision still waiting on you; and what should be
+specifically tested physically at the site next week -- in particular, Set Clock's effect on that
+day's schedule and Restore Defaults' idle-gate, since neither has ever been exercised remotely
+before.
+
+
+STATUS: This is the plan only. No website or additional firmware code has been written yet for Part
+2 of the request. Say the word (or flag any changes you want to this design) and the actual
+implementation + build + final report will follow.

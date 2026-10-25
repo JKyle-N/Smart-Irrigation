@@ -1,0 +1,213 @@
+INVERTER SWITCH / RELAY / PWR_FAIL INVESTIGATION (READ-ONLY) + STATUS RECONFIRMATION
+================================================================================
+Date: 2026-09-08
+Status: INVESTIGATION AND VERIFICATION ONLY. No code was modified. Nothing was built or flashed.
+
+
+CONTEXT
+-------
+This round bundles three things: (1) a correction -- the battery-voltage sensor is NOT physically
+installed after all (superseding the immediately prior message), so battery telemetry is explicitly
+NOT being treated as a PWR_FAIL cause and was not touched; (2) a new, read-only investigation into a
+hardware hypothesis -- a physical manual inverter switch possibly left ON while ESP2 also drives an
+inverter relay, and whether this could plausibly relate to the PWR_FAIL VOLTAGE behavior seen during
+Force Run; (3) reconfirmation that the previously-approved firmware changes and the completed
+website/LCD-parity implementation are still intact, unchanged, and not reverted.
+
+PATH NOTE: the project lives at C:\Users\johnm\Documents\RESAERCH PROJECT CAP2_v2.0\Smart-
+Irrigation-main (the "sugia" path in the instructions does not exist on this machine, consistent
+with every prior session).
+
+
+STATUS RECONFIRMATION (verified fresh this turn, nothing reverted)
+------------------------------------------------------------------
+- ESP1/src/main.cpp:727  -- char colMode[20];  CONFIRMED present, unchanged.
+- ESP2/src/main.cpp:166  -- const unsigned long INVERTER_WARMUP_MS = 5000;  CONFIRMED present,
+  unchanged.
+- ESP1/src/main.cpp -- SET_CLOCK, SET_THRESH, RESTORE_DEFAULTS, and forceBlockedFlash (the Force
+  Run race fix) all CONFIRMED present (24 total matches across their declaration/use sites),
+  matching the completed Plan-v2 implementation exactly. No re-implementation was needed or
+  performed -- this work was already done and built in a prior turn; this is a verification pass
+  only.
+
+
+BATTERY SENSOR (per explicit instruction)
+------------------------------------------
+PHYSICAL SENSOR NOT INSTALLED YET; UNAVAILABLE BATTERY TELEMETRY IS NOT BEING TREATED AS THE CAUSE
+OF PWR_FAIL. No battery-sensing code, calibration, or BATTERY_SAFETY_ENABLED was inspected further
+or touched this session. The unavailable battery voltage/current display remains a known, separate,
+incomplete feature to be revisited once the physical sensor is installed -- unrelated to everything
+below.
+
+
+INVERTER SWITCH / RELAY / PWR_FAIL INVESTIGATION
+=================================================
+
+1-2. EXACT ESP2 INVERTER GPIO/PCF8575 OUTPUT
+#define OUT_INVERTER 5 (ESP2/src/main.cpp:113) -- PCF8575 bit P5, comment: "inverter relay (AC
+source)". This is an I2C-expander bit, not a raw ESP32 GPIO -- ESP2 never drives the inverter relay
+through its own GPIO pins directly, only through the PCF8575 (same as every other actuator).
+
+3. RELAY ON/OFF POLARITY -- confirmed exactly
+  ESP2/src/main.cpp:569: void pcfOn(uint8_t bit)  { pcfWrite(pcfShadow & ~(1 << bit)); }  // clear bit = ON
+  ESP2/src/main.cpp:570: void pcfOff(uint8_t bit) { pcfWrite(pcfShadow |  (1 << bit)); }  // set bit  = OFF
+ACTIVE-LOW: a relay is energized ("ON") when its PCF8575 bit is driven LOW (cleared), and
+de-energized ("OFF") when driven HIGH (set). Applies uniformly to every relay including
+OUT_INVERTER -- nothing inverter-specific about its polarity.
+
+4. EVERY PLACE OUT_INVERTER IS TURNED ON
+  Line 1026 (stageBegin())        -- Generic AC-stage entry, used by BOTH SEQ_FILL (transfer) and
+                                      SEQ_DELIVER (booster), since both pass isAC=true
+  Line 1231 (SEQ_MIX)             -- Direct pcfOn(OUT_INVERTER); pcfOn(OUT_MIXER); -- mixer stage
+                                      doesn't go through stageBegin()
+  Line 879 (EXERCISE handler)     -- Bare pump-exercise path: pcfOn(OUT_INVERTER); pcfOn(bit); --
+                                      used by the website's "Five-second exercise" buttons / the
+                                      48h auto-exercise
+  Line 851 (Testing dead-man)     -- Combo rows (COMBO_FILL[]/COMBO_PUSH_A/B/C[], lines 280-283)
+                                      each explicitly list OUT_INVERTER as a member
+  Line 1579 (setupPrime())        -- Flow-calibration priming helper, AC lines only
+                                      (RESMIX/MIXIRR)
+
+5. EVERY PLACE OUT_INVERTER IS TURNED OFF
+  Line 1190 (SEQ_DOSE)            -- Explicit, deliberate: "nutrient pumps are DC; drop the AC
+                                      source"
+  Line 1593 (stopPrime())         -- Priming cleanup, mirrors setupPrime()
+  Line 508 (exercise stop path)   -- Alongside pcfOff(exRunBit)
+  Line 575 (stopAll())            -- pcfWrite(0xFFFF) -- blanket all-off, including inverter +
+                                      master cutoff; called from holdFault(), finishOk(), emergency
+                                      stop, and boot-safety init (line 464)
+  Line 578 (stopKeepBank())       -- pcfWrite(0x7FFF) -- all individual relays off (incl.
+                                      inverter) while master cutoff (P17) stays energized; used
+                                      when switching Testing selections
+
+6. IS THE INVERTER USED DURING EACH STAGE?
+  Fill/Transfer (SEQ_FILL)        Yes -- via stageBegin(OUT_TRANSFER, true, ...)
+  Dose (SEQ_DOSE)                 No -- EXPLICITLY TURNED OFF at entry (DC dosing pumps)
+  Mix (SEQ_MIX)                   Yes -- turned back on directly
+  Deliver/Booster (SEQ_DELIVER)   Yes -- via stageBegin(OUT_BOOSTER, true, ...)
+  Flush Fill / Flush Deliver      Yes -- both reuse stageBegin() with isAC=true (same
+                                   transfer/booster relays)
+  Pump tests (RUN_PUMP_TEST/EXERCISE)  Yes -- explicit pcfOn(OUT_INVERTER) before the test pump
+  Testing (LCD dead-man combos)   Yes -- explicitly listed in the combo arrays
+  Force Run                       Yes, IDENTICALLY TO A SCHEDULED RUN -- Force Run does not have
+                                   its own inverter logic; it populates the same work-order fields
+                                   ESP1 hands to ESP2's startWorkOrder(), which runs the exact same
+                                   SEQ_FILL -> ... -> SEQ_DELIVER state machine traced above. There
+                                   is no separate "Force Run inverter sequence" in the firmware --
+                                   confirmed by the absence of any inverter-related code inside the
+                                   Force-Run-specific parts of either ESP1 or ESP2.
+
+7. EXACT INVERTER WARM-UP SEQUENCE
+Generic, for any AC stage (stageBegin()/stagePoll(), ESP2/src/main.cpp:1019-1027, 1042-1047):
+  1. stageBegin() sets sgPumpOn=false, sgT0=millis(), and if isAC, calls pcfOn(OUT_INVERTER) --
+     inverter energizes immediately, pump does NOT.
+  2. stagePoll()'s first branch: if (!sgPumpOn) { if (millis()-sgT0 >= (sgIsAC ?
+     INVERTER_WARMUP_MS : VALVE_SWITCH_MS)) { attachFlow(sgFlow); pcfOn(sgPump); sgPumpOn=true;
+     sgT0=millis(); } return 0; } -- the pump relay only energizes after the full warmup elapses.
+This is identical for the transfer pump (SEQ_FILL) and booster pump (SEQ_DELIVER) -- both wait the
+same fixed delay after their own stage begins, regardless of whether the inverter was already on
+from a prior stage.
+
+8. CURRENT INVERTER_WARMUP_MS VALUE
+5000 (ESP2/src/main.cpp:166) -- confirmed, the already-approved change from 2000, still in place
+and already built (see Status reconfirmation above).
+
+9. CAN FIRMWARE COMMAND THE INVERTER OFF BETWEEN TRANSFER AND BOOSTER?
+THE CAPABILITY EXISTS (pcfOff(OUT_INVERTER) is a real, working function, used in several places
+above) BUT IT IS NOT EXERCISED AT THAT SPECIFIC TRANSITION FOR A PLAIN IRRIGATION RUN. Traced
+precisely: SEQ_FILL's completion (line 1182) calls endMeteredStage() (which calls stageEnd() ->
+pcfOff(sgPump), i.e. the TRANSFER PUMP, not the inverter) and then explicitly
+pcfOff(OUT_RES_VALVE), then goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER). For an IRRIGATION-ONLY
+run (the common case, and what "Transfer alone"/"Booster alone"/"Full Force Run" tests would most
+likely exercise), this goes straight to SEQ_DELIVER -- THE INVERTER IS NEVER TURNED OFF IN BETWEEN;
+IT STAYS CONTINUOUSLY ENERGIZED FROM THE START OF FILL THROUGH THE END OF DELIVER. Only for a
+FERTIGATION run does the inverter get toggled off (at SEQ_DOSE entry) and back on (at SEQ_MIX
+entry) before reaching Deliver -- and even then, that's the dosing stage's requirement (DC pumps),
+not something tied to the transfer-to-booster transition itself.
+
+10. COULD FIRMWARE LEAVE THE INVERTER ON UNEXPECTEDLY?
+No firmware path was found that fails to eventually turn the inverter off: every terminal state --
+finishOk(), holdFault() (any fault including PWR_FAIL), emergency stop, and the boot-time safety
+init -- routes through stopAll(), which unconditionally sets every bit including the inverter to
+OFF alongside dropping the master cutoff (P17). No inverter-on code path was found that lacks a
+corresponding off path. (This addresses the FIRMWARE'S OWN behavior only -- see the explicit
+hardware caveat below for what firmware cannot see or control.)
+
+
+DIRECT ANSWERS TO THE REPORT'S NUMBERED ITEMS
+==============================================
+
+1. CONFIRMED BY FIRMWARE: OUT_INVERTER = PCF8575 bit 5, active-low, with a complete, traced set of
+   ON/OFF sites (all above) and no path that leaves it stuck on.
+2. CONFIRMED BY FIRMWARE: Force Run's inverter behavior is identical to a scheduled run -- no
+   separate logic exists.
+3. CONFIRMED BY FIRMWARE: transfer and booster remain strictly sequential -- this investigation
+   found nothing that changes the sequential-pump conclusion from the prior Force Run trace.
+   sgPump/step remain single-valued; the inverter being continuously on across both stages does not
+   imply the PUMPS overlap -- only one of OUT_TRANSFER/OUT_BOOSTER is ever the active sgPump at a
+   time, per the previously-traced state machine.
+4. CONFIRMED BY FIRMWARE, IMPORTANT NUANCE: the inverter is NOT commanded off between transfer and
+   booster in the common (irrigation-only) case -- it stays on continuously across both. This is a
+   normal, intentional design (both stages need AC power back-to-back), not a bug -- but it is
+   directly relevant to the hardware hypothesis below.
+5. PLAUSIBLE HARDWARE HYPOTHESIS, NOT CONFIRMED: whether a physical manual inverter switch left ON
+   interacts with ESP2's P5 relay in a way that affects the voltage PZEM measures cannot be
+   confirmed from source. What IS confirmed is only the PWR_FAIL trigger condition itself (from the
+   prior investigation, re-cited here unchanged): PZEM-measured AC voltage <215.0V or >240.0V while
+   sgPumpOn && sgIsAC (ESP2/src/main.cpp:189, checked every 500ms). This check is agnostic to WHY
+   the voltage is out of range -- it would fire identically whether the cause is a weak inverter,
+   mains sag under pump inrush, or an unusual interaction between a manual switch and the relay.
+   THE FIRMWARE CANNOT DISTINGUISH THESE FROM EACH OTHER; ONLY PHYSICAL MEASUREMENT CAN.
+6. CANNOT BE DETERMINED WITHOUT PHYSICAL INSPECTION -- searched exhaustively, found nothing: a
+   full-project search (every .cpp/.h file and every .md document) for any description of a
+   physical inverter switch, its relationship to OUT_INVERTER/P5, or exactly where the PZEM
+   module's voltage/current sensing leads are physically connected relative to the inverter or a
+   manual switch, returned NO RESULTS WHATSOEVER. The only relevant lines that exist are the bit's
+   own one-line comment ("inverter relay (AC source)") and PZEM's generic description ("AC
+   mains/inverter supply voltage feeding the pump circuit") -- neither says where in the circuit,
+   relative to a manual switch, the measurement or the relay's contacts actually sit. NO WIRING
+   INFORMATION HAS BEEN INVENTED; this is a genuine, confirmed gap in the available source and
+   documentation, not an oversight in this investigation.
+7. Directly answered in item 6 above: NO, the source does not contain enough information.
+8. WHAT MUST BE PHYSICALLY CHECKED AT THE SITE (matches and slightly extends the user's own stated
+   test plan): with the manual switch OFF, confirm ESP2's relay alone can start the inverter;
+   separately, with the manual switch ON, observe whether ESP2's relay cycling has any effect at
+   all (a symptom of the switch and relay being in parallel/either-can-drive) or whether the relay
+   is the sole control (switch acting only as an upstream enable in series); watch the PZEM voltage
+   reading specifically during the transfer-to-booster transition (where the inverter firmware
+   confirms it stays continuously on) versus during initial inverter warm-up (where a weak/marginal
+   inverter would be expected to sag hardest, per the prior Force Run investigation); confirm which
+   side of the inverter (input/output) and which side of the manual switch the PZEM's sensing leads
+   are actually attached to, since this determines what a voltage excursion would even mean.
+9. THE 5-SECOND WARM-UP IS A REASONABLE TEST CHANGE: it gives the inverter strictly more time to
+   reach stable output before load is applied, which only ever helps (not hurts) a
+   voltage-stability concern, and it does not alter any safety threshold, gate, or the sequence
+   itself -- consistent with the already-approved, already-built change.
+10. Classification recap, as requested:
+    - CONFIRMED BY FIRMWARE: exact GPIO/bit/polarity, every ON/OFF site, that Force Run uses the
+      identical sequence as a scheduled run, that transfer/booster stay sequential, that the
+      inverter is not toggled off between them in the common case, and the exact PWR_FAIL trigger
+      condition (unchanged from the prior trace).
+    - PLAUSIBLE HARDWARE HYPOTHESIS: that a manual switch left on, interacting with ESP2's relay in
+      some way, could contribute to a voltage reading PZEM interprets as PWR_FAIL. Nothing in the
+      firmware confirms or refutes this specifically.
+    - CANNOT BE DETERMINED WITHOUT PHYSICAL INSPECTION: the actual wiring topology (series vs.
+      parallel, which side is switched, where PZEM's leads attach) -- genuinely absent from source
+      and documentation, not guessed at here.
+
+
+WHAT WAS NOT DONE, PER EXPLICIT INSTRUCTION
+============================================
+No code was modified. No new "fix" was created for the inverter hypothesis. FLOW_FAIL, PWR_FAIL
+thresholds, PZEM safety logic, emergency stop, actuator cutoff, relay mapping, the
+transfer/booster interlock, Nano firmware, battery-sensing code/config, and the pump sequence were
+all read (where relevant to tracing the above) but none were changed. Nothing was built. Nothing
+was flashed.
+
+
+HOW TO VERIFY
+--------------
+ESP2/src/main.cpp:113 (bit definition), :569-570 (polarity), :280-283 (combo arrays), :1019-1047
+(generic AC-stage warmup), :1155-1185 (SEQ_FILL), :1230-1246 (SEQ_MIX), :1187-1227 (SEQ_DOSE),
+:1277-1300 (SEQ_DELIVER), :187-190 (PZEM thresholds, unchanged), :166 (INVERTER_WARMUP_MS,
+unchanged). ESP1/src/main.cpp:727 (colMode[20], unchanged).

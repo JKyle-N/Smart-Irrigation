@@ -1,0 +1,198 @@
+DIAGNOSIS: HELD -- PWR_FAIL VOLTAGE (read-only trace)
+================================================================================
+
+CONTEXT
+-------
+This is a focused, read-only follow-up to the 2026-09-07 post-flash diagnosis (that full report is
+saved separately as Diagnostic_Report_2026-09-07.txt in this same folder). The user observed
+"HELD: PWR_FAIL VOLTAGE" on the physical LCD during a Force Run attempt and wanted PWR_FAIL_VOLTAGE
+traced completely through the CURRENT ESP1 and ESP2 source, specifically to determine whether it is
+connected to the battery-voltage ADC (which is not physically installed, with
+BATTERY_SAFETY_ENABLED=0) or to something else entirely. Nothing has been modified -- this is
+diagnosis only, per explicit instruction.
+
+
+TRACE, STEP BY STEP, WITH EXACT FILE:LINE CITATIONS
+----------------------------------------------------
+
+1/2/3/4. EXACT FUNCTION, VARIABLE, MEASUREMENT TYPE, AND THRESHOLD -- all in safetyMonitor() on ESP2:
+
+  ESP2/src/main.cpp:187-190:
+  const float PZEM_MIN_CURRENT_A = 0.5f;
+  const float PZEM_OVERCURRENT_A = 3.0f;
+  const float PZEM_V_MIN = 215.0f, PZEM_V_MAX = 240.0f;
+  const unsigned long PZEM_NO_CURRENT_MS = 30000;
+
+  ESP2/src/main.cpp:1353-1404 (safetyMonitor()):
+  void safetyMonitor() {
+    // PZEM validation only while an AC pump is actively running
+    if (step == SEQ_NONE || !sgPumpOn || !sgIsAC) { acNoCurrentSince = 0; return; }
+    if (millis() - lastPzemMs < PZEM_POLL_MS) return;   // throttled to every 500ms
+    lastPzemMs = millis();
+    float v = pzem.voltage();
+    float i = pzem.current();
+    ...
+    if (i > PZEM_OVERCURRENT_A) { ...; holdFault("PWR_FAIL", "OVERCURRENT|i=...");  return; }
+    if (v < PZEM_V_MIN)         { ...; holdFault("PWR_FAIL", "VOLTAGE|v=%.1f|LOW"); return; }
+    if (v > PZEM_V_MAX)         { ...; holdFault("PWR_FAIL", "VOLTAGE|v=%.1f|HIGH");return; }
+    if (i < PZEM_MIN_CURRENT_A) { ... after 30s ...; holdFault("PWR_FAIL", "NO_CURRENT|i=..."); }
+  }
+
+  "v" and "i" come from pzem.voltage()/pzem.current() -- the PZEM-004T AC ENERGY-METER MODULE,
+  wired on ESP2's hardware UART1 (PZEM_TX_PIN=13/PZEM_RX_PIN=14). This measures AC MAINS/INVERTER
+  SUPPLY VOLTAGE feeding the pump circuit -- an entirely separate sensor, on an entirely separate
+  chip, from ESP1's DC battery-voltage ADC.
+
+  EXACT THRESHOLD: 215.0 V to 240.0 V. Below 215.0 -> "VOLTAGE|v=<reading>|LOW"; above 240.0 ->
+  "VOLTAGE|v=<reading>|HIGH". This is unambiguously an AC MAINS VOLTAGE WINDOW (matches
+  Operator_Manual.md's documented PWR_FAIL: "Power fault on an AC pump... mains voltage out of
+  range") -- nothing like a 10-15V DC battery scale.
+
+5. EXACT HELD CONDITIONS: the check only runs at all while step != SEQ_NONE && sgPumpOn && sgIsAC
+   -- i.e. ONLY WHILE AN AC-POWERED PUMP (transfer, booster, or mixer) IS ACTIVELY ENERGIZED as part
+   of a metered stage. The moment v/i breaches its window, holdFault("PWR_FAIL", loc)
+   (ESP2/src/main.cpp:1090-1104) runs: it ends the metered stage (crediting partial liters already
+   moved), calls stopAll() (de-energizes the ENTIRE actuator bank via the master cutoff, not just
+   the one pump), sets faultHeld=true on ESP2 (holds the mixing-tank volume, stays alive awaiting
+   recovery), and replies "PWR_FAIL,<loc>" to ESP1 over UART.
+
+   ESP1 receives it generically, alongside every other hard fault type:
+     ESP1/src/main.cpp:2742-2743:
+     } else if (resp == "PWR_FAIL") {
+       enterFaultHold("PWR_FAIL", arg.c_str());
+
+   enterFaultHold() (ESP1/src/main.cpp:7400-7430) sets esp2Held=true, builds
+   lastFaultMsg = "PWR_FAIL VOLTAGE|v=<x>|LOW COL_<x>" (or similar), logs it, sends an SMS alert
+   with the STOP/RELEASE/IRRIGATE/NORMAL recovery menu, and opens the LCD fault screen -- this is
+   what renders as "HELD: PWR_FAIL VOLTAGE" (the LCD display simply doesn't have room to also show
+   the v=.../LOW detail on the header line; it is still present in the underlying message).
+
+6. CAN THE MISSING BATTERY-VOLTAGE SENSOR TRIGGER THIS? NO -- confirmed by exhaustive search.
+   A full-file, case-insensitive grep of ESP1/src/main.cpp for every occurrence of "pzem" turns up
+   exactly 5 hits, none of which touch battery code: the diagnostic-ID list (:877), the TELE
+   SD-logging handler (:2531-2532), two comments (:2754, :7883), and the LCD diagnostic-screen case
+   label (:8067). Separately, ESP2/src/main.cpp has ZERO battery-related code at all (confirmed in
+   the prior investigation) -- ESP2 doesn't even know what a battery is. The battery ADC path
+   (calBattV/readAdcTrimmed(PIN_BATT_V) on ESP1, GPIO35) and the PZEM AC-voltage path
+   (pzem.voltage() on ESP2) are TWO COMPLETELY INDEPENDENT MEASUREMENT SYSTEMS ON TWO DIFFERENT
+   CHIPS, feeding two different fault families. There is no code path by which an uncalibrated or
+   absent battery sensor could produce a PWR_FAIL of any kind -- PWR_FAIL doesn't exist anywhere in
+   ESP1's own logic; ESP1 only RELAYS AND DISPLAYS whatever ESP2 sends it (confirmed: the only two
+   PWR_FAIL occurrences in the whole of ESP1/src/main.cpp are the enterFaultHold dispatch line and
+   its neighboring FLOW_FAIL/ESP2_ERROR siblings -- no independent generation).
+
+7. ESP1 OR ESP2? BOTH, in clearly separated roles. DETECTION AND MEASUREMENT: ESP2
+   (safetyMonitor(), reading the PZEM module directly). DISPLAY, LOGGING, SMS ALERT, FIREBASE
+   PUBLISH, AND RECOVERY-MENU HANDLING: ESP1 (enterFaultHold()), exactly mirroring how FLOW_FAIL is
+   split between the two controllers.
+
+8. IS THE FAULT LEGITIMATE GIVEN CURRENT HARDWARE? YES -- this is working as designed, and it is
+   entirely unrelated to the not-yet-installed battery sensor. If it fired, the PZEM module on ESP2
+   detected the AC supply voltage genuinely outside 215-240V (or a current anomaly) while an AC
+   pump was running. This needs a hardware/electrical explanation (see below), not a firmware
+   explanation.
+
+9. RESOLVABLE WITHOUT REFLASHING? Yes, in the sense that nothing needs to change in firmware -- the
+   fault is behaving correctly. The underlying AC supply issue, if real, needs a physical fix, not
+   a code fix.
+
+10. CAN THE WEBSITE SAFELY CLEAR IT? Yes, mechanically -- but "clear" only makes sense once the
+    underlying voltage problem is actually gone. The existing RECOVER Firebase command
+    (ESP1/src/main.cpp:6257-6266) calls the exact same issueRecovery(sel) function (:7481-7514) the
+    LCD menu and SMS use -- same code path, same server-side approval gating, nothing
+    PWR_FAIL-specific is missing. Choosing NORMAL sends RESUME,NORMAL to ESP2, which re-energizes
+    and re-attempts the paused stage -- which will immediately re-trip safetyMonitor() again if the
+    AC voltage is still out of range. (Note: unlike FLOW_FAIL, PWR_FAIL does NOT get the flow-blind
+    "resume on a timer" fallback -- that's gated on lastHoldFlow, which holdFault() only sets true
+    for resp=="FLOW_FAIL", confirmed at ESP2/src/main.cpp:1091,1098.) So the website's RECOVER
+    button is safe to use, but choosing NORMAL before the voltage is actually fixed will just
+    reproduce the same hold a few seconds later.
+
+11. IS THIS STALE FIREBASE STATE? Unlikely, and checkable. The published dg["fault"] object
+    (ESP1/src/main.cpp:5706-5722) carries held, code, at (timestamp), lastClearReason, and -- while
+    held -- repeats/steerRelease/autoCancelAt/a recovery options array, refreshed on ESP1's normal
+    telemetry cadence, explicitly designed so "the dashboard... offers exactly the choices the LCD
+    menu does" (comment at :5704-5705). Check diagnostics.fault.at against the current time and
+    diagnostics.fault.held against the LCD's live state to rule out staleness in any specific
+    instance -- the mechanism itself is not a stale/cached snapshot, it's the same live struct the
+    LCD reads.
+
+12. RELATED TO THE PREVIOUS FLOW_FAIL_TRANSFER? Not directly -- they are independent checks that
+    happen to both gate the same class of AC-pump-driven stage. FLOW_FAIL is about zero flow-meter
+    pulses; PWR_FAIL VOLTAGE is about AC supply voltage -- different sensors (flow pulse counter vs.
+    PZEM), different physical cause. However, IF THIS PWR_FAIL VOLTAGE HAPPENED DURING THE SAME
+    TRANSFER/FILL STAGE investigated in the prior report, it is worth checking whether they are
+    symptoms of a common upstream cause -- e.g., a sagging/undersized inverter or AC supply under
+    load could plausibly cause a pump to run weakly (contributing to a flow fault on one attempt)
+    and also sag the measured mains voltage below 215V on another (triggering this fault) -- that
+    would be a hardware hypothesis to test (see checks below), not something confirmed by the code
+    alone.
+
+13. CAN PWR_FAIL_VOLTAGE SAFELY COEXIST WITH BATTERY_SAFETY_ENABLED=0? Yes, cleanly -- they are
+    unrelated subsystems. BATTERY_SAFETY_ENABLED (ESP1/src/main.cpp:83) only guards ESP1's
+    DC-battery-triggered run-blocking code (#if BATTERY_SAFETY_ENABLED around
+    batteryCritical/batteryLow checks in controlTick()/exerciseTick()) -- entirely separate from
+    ESP2's safetyMonitor()/PZEM AC-voltage protection, which has no enable flag at all (it is
+    always active whenever an AC pump runs) and was not touched by that define. Disabling
+    DC-battery safety has zero effect on AC-mains PWR_FAIL protection remaining fully active -- this
+    is correct, expected, and should not be changed.
+
+
+PZEM/POWER-MONITORING VALUES ASSOCIATED WITH THE FAULT
+-------------------------------------------------------
+- THE EXACT TRIGGERING READING IS ALREADY EMBEDDED IN THE FAULT DETAIL ITSELF -- e.g.
+  "VOLTAGE|v=210.5|LOW" -- which flows all the way to Firebase via diagnostics.fault.code
+  (t.lastFault). No extra lookup is needed to know what voltage tripped it.
+- LIVE PZEM V/I/P OUTSIDE OF A FAULT: confirmed via an exhaustive grep (5 total hits of "pzem" in
+  all of ESP1/src/main.cpp) that PZEM readings are NOT part of the continuous Firebase
+  live-telemetry snapshot. They are only (a) logged verbatim to the SD card during any AC-pump run
+  (TELE,PZEM,<v>,<i>,<p>,ACS,<a> -> logEvent("ESP2","SENSOR",...), :2531-2534), or (b) viewable
+  on-demand on the LCD's Sensor Diagnostics screen by requesting the PZEM_V/PZEM_I/PZEM_P
+  calibration-stream IDs (DIAG_ESP2_ID[], :877; rendered at :8067). THE WEBSITE CURRENTLY HAS NO
+  LIVE AC-VOLTAGE/CURRENT GAUGE -- only what's inside a fault's own message when one fires, or
+  what's in a downloaded SD log.
+
+
+SUMMARY BLOCK (AS REQUESTED)
+------------------------------
+
+PWR_FAIL_VOLTAGE SOURCE:        ESP2 (safetyMonitor(), ESP2/src/main.cpp:1353-1404), via the
+                                 PZEM-004T AC energy meter; relayed to and displayed by ESP1
+                                 (enterFaultHold(), ESP1/src/main.cpp:7400-7430).
+
+TRIGGER CONDITION:               An AC pump (transfer/booster/mixer) is actively running AND the
+                                 PZEM-measured AC MAINS voltage is <215.0V or >240.0V
+                                 (ESP2/src/main.cpp:189, checked every 500ms while sgPumpOn&&sgIsAC).
+
+MEASUREMENT SOURCE:              PZEM-004T AC energy-meter module on ESP2 (AC mains/inverter supply
+                                 voltage) -- NOT the DC battery-voltage ADC (GPIO35/opto) on ESP1.
+                                 Confirmed unrelated to the missing battery sensor.
+
+SAFE WEBSITE-ONLY FIX:           N/A to "fix" -- nothing is broken. YES, the website can safely use
+                                 the existing RECOVER command to clear a held instance (same path as
+                                 LCD/SMS), but doing so before the AC voltage is actually back in
+                                 range will just re-trigger the hold.
+
+FIRMWARE CHANGE REQUIRED:        NO. The fault, threshold, and logic are correct and should not be
+                                 changed, weakened, or bypassed.
+
+HARDWARE CHECK REQUIRED:         YES. Inspect the AC power path feeding the pump circuit:
+                                   1. Actual mains/inverter output voltage under load (measure with a
+                                      meter while a pump is commanded to run) -- confirm it's really
+                                      outside 215-240V, and whether it sags specifically when a pump
+                                      starts (inrush) vs. is out of range even at idle.
+                                   2. Inverter sizing/capacity vs. pump inrush current.
+                                   3. PZEM-004T module wiring/CT clamp orientation and connections
+                                      (a miswired/loose PZEM can itself misreport voltage).
+                                   4. Whether this coincides with the same run/stage as the prior
+                                      FLOW_FAIL_TRANSFER finding -- if so, a common AC-supply
+                                      weakness affecting the transfer pump is a reasonable hypothesis
+                                      to test physically.
+
+
+HOW TO VERIFY
+--------------
+Every citation is file:line against the current working tree. Key ones to check directly:
+ESP2/src/main.cpp:187-190 (thresholds), :1353-1404 (safetyMonitor()), :1090-1104 (holdFault());
+ESP1/src/main.cpp:2742-2743 (dispatch), :7400-7430 (enterFaultHold()), :6257-6266 (the RECOVER
+Firebase command), :5706-5722 (the published fault diagnostics object).

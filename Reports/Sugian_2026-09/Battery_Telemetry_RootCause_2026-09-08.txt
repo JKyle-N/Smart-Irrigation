@@ -1,0 +1,279 @@
+ROOT-CAUSE SCAN: BATTERY VOLTAGE/CURRENT TELEMETRY (READ-ONLY)
+================================================================================
+Date: 2026-09-08
+Status: INVESTIGATION ONLY. No source code, calibration, hardware config, or Firebase rules were
+modified. Nothing was built. Nothing was flashed.
+
+
+CONTEXT
+-------
+The website shows battery voltage/current as unavailable or unusable. The user has now confirmed a
+physical battery sensor IS installed (superseding earlier "not installed" context) and requested a
+fresh, source-level, read-only trace of the complete path: physical sensor -> ESP1 ADC/I2C ->
+conversion -> calibration -> safety gates -> telemetry -> Firebase -> website.
+
+PATH NOTE: the instruction referenced C:\Users\sugia\..., which does not exist on this machine
+(same discrepancy as prior sessions). All work below is against
+C:\Users\johnm\Documents\RESAERCH PROJECT CAP2_v2.0\Smart-Irrigation-main, the path this entire
+session has used.
+
+HEADLINE FINDING, STATED UP FRONT: this is now fully root-caused. A single dead boolean flag
+(inaOk, a leftover from the removed INA226 chip) permanently gates off the battery
+voltage/current/percent fields from ever being published to Firebase -- regardless of whether the
+physical sensor and its ADC/I2C reading code are working correctly. Confirmed by exhaustive search:
+inaOk appears in exactly two places in the entire 8900+ line file -- its false initializer and the
+one place that reads it -- and is NEVER reassigned anywhere.
+
+
+A. PHYSICAL SENSOR
+------------------
+Two physically distinct sensors, for two different quantities, both real and both actively coded:
+
+- VOLTAGE: an analog signal through an optocoupler, into ESP32 ADC1, GPIO35
+  (#define PIN_BATT_V 35, ESP1/src/main.cpp:75, comment: "battery VOLTAGE via opto -> ADC1
+  (nonlinear; polynomial-calibrated)"). No specific opto part number is named in this source file
+  (the PS817 part number appears in a separate design doc from earlier in this project, not here).
+- CURRENT: an ACS758 Hall-effect current sensor, whose analog output feeds an external ADS1115 I2C
+  ADC module (NOT the ESP32's own ADC) -- #define ACS_ADDR 0x48 (ADS1115 address, tied to GND;
+  comment confirms no clash with LCD 0x27/EEPROM 0x57/RTC 0x68, line 214), #define ACS_CHANNEL 0
+  ("ACS758 output on A0; A1..A3 unused", line 215).
+- #define PIN_BATT_I 34 (line 74) still exists and is still configured
+  (analogSetPinAttenuation(PIN_BATT_I, ADC_11db), line 1619) but is NO LONGER READ ANYWHERE --
+  confirmed by tracing readBatteryAdc() (below), which only calls readAdcTrimmed(PIN_BATT_V), never
+  PIN_BATT_I. Matches the file's own comment: "Current now comes from the ACS758 via the ADS1115,
+  NOT the opto ADC on GPIO34 (which read 0.00 A on every sample for 16 days)" (lines 4885-4886).
+  GPIO34/PIN_BATT_I is a stale, vestigial definition -- harmless, but an example of the same
+  "comment/name disagrees with code" pattern that produced the main bug (see G).
+
+
+B. ESP1 READING
+----------------
+VOLTAGE PATH (ESP1/src/main.cpp:4883-4884, readBatteryAdc()):
+  battV = (float)applyPoly(calBattV, readAdcTrimmed(PIN_BATT_V));
+
+  - readAdcTrimmed(pin) (lines 4811-4819): takes 64 samples of analogRead(pin) 150us apart, sorts
+    them, discards the 8 highest and 8 lowest, averages the middle 48. A real, reasonable
+    noise-rejection technique -- not a placeholder.
+  - applyPoly(cal, raw) (lines 4821-4825): evaluates v = a0 + a1*u + a2*u^2 + a3*u^3, u = raw/4095,
+    against whatever calBattV currently holds (see F).
+  - NO VALIDITY/RANGE CHECK EXISTS ON THE VOLTAGE ADC VALUE ITSELF. battV is unconditionally
+    computed from whatever the pin reads, every single call -- there is no "is this raw value
+    plausible" test, no floating-pin detection. See G/L for why this matters.
+
+CURRENT PATH (lines 4886-4896): fundamentally different mechanism -- I2C, not analog:
+  - acsConfigure() (lines 4850-4864) programs the ADS1115 into continuous-conversion mode once.
+  - acsReadVolts(float &v) (lines 4868-4881) reads the latest 2-byte conversion result over I2C.
+    EXPLICITLY RETURNS FALSE ON ANY I2C FAILURE -- comment: "Returns false on any I2C fault, so a
+    missing or unpowered ADC surfaces as a fault flag rather than a plausible-looking 0 A"
+    (line 4867). This is a correctly-designed fault-detection path, unlike the voltage side.
+  - In readBatteryAdc(): acsOk = acsReadVolts(vAdc); if (acsOk) { battIsigned = (vAdc*ACS_DIV -
+    ACS_ZERO_V)/ACS_SENS_V_PER_A; battI = fabsf(battIsigned); } -- IF acsOk IS FALSE, battI IS
+    SIMPLY LEFT AT WHATEVER IT LAST WAS (its global initializer is 0, ESP1/src/main.cpp:1040:
+    float battV = 0, battI = 0, battP = 0;), not marked invalid in any way at this point.
+  - battP = battV * battI; runs UNCONDITIONALLY, every call, even when acsOk is false -- mixing a
+    fresh battV with a possibly-stale-or-never-set battI.
+
+CADENCE: powerTick() (lines 4911-4917) rate-limits to INA_READ_INTERVAL_MS (name is a leftover from
+the removed INA226, functionally harmless) and calls readBatteryAdc() every interval, called from
+the main loop() (line 1717, comment still literally says "INA226 I2C read" -- another stale
+comment, harmless in itself but symptomatic of an incomplete rename/removal throughout this area).
+
+
+C. BATTERY VOLTAGE -- exact reason it is unavailable
+-----------------------------------------------------
+CONFIRMED ROOT CAUSE, NOT A HYPOTHESIS. The publish site (ESP1/src/main.cpp:5631-5636, inside
+firebaseUploadLive()):
+
+  if (t.inaValid) {
+    sensors["batteryVoltage"] = t.battV;
+    ...
+    sensors["batteryPercent"] = (int)(pct + 0.5f);
+    sensors["batteryCurrent"] = t.battI;
+  }
+
+t.inaValid is set at line 5174: telem.inaValid = inaOk;. inaOk is declared
+"bool ... inaOk = false;" at line 388 and IS NEVER ASSIGNED ANY OTHER VALUE ANYWHERE IN THE FILE --
+confirmed by an exhaustive regex search for every assignment to it (only the declaration matches).
+Therefore t.inaValid is ALWAYS FALSE, this if block NEVER EXECUTES, and sensors.batteryVoltage
+(along with batteryPercent and this copy of batteryCurrent) is NEVER ADDED TO THE PUBLISHED JSON AT
+ALL -- not null, not 0, genuinely absent as a key -- regardless of whether battV itself (computed
+just above, unconditionally, every tick) is a correct reading.
+
+This is a leftover from the INA226 removal: inaOk was very likely set inside the old INA226
+init/probe code, which was deleted when the sensor was replaced by the ADC/opto approach -- but the
+declaration and this one downstream read were never updated to reflect that removal. CLAUDE.md
+ITSELF (this project's own locked-architecture doc) STATES "INA226 code (include, object, init,
+inaOk) is removed" -- THAT CLAIM IS STALE relative to the actual current source; inaOk is
+demonstrably still present and still wired into the live telemetry path.
+
+
+D. BATTERY CURRENT -- exact reason it is unavailable/inconsistent
+--------------------------------------------------------------------
+More nuanced than voltage -- there are TWO SEPARATE, INDEPENDENT publish sites:
+
+1. sensors.batteryCurrent (line 5636, inside the same if (t.inaValid) block as voltage) -- blocked
+   for the exact same reason as C. Always absent.
+2. diagnostics.power.batteryCurrent and diagnostics.power.batteryPower -- a COMPLETELY DIFFERENT,
+   UNCONDITIONAL block (dpw["batteryCurrent"] = t.battI; dpw["batteryPower"] = t.battP;) that is
+   NOT gated by inaValid at all. This one DOES reach Firebase, using the real, live
+   t.battI/t.battP values, and the website's Diagnostics tab does read it (script.js:1004:
+   d.power?.batteryCurrent, d.power?.batteryPower).
+
+So: current is PARTIALLY AVAILABLE -- via Diagnostics, not via the main sensor card -- and only
+meaningfully so if the ADS1115 is actually being detected on I2C (acsOk true at least once). IF THE
+ADS1115 IS NOT RESPONDING AT ALL, battI/battP STAY AT THEIR BOOT-TIME 0 FOREVER, AND THIS UNGATED
+PATH WILL DISPLAY A PLAUSIBLE-LOOKING "0.00 A" / "0.0 W" RATHER THAN ANY "UNAVAILABLE" INDICATION --
+this specific path has no protection against the "plausible but wrong" failure mode (see the
+firmware-fix section). This cannot be resolved from source alone; it requires checking the live
+diagnostics.peripherals.batterySensorOk value against whether the ADS1115 hardware is actually
+wired/powered.
+
+Voltage has NO EQUIVALENT SECONDARY PATH -- battV is never published anywhere outside the gated
+sensors block, so voltage is unconditionally and completely unavailable everywhere on the site
+today, while current is unavailable on the main card but may be visible (correctly, or as a
+misleading zero) in Diagnostics.
+
+
+E. TELEMETRY -- Firebase fields and website reads (verified matching, no name mismatch)
+-------------------------------------------------------------------------------------------
+  Firebase field                              ESP1 publish site      Gated by                Website read
+  sensors.batteryVoltage                      main.cpp:5632           t.inaValid (always false) script.js:891
+  sensors.batteryPercent                      main.cpp:5637           t.inaValid (always false) script.js:892
+  sensors.batteryCurrent                      main.cpp:5638           t.inaValid (always false) script.js:893
+  diagnostics.power.batteryCurrent            main.cpp (dpw block)    none (unconditional)      script.js:1004
+  diagnostics.power.batteryPower              main.cpp (dpw block)    none (unconditional)      script.js:1004
+  diagnostics.power.batteryLow/Critical       main.cpp (dpw block)    none (unconditional)      script.js:1004
+  diagnostics.peripherals.batterySensorOk     main.cpp:5707 (t.acsOk_) none (unconditional)      script.js:1002
+
+NO FIELD-NAME MISMATCH EXISTS ANYWHERE -- every field the website reads is spelled exactly as ESP1
+publishes it. The website's numberText()/hasValue() helpers correctly report "Unavailable" for a
+genuinely-absent key, exactly as designed -- THIS IS NOT A WEBSITE BUG. The problem is 100%
+upstream, in what ESP1 chooses to publish.
+
+batterySensorOk (the one diagnostic that IS live) reflects ONLY acsOk -- the CURRENT sensor's I2C
+health -- confirmed by telem.acsOk_ = acsOk; (line 5184) and dpe["batterySensorOk"] = t.acsOk_;
+(line 5707). It says nothing whatsoever about the voltage ADC path. THIS MEANS THE WEBSITE CAN
+GENUINELY SHOW "BATTERY SENSOR: OK" WHILE SIMULTANEOUSLY SHOWING "BATTERY VOLTAGE: UNAVAILABLE" AT
+THE SAME TIME -- not a contradiction in the data, but a confusing pairing, now fully explained: one
+is a live current-sensor health flag, the other is gated by an unrelated dead flag.
+
+
+F. CALIBRATION
+---------------
+Two independent calibration concepts, neither of which is the cause of C/D, but both relevant to
+correctness IF the gate above were fixed:
+
+- battCalLoaded (bool, global) -- set true inside loadBattCal() (lines 4827-4839) ONLY IF NVS
+  namespace "adccal" contains a validly-tagged calibration record (magic number 0xADC0CA11, degree
+  1-3) for voltage and/or current independently. If NVS has nothing, calBattV/calBattI keep their
+  hardcoded default polynomials. BATTCALLOADED IS NEVER READ ANYWHERE EXCEPT ONE BOOT-TIME
+  Serial.printf (line 4839) -- it does not gate telemetry, does not gate display, and is not
+  published to Firebase. Whether real calibration was ever performed is therefore currently
+  invisible to the website even if the gate in C were fixed.
+- inaOk/inaValid (this report's main finding) is a COMPLETELY SEPARATE, UNRELATED flag -- not a
+  calibration-validity flag at all, despite superficially looking like a "sensor OK" check. It
+  never reflects anything about the actual opto-ADC or ADS1115 hardware.
+
+
+G. HARDWARE/FIRMWARE MISMATCH
+------------------------------
+- PIN_BATT_I/GPIO34 is defined and still has its ADC attenuation configured, but is NO LONGER READ
+  by any function -- the comment on its own definition line (74, "battery CURRENT via opto")
+  describes a design that was superseded by the ADS1115/ACS758 approach. Harmless (nothing depends
+  on it), but a real code/comment mismatch matching what was asked to check for.
+- powerTick()'s rate-limit variable name (INA_READ_INTERVAL_MS), the loop() call-site comment
+  ("INA226 I2C read", line 1717), and readBatteryAdc()'s own header block ("POWER (INA226 battery
+  monitoring...)", line 4808) are all stale names/comments from before the INA226 removal --
+  cosmetic, but they are exactly the kind of leftover that makes an incomplete removal (like inaOk)
+  easy to miss on review.
+- No GPIO conflict found: GPIO34/35 are input-only ADC1 pins, confirmed not reused elsewhere for
+  another subsystem in this file.
+- CLAUDE.md (this project's own authoritative doc) is itself now factually wrong on this point --
+  see C. Worth correcting once a fix is made, so the next person doesn't trust the same stale claim.
+
+
+H. SAFETY
+----------
+BATTERY_SAFETY_ENABLED (#define ... 0, confirmed unchanged) gates a COMPLETELY SEPARATE code path
+-- batterySafetyTick()'s raiseFault() calls, and run-blocking checks inside
+controlTick()/exerciseTick() -- all #if BATTERY_SAFETY_ENABLED compiled out. THIS DEFINE HAS NO
+RELATIONSHIP TO THE TELEMETRY-AVAILABILITY BUG IN C/D. Even if the inaValid gate were fixed today,
+BATTERY_SAFETY_ENABLED would still need to independently be set to 1 for any battery-triggered
+stop/alert behaviour to compile in -- and per this project's own locked notes, that is a deliberate,
+separate decision, not an oversight. CONFIRMED: battery sensing today is telemetry/display-only and
+affects no safety or control logic regardless of this bug. Fixing the telemetry gate is a pure
+visibility fix with zero effect on irrigation/fertigation behaviour.
+
+
+I. ROOT CAUSE (ranked)
+------------------------
+1. CONFIRMED -- sensors.batteryVoltage/batteryPercent/batteryCurrent never publish because
+   t.inaValid (sourced from inaOk, a dead leftover from the removed INA226 code) is permanently
+   false. Proven by exhaustive search: inaOk is assigned exactly once in the entire file (its own
+   false initializer) and read exactly once (into telem.inaValid) -- no other code path can ever
+   make it true.
+2. CONFIRMED -- this is unrelated to whether the physical sensor works. battV/battI are computed by
+   real, live ADC/I2C reading code every tick, completely independently of inaOk.
+3. HIGHLY LIKELY (cannot be fully confirmed without live hardware access, which was not used per
+   instruction) -- even after fixing the gate, the VOLTAGE reading's correctness depends entirely
+   on calBattV actually holding a real calibration (see F) and GPIO35's physical connection being
+   intact; there is no automatic self-check for this on the voltage side the way there is for
+   current (acsOk/I2C ACK).
+4. POSSIBLE -- the ADS1115 may or may not currently be responding on the I2C bus; live
+   diagnostics.peripherals.batterySensorOk would answer this directly but was not queried (no
+   device access in this task).
+5. RULED OUT -- website field-name mismatch (table in E shows exact matches throughout).
+6. RULED OUT -- GPIO conflict with another subsystem.
+7. RULED OUT -- BATTERY_SAFETY_ENABLED causing the unavailability (it gates unrelated safety-action
+   code, not telemetry publishing).
+8. RULED OUT -- calibration-flag gating (battCalLoaded gates nothing; it is informational only and
+   isn't even the flag involved in the actual bug).
+
+
+J. REQUIRED FIX (NOT IMPLEMENTED -- description only, per instruction)
+--------------------------------------------------------------------------
+The minimal, precise fix is to stop gating sensors.batteryVoltage/batteryPercent/batteryCurrent on
+the dead inaValid/inaOk flag, and instead gate on something that actually reflects whether a real
+reading exists. Two reasonable options, in order of how much they change:
+
+- SMALLEST CHANGE: remove the if (t.inaValid) condition around the voltage/percent block entirely
+  (since the voltage ADC read has no independent validity signal of its own -- see C/G -- a bare
+  removal makes voltage always publish, which is honest about what the hardware can currently tell
+  us) and change the CURRENT's copy in that same block to instead check t.acsOk_ (the
+  already-correct, already-live flag) -- i.e., publish batteryCurrent/the percent-if-it-depends-on-
+  current only when acsOk_ is true, exactly mirroring what diagnostics.power already does correctly
+  today.
+- MORE COMPLETE: also stop publishing a battV-derived number at all when there is no signal that
+  the voltage path is genuinely connected/calibrated (e.g., gate on battCalLoaded for voltage
+  specifically, so an uncalibrated/disconnected opto input shows "Unavailable" instead of a bare
+  polynomial-of-noise number) -- this directly addresses the "plausible but wrong value" risk, at
+  the cost of requiring a real calibration pass before voltage ever displays anything.
+- Either way: remove or rename the now-dead inaOk/inaValid naming so a future reader isn't misled by
+  it again, and correct CLAUDE.md's claim that inaOk was removed.
+- Separately (lower priority, cosmetic): rename/remove the unused PIN_BATT_I/GPIO34 definition and
+  the stray "INA226" comments/names in powerTick()/loop()/readBatteryAdc()'s header, so the next
+  person tracing this path isn't misdirected the way this investigation initially could have been.
+
+NO CODE WAS CHANGED to arrive at this description, per instruction.
+
+
+K. CONFIDENCE
+---------------
+- Primary root cause (dead inaOk/inaValid gate blocking all of sensors.battery*): 99%. Based
+  entirely on direct source evidence -- an exhaustive assignment search leaves no ambiguity.
+- Current partially reaching Diagnostics via the ungated diagnostics.power path: 95% (verified by
+  reading both the publish and the website read site directly; the 5% reservation is only because
+  live behaviour of acsOk on the actual rig was not observed).
+- Whether the physical sensors themselves are correctly wired/calibrated right now: NOT ASSESSABLE
+  FROM SOURCE ALONE -- 0% claimed, by design, since this was a read-only, no-hardware-access
+  investigation. Item I.4 names exactly what live field would answer this
+  (diagnostics.peripherals.batterySensorOk) without needing any code change.
+
+
+HOW TO VERIFY
+--------------
+Every citation is file:line against the current working tree. Key ones to check directly:
+ESP1/src/main.cpp:388 (inaOk declaration), :5174 (telem.inaValid = inaOk), :5631-5638 (the gated
+publish block), :4883-4898 (readBatteryAdc()), :4850-4881 (ADS1115 config/read), :5707
+(batterySensorOk publish); Website/script.js:891-894 (main card reads), :1002,1004 (Diagnostics
+reads).

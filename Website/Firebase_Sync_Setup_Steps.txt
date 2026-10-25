@@ -1,0 +1,110 @@
+SMART IRRIGATION -- WEBSITE <-> FIREBASE <-> ESP1 SETUP STEPS
+================================================================
+Do these in order. Steps 2-4 happen on the DEVICE (via SMS or its own WiFi
+hotspot), not on this computer. Nothing here touches Firebase further --
+that part (deploying the database rules) is already done.
+
+
+STEP 1 -- UPLOAD
+----------------
+Flash ESP1/src/main.cpp to the ESP32 #1 board as usual (PlatformIO upload).
+Already verified it compiles clean (23.6% RAM / 40.8% Flash, matches the
+known-good baseline).
+
+
+STEP 2 -- WIFI  (skip if this board already has WiFi set up)
+----------------
+Text the device, from the OWNER phone number only:
+
+    WIFI,<your-ssid>,<your-password>
+
+    -- or, no typing on a phone keypad --
+
+    WIFIPORTAL
+
+  then on your phone: join WiFi "Irrig-Setup" (password irrigate123),
+  open 192.168.4.1, pick your network from the scanned list, enter the
+  password, press Save. It reconnects and enables the radio automatically.
+
+
+STEP 3 -- FIND THE DEVICE'S FIREBASE ACCOUNT  (check this BEFORE step 4)
+----------------
+Open: Firebase Console -> smart-irrigation-web2 -> Authentication -> Users
+
+Look for a user whose UID is exactly:
+
+    6hNg56ldAaSmpnodG1Xla0vn61O2
+
+  - If it EXISTS: that is the device account. Get/reset its password.
+    Use its email + password in Step 4.
+
+  - If it does NOT exist: create a new user (Add user) with any email
+    and password you want to dedicate to the device. Firebase will give
+    it a DIFFERENT auto-generated UID.
+    -> Before doing Step 4, tell Claude the new UID so
+       Website/firebase-rules.json can be updated to that UID and
+       redeployed. Skipping this means ESP1 will sign in fine, but
+       every write it makes will be silently rejected by the rules.
+
+
+STEP 4 -- CONNECT ESP1 TO FIREBASE  (pick ONE option)
+----------------
+OPTION A -- SoftAP portal (easiest, one form):
+    1. Text: WIFIPORTAL   (skip if the portal is already open from Step 2)
+    2. Phone -> join "Irrig-Setup" (irrigate123) -> browse to
+       192.168.4.1/admin
+    3. Enter the admin PIN (default 1234, unless changed)
+    4. In the Firebase section, fill in:
+
+         RTDB URL :  https://smart-irrigation-web2-default-rtdb.asia-southeast1.firebasedatabase.app
+         Enabled  :  [checked]
+         Device email    : _______________________  (from Step 3)
+         Device password : _______________________  (from Step 3)
+
+    5. Save.
+
+OPTION B -- SMS (owner phone number only). Send these THREE texts,
+in this exact order:
+
+    1)  FBASE,APIKEY,AIzaSyDWUeD3kTUX6RBwOhP-ZKAP4qQznQu6n_M
+
+    2)  FBASE,https://smart-irrigation-web2-default-rtdb.asia-southeast1.firebasedatabase.app
+
+    3)  FBASE,AUTH,<device-email>,<device-password>
+        (fill in the two <...> parts from Step 3 -- this is the message
+        that actually triggers sign-in, so send it last)
+
+
+STEP 5 -- LOG IN TO THE WEBSITE  (the only step on the site itself)
+----------------
+Open the dashboard and sign in with YOUR OWN email + password -- a
+normal, separate Firebase Auth account for you as the human operator.
+This is NOT the device account from Step 3.
+
+If you don't have a login yet: Firebase Console -> Authentication ->
+Users -> Add user, any email + password, then use that to sign in.
+
+
+STEP 6 -- VERIFY
+----------------
+On the dashboard: Diagnostics tab -> "Firebase" panel. You want to see:
+
+    Enabled          : Enabled
+    RTDB URL         : Configured
+    Device account   : Configured
+    Signed in        : Yes
+    Last upload      : OK
+
+If "Signed in" stays "No", check "Last auth issue" right below it on the
+same panel -- it names which of Step 3/4's values is wrong.
+
+
+DONE
+----------------
+Once Step 6 shows "Signed in: Yes", the website updates by itself --
+no further action needed there. Live data, commands, and the Manual/Test
+tab all become usable at that point.
+
+Note: this covers WEBSITE <-> FIREBASE <-> ESP1 connectivity only. It does
+not cover whether dosing amounts / calibration constants are safe to run
+unattended -- that is a separate, still-open item (see SESSION_HANDOFF.md).

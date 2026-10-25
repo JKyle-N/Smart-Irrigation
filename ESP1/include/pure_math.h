@@ -34,6 +34,19 @@ static inline long imap(long x, long inLo, long inHi, long outLo, long outHi) {
 
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+// Days in a given (year, month), Gregorian leap-year rule. month is 1-12; an out-of-range month
+// returns 31 (the caller's own month bound already rejects it before this would matter -- this
+// just never returns something smaller than any real month, so it can't over-reject a valid day).
+static inline bool isLeapYear(int year) {
+  return (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0);
+}
+static inline int daysInMonth(int year, int month) {
+  static const int DAYS[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+  if (month < 1 || month > 12) return 31;
+  if (month == 2 && isLeapYear(year)) return 29;
+  return DAYS[month - 1];
+}
+
 /* ---- soil moisture -------------------------------------------------------- */
 
 // Map a raw soil ADC to 0..100 % using this column's endpoints (dry = high ADC, wet = low ADC).

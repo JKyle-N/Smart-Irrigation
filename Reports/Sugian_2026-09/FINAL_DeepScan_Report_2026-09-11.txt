@@ -1,0 +1,242 @@
+================================================================================
+ FINAL COMPREHENSIVE DEEP SCAN -- Website / Firebase / Vercel / ESP1 / ESP2 / Nano
+ Date: 2026-09-10/11
+================================================================================
+
+METHOD
+--------------------------------------------------------------------------------
+Three independent, fresh (no prior bias/context) agents were run in parallel,
+each reading its component's files completely from scratch -- not diffing
+against memory of earlier sessions -- then attempting an actual build/validation
+step:
+  1. ESP1 (master controller): ESP1/src/main.cpp (9,692 lines) + pure_math.h,
+     full read, then `pio run`.
+  2. ESP2 (actuator executor) + Nano (sensor hub): ESP2/src/main.cpp (1,731
+     lines) + flow_math.h + Nano/Nano.ino (729 lines), full read, then `pio run`
+     on both.
+  3. Website + Firebase rules + Vercel: script.js (2,824 lines), index.html,
+     style.css, firebase-rules.json, firebase-config.js, README.md, and
+     delete-user-api/api/delete-user.js, full read, then node --check / JSON
+     parse / `firebase deploy --only database --dry-run`.
+
+Every finding below was independently re-verified by hand (not taken on faith
+from the audit) before being fixed, including tracing the EXACT call graph and
+which CPU core each function actually runs on for the ESP1 finding, and
+recounting the actual character lengths of every hold-to-run target string for
+a bug I found myself while implementing that agent's suggested fix.
+
+RESULT: 1 HIGH-severity bug found and fixed (ESP1, a genuine new cross-core
+race condition), 1 buffer-overflow bug caught during that fix (self-caught,
+never shipped), 1 medium Firebase-rules bug found and fixed (website), 3 more
+low-severity issues found and fixed (website + Vercel). Everything now builds/
+validates clean. Full detail below.
+================================================================================
+
+PART 1 -- ESP1 (master controller)
+================================================================================
+
+1. [FIXED, HIGH] New hold-to-run polling function called core-1-only functions
+   directly from core 0 (netTask) -- a genuine cross-core race
+--------------------------------------------------------------------------------
+`firebasePollTestHold()` runs entirely inside `netTask`, which is pinned to
+core 0. It was calling `setState(TEST_MODE)`, `logEvent(...)`, and (via
+`pulseFinish()`) `sendEsp2()` directly from there. `logEvent()` unconditionally
+appends to the single global `String logBuf`, which core 1 mutates dozens of
+times/sec elsewhere; ESP32 Arduino's `String` has no internal locking, and a
+concatenation can trigger a heap `realloc`. Two FreeRTOS tasks on two physical
+cores mutating the same String with no mutex is EXACTLY the bug class this same
+file already found and fixed twice before (the fbAuthErrLog/fbPollErrLog
+deferred-logging hand-off, whose own comments describe the identical failure
+mode almost verbatim) -- this reintroduced it.
+I independently confirmed this by tracing the call graph: `firebaseCommandTick()`
+(which safely does the equivalent job for TEST_PULSE -- arming, setState,
+logEvent) is called from loop() at main.cpp:1764, i.e. CORE 1, not from inside
+netTask. `firebasePollTestHold()`, by contrast, did the network fetch AND the
+state-mutating actions in one function, and I had placed its call site inside
+netTask alongside firebasePollManual() -- an incomplete mirror of the pattern it
+claimed to copy.
+Concrete failure scenario: pressing a hold-to-run button on the dashboard could,
+if the timing lined up with core 1's own routine logging, corrupt the heap
+(possible crash/reboot) or interleave garbage bytes into an ESP2 UART frame in
+flight at that instant.
+FIX APPLIED: `firebasePollTestHold()` is now a pure scalar hand-off (mirrors
+firebasePollManual()/webManualTick()'s own split exactly) -- it only ever writes
+three plain scalars (`testHoldReqWant`, `testHoldReqBit[12]`, `testHoldReqFresh`)
+and `testHoldLastFreshMs`. All the actual arm/release logic (the idle/safety
+gate check, `esp2SetPower()`, `setState()`, `logEvent()`, `pulseFinish()`) moved
+into `pulseTick()`, which already runs every loop() iteration on core 1 (same
+call site as `testHoldTick()`). Rebuilt successfully after the change.
+
+2. [SELF-CAUGHT, would have been HIGH] Buffer too small for the longest target
+   string, while implementing fix #1
+--------------------------------------------------------------------------------
+The new hand-off scalar was first written as `char testHoldReqBit[8]`. The
+longest target string is "transfer" -- 8 characters, needing 9 bytes with the
+null terminator. `strncpy()` into an 8-byte buffer would have silently
+truncated it to "transfe", which would never match `pulseRowForTarget()`'s
+`strcmp(t, "transfer")` check -- every hold-to-run request for the transfer
+pump would have silently failed to arm, with no error surfaced anywhere.
+Caught and fixed before ever building: buffer sized to 12 bytes.
+
+3. [FIXED, low] Hold-to-run events never reached the dashboard's diagnostics/
+   event log
+--------------------------------------------------------------------------------
+`webWorthy()`'s allow-list for `type=="ACT"` recognized `"TEST|"`, `"PULSE|"`,
+`"EXERCISE|"` prefixes but not the new feature's own `"TESTHOLD|..."` lines --
+so arming, finishing, or aborting a web hold-to-run press was completely
+invisible in the dashboard's Recent Events / diagnostics, unlike every other
+remote-triggered action. No safety impact (ESP2's own dead-man is unaffected
+either way) -- purely an operator-visibility gap.
+FIX APPLIED: added `d.startsWith("TESTHOLD|")` to the same check that already
+covers TEST|/PULSE|/EXERCISE|.
+
+Verification of the five earlier-in-session fixes (SET_THRESH validation,
+tsUpload() validity gating, WIFIPORTAL,STOP case-sensitivity, schedule
+start/end wrap validation, restoreDefaults()'s fertGap default): all five
+independently re-confirmed correct and unregressed, with exact file:line
+citations in the full audit transcript.
+
+ESP1 build after both fixes: SUCCESS. RAM 23.6% (77,304 B), Flash 41.2%
+(1,296,881 B) -- matches the known-good reference (77,288 B / 1,296,885 B)
+almost exactly; the tiny few-byte delta is the expected result of restructuring
+a handful of lines, not a red flag.
+
+================================================================================
+PART 2 -- ESP2 (actuator executor) + Nano (sensor hub)
+================================================================================
+NO CHANGES MADE THIS ROUND. Independent fresh audit found:
+- All four of this session's earlier ESP2 fixes (mixActive/!faultHeld guard,
+  EXERCISE inverter-warmup with all 5 reset sites correctly clearing
+  exRunPumpOn, TEST,ENTER's DONE,EXERCISE reply cross-verified against ESP1's
+  actual parser, MIX,0-means-default) independently re-derived from current
+  source and confirmed correct, not just present.
+- Two new observations, both explicitly assessed as no-fix-needed: a likely-
+  intentional CAL_START/PRIME_START overlap with no double-actuation risk (CAL
+  never calls pcfOn()), and a sub-single-pulse ISR edge case that only affects
+  TEST-mode-only telemetry, never a safety decision or real volume metering.
+- Nano: confirmed it still does zero decision-making/actuation anywhere in the
+  file; ISR safety, watchdog coupling (with a compile-time static_assert), and
+  buffer/framing bounds all independently re-verified correct.
+
+Both builds SUCCESS, matching the known-good reference EXACTLY, byte-for-byte:
+ESP2 RAM 7.1% (23,228 B) / Flash 25.8% (337,637 B); Nano RAM 52.0% (1,064 B) /
+Flash 48.2% (14,792 B).
+
+================================================================================
+PART 3 -- Website / Firebase / Vercel
+================================================================================
+
+1. [FIXED, medium] /irrigation/testHold's rule was missing the release
+   carve-out /irrigation/manual already has
+--------------------------------------------------------------------------------
+writeTestHold()'s own comment in script.js explicitly says "releasing always
+goes through regardless of tier, so a lost grant... can never leave a relay
+stuck energised because the release write itself got refused" -- matching
+/irrigation/manual's rule, which has exactly that carve-out
+(`newData.child('want').val() === false || ...`). /irrigation/testHold's rule
+had NO such branch: every write, including release (want:false), required the
+operator/temp-access/subOperator check.
+Concrete failure scenario: an operator withholds a Sub-operator grant (or a 1h
+temp grant expires, or the account gets restricted/blocked) at the exact
+moment that account is holding a hold-to-run button down. The release write is
+now rejected server-side with PERMISSION_DENIED instead of succeeding -- the
+Firebase-side `want` flag is left stuck true (though physical safety is still
+independently backstopped by ESP2's hardware dead-man and ESP1's own 8s
+browser-timeout, both unaffected by what's in Firebase).
+FIX APPLIED: added the identical `want:false` carve-out to testHold's write
+rule, mirroring /irrigation/manual exactly.
+
+2. [FIXED, low] setManualTestArmed() had no privilege check of its own
+--------------------------------------------------------------------------------
+Every top-level function in this non-module script is implicitly reachable
+from a browser console. This one function could flip #mtGate/#mtControls's
+hidden state for ANY signed-in account (even pending/rejected/disabled), one
+layer deeper than the tab-click-handler and Proceed-button checks already
+built to close this exact class of gap. Impact was cosmetic only (every real
+write underneath re-verifies privilege independently, client AND server-side).
+FIX APPLIED: added the same canAccessPrivilegedTabs() guard at its own top.
+
+3. [FIXED, low] Toast notifications could leak DOM nodes forever for a viewer
+   with reduced-motion/animations disabled
+--------------------------------------------------------------------------------
+Removal depended entirely on a transitionend event, which never fires for an
+effectively-zero-duration transition. activeToasts (the tracking Map) was
+already cleaned up correctly either way -- this was a silent DOM leak, not a
+functional one, but could accumulate over a long session.
+FIX APPLIED: a 300ms fallback setTimeout races the transitionend listener;
+whichever fires first removes the element, the other is a harmless no-op.
+
+4. [FIXED, low] delete-user-api's cleanup used Promise.all instead of
+   Promise.allSettled
+--------------------------------------------------------------------------------
+admin.auth().deleteUser() already commits before the three-node cleanup
+(/users, /presence, /activity) runs. With Promise.all, one transient failure
+among the three removes rejected the whole batch and reported a 500 "delete
+failed" even though the Auth account was already gone -- and a retry's very
+first line would then throw "no such user" before ever reaching cleanup again,
+permanently orphaning whichever node didn't get removed the first time.
+FIX APPLIED: switched to Promise.allSettled with per-path failure reporting
+(logged server-side, and returned as a non-blocking `cleanupFailed` list in the
+response) so a partial cleanup failure is visible instead of silently orphaning
+data or being conflated with an actual delete failure.
+
+Verified clean, no new issues found (explicitly checked, not skipped):
+- Six-tier access-path trace for Manual/Test + the 6 privileged command types
+  (Main operator / Creator / Sub-operator / temp-access / plain-approved /
+  pending-restricted-rejected-disabled) -- every tier's actual reachable
+  capability matches the intended model exactly, full trace table in the audit
+  transcript.
+- XSS: every innerHTML/template-literal sink carrying Firebase- or user-
+  sourced content passes through escapeHtml(); no injectable path found.
+- /presence and /activity read rules confirmed exactly as narrow as required
+  (activity has no self-read at all, not even for the record's own owner).
+- The one multi-field update() call touching status+tempAccessUntil+
+  subOperator together (the reject/block/restrict handler) correctly
+  authorized end-to-end against the /users/{uid} rule tree, no cascade bug.
+- Every DOM id script.js references exists in index.html; every CSS class
+  script.js toggles has a matching style.css rule.
+- The clock-skew grant-token fix from earlier this session (grantTempAccess()
+  anchoring off Firebase's own server clock) reconfirmed present and correct.
+
+VALIDATION RESULTS (all re-run after this round's fixes):
+  node --check script.js                        -> exit 0
+  JSON.parse firebase-rules.json                -> JSON OK
+  firebase deploy --only database --dry-run     -> rules syntax valid
+  node --check delete-user-api/api/delete-user.js -> exit 0
+No deploys, publishes, or commits were performed as part of this scan.
+
+================================================================================
+OVERALL FINAL VERDICT
+================================================================================
+One genuinely serious defect was found and fixed this round (the ESP1 cross-
+core race), plus a buffer-overflow bug caught and fixed before it ever reached
+a build, plus five lower-severity issues (one medium Firebase-rules gap, four
+low/cosmetic) across the website and Vercel function -- all now fixed and
+independently re-validated. ESP2 and Nano needed no changes and are confirmed,
+byte-for-byte, matching their known-good build sizes. All three components now
+build/validate cleanly with no known outstanding defects from this pass.
+
+"Comprehensively tested" has one real limit worth being explicit about: nothing
+here has run on physical hardware. Every check performed is the maximum
+possible without it -- full fresh source reads by independent reviewers, every
+prior fix re-derived from current code (not taken on faith), and successful
+compiles/syntax/rule validation for all three firmware images plus the whole
+web/cloud stack. That is real, substantive verification, but it is still
+static analysis plus a compiler, not a running system. This project's own
+Commissioning_Flash_Plan.md exists for exactly this reason -- its staged A-G
+process (especially Stage C, cutting ESP1's power mid-hold to prove ESP2's own
+400ms dead-man works with no help from ESP1) is what actually proves the
+hold-to-run feature's safety claim on real hardware, not this scan.
+
+================================================================================
+WHAT'S LEFT (yours, as agreed all session)
+================================================================================
+  [ ] Deploy the Firebase rules fix (testHold's release carve-out):
+      firebase deploy --only database   (from Website/)
+  [ ] Deploy delete-user-api's fix: vercel --prod (from delete-user-api/)
+  [ ] Publish the website as usual (README.md/firebase-rules.json/index.html/
+      script.js/style.css all have accumulated changes this session)
+  [ ] Flash Nano / ESP1 / ESP2 whenever ready, per Flash_Instructions_2026-09-10.txt
+      and Commissioning_Flash_Plan.md's staged A-G process -- nothing has been
+      flashed by me at any point this session.
+================================================================================
