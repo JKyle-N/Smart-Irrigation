@@ -1452,6 +1452,18 @@ function updateDashboard() {
   // low/critical flags. Also shown under Diagnostics > Power; this is the front-page copy.
   setText("batteryPower", numberText(diagnostics.power?.batteryPower, 1, "W"));
   setText("powerSource", rawText(system.powerSource));
+  // Secondary battery (INA226). ESP1 omits these keys while the monitor is not answering, so absent
+  // reads as Unavailable rather than a made-up 0 V.
+  if (hasValue(sensors.secondaryBatteryVoltage)) {
+    setText("secondaryBattery", numberText(sensors.secondaryBatteryVoltage, 2, "V") + " (" +
+      numberText(sensors.secondaryBatteryPercent, 0, "%") + ")" + (sensors.secondaryBatteryLow ? " LOW" : ""));
+  } else {
+    setText("secondaryBattery", "Unavailable");
+  }
+  setText("secondaryCurrent", numberText(sensors.secondaryBatteryCurrent, 2, "A"));
+  setText("boardSupply", system.boardSupply === "secondary" ? "Secondary battery (isolated)"
+    : system.boardSupply === "main" ? (system.secondaryBattSwitching ? "Main battery" : "Main battery (switching off)")
+    : "Unavailable");
   setText("liveAge", snapshotAgeText());
 
   const fresh = deviceIsFresh();

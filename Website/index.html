@@ -187,6 +187,9 @@
         <article class="card"><h3>Battery current<button type="button" class="info-icon" aria-haspopup="dialog" aria-expanded="false" aria-label="About Battery current" data-info-title="Battery current" data-info-text="Current flowing to or from the battery, in amps.">i</button></h3><p id="batteryCurrent">Unavailable</p></article>
         <article class="card"><h3>Battery power<button type="button" class="info-icon" aria-haspopup="dialog" aria-expanded="false" aria-label="About Battery power" data-info-title="Battery power" data-info-text="Power draw right now, in watts.">i</button></h3><p id="batteryPower">Unavailable</p></article>
         <article class="card"><h3>Power source<button type="button" class="info-icon" aria-haspopup="dialog" aria-expanded="false" aria-label="About Power source" data-info-title="Power source" data-info-text="Current power source, as reported by ESP1.">i</button></h3><p id="powerSource">Unavailable</p></article>
+        <article class="card"><h3>Secondary battery<button type="button" class="info-icon" aria-haspopup="dialog" aria-expanded="false" aria-label="About Secondary battery" data-info-title="Secondary battery" data-info-text="The 4S Li-ion battery (16.8 V full) that powers the controllers and sensors while the inverter runs, so they have no electrical link to the inverter's battery. Charged from the main battery while idle. Below its low threshold, runs that need the inverter are refused.">i</button></h3><p id="secondaryBattery">Unavailable</p></article>
+        <article class="card"><h3>Secondary current<button type="button" class="info-icon" aria-haspopup="dialog" aria-expanded="false" aria-label="About Secondary current" data-info-title="Secondary current" data-info-text="Current through the secondary battery's INA226 monitor, in amps. Positive while it is supplying the controllers.">i</button></h3><p id="secondaryCurrent">Unavailable</p></article>
+        <article class="card"><h3>Board supply<button type="button" class="info-icon" aria-haspopup="dialog" aria-expanded="false" aria-label="About Board supply" data-info-title="Board supply" data-info-text="Which battery the controllers are running from right now: main, or secondary (isolated while the inverter runs).">i</button></h3><p id="boardSupply">Unavailable</p></article>
       </div>
 
       <article class="panel run-panel">
@@ -343,7 +346,7 @@
         </div>
 
         <h3>Timed pulses<button type="button" class="info-icon" aria-haspopup="dialog" aria-expanded="false" aria-label="About Timed pulses" data-info-title="Timed pulses" data-info-text="Runs the chosen combination for the seconds you set, then stops. pH pumps dispense corrosive adjuster — confirm first.">i</button></h3>
-        <p class="hint">Same combinations as the LCD Testing screen, on a timer instead of a held button. Transfer runs as <em>fill</em> (reservoir valve + pump), since running it against a shut valve dead-heads it.</p>
+        <p class="hint">Same combinations as the LCD Testing screen, on a timer instead of a held button. Transfer runs as <em>fill</em> (inverter + transfer pump, drawing straight from the reservoir); the column pushes run the column valve with the booster. While the inverter runs, the controllers switch to the secondary battery.</p>
         <div class="control-grid">
           <label>Target<select id="pulseTarget">
             <option value="transfer">Transfer pump (fill: reservoir → mix)</option>
