@@ -1451,9 +1451,14 @@ void safetyMonitor() {
   // voltage-window/overcurrent/stall protection during every fertigation run's mix stage -- the only
   // prior protection was the mixer-specific ACS712 overcurrent check, which never watches AC supply
   // voltage at all. Added as its own `mixActive` context, same pattern as exercise/prime above.
+  // Each AC context is only checked once the inverter has had INVERTER_WARMUP_MS to settle -- the same
+  // window a work-order stage gets, since seqActive waits on sgPumpOn, which stageBegin()/stagePoll()
+  // only set after the warmup. Without it a still-ramping inverter reads below PZEM_V_MIN and trips
+  // PWR_FAIL,VOLTAGE|LOW on every exercise, AC prime and mix (an EXERCISE spends its whole warmup with
+  // exRunOffAt already set but the pump not yet on).
   bool seqActive      = (step != SEQ_NONE && sgPumpOn && sgIsAC);
-  bool exerciseActive = (exRunOffAt != 0);
-  bool primeAcActive  = (primeLine != "" && primeIsAC);
+  bool exerciseActive = (exRunOffAt != 0 && exRunPumpOn);
+  bool primeAcActive  = (primeLine != "" && primeIsAC && millis() - primeOnMs >= INVERTER_WARMUP_MS);
   // Audit fix (2026-09-10): unlike seqActive/exerciseActive/primeAcActive, which all self-clear as a
   // side effect of their own fault teardown (sgPumpOn->false, exRunOffAt->0, primeLine->""), `step`
   // is DELIBERATELY left at SEQ_MIX across a held fault so RESUME,NORMAL can goStep(step) back into
@@ -1461,7 +1466,8 @@ void safetyMonitor() {
   // mixer/inverter correctly off (near-zero PZEM current), safetyMonitor() re-tripped NO_CURRENT and
   // re-fired holdFault()/PWR_FAIL roughly every PZEM_POLL_MS, indefinitely, until RESUME. Mirrors
   // runSequence()'s own `if (faultHeld) return;` guard.
-  bool mixActive      = (step == SEQ_MIX && !faultHeld);
+  // stepInit too: until SEQ_MIX's own init runs, stepStart still holds the previous step's start.
+  bool mixActive      = (step == SEQ_MIX && !faultHeld && stepInit && millis() - stepStart >= INVERTER_WARMUP_MS);
   if (!seqActive && !exerciseActive && !primeAcActive && !mixActive) { acNoCurrentSince = 0; return; }
 
   // Throttle the (blocking) Modbus reads so we don't poll every loop iteration.
