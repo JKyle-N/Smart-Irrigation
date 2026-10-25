@@ -13,3 +13,8 @@ window.FIREBASE_CONFIG = {
   messagingSenderId: "YOUR_SENDER_ID",
   appId: "YOUR_APP_ID"
 };
+
+// Endpoint for the operator-only "Delete user" action (see delete-user-api/) -- deploy that
+// project to Vercel/Netlify first, then paste its URL here. Not a secret; the privileged
+// credentials live only in that service's own environment variables, never in this file.
+window.DELETE_USER_API_URL = "https://YOUR-PROJECT.vercel.app/api/delete-user";
