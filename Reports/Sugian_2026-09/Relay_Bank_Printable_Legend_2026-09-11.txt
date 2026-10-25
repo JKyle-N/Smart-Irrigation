@@ -1,0 +1,66 @@
+================================================================================
+ PCF8575 RELAY BANK -- PRINTABLE LEGEND
+ Post this near the physical relay bank.
+================================================================================
+SOURCE: extracted from Smart_Irrigation_System_Reference_FINAL.md section
+19.4.7 (the project's own authoritative wiring reference), cross-checked word
+for word against the CURRENT ESP2/src/main.cpp #define OUT_* block on
+2026-09-11 -- all 16 entries match exactly, no drift between the doc and the
+code that was found.
+
+*** CAUTION -- READ BEFORE TRUSTING THIS SHEET ***
+This is a documentation cross-check, not a continuity trace of the actual
+wires. A document (however carefully cross-checked) is not proof of what is
+physically connected to what -- if a wire was ever run to the wrong screw
+terminal at build time, this sheet would confidently repeat that same mistake.
+Before you rely on this sheet to touch anything, confirm it against the
+Commissioning_Flash_Plan.md Stage A/B checks, or run the standalone wiring
+test tool built for exactly this purpose: `Test Code/ESP2_PCF8575_SEQ/`
+(flashes to ESP2 alone, walks every output ON one at a time, P0->P15, 1s gap,
+naming each channel on the serial monitor as it fires) -- watch the actual
+relay/device respond each time and confirm it's the one this sheet says it is.
+
+================================================================================
+ Pin   Device                          Notes
+================================================================================
+ P0    Reservoir Valve
+ P1    Column A Valve
+ P2    Column B Valve
+ P3    Column C Valve
+ P4    Mixing Tank Valve
+ P5    Inverter Relay                  AC power source for the pumps below
+ P6    Transfer Pump                   AC -- reservoir -> mixing tank
+ P7    Booster Pump                    AC -- mixing tank -> columns
+ P10   Mixer Motor                     AC, current-monitored (ACS712)
+ P11   Nutrient A Pump                 DC dosing
+ P12   Nutrient B Pump                 DC dosing
+ P13   Nutrient C Pump                 DC dosing
+ P14   Nutrient D Pump                 Wired but NOT used by automatic dosing
+                                       (only N/P/K -- A/B/C -- are dosed).
+                                       Reachable only via manual line-priming.
+ P15   pH Up Pump                      *** CORROSIVE *** manual-only, never
+                                       run by any automatic sequence
+ P16   pH Down Pump                    *** CORROSIVE *** manual-only, never
+                                       run by any automatic sequence
+ P17   MASTER ACTUATOR-POWER CUTOFF    Not a device -- gates power to EVERY
+                                       output above. Losing P17 = everything
+                                       above goes OFF (fail-safe by design).
+================================================================================
+
+COMBINATION TEST ROWS (LCD Testing screen + the website's Timed-Pulse /
+Hold-to-run controls use these row numbers, not raw pin numbers, for the 4
+"do something useful" combos -- each energizes several pins above together):
+  Row 16 (Fill)          = Inverter + Reservoir Valve + Transfer Pump
+  Row 17 (Push -> Col A) = Inverter + Mixing Tank Valve + Column A Valve + Booster Pump
+  Row 18 (Push -> Col B) = Inverter + Mixing Tank Valve + Column B Valve + Booster Pump
+  Row 19 (Push -> Col C) = Inverter + Mixing Tank Valve + Column C Valve + Booster Pump
+
+================================================================================
+Two things worth knowing while you're at the panel:
+  - P17 is a real relay, not a Nano reset line anymore (that old wiring is
+    retired) -- if you ever see an old wiring note calling P17 "Nano reset,"
+    it is stale; trust this sheet and the current reference doc instead.
+  - The bank must be wired so LOSING P17 power turns everything OFF (loads on
+    normally-open contacts). If you ever add or rewire anything on this bank,
+    that fail-safe direction is the one invariant that must never be broken.
+================================================================================

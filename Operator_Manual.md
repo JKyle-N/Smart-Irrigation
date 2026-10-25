@@ -1,11 +1,13 @@
 # Smart Irrigation & Fertigation — Operator Manual
 
 A complete field reference for **running the system** and **reading everything it sends you**.
-It has two interfaces:
+It has three interfaces:
 
 - **GSM / SMS** — remote control. Text commands to the controller's SIM card; it texts replies,
   alerts, and reports back.
 - **LCD + 5 buttons** — local control on the panel (UP, DOWN, ENTER, BACK, MODE).
+- **Website dashboard** — a browser-based view with live telemetry, history, and (for approved
+  accounts) remote controls. See §8.
 
 **Mental model:** the Arduino Nano *reads sensors*, ESP32 #1 (the master) *decides and talks to you*,
 ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS or at the LCD.
@@ -369,5 +371,68 @@ can now be set from the **Calibration** and **Thresholds** menus without reflash
 
 ---
 
+## 8. Website dashboard
+
+A browser-based third interface, separate from SMS and the LCD. It talks to the controller through
+Firebase, not directly — so it can be open from anywhere with internet, not just standing at the rig
+or in SMS range. *(Ask whoever manages the system for the dashboard's actual web address — it isn't
+repeated here since it can change independently of this manual.)*
+
+### 8.1 Getting an account
+1. Open the dashboard link and click **Create account** — name, email, password.
+2. Your new account starts as **pending**: you can see the read-only Live dashboard immediately, but
+   every control that would touch real hardware stays blocked until an operator approves you.
+3. Ask an operator to approve you in **User Management**. Once approved, the blocked controls unlock
+   automatically — no need to sign out and back in.
+4. Forgot your password? Use **Forgot password?** on the sign-in screen; a reset link is emailed to
+   you the same way any normal account recovery works.
+
+### 8.2 Account levels
+The dashboard has more levels than SMS/LCD access, because unlike a single owner phone number, several
+people may need to see or use it at once:
+
+| Level | Who | Can see | Can touch hardware |
+|---|---|---|---|
+| **Pending / Restricted / Rejected** | A brand-new signup, or an approved account an operator has limited, or one an operator reviewed and did not approve | Every tab except Manual/Test, System, and User Management — but every actuating button on them is disabled, and Zone Profiles is read-only text. Only the account-status banner's wording tells these three apart | No |
+| **Approved** | A normal approved account | Same tabs as above, all now actually usable | Yes — Controls, Zone Profiles, Force Run, Emergency Stop, recovery. **Not** Manual/Test or System (see below) |
+| **Sub-operator** | An approved account an operator has separately elevated, no time limit | Everything Approved sees, plus **Manual/Test** and **System** | Yes, everything Approved has, plus direct relay tests and remote Set Clock/Thresholds/Restore Defaults. Stays in effect until an operator takes it back |
+| **Temp access (1h)** | An approved account an operator has elevated for exactly one hour | Same reach as Sub-operator | Same as Sub-operator, but it expires on its own after 1 hour — no need for an operator to remember to take it back |
+| **Operator** (Main / Creator) | The two fixed accounts that administer the system | Everything, including **User Management** | Everything, always |
+| **Blocked** | An account an operator has disabled | Nothing — a full-screen "access blocked" takeover replaces the entire dashboard | No |
+
+Sub-operator and the 1-hour temp grant unlock the *exact same* things — the only difference is whether
+it expires by itself. An operator grants or withholds either from that account's row in **User
+Management**; hovering the small **"i"** next to each button explains which is which if it's not
+obvious at a glance.
+
+### 8.3 Tabs
+| Tab | Who sees it | What it's for |
+|---|---|---|
+| **Live dashboard** | Everyone signed in | Read-only telemetry: reservoir/mixing levels, flow, battery, per-zone NPK/pH/EC/moisture, run progress, command history. |
+| **Zone profiles** | Everyone signed in | Crop/growth-stage reference notes per physical zone (A/B/C). Editable only once approved; read-only text otherwise. Purely a dashboard planning note — the rig only actually changes when you press "Send to ESP1" on the firmware-settings form underneath. |
+| **Controls** | Approved and above | Disable/re-enable actuations, reboot Nano/ESP2/ESP1, Emergency Stop, Force Run (a real one-off irrigation/fertigation outside the schedule). |
+| **Manual/Test** | Sub-operator / temp-access / operator only | **Direct hardware control** — every button here energises a real relay immediately, with none of the checks a scheduled run goes through. Opening it takes the rig out of automatic until you leave. Covers preventive pump exercise, Timed Pulses (run a pump/valve combo for a set number of seconds), and Hold-to-run (press-and-hold buttons that mirror the LCD Testing screen's own dead-man button — energised only while held. Because the press travels through Firebase, release is not instant: the relay drops about 1 s after you let go, within about 4 s if the tab or connection is lost, and after 15 s of continuous holding at the latest. After that cap, let go and press again to restart). The pH pumps dispense a corrosive adjuster and ask you to confirm first. |
+| **Diagnostics** | Everyone signed in | The same raw/pre-conversion sensor values the LCD's Sensor Diag pages show, plus recent ESP1 events. |
+| **System** | Sub-operator / temp-access / operator only | Remote equivalents of LCD Settings-menu items not covered elsewhere: Set Clock, Thresholds, Restore Defaults, LCD Lock status (read-only). |
+| **User Management** | Operators only | Approve/reject/restrict/block/delete accounts, force a sign-out ("Kick," only offered while that account is actually online), see who's online/offline and for how long, grant/withhold Sub-operator or the 1h temp grant, and see each account's most recent actions (last 15, click to expand). |
+
+### 8.4 "Waiting for a current ESP1 snapshot"
+The dashboard only ever shows what ESP1 last reported — if that snapshot goes stale (ESP1 offline, no
+WiFi, etc.), every actuating control on the page disables itself rather than let you send a command
+into the dark. You can still **open** Manual/Test with a stale snapshot (Proceed always works for an
+account with the right access level) — you just won't be able to press anything inside it until the
+connection is confirmed current again, at which point a **"Direct hardware control"** banner reappears
+as a reminder before you touch anything.
+
+### 8.5 Pop-up notifications
+Since 2026-09, most actions (command results, account-management outcomes) also show as a small pop-up
+in the corner of the screen — bottom-right on a computer, top of the screen on a phone — fading out on
+its own after a few seconds. If several happen close together they clear out faster than usual rather
+than piling up; click one to dismiss it early. This is in addition to, not instead of, the normal status
+text elsewhere on the page, which stays there for you to read back later.
+
+---
+
 *This manual reflects the firmware in this repository (ESP32 #1 `handleSms` / reports / alerts +
-the LCD menu). If a command or message looks different on your unit, the firmware version may differ.*
+the LCD menu) and the website as of 2026-09-11. If a command, message, or dashboard control looks
+different on your unit, the firmware or website version may have moved on since this was written.*

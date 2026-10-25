@@ -1,0 +1,648 @@
+DIAGNOSIS REPORT -- SMART IRRIGATION SYSTEM (post ESP1/ESP2 flash, 2026-09-07)
+================================================================================
+
+CONTEXT
+-------
+The user flashed new ESP1 and ESP2 firmware (Nano remains on old firmware) and tested the live
+system. Four problems surfaced. This was a DIAGNOSIS-ONLY investigation -- nothing was edited,
+deployed, flashed, or reconfigured. All findings below are sourced directly from the current
+on-disk firmware/website source (not memory, not the older reference docs, except where explicitly
+cited for historical corroboration), per the project's own SESSION_HANDOFF.md rule to verify
+against source rather than reasoning from documentation.
+
+ARCHITECTURE RECAP (from CLAUDE.md, confirmed against source):
+  - Nano (old firmware, unchanged) -- sensor hub only. No actuators, no Firebase, no decisions.
+  - ESP1 (ESP1/src/main.cpp, newly flashed) -- master controller: decisions, scheduling, GSM,
+    LCD+buttons, WiFi/Firebase, fault classification. Owns NO relay GPIOs directly.
+  - ESP2 (ESP2/src/main.cpp, newly flashed) -- actuator executor: drives every pump/valve via an
+    I2C PCF8575 expander, counts all flow pulses, does local protective stops. No WiFi/Firebase
+    code at all -- talks only to ESP1 over UART2.
+
+FULL RELAY MAP (PCF8575 bits, ESP2/src/main.cpp:108-124, mirrored as names-only in
+ESP1/src/main.cpp:1219-1224):
+
+  Bit  Name          Output
+  0    ResValve      OUT_RES_VALVE       -- reservoir valve
+  1/2/3 Col A/B/C Vlv OUT_COL_A/B/C      -- column valves
+  4    Mix Valve     OUT_MIX_VALVE
+  5    Inverter      OUT_INVERTER        -- AC source enable
+  6    Transfer      OUT_TRANSFER        -- reservoir->mix pump
+  7    Booster       OUT_BOOSTER         -- mix->column pump
+  8    Mixer         OUT_MIXER           -- (AC, ACS712-monitored)
+  9/10/11 Nut A/B/C  dosing pumps
+  12   Nut D         wired, UNUSED by design
+  13/14 pH Up/Down   dosing pumps
+  15   Mast Cutoff   OUT_MASTER_CUTOFF   -- fail-safe bank power
+
+  Plus two combo "rows" used by remote/LCD testing:
+    16 = Fill        (Inverter+ResValve+Transfer)
+    17/18/19 = Push->Col A/B/C  (Inverter+MixValve+ColValve+Booster)
+
+FLOW SENSOR GPIOs (all on ESP2, interrupt-driven, one shared ISR/counter swapped per stage via
+attachFlow()/detachFlow(), ESP2/src/main.cpp:675-690, FALLING edge + INPUT_PULLUP):
+  FLOW_RES_MIX=GPIO26 (transfer/fill), FLOW_MIX_IRR=GPIO5 (shared by all 3 column pushes),
+  FLOW_NUT_A/B/C=GPIO23/19/18, FLOW_NUT_D=GPIO27, FLOW_PH_UP/DN=GPIO4/25.
+
+IMPORTANT PIN-NAMING TRAP: ESP1's OWN GPIO26 is a completely different, unrelated pin --
+ESP1/src/main.cpp:60: #define SIM_RX_PIN 26 (SIM800L GSM UART RX, CLAUDE.md-locked). "GPIO26 is
+the transfer flow sensor" is only true of the ESP2 chip; do not confuse the two chips' pin maps.
+
+
+================================================================================
+PROBLEM 1 -- Force Run rejected: "someone is using the LCD"
+================================================================================
+
+ROOT CAUSE / MECHANISM (not a bug -- working as designed):
+ESP1 gates every new remote or automatic actuation (FORCE_RUN, TEST_PULSE, RUN_PUMP_TEST, the
+scheduler controlTick(), and the pump-exercise exerciseTick()) behind a 7-condition "safely idle"
+check. The literal string "someone is using the LCD" is the last, catch-all branch of that check,
+reached only when nothing more specific applies:
+
+  ESP1/src/main.cpp:6174-6188 (FORCE_RUN handler, firebaseCommandTick())
+  if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
+      pendingExercise.active || esp2Held || fbRemoteExerciseId[0] ||
+      actuationsDisabled || webManualHeld()) {
+    const char *why = (sysState != IDLE_STATE || wo.active || pendingRun.active) ? "a run is in progress"
+                     : esp2Held ? "a fault is held"
+                     : (pendingExercise.active || fbRemoteExerciseId[0]) ? "a test is already running"
+                     : actuationsDisabled ? "actuations are disabled"
+                     : webManualHeld() ? "the Manual/Test tab has direct control"
+                     : "someone is using the LCD";
+    firebaseQueueStatus(c.id, "rejected", why);
+
+(Same literal string is duplicated at 4 other call sites: :3327, :6313, :6491, :7922 -- no shared
+helper function.)
+
+The variable is uiMode (ESP1/src/main.cpp:1120-1121, enum {UI_DATA, UI_MENU, UI_EDIT, UI_TEST,
+UI_CAL, UI_DIAG}), set away from UI_DATA by opening Settings/Testing/Calibration/Sensor Diag/any
+field editor on the physical LCD. This is explicitly a DIFFERENT mechanism from the "Lock Screen"
+feature (lcdLocked, :1361) -- the code comment is explicit:
+
+  ESP1/src/main.cpp:1358-1360:
+  /* ---- LCD lock (Part D: manual stranger-lock, independent of uiMode) -------- *
+   * lcdLocked gates ONLY the buttons + LCD render -- automation still runs because
+   * controlTick/exerciseTick gate on uiMode (which stays UI_DATA while locked).    */
+
+So turning on Lock Screen does NOT cause this rejection; it only fires when a person has genuinely
+opened a menu.
+
+ANSWERS TO THE NUMBERED SUB-QUESTIONS:
+ 1. LCD state = uiMode != UI_DATA (any of UI_MENU/UI_EDIT/UI_TEST/UI_CAL/UI_DIAG).
+ 2. ESP1 generates the rejection (ESP2/Nano have no involvement -- confirmed by grep, zero hits).
+ 3. Variable: uiMode (ESP1/src/main.cpp:1121).
+ 4. Set by: opening Settings (:8262), Testing (:8528), Calibration (:7540), Sensor Diag (:7894),
+    any field editor (:8467/:8543).
+ 5. Cleared by: explicit BACK/Exit navigation, any fault entry (enterFaultHold/enterEmergencyStop
+    force uiMode=UI_DATA), and an automatic 5-minute idle timeout (next point).
+ 6. MAXIMUM DURATION IF FORGOTTEN: 5 MINUTES. UI_IDLE_TIMEOUT_MS = 300000 (:1109); uiIdleTick()
+    (:8323-8333) auto-returns to UI_DATA after 5 minutes of no button press -- explicitly EXCEPT
+    during EMERGENCY_STOP/held-fault (which are never in this state anyway).
+ 7. No -- cannot be left latched indefinitely; self-clears after 5 minutes, and MODE+BACK always
+    force-clears it immediately regardless.
+ 8. Yes -- uiMode is a plain RAM global (= UI_DATA at declaration, never read/written to NVS),
+    unlike lcdLocked/actuationsDisabled which DO persist. Any reboot clears it instantly.
+ 9. Only per-command, not ambient. The reason is PATCHed onto that specific command's own Firebase
+    node (/irrigation/commands/<id>, via firebaseFlushStatus() :6122-6129). There is NO standing
+    uiMode/"LCD busy" field in the general telemetry snapshot (firebaseUploadLive(), confirmed by
+    reading its full system/sensors/actuators/diagnostics sections) -- so the website cannot show
+    this proactively before a Force Run is attempted, only after.
+10. The website already surfaces this about as well as it can: script.js:1032-1041's
+    FORCE_ABORT_REASONS table and explainNotSafelyIdle() (script.js:1018-1027) both explicitly
+    document in their own comments that some conditions (uiMode included) "are not published
+    anywhere and stay genuinely unknown."
+11. Expected safety behavior, not a bug. It also correctly pauses the automatic scheduler
+    (controlTick(), :4621) and pump-exercise routine (exerciseTick(), :3593) while someone is on
+    the menu -- preventing the automation and a human at the panel from fighting over the same
+    actuator bank.
+12. The website's current message is already functionally equivalent to the user's suggested
+    wording, and comes directly from firmware verbatim (no decoding needed in the common path) --
+    see recommendation below for a small polish, not a fix.
+13. No safe website-only way exists to clear it, and there shouldn't be one -- confirmed no such
+    command exists anywhere in script.js/index.html. Overriding a human's physical presence at the
+    panel from a browser would defeat the purpose of the guard.
+14. Confirmed: not bypassed in this analysis; recommend keeping it exactly as-is.
+
+CLASSIFICATION: Website/Firmware (already correct) -- P3, usability polish only, no defect.
+FIXABLE WITHOUT FLASHING: Yes, entirely -- nothing here requires a firmware change to be correct;
+only an optional richer message would need one.
+RECOMMENDED FIX: Website-only. Add a static help tooltip/expandable note near the Force Run button
+explaining: "If Force Run says the LCD is in use, someone left the physical panel in a menu -- it
+clears automatically within 5 minutes, or immediately if they press BACK, or on any reboot."
+OPTIONAL (not required) firmware polish: publish uiMode (or a boolean derived from it) into
+firebaseUploadLive()'s diagnostics object so the website could show a proactive "LCD in use" banner
+ahead of time; this is a pure telemetry addition with no control-logic risk.
+SAFETY IMPACT: None -- correct behavior.
+
+
+================================================================================
+PROBLEM 2 -- Column settings rejected: "mode must be AUTO or IRRIGATION_ONLY"
+================================================================================
+
+ROOT CAUSE -- A GENUINE FIRMWARE BUG, FULLY IDENTIFIED:
+
+  ESP1/src/main.cpp:727:  char  colMode[14];    // "AUTO" | "IRRIGATION_ONLY" ("" = absent)
+
+The literal string "IRRIGATION_ONLY" is 15 characters + a null terminator = 16 bytes. The buffer
+is only 14 bytes. The copy that fills it uses the safe, truncating strlcpy (no memory corruption --
+just silent data loss):
+
+  ESP1/src/main.cpp:6086: strlcpy(c.colMode, req["payload"]["mode"] | "", sizeof(c.colMode));
+
+strlcpy with sizeof(c.colMode)==14 copies at most 13 characters, so "IRRIGATION_ONLY" becomes
+"IRRIGATION_ON" (13 chars) inside c.colMode. That truncated string then fails BOTH comparisons in
+the validator:
+
+  ESP1/src/main.cpp:6374-6378:
+  if (c.colMode[0]) {
+    if      (!strcmp(c.colMode, "AUTO"))            { newMode = MODE_AUTO;            setMode = true; }
+    else if (!strcmp(c.colMode, "IRRIGATION_ONLY")) { newMode = MODE_IRRIGATION_ONLY; setMode = true; }
+    else { firebaseQueueStatus(c.id, "rejected", "mode must be AUTO or IRRIGATION_ONLY"); continue; }
+  }
+
+-> falls through to the else -> THE EXACT REJECTION THE USER SAW.
+
+SCOPE OF IMPACT: Only "Irrigation only" is affected (15 chars, truncates). "AUTO" (4 chars) fits
+easily and works. "(unchanged)" (empty string) also works correctly -- see below. This is 100%
+reproducible, not intermittent: selecting "Irrigation only" for any column, every time, will always
+be rejected.
+
+THE WEBSITE IS COMPLETELY INNOCENT HERE -- AND THE "(unchanged)" DESIGN IS ALREADY CORRECT.
+Confirmed on both ends:
+  - Website (script.js:713-717,1364-1365): <option value="">(unchanged)</option>, and
+    "if (mode) payload.mode = mode;" -- an empty string is falsy, so the mode key is OMITTED
+    entirely from the payload when "(unchanged)" is selected. Author's own comment: "the firmware
+    treats absent fields as 'leave unchanged,' so a partial edit cannot clobber the rest of the
+    column's configuration" (script.js:1361-1362).
+  - Firmware (ESP1/src/main.cpp:6086,6374): an absent JSON mode key defaults to "" via
+    ArduinoJson's | "" operator, and "if (c.colMode[0])" correctly skips validation entirely for
+    an empty string -- mode is left untouched, and the rest of the command (other fields) can still
+    succeed. This is a clean, working, two-pass validate-then-apply design
+    (ESP1/src/main.cpp:6361-6363,6407-6408) that explicitly guards against a bad field leaving
+    earlier fields "applied-live-but-unsaved."
+
+So the user's working theory (that the website might be sending an invalid sentinel for
+"(unchanged)") is NOT what's happening -- that path already works. The actual bug is an unrelated,
+narrow buffer-size mistake that only bites the real, valid "IRRIGATION_ONLY" value.
+
+ANSWERS TO THE NUMBERED SUB-QUESTIONS:
+ 1. Dropdown options: exactly ""/"AUTO"/"IRRIGATION_ONLY" (script.js:713-717) -- correct.
+ 2. Website validation: none beyond the <select>'s own constrained value set, plus a "must change
+    at least one field" client-side guard (script.js:1398) -- no bug here.
+ 3. Firebase structure: {col, mode?, enabled?, schedMode?, winStart?, winEnd?, targetN/P/K/PH?} --
+    matches firmware's expectations field-for-field.
+ 4. ESP1 parser: firebaseCommandTick()'s SET_COLUMN branch, ESP1/src/main.cpp:6354-6431.
+ 5. Exact accepted values: "AUTO" or "IRRIGATION_ONLY", case-sensitive exact match only.
+ 6. "(unchanged)" means: don't touch this column's stored mode; only fields actually supplied get
+    changed.
+ 7. Yes, and it already IS represented by omission (empty string / absent JSON key) -- this part
+    is already correct on both website and firmware.
+ 8. No -- confirmed the website already omits the key correctly.
+ 9. No -- the fix cannot be made in Website/script.js at all; the defect is entirely inside ESP1's
+    fixed-size C buffer.
+10. Firebase rules: not involved -- no .validate on mode's shape in irrigation/commands beyond
+    source/status, so this is purely an ESP1-internal string-handling bug.
+11. Yes, firmware change is required -- see fix below.
+
+CLASSIFICATION: Firmware (ESP1). P2 -- functional bug, not safety-critical (no relay energizes
+incorrectly; it just prevents saving a legitimate configuration choice).
+FIXABLE WITHOUT FLASHING: No.
+RECOMMENDED FIX: Widen the buffer, e.g. "char colMode[20];" (ESP1/src/main.cpp:727) -- the smallest
+possible safe change (16 bytes needed minimum; 20 leaves headroom for a possible future value
+without ever repeating this class of bug). No other line needs to change -- strlcpy's
+sizeof(c.colMode) argument auto-adjusts. Does not weaken validation -- the strcmp checks stay
+exactly as strict; this only fixes truncation upstream of them, exactly matching the user's
+instruction not to weaken ESP1 validation.
+SAFETY IMPACT: None -- pure data-integrity fix, no control-path/safety-interlock changes.
+
+
+================================================================================
+PROBLEM 3 -- Individual relay controls (Manual/Test)
+================================================================================
+
+HEADLINE FINDING: this is already substantially implemented, safely, and needs no new Firebase
+path. The website's Manual/Test page already exposes:
+  - "Five-second exercises": dedicated Transfer / Booster / Mixer buttons ->
+    RUN_PUMP_TEST {pump: "transfer"|"booster"|"mixer"} (index.html:325-331;
+    ESP1/src/main.cpp:6461-6519).
+  - "Timed pulses": a 10-target dropdown (transfer, colA/B/C, mixer, nutA/B/C, phUp, phDn) ->
+    TEST_PULSE {target, seconds} (index.html:333-354; dispatch via pulseRowForTarget(),
+    ESP1/include/pure_math.h:108-122, driving the exact same ESP2 TEST-row protocol the physical
+    LCD Testing menu uses).
+  - Both already go through the existing queueCommand() choke point (script.js:623-667), which
+    enforces the isApprovedUser() gate before anything reaches Firebase, and the existing
+    irrigation/commands Firebase rule already permits any new payload shape under that same node
+    with ZERO rule changes (the .write rule only checks source/status,
+    Website/firebase-rules.json:16-21).
+
+WHY A STANDALONE RESERVOIR VALVE BUTTON IS DELIBERATELY ABSENT -- AND SHOULD STAY THAT WAY:
+Confirmed in the website's own comment: "There is deliberately no standalone Valve A/B/C button,
+because there is no way for this page to confirm a valve actually closed again afterward"
+(index.html:277-280). The reservoir valve is only ever exposed BUNDLED inside the "Fill" combo (row
+16 = Inverter+ResValve+Transfer pump together) -- which is exactly what "Transfer pump (fill:
+reservoir -> mix)" in the Timed-pulses dropdown already drives. This avoids a real hazard: running
+the transfer pump against a shut valve would dead-head it --
+ESP1/include/pure_math.h:104-107: "Transfer maps to the FILL COMBO (16), not the bare transfer
+relay: running that pump against a shut reservoir valve dead-heads it." This is good, deliberate,
+already-safe engineering -- DO NOT ADD A BARE VALVE BUTTON.
+
+ONE NUANCE WORTH THE USER'S EXPLICIT ATTENTION (not a bug, but verify against your pump specs):
+The "Five-second exercises" Transfer/Booster/Mixer buttons use a DIFFERENT mechanism
+(RUN_PUMP_TEST/pump-exercise) than "Timed pulses," and this one does NOT open any valve at all --
+confirmed: ESP2/src/main.cpp:878-879 energizes the inverter + the bare pump relay directly, with
+"no valve-open check or interlock whatsoever." This is an existing, pre-flash design intended for
+periodic anti-seizure exercise (a short dead-headed run), clamped to 1-10 s
+(PUMP_EX_RUN_MIN_MS/MAX_MS, ESP2/src/main.cpp:208-209). Whether a brief dead-headed run is safe for
+your specific transfer/booster pump is a hardware/pump-datasheet question, not a firmware one --
+worth a quick confirmation, since it's unrelated to (and predates) this session's changes.
+
+FULL RELAY/GPIO MAP: see the Context section above -- this fully answers "every individually
+controllable relay/output" and "exact GPIO mapping" with ZERO assumptions, read directly from
+ESP2/src/main.cpp:108-130.
+
+ANSWERS TO THE NUMBERED SUB-QUESTIONS:
+ 1-2. Every relay + GPIO: see Context table. Existing command/protocol: TEST_PULSE (timed,
+    valve-safe combos) and RUN_PUMP_TEST/START_PUMP/TOGGLE_MIXER (bare 5 s exercise, no valve).
+ 3. LCD Testing screen: yes -- exposes ALL 20 rows (16 single relays + 4 combos) unconditionally,
+    even for disabled columns (ESP1/src/main.cpp:8348-8351, TEST_ROWS=20 at :1230).
+ 4. Manual/Test already supports individual relay commands internally: yes, for transfer, booster,
+    mixer, all 3 column pushes, all 3(4) nutrient pumps, and both pH pumps.
+ 5. Same as LCD: yes, identical underlying ESP2 protocol (TEST,HOLD,<row>).
+ 6. Website can safely expose the same functionality: already does, for everything that has a sound
+    safety story. Bare valves: no, by design (see above).
+ 7. Firebase already permits these commands: yes, confirmed -- no .validate restricts payload
+    shape under irrigation/commands/$commandId beyond source/status.
+ 8. New Firebase path required: no.
+ 9. Website-only implementation possible: yes, for anything beyond what's already built (if ever
+    wanted) -- would reuse the existing TEST_PULSE/pulseRowForTarget() pattern.
+10. Firmware modification required: no, for the 3 relays the user named (Transfer/Booster/Mixer) --
+    already present. A standalone Reservoir Valve control would need firmware validation changes
+    AND is not recommended for the reason above.
+
+CLASSIFICATION: Website (already correct) / Firmware (already correct, no change needed). P4 --
+informational; confirms existing correct behavior, with one P3 verification item (pump dead-head
+tolerance for the exercise feature -- hardware confirmation, not firmware).
+SAFETY IMPACT: None -- current design already satisfies every safety requirement in the request
+(dead-man+cap on ESP2, valve-combo bundling, approval gating, no new bypass paths).
+
+
+================================================================================
+PROBLEM 4 -- Transfer pump flow test: "completed - NO FLOW - 0 pulses, check pump"
+================================================================================
+
+WHAT "completed" ACTUALLY MEANS (this is the crux, and it is by design, not a bug):
+
+  ESP1/src/main.cpp:8796-8799 (pulseTick, PU_REPORT phase):
+    // Waiting on ESP2's TEST,FLOW answer so the result can say whether fluid actually moved --
+    if (puFlowSeen || millis() - puReportMs > PULSE_REPORT_WAIT_MS) pulseFinish(true, "pulse complete");
+
+ok=true ("completed") fires purely because the timed pulse FINISHED WITHOUT BEING ABORTED by a
+fault/lockout/menu interruption -- it says nothing about flow yet. The flow verdict is computed
+SEPARATELY, immediately after, inside pulseFinish():
+
+  ESP1/src/main.cpp:8748-8757:
+  if (ok) {
+    if (k <= 0.0f)        detail += "; no flow sensor on this output";
+    else if (!sawFlow)    detail += "; no flow report from ESP2";
+    else {
+      ...
+      detail += pulses ? ("; FLOW OK " + String(pulses) + " pulses ~" + vol)
+                       : String("; NO FLOW - 0 pulses, check pump, line or sensor");
+    }
+  }
+
+The exact string the user saw ("NO FLOW - 0 pulses, check pump...") only appears in the branch
+where ESP2 DID reply with a valid pulse count (sawFlow==true) and that count was exactly zero.
+This rules out a communications glitch (the "no flow report from ESP2" branch is a distinct,
+different message) and rules out a missing/zero calibration K-factor (the "no flow sensor on this
+output" branch is also distinct). This is a clean, unambiguous "ESP2 counted zero pulses on GPIO26
+during the pump-run window" result.
+
+ANSWERS TO THE NUMBERED SUB-QUESTIONS:
+ 1. Pump relay energized: yes -- TEST_PULSE "transfer" maps to row 16, the Fill combo, which drives
+    OUT_INVERTER+OUT_RES_VALVE+OUT_TRANSFER together (confirmed, not assumed).
+ 2. GPIO: OUT_TRANSFER = PCF8575 bit 6 (not a raw ESP32 GPIO -- it's an I2C relay output on ESP2).
+ 3. Flow sensor counted: FLOW_RES_MIX, ESP2 GPIO26 (confirmed, this chip only).
+ 4. Sensor saw 0 pulses: yes, confirmed by the exact message text (see above).
+ 5. Pulse threshold: for this manual test, the check is simply "pulses > 0" at the end of the fixed
+    duration (no minimum-count threshold beyond nonzero). For the AUTOMATIC run, ESP2 uses a
+    time+volume threshold: FLOW_TIMEOUT_MS = 10000 (10 s of zero measured flow after pump start,
+    ESP2/src/main.cpp:167) -> holdFault("FLOW_FAIL","TRANSFER").
+ 6. Yes, 0 pulses is a genuine no-flow signal here -- comms and calibration failure modes are ruled
+    out by the specific message text, as explained above.
+ 7. Yes -- confirmed the SAME physical sensor/ISR is used by both paths:
+    ESP2/src/main.cpp:1472: case OUT_TRANSFER: case 16: return FLOW_RES_MIX; (both the bare relay
+    and the manual-test combo row map to the identical flow pin), and ESP1's own K-factor lookup
+    for this row (ESP1/src/main.cpp:538: case 16: case 6: return calKResMix;) confirms the same
+    calibration category is used for both. THIS MANUAL TEST IS A VALID DIAGNOSTIC OF THE AUTOMATIC
+    FORCE RUN TRANSFER STAGE.
+ 8. THIS STRONGLY CORROBORATES THE EARLIER FLOW_FAIL_TRANSFER HISTORY. A prior diagnostic report
+    (Diagnostic Finding 0728 to 0805.md, dated 2026-08-07, against the PREVIOUS firmware) already
+    found and root-caused an identical symptom: FLOW_FAIL|TRANSFER faults reproduced 3x
+    consecutively with ~12-13s latency matching FLOW_TIMEOUT_MS, explicitly concluded to be "a real
+    hardware condition... No code bug" requiring physical inspection, not a firmware change. New
+    firmware does not fix hardware -- this looks like the same unresolved physical issue
+    persisting.
+    ONE IMPORTANT NUANCE: that report attributed the fault specifically to "Column B" wiring, but
+    the test the user just ran exercises the SHARED reservoir->mix Fill stage (used by all three
+    columns, not a per-column path) -- so if this shared stage has degraded, it could now affect
+    filling for every column, which is a broader concern than the original Column-B-specific
+    framing.
+ 9. The flow sensor itself could absolutely be faulty -- this is one of several equally-plausible
+    physical explanations (see inspection list below); firmware cannot distinguish "sensor dead"
+    from "genuinely no flow" beyond what's already reported.
+10. Yes, the transfer valve must be open for real flow, and:
+11. Yes, confirmed -- the website/manual test IS opening the required valve. TEST_PULSE "transfer"
+    uses combo row 16, which includes OUT_RES_VALVE, not the bare pump relay.
+12. No -- the current design structurally prevents the pump from running with the valve shut for
+    this specific test (see Problem 3's dead-head note above); this was already correctly
+    engineered to avoid exactly that failure mode.
+13/14. Air-lock, blockage, or sensor-orientation problems are all physically plausible and CANNOT
+    be distinguished from firmware/logs alone -- this needs the physical inspection below.
+15. GPIO26 IS CORRECT FOR THE TRANSFER FLOW SENSOR -- ON ESP2. (Do not confuse with ESP1's own
+    unrelated GPIO26, which is the SIM800L UART RX pin -- see Context section.)
+16. Power/pull-up/filtering: confirmed INPUT_PULLUP + FALLING edge interrupt is configured
+    (ESP2/src/main.cpp:681-682) -- no software debounce filtering exists, which is a data point but
+    not directly explanatory of a ZERO-count result (debounce issues cause over-counting, not
+    under-counting).
+17. Pulse counter could miss pulses: low risk architecturally -- flowPulses is a "volatile unsigned
+    long" incremented by a bare one-line ISR; only one sensor is ever active at a time via explicit
+    attach/detach; a 32-bit read on ESP32 is atomic so a torn read is very unlikely. This is not a
+    likely explanation for a clean zero-count result.
+18. 5 SECONDS IS SHORT BUT WAS NOT THE LIMITING FACTOR HERE. At the bench K-factor (450
+    pulses/liter) any real flow would produce multiple pulses within a fraction of a second, so
+    zero pulses in 5 seconds is already a meaningful result. That said, the manual test's duration
+    is user-adjustable 1-15s (PULSE_MAX_S=15, ESP1/src/main.cpp:556) and is SHORTER than
+    production's own 10-second FLOW_TIMEOUT_MS -- RECOMMEND RE-RUNNING AT 10-15 SECONDS to directly
+    match/exceed the production threshold for a maximally comparable, conclusive result.
+
+CLASSIFICATION: Hardware (confirmed by process of elimination through firmware behavior) -- P1,
+BLOCKS ALL AUTOMATED FILL/IRRIGATION/FERTIGATION RUNS until resolved, since every run needs this
+shared stage to succeed. The safety system itself (FLOW_FAIL hold) is working correctly.
+FIXABLE WITHOUT FLASHING: No firmware change is recommended or needed -- DO NOT TOUCH FLOW_FAIL
+LOGIC OR THRESHOLDS (per the user's own instruction, and matching this project's own prior
+documented guidance not to do so).
+RECOMMENDED ACTION: Physical inspection only (see answer E below).
+SAFETY IMPACT: None from the software -- the hold-on-fault behavior is correct and protective. The
+UNDERLYING hardware condition, if real, means no water/nutrients can currently be delivered.
+
+
+================================================================================
+BATTERY VOLTAGE (commissioning fact, not a numbered problem, but explicitly requested)
+================================================================================
+
+Confirmed: ESP1 does have battery voltage code (readBatteryAdc(), ESP1/src/main.cpp:4872-4887),
+reading GPIO35 through a calibration polynomial (calBattV). Two things compound the "must not
+pretend a voltage exists" risk:
+
+1. NO INSTALLED/CALIBRATED CHECK GATES THE PUBLISHED NUMBER. The default (uncalibrated) polynomial
+   is calBattV = {1, {0.0, 1.0, 0.0, 0.0}} (:1032) -- i.e. battV = raw_adc/4095 when never
+   calibrated. A flag battCalLoaded (:1034) does exist and correctly tracks whether real NVS
+   calibration was ever loaded -- but it is ONLY used for a boot-time serial print (:4828); it is
+   NEVER consulted before publishing battV to Firebase/LCD. With the sensor not physically
+   installed, GPIO35 will float or read some arbitrary value, and the firmware will still compute
+   and confidently display SOME number rather than "Unavailable."
+
+2. THE WEBSITE'S DIAGNOSTICS "Battery sensor: OK/Not OK" FLAG DOES NOT REFLECT THE VOLTAGE PATH AT
+   ALL. Tracing it precisely: dpe["batterySensorOk"] = t.acsOk_ (ESP1/src/main.cpp:5689) <-
+   telem.acsOk_ = acsOk (:5173) <- acsOk = acsReadVolts(vAdc) inside readBatteryAdc() -- this is the
+   BATTERY CURRENT sensor (an ACS758 via a separate ADS1115 I2C ADC, which itself replaced an
+   earlier dead opto-current path -- code comment: "Current now comes from the ACS758 via the
+   ADS1115, NOT the opto ADC on GPIO34 (which read 0.00 A on every sample for 16 days)"). So
+   "Battery sensor: OK" can show OK purely because the CURRENT chain responded, while saying
+   nothing about whether the displayed VOLTAGE number is real or a meaningless floating-pin
+   artifact.
+
+CLASSIFICATION: Firmware + Website -- P3, commissioning-time clarity issue, not safety-critical
+(BATTERY_SAFETY_ENABLED=0, confirmed compiled out at :83, so nothing currently ACTS on this value
+regardless -- this is purely a display/telemetry honesty issue, not a control-path risk).
+RECOMMENDED FIX (small, low-risk, firmware + website): Gate the published battery voltage on
+battCalLoaded -- publish/display "Unavailable" until a real calibration has been saved -- and
+either rename the website's diagnostic label to something accurate (e.g. "Battery current sensor")
+or add a second, correctly-wired flag specifically for the voltage-ADC path. No control logic
+changes.
+
+
+================================================================================
+FULL COMPATIBILITY CHECK -- Website <-> Firebase <-> ESP1 <-> ESP2 <-> Nano
+================================================================================
+
+- COMMAND SURFACE (confirmed exhaustively from firebaseCommandTick(), ESP1/src/main.cpp:6139-6519):
+  FORCE_RUN, EMERGENCY_STOP, ENABLE_ACTUATIONS/DISABLE_ACTUATIONS, CANCEL_FORCE, ACK_FAULT,
+  RECOVER, ESTOP_RECOVER, DIAG_SWEEP, TEST_PULSE, SET_EXERCISE, SET_COLUMN, REBOOT,
+  RUN_PUMP_TEST/START_PUMP/TOGGLE_MIXER. The website's command inventory (script.js) matches this
+  set for every button the user exercised -- no orphaned/mismatched command types found in this
+  investigation.
+- FIREBASE RULES (Website/firebase-rules.json) already match the website's actual usage.
+  irrigation/manual requires {seq:number, want:boolean} -- matches writeManualHold() exactly.
+  irrigation/commands/$id requires source==="dashboard", status==="queued" on create -- matches
+  queueCommand() exactly. Role gating is a binary users/$uid/status==="approved" (or one of 2 admin
+  UIDs) -- matches isApprovedUser() client-side checks. No drift found between the rules file and
+  current script.js usage.
+- ESP1 <-> ESP2 PROTOCOL: text commands over UART2 (TEST,HOLD,<row>/TEST,RELEASE/TEST,FLOW/work
+  orders) -- confirmed both sides agree on the row numbering (ESP1's TEST_NAMES[16] mirrors ESP2's
+  OUT_* defines exactly, bit-for-bit).
+- ESP1 <-> NANO: unaffected by this flash (Nano untouched); ESP1 side of this link was not part of
+  this investigation's scope beyond confirming Nano has zero Firebase/WiFi code and cannot be
+  reached directly by the website.
+- KNOWN DUPLICATED-CONSTANT DRIFT RISK (pre-existing, not caused by this flash):
+  COLUMN_ENABLED = {true,true,false} is manually mirrored in THREE places (ESP1, ESP2, Nano) with
+  no runtime cross-check -- already flagged in SESSION_HANDOFF.md as a known gap. Not one of the
+  user's 4 reported problems, but relevant to "full compatibility."
+- OLD ESP1/ESP2 FIRMWARE IS CORRECTLY TREATED AS REFERENCE-ONLY in this analysis -- all line
+  citations above are from the current, just-flashed source trees.
+
+
+================================================================================
+PRIORITIZED REPORT
+================================================================================
+
+P1 -- Transfer/Fill stage: 0 pulses on flow test
+  Root cause:       Genuine physical hardware fault (pump/sensor/line/reservoir) on the shared
+                     reservoir->mix path
+  File(s):           Hardware (verified via ESP2/src/main.cpp, ESP1/src/main.cpp logic)
+  Function/Line:     pulseFinish() ESP1:8730-8765; flowPinForBit()/GPIO26 ESP2:130,1472
+  Current behavior:  Pump/valve energize correctly; ESP2 reports a valid but zero pulse count
+  Expected behavior: Non-zero pulses when pump runs with valve open and water available
+  Layer:             Hardware
+  Fixable w/o flash: N/A -- no code fix exists
+  Recommended fix:   Physical inspection (see answer E)
+  Safety impact:     Blocks all automated fill stages until resolved; software fault-hold is
+                     correct and already protective
+
+P2 -- "Irrigation only" column mode always rejected
+  Root cause:       14-byte buffer (colMode[14]) truncates the 15-char literal "IRRIGATION_ONLY"
+                     via strlcpy, producing a string that matches neither valid enum value
+  File(s):           ESP1/src/main.cpp
+  Function/Line:     struct field :727; copy :6086; compare :6374-6378
+  Current behavior:  100% rejection of a valid, correctly-sent website value
+  Expected behavior: Column mode saved as IRRIGATION_ONLY
+  Layer:             Firmware
+  Fixable w/o flash: No
+  Recommended fix:   Widen buffer to char colMode[20]
+  Safety impact:     None -- pure data-integrity fix, validation strictness unchanged
+
+P2 (verify) -- 5 s pump-exercise dead-heads pump, no valve check
+  Root cause:       Existing, pre-flash design for anti-seize exercise
+  File(s):           ESP2/src/main.cpp:878-879
+  Function/Line:     RUN_PUMP_TEST handler
+  Current behavior:  Bare pump relay + inverter, no valve
+  Expected behavior: Confirm acceptable for installed pump hardware
+  Layer:             Hardware fact-check
+  Fixable w/o flash: N/A
+  Recommended fix:   Confirm against pump datasheet; no code change indicated
+  Safety impact:     Only a concern if pump cannot tolerate brief dead-heading
+
+P3 -- Force Run "someone is using the LCD" gives minimal detail
+  Root cause:       uiMode/menu state is not published in ambient telemetry, only per-command
+  File(s):           ESP1/src/main.cpp (telemetry: firebaseUploadLive()); Website/script.js:1018-1041
+  Function/Line:     n/a (absence)
+  Current behavior:  Correct, human-readable, but only visible after an attempt; self-clears in <=5 min
+  Expected behavior: Optionally: proactive banner naming which menu
+  Layer:             Website (now) / Firmware (optional, richer)
+  Fixable w/o flash: Yes, for the recommended fix
+  Recommended fix:   Add explanatory tooltip/help text; optionally publish uiMode later
+  Safety impact:     None -- already-correct safety behavior
+
+P3 -- Battery voltage can show a fabricated-looking number; "Battery sensor OK" flag doesn't
+       reflect the voltage path
+  Root cause:       No gate on battCalLoaded; diagnostic flag is wired to the current-sensor
+                     (ACS758), not voltage
+  File(s):           ESP1/src/main.cpp:1032-1034,4822-4828,4872-4887,5173,5689
+  Function/Line:     readBatteryAdc(), battCalLoaded
+  Current behavior:  Shows a plausible-looking number/OK flag regardless of real sensor presence
+  Expected behavior: Show "Unavailable" until calibrated; correctly-labeled diagnostic
+  Layer:             Firmware + Website
+  Fixable w/o flash: No (firmware) / Yes (label text once field added)
+  Recommended fix:   Gate display on battCalLoaded; rename/add diagnostic flag
+  Safety impact:     None -- BATTERY_SAFETY_ENABLED=0, nothing acts on this value
+
+P4 -- Duplicated literal string across 5 call sites
+  Root cause:       Code-quality only
+  File(s):           ESP1/src/main.cpp:3327,6185,6313,6491,7922
+  Current behavior:  Works correctly everywhere
+  Expected behavior: Single shared helper
+  Layer:             Firmware
+  Fixable w/o flash: No
+  Recommended fix:   Optional refactor to one function
+  Safety impact:     None
+
+P4 -- Individual relay controls
+  Root cause:       Not a defect -- already implemented correctly
+  File(s):           Website/index.html:325-368, script.js, ESP1/src/main.cpp:6294-6519, pure_math.h
+  Current behavior:  Transfer/Booster/Mixer/3 column-pushes already exposed safely
+  Expected behavior: (already met)
+  Layer:             Website+Firmware (both already correct)
+  Fixable w/o flash: N/A
+  Recommended fix:   No action needed
+  Safety impact:     None
+
+
+================================================================================
+1. WEBSITE-ONLY FIXES
+================================================================================
+- Add a short help/tooltip near the Force Run button explaining the "someone is using the LCD"
+  message, its <=5-minute auto-clear, and that it is not overridable from the web by design.
+- (Optional, paired with the battery firmware change) Rename or split the Diagnostics "Battery
+  sensor" label so it doesn't imply the voltage reading is validated.
+
+================================================================================
+2. FIREBASE-ONLY FIXES
+================================================================================
+- None identified. firebase-rules.json already matches current script.js/ESP1 usage exactly; no
+  rule changes are needed for any of the 4 problems, including any future individual-relay
+  additions (the existing irrigation/commands rule already permits new payload shapes).
+
+================================================================================
+3. FIRMWARE FIXES REQUIRED (need a reflash)
+================================================================================
+- Problem 2: widen char colMode[14] -> char colMode[20] at ESP1/src/main.cpp:727. Minimal,
+  precisely-scoped, does not touch validation strictness or any safety interlock.
+- Battery voltage (commissioning): gate the published/displayed voltage on battCalLoaded
+  (ESP1/src/main.cpp:1034) rather than always showing a computed number; expose a correctly-labeled
+  flag if the website is to show sensor status. Optional, low priority, no safety impact.
+- Optional/low-priority: publish uiMode (or a derived boolean) in firebaseUploadLive()'s
+  diagnostics object, to allow a proactive "LCD in use" banner. Not required -- current behavior is
+  already correct and reasonably clear.
+
+================================================================================
+4. HARDWARE/SENSOR ACTIONS REQUIRED
+================================================================================
+- Transfer/Fill flow fault (Problem 4) -- physical inspection (see answer E below). Do not modify
+  FLOW_FAIL logic, thresholds, or bypass the fault.
+- Battery voltage sensor -- not yet installed per the user's own statement; install/wire before
+  expecting a real reading, and run the ESP1 ADC calibration bench tool afterward.
+- Confirm pump dead-head tolerance for the 5 s anti-seize exercise feature against the actual
+  transfer/booster pump's datasheet (pre-existing design, unrelated to this flash).
+
+================================================================================
+5. THINGS THAT SHOULD NOT BE CHANGED
+================================================================================
+- FLOW_FAIL logic, FLOW_TIMEOUT_MS, or any flow pulse threshold -- confirmed correct, matches a
+  prior (2026-08-07) independent diagnostic conclusion that this is a genuine hardware condition.
+- The LCD-in-use safety gate (uiMode-based Force Run guard) -- working exactly as designed.
+- The "no standalone valve button" decision in Manual/Test -- deliberate, documented, sound safety
+  reasoning (no valve-position feedback exists).
+- strcmp validation strictness for SET_COLUMN mode -- the fix is a buffer size, not a validation
+  rule; do not loosen the accepted-value check.
+- ESP2's dead-man (TEST_HOLD_TIMEOUT_MS=400ms) and hard caps (TEST_HARD_CAP_MS=30s/
+  TEST_COMBO_CAP_MS) -- unrelated to any reported problem, already correct.
+- BATTERY_SAFETY_ENABLED -- leave at 0 unless the user separately decides to re-enable
+  battery-based run-blocking; not in scope of these 4 problems.
+
+
+================================================================================
+DIRECT ANSWERS
+================================================================================
+
+A. CAN "someone is using the LCD" BE IMPROVED WITHOUT FIRMWARE?
+Yes for polish, but nothing is actually broken. The current message is already a direct,
+human-readable string from firmware (not a vague code), and it already self-clears within 5 minutes
+automatically or immediately on BACK/reboot. Recommend a website-only help-text addition; a richer
+message (naming which menu) would need a small, optional, low-risk firmware telemetry addition.
+
+B. CAN THE COLUMN SETTINGS REJECTION BE FIXED WITHOUT FIRMWARE?
+No. The website is already sending and handling everything correctly. The bug is a 14-byte C buffer
+in ESP1 that truncates the literal string "IRRIGATION_ONLY" before it's compared -- this can only be
+fixed by widening that buffer and reflashing ESP1.
+
+C. CAN INDIVIDUAL RELAY BUTTONS BE ADDED WITHOUT FIRMWARE?
+Mostly moot -- Transfer, Booster, Mixer, and the 3 column-push combos are ALREADY exposed on the
+Manual/Test page, dispatched through commands ESP1 already implements, over a Firebase path whose
+rules already permit them. No new relay buttons are recommended for the Reservoir Valve or other
+bare valves -- this was deliberately excluded by the original design because there's no way to
+confirm a valve's position afterward, and adding it would reintroduce a dead-heading risk the
+current design specifically avoids.
+
+D. DOES THE 0-PULSE TRANSFER TEST CONFIRM THE PHYSICAL FLOW PROBLEM?
+Yes, with high confidence. The exact response text only occurs when ESP2 successfully replied with
+a genuine zero pulse count -- ruling out a UART/communication failure and ruling out a
+missing/invalid calibration factor as explanations. The valve is confirmed to already be opened
+correctly by this test (it uses the Fill combo, not the bare pump relay), ruling out "closed valve"
+as the cause. This matches a previously-documented (2026-08-07), independently-confirmed hardware
+flow fault on this same subsystem.
+
+E. WHAT SHOULD BE PHYSICALLY INSPECTED NEXT?
+In order of likelihood, reusing (and re-verifying, since firmware changed but hardware did not) the
+checklist from the prior diagnostic report:
+  1. The reservoir->mix (transfer/fill) flow sensor itself -- is it connected, correctly oriented
+     (flow-direction arrow), and genuinely in the water path?
+  2. The transfer pump -- does it audibly/physically spin when the test runs? (Listen during a
+     repeat test.)
+  3. Reservoir level and inlet -- is there actually water available to draw from?
+  4. The PCF8575 relay outputs for OUT_RES_VALVE (bit 0) and OUT_TRANSFER (bit 6) -- confirm the
+     physical relays click during the test.
+  5. Air-lock or blockage in the pump/pipe run.
+  6. AC power path -- confirm OUT_INVERTER engages and check PZEM logs for a concurrent PWR_FAIL/
+     overcurrent alongside the flow result.
+Also recommended: re-run the Manual/Test pulse at 10-15 SECONDS (not 5) to match/exceed ESP2's own
+10-second production FLOW_TIMEOUT_MS, for a maximally comparable, conclusive result.
+
+
+================================================================================
+HOW TO VERIFY THESE FINDINGS YOURSELF
+================================================================================
+Every citation above is file:line against the current working tree -- open the file and line
+directly (no line-number drift risk since this was read live, not from a stale doc). Key ones to
+spot-check first: ESP1/src/main.cpp:727 (the buffer), :6086 and :6374-6378 (the truncation and
+compare), :6174-6188 (Force Run gate), :8730-8813 (pulse test logic), ESP2/src/main.cpp:108-130
+(relay/flow GPIO map).

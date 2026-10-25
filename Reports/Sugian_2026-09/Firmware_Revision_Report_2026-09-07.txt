@@ -1,0 +1,121 @@
+FIRMWARE REVISION REPORT -- TWO INTENTIONAL CHANGES (NOT FLASHED)
+================================================================================
+Date: 2026-09-07
+Scope: ESP1 colMode buffer fix + ESP2 INVERTER_WARMUP_MS increase, per explicit instruction.
+Nothing was flashed to hardware. Nano was not touched.
+
+
+0. PATH NOTE (raised before any edit was made)
+------------------------------------------------
+The instruction referenced the project at:
+  C:\Users\sugia\Documents\RESAERCH PROJECT CAP2_v2.0\Smart-Irrigation-main
+That path does NOT exist on this machine (verified with Test-Path -> False). The actual project
+lives at:
+  C:\Users\johnm\Documents\RESAERCH PROJECT CAP2_v2.0\Smart-Irrigation-main
+-- the same path used throughout this entire session, containing the ESP1/ESP2 folders described.
+All work below was done there. If "sugia" refers to a genuinely different machine/checkout, the
+changes below have NOT been applied there and would need to be repeated or copied over.
+
+
+1. EXACT FILES MODIFIED
+-------------------------
+  - Smart-Irrigation-main\ESP1\src\main.cpp  (1 line changed: line 727)
+  - Smart-Irrigation-main\ESP2\src\main.cpp  (1 line changed: line 166)
+No other files were touched. Nano/*.ino was not opened or modified.
+
+
+2. EXACT OLD -> NEW VALUES
+-----------------------------
+ESP1/src/main.cpp:727 (inside `struct FirebaseCommand`):
+  OLD:  char  colMode[14];    // "AUTO" | "IRRIGATION_ONLY" ("" = absent)
+  NEW:  char  colMode[20];    // "AUTO" | "IRRIGATION_ONLY" ("" = absent)
+
+ESP2/src/main.cpp:166:
+  OLD:  const unsigned long INVERTER_WARMUP_MS = 2000;  // inverter+valve settle before AC pump
+  NEW:  const unsigned long INVERTER_WARMUP_MS = 5000;  // inverter+valve settle before AC pump
+
+Both confirmed present exactly as described BEFORE editing (fresh grep/read, not assumed from
+memory), and both confirmed as the final state AFTER editing (fresh grep after the build).
+
+
+3. CONFIRMATION THAT NO OTHER FUNCTIONAL CHANGES WERE MADE
+--------------------------------------------------------------
+Pre-edit inspection found the following additional references, none of which needed or received any
+change:
+  - ESP1: `strlcpy(c.colMode, req["payload"]["mode"] | "", sizeof(c.colMode));` (:6086) uses
+    `sizeof(c.colMode)`, which auto-adjusts to the new size -- untouched, no hardcoded "14" anywhere.
+    The two `strcmp(c.colMode, "AUTO"/"IRRIGATION_ONLY")` validation checks (:6375-6376) are
+    content-based comparisons, unaffected by buffer size, and were left exactly as-is. A
+    similarly-named but unrelated function, `colMode3()` (LCD 3-state column-mode editor,
+    :8346/8458/8636), operates on a completely different variable (`col[c].mode`) and was not
+    touched.
+  - ESP2: `INVERTER_WARMUP_MS` has exactly one usage site (`stagePoll()`, :1044). The sibling
+    constant `VALVE_SWITCH_MS = 1000` (the DC-stage settle time, :165) is a separate constant and
+    was NOT changed. Verified that `sgT0` (the timer this constant is measured against) is reset to
+    `millis()` at the moment the pump actually energizes (inside `stagePoll()`, right after
+    `pcfOn(sgPump)`), so `FLOW_TIMEOUT_MS` (the no-flow fault timeout) and the per-stage hard cap are
+    both measured from pump-ON, not from stage-begin -- this change only delays WHEN the pump turns
+    on; it does not shorten or otherwise touch the flow-fail detection window, the stage time cap, or
+    any other safety timeout.
+  - Confirmed the pump sequence itself was not touched: `SEQ_FILL`/`SEQ_DELIVER` still transition
+    through the same `goStep()` calls, the transfer pump is still turned off (`stageEnd()` inside
+    `endMeteredStage()`) before the state machine advances to the deliver stage, and `FLOW_FAIL`/
+    `PWR_FAIL`/`PZEM_V_MIN`/`PZEM_V_MAX`/`PZEM_OVERCURRENT_A`/`PZEM_MIN_CURRENT_A` and the emergency-
+    stop path (`MODE+BACK` -> `enterEmergencyStop`) are all untouched -- none of these symbols appear
+    anywhere near either edited line, and neither edit is a `#define`/`#if` that could compile out
+    any safety code.
+  - No repository (git) is present at this project root, so no `git diff` was available as a second
+    proof; instead, scope was verified directly via the Edit tool, which requires an exact, unique
+    match against the existing text -- providing tool-level certainty that only these two single
+    lines were changed in each file.
+
+
+4. ESP1 BUILD RESULT
+-----------------------
+  Command: pio run   (in Smart-Irrigation-main\ESP1)
+  Result:  SUCCESS -- 0 errors, 0 warnings.  Took 49.24 s.
+  RAM:   23.6% (77,296 / 327,680 bytes)
+  Flash: 41.0% (1,290,649 / 3,145,728 bytes)
+
+
+5. ESP2 BUILD RESULT
+-----------------------
+  Command: pio run   (in Smart-Irrigation-main\ESP2)
+  Result:  SUCCESS -- 0 errors, 0 warnings.  Took 13.75 s.
+  RAM:   7.1%  (23,112 / 327,680 bytes)
+  Flash: 25.7% (336,345 / 1,310,720 bytes)
+
+
+6. GENERATED FIRMWARE BINARIES
+---------------------------------
+  ESP1: Smart-Irrigation-main\ESP1\.pio\build\esp32dev\firmware.bin   (1,297,232 bytes)
+  ESP2: Smart-Irrigation-main\ESP2\.pio\build\esp32dev\firmware.bin     (336,704 bytes)
+Both were freshly regenerated by this build (both logs show `Compiling .../src/main.cpp.o` and
+`Successfully created esp32 image.` for this run) -- not stale/cached artifacts.
+
+
+7. CONFIRMATION -- NO HARDWARE WAS FLASHED
+----------------------------------------------
+Only `pio run` (compile) was executed for ESP1 and ESP2. `pio run --target upload` (or any
+upload/flash command) was never invoked. No serial/USB upload occurred. Nano was never opened,
+edited, or built.
+
+
+8. WARNINGS / CONCERNS FOUND DURING INSPECTION
+--------------------------------------------------
+  a. PATH DISCREPANCY (see section 0) -- the instruction's path does not exist on this machine;
+     confirm which physical machine/checkout you intend to flash from next week, since the edits
+     above only exist at the `johnm` path.
+  b. Build-size baseline mismatch (informational, not a defect): `SESSION_HANDOFF.md`'s "known-good"
+     reference sizes (ESP1 RAM 23.6%/Flash 40.8%, ESP2 RAM 7.1%/Flash 25.5%) are dated 2026-08-19,
+     against an older commit. The sizes measured just now are extremely close (ESP1 Flash +~0.2pp,
+     ESP2 Flash +~0.2pp) but not byte-identical to that stale baseline -- expected, since that
+     document is itself a snapshot from weeks before the currently-flashed firmware and is not a
+     same-day comparison point. No git repository exists here to produce a precise before/after diff
+     of the build artifacts themselves, so this can't be fully reconciled to the byte; however, the
+     Edit tool's exact-unique-match requirement gives direct, tool-level certainty that only the two
+     described lines changed in source, independent of this build-size observation.
+  c. No compiler warnings of any kind were introduced or pre-existing in either build -- both are
+     completely clean.
+  d. Both requested changes WERE present in the code exactly as described before editing -- no
+     "STOP" condition was triggered.

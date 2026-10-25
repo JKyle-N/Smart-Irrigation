@@ -1,0 +1,239 @@
+================================================================================
+ HOLD-TO-RUN FEATURE + DEEP-SCAN FOLLOW-UP FIXES -- REPORT
+ Date: 2026-09-10
+================================================================================
+
+STATUS UP FRONT
+--------------------------------------------------------------------------------
+Everything below is CODE-COMPLETE and VERIFIED AT THE LEVEL THAT DOES NOT
+REQUIRE HARDWARE: ESP1 compiles clean, the Firebase rules pass a real dry-run
+against Firebase's own compiler, and script.js has no syntax errors. Nothing has
+been:
+  - flashed to ESP1 / ESP2 / Nano,
+  - deployed to the live Firebase rules,
+  - or click-tested in a real browser against real hardware.
+
+"Ready to use" therefore means "ready for you to deploy the rules and, on your
+own schedule, flash + bench-test" -- not "already proven on the rig." Treat it
+the same way this project's own SESSION_HANDOFF.md says to treat every prior
+round: unflashed work is unproven no matter how carefully it was reviewed.
+
+================================================================================
+PART 1 -- NEW FEATURE: Manual/Test "Hold-to-run" buttons
+================================================================================
+
+WHAT IT DOES
+  Press-and-hold buttons on the website's Manual/Test tab, one per relay
+  target (same 9 targets as the existing Timed Pulses dropdown: transfer,
+  colA/B/C, mixer, nutA/B/C, phUp, phDn). Energises the relay only while held;
+  stops the instant you release, lose connection, switch away, or the tab goes
+  hidden. This SITS ALONGSIDE the existing Timed Pulses feature -- both exist,
+  neither replaced the other, per your explicit instruction.
+
+  Mechanically it is the website's equivalent of the LCD Testing screen's own
+  physical dead-man button, reusing ESP2's EXISTING TEST,HOLD / TEST,RELEASE
+  protocol untouched. ESP2 firmware needed ZERO changes.
+
+HOW IT WORKS END TO END
+  1. Website writes {seq, bit, want} to Firebase at irrigation/testHold on
+     mousedown/touchstart (want:true) and mouseup/touchend/etc (want:false),
+     refreshing every 1.2s while held.
+  2. ESP1's new firebasePollTestHold() polls that node every 3s (same cadence
+     as every other command poll), and when it sees a genuinely new request it
+     arms ESP2 (TEST,ENTER), then streams TEST,HOLD,<row> every 150ms -- well
+     inside ESP2's own 400ms dead-man -- for as long as the website keeps
+     refreshing want:true.
+  3. If the website goes silent for more than 8 seconds (TEST_HOLD_BROWSER_
+     TIMEOUT_MS), ESP1 releases on its own. Either way, ESP2's own 400ms
+     hardware dead-man is the actual physical safety backstop, exactly as it
+     already is for the LCD's own Testing screen and for Timed Pulses.
+  4. Corrosive targets (pH Up/Down) need one confirm() dialog first, which
+     "arms" that button for 8 seconds -- a plain tap does nothing; you must
+     confirm, then press-and-hold within that window.
+
+BUG I FOUND AND FIXED WHILE BUILDING THIS (before you ever saw it)
+  My first draft set the "browser vanished" timeout to 3000ms -- identical to
+  ESP1's own Firebase poll interval (FIREBASE_COMMAND_POLL_MS). That would have
+  falsely released a still-held button on nothing worse than one slow poll
+  cycle. Fixed by raising it to 8000ms, comfortably clearing 2+ poll cycles.
+
+FILES CHANGED
+  ESP1/src/main.cpp
+    - New state: puHoldMode, testHoldSeq, testHoldLastFreshMs,
+      TEST_HOLD_BROWSER_TIMEOUT_MS (8000ms).
+    - New function firebasePollTestHold() (mirrors firebasePollManual()).
+    - pulseTick(): PU_ARM->PU_RUN and the PU_RUN loop both branch on
+      puHoldMode (skip the fixed timer; use the browser-freshness timeout
+      instead). Timed Pulses' own fixed-duration behaviour is UNCHANGED.
+    - pulseFinish(): now clears puHoldMode and labels the log/status
+      "TESTHOLD|..." instead of "PULSE|..." when it was a hold.
+    - Call to firebasePollTestHold() added next to the existing
+      firebasePollManual() call in the core-0 net task.
+    - Rebuilt: SUCCESS, RAM 23.6% / Flash 41.2% -- unchanged from baseline.
+
+  Website/firebase-rules.json
+    - New irrigation/testHold node: write-gated identically to the existing
+      6 privileged commands (operator UID or an active tempAccessUntil
+      grant), value-shape validated (seq/want/bit), bit restricted to the
+      same 9-target whitelist ESP1's pulseRowForTarget() accepts.
+
+  Website/index.html
+    - New "Hold-to-run" section in Manual/Test, 10 buttons (9 targets, 2 of
+      them the pH pair styled as danger buttons).
+    - New #mtControlsNote line at the top of #mtControls for the
+      stale/reconnected banner (see Part 2).
+
+  Website/style.css
+    - .hold-btn / .hold-btn.holding / .hold-btn.danger.holding -- visual
+      "energised" state while pressed, touch-action:none so a held touch
+      can't turn into a scroll/zoom gesture mid-press.
+
+  Website/script.js
+    - writeTestHold(), mtHoldStart()/mtHoldStop(), the press/release event
+      wiring for all 10 buttons, reportHoldResult().
+    - Release wired into every exit path: mouseup/touchend/mouseleave,
+      window blur, browser-tab hidden (visibilitychange -- immediate, no
+      grace period, unlike the 60s manual-hold lease), pagehide, sign-out,
+      leaving the Manual/Test nav tab, and syncControlAvailability() (device
+      goes stale or approval is lost mid-press).
+    - Hold buttons added to the same normalAllowed gate every other Manual/
+      Test actuating control already uses (signed in + approved + fresh).
+
+================================================================================
+PART 2 -- FIX: Manual/Test "Proceed" stuck when ESP1 snapshot is stale
+================================================================================
+
+THE BUG YOU REPORTED
+  "When the website is in Waiting for a current ESP1 snapshot, I can't access
+  Manual/Test -- it's stuck and the Proceed button is unclickable."
+
+ROOT CAUSE
+  Proceed was disabled until ESP1's webManual state actually reached "held" --
+  but ESP1 can only grant that once it is alive. With no snapshot at all,
+  state stays "idle" forever, so Proceed was permanently disabled. There was
+  no way in.
+
+THE FIX (matches the design you confirmed)
+  - Proceed now only checks that your account is approved -- it always reveals
+    the Manual/Test screen. It no longer waits for ESP1 to grant anything.
+  - Every individual test button (Timed Pulses, hold-to-run, exercise, sweep,
+    etc.) stays disabled via the EXISTING freshness/approval check
+    (syncControlAvailability()) until ESP1 is genuinely connected -- so you
+    can get into the tab, but nothing fires blind.
+  - A banner inside the controls area now reads:
+      Stale:      "ESP1 appears offline -- Snapshot received Xm ago. Requests
+                   are queued but nothing runs until it reconnects."
+      Reconnected: "Direct hardware control -- this tab drives the hardware
+                   directly." (the same warning re-surfaced as a reminder)
+
+A SECOND BUG I FOUND WHILE FIXING THIS ONE
+  The existing "kick the operator back out" logic (for when ESP1 revokes or
+  refuses a hold) was written as "if state is not held, back out" -- which
+  used to be safe only because you could never get IN except via "held" in
+  the first place. Now that Proceed lets you in with a stale/idle state, that
+  same line would have instantly un-proceeded you the moment you clicked
+  Proceed on a stale snapshot -- defeating the entire fix. Narrowed it to only
+  fire on an ACTUAL revoke/refuse (a hold that was granted and then taken
+  back), not on "never granted yet."
+
+================================================================================
+PART 3 -- 5 FIXES FROM THE PRIOR DEEP-SCAN (NOW CLOSED OUT)
+================================================================================
+
+1. [HIGH] writeManualHold() release-gate bug
+   Before: releasing Manual/Test (want=false) was gated behind isApprovedUser()
+   -- the SAME check that gates acquiring it -- directly contradicting the
+   function's own comment ("releasing must always go through"). If an operator
+   restricted/blocked an account WHILE it held Manual/Test, that account's own
+   release write silently failed, leaving the relay held until ESP1's 60s
+   lease timed it out on its own instead of releasing immediately.
+   Fixed client-side (release now only requires being signed in) AND
+   server-side (firebase-rules.json's irrigation/manual .write now also
+   allows the write when want===false, regardless of approval status).
+
+2. [MEDIUM] Force Run's doseMl had no server-side validator
+   liters/delaySeconds/targetN/P/K/PH all had range validators; doseMl{A,B,C}
+   (the per-nutrient mL amounts) did not -- client capped it at 500mL each,
+   but nothing stopped a tampered/replayed request server-side. Added
+   matching 0-500 validators for doseMl/A, doseMl/B, doseMl/C.
+
+3. [MINOR] canAccessPrivilegedTabs() didn't re-check approval
+   hasTempAccess() only checks the grant's timestamp, not current standing --
+   restricting/blocking an account mid-grant left it privileged (could still
+   see Manual/Test + System) until the grant's own clock ran out, up to an
+   hour later. Fixed: now requires hasTempAccess() AND isApprovedUser()
+   together.
+
+4. [MINOR] Restrict/Block didn't clear a live tempAccessUntil grant
+   If an account was restricted or blocked while still holding an
+   unexpired temp-access grant, re-approving it before that grant's own
+   clock ran out silently handed privileged access straight back with no
+   fresh grant from an operator. Fixed: any status change away from
+   "approved" (reject/block/restrict) now clears tempAccessUntil in the
+   same write.
+
+5. [OPERATIONAL] Vercel ALLOWED_ORIGIN
+   Checked via `vercel env ls` against the delete-user-api project: it IS
+   set in Production. No action needed -- closing this out, not a code bug.
+
+================================================================================
+VERIFICATION PERFORMED THIS ROUND
+================================================================================
+  - ESP1: `pio run` -> SUCCESS, RAM 23.6% / Flash 41.2% (matches known-good
+    baseline, no unexpected growth).
+  - Website/firebase-rules.json: valid JSON, and
+    `firebase deploy --only database --dry-run` -> rules syntax valid
+    (checked against Firebase's real compiler, no rules actually deployed).
+  - Website/script.js: `node --check` -> clean, no syntax errors.
+  - `git status`/`git diff --stat` on Website/: only firebase-rules.json,
+    index.html, script.js, style.css touched -- nothing unrelated staged.
+  - Vercel: `vercel env ls` confirms ALLOWED_ORIGIN set in Production.
+
+NOT verified this round (cannot be, without hardware/a live deploy):
+  - No physical flash of ESP1/ESP2/Nano.
+  - No live click-test of the new buttons against a real Firebase project /
+    real ESP1.
+  - Native host unit tests (`pio test -e native`) still cannot run on this
+    machine -- no gcc/g++ on PATH, a pre-existing environment gap, not new.
+
+================================================================================
+WHAT YOU SHOULD DO NEXT (IN ORDER)
+================================================================================
+1. DEPLOY THE FIREBASE RULES (rules only -- no hardware involved):
+     cd Website
+     firebase deploy --only database
+   This is required before the new hold-to-run buttons or any of the 4
+   client/server fixes in Part 3 can take effect live -- the OLD rules are
+   still live right now.
+
+2. PUBLISH THE WEBSITE yourself, as you've been doing (index.html, script.js,
+   style.css, firebase-rules.json all changed).
+
+3. LIVE-TEST from the browser once both of the above are live, WITHOUT
+   flashing anything yet (current firmware on the rig is whatever was last
+   flashed):
+     - Open Manual/Test with a stale/no snapshot -> confirm Proceed now works
+       and shows the "ESP1 appears offline" banner with every button greyed
+       out.
+     - With ESP1 actually reachable: confirm the "Direct hardware control"
+       reminder appears and buttons enable.
+     - Try releasing Manual/Test hold immediately after being restricted by
+       an operator in another tab/session -- confirm it still releases
+       instantly instead of waiting 60s.
+   None of this needs the NEW ESP1 firmware yet -- items 1-2 and this step
+   only touch the website + rules, which is independent of what's flashed.
+
+4. ONLY WHEN YOU DECIDE TO FLASH ESP1 (this is the step that actually
+   introduces the new hold-to-run wire protocol) -- follow this project's own
+   Commissioning_Flash_Plan.md staged process, same as always: flash with
+   actuations disabled first, confirm telemetry/LCD/web tabs agree, and
+   specifically re-run Stage C (cut ESP1's power mid-hold, confirm ESP2's own
+   400ms dead-man drops the relay with NO help from ESP1) before ever
+   flashing anything that can be armed via the new hold-to-run buttons for
+   real. This is unchanged from the process you already agreed to earlier in
+   this project -- nothing about tonight's work changes that plan.
+   ESP2 and Nano do not need reflashing for this feature (unchanged).
+
+I have not deployed step 1, published step 2, or flashed anything in step 4 --
+all four remain yours to trigger explicitly, as agreed all session.
+================================================================================

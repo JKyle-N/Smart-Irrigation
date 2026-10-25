@@ -1,0 +1,210 @@
+PLAN v2: ESP1/ESP2 FIRMWARE + WEBSITE LCD-PARITY (APPROVED, WITH COLUMN MODE + FORCE RUN REVISIONS)
+================================================================================
+Status: PLAN ONLY -- nothing in this revision has been implemented yet. Nothing has been flashed.
+
+
+CONTEXT
+-------
+This extends the previously-approved audit/plan (see Website_Parity_Plan_2026-09-08.txt) with the
+review revisions you gave. Two firmware changes remain already-implemented and built (re-verified
+this session, unchanged):
+  - ESP1/src/main.cpp:727   char colMode[14] -> char colMode[20]
+  - ESP2/src/main.cpp:166   INVERTER_WARMUP_MS 2000 -> 5000
+Nothing has been flashed to hardware.
+
+Two things changed since the last approval round:
+  1. COLUMN MODE must become a real see-current-state-and-edit interface, not just a write-only
+     dropdown.
+  2. NEW APPROVED CHANGE: fix the LCD-vs-web Force Run race discovered in the prior audit.
+Everything else from the prior plan (the 15-function mapping, what's reused vs. new vs. intentionally
+excluded) stands and is restated below in full, since the final report must cover it again.
+
+STANDING ARCHITECTURE RULE (unchanged, re-confirmed): every new command below is a new command-type
+branch added to the existing Firebase command dispatcher, calling the same save/state functions the
+LCD already calls -- not the never-built Firebase-to-SMS-handler bridge. Firebase rules need ZERO
+changes (re-confirmed twice independently: the rule governing command writes never inspects the
+command's type or payload shape). No new privilege tier -- every new command reuses the exact same
+approved-operator gate every existing command already uses, including the already-destructive
+Reboot/Disable-Actuations buttons.
+
+
+MAJOR REVISION -- COLUMN MODE: WHAT WAS FOUND, WHAT'S BEING BUILT
+---------------------------------------------------------------------
+INVESTIGATED FRESH THIS ROUND: the current "Zone Profiles" tab already shows ALL 3 PHYSICAL COLUMNS
+SIMULTANEOUSLY as separate always-visible cards (A, B, C -- confirmed exactly 3 columns exist in
+firmware, tagged A/B/C). Column-enabled state currently defaults to Enabled, Enabled, Disabled --
+COLUMN C IS DISABLED BY DEFAULT TODAY. Each card already has live sensor readings, a crop/stage
+planning picker (website-only, doesn't touch ESP1), and a "Firmware settings" form
+(mode/enabled/schedule/window/targets) that sends to the existing column-settings command.
+
+THE REAL GAP, PRECISELY IDENTIFIED: every field in that firmware-settings form defaults to either
+"(unchanged)" or blank -- NONE OF THEM DISPLAY THE COLUMN'S ACTUAL CURRENT VALUE. Confirmed by
+tracing the telemetry-publishing code directly: the column's real mode / enabled-flag / schedule-mode
+/ window start-end / N-P-K-pH targets are NEVER referenced anywhere in the function that builds the
+live telemetry snapshot -- only per-column SENSOR readings are published today. This is a write-only
+form, not a status display, which is the actual root of what your request is pointing at.
+
+DESIGN DECISION ON THE REQUESTED "[Column A dropdown]" SELECTOR -- stated explicitly so it can be
+overridden if this reading is wrong: your requirement #8 ("clearly see which columns are currently
+active/enabled") and requirement #1 ("see all available columns") are already served BETTER by the
+existing simultaneous-3-cards layout than a single dropdown that hides the other two columns would
+be -- a hide-others selector would make it HARDER, not easier, to see at a glance which columns are
+active. Rather than replace the card layout with a dropdown, THE PLAN IS TO KEEP the
+three-cards-at-once structure (it already IS "select which column to configure" -- you edit the card
+for the column you want) AND FIX THE ACTUAL GAP: add a live "Current: ..." status readout to each
+card, sourced from real ESP1 state, so requirements #3, #8, and the source-of-truth requirement are
+properly met without inventing a second, competing UI paradigm or a website-only "active column"
+concept that doesn't correspond to anything in firmware. "Selected for editing" stays naturally
+distinct from "enabled for operation" because Enabled is its own visible field/toggle in each card --
+not something merely looking at a card changes.
+
+WHAT THIS REQUIRES:
+1. New ESP1 telemetry (additive, read-only, no new command): publish each column's actual mode,
+   enabled state, schedule mode, resolved window start/end, and N/P/K/pH targets into the live
+   telemetry snapshot. All values ESP1 already holds in memory -- nothing new is computed, only
+   exposed.
+2. Website: each zone card gets a "Current configuration" readout (Mode, Enabled, Schedule/Window,
+   Targets) rendered from that new telemetry, positioned above the existing edit form, so the
+   operator sees real state before deciding what to send -- plus the new Preset dropdown (below).
+   After a column-settings send succeeds, the next telemetry refresh naturally updates this readout,
+   satisfying "after a setting is sent, read/display the actual resulting state."
+3. Exact valid modes, read from source, not assumed: there are exactly two real mode values, AUTO and
+   IRRIGATION_ONLY. The LCD's apparent "3rd state" is not a mode value at all -- it is the SEPARATE
+   column-enabled flag (OFF = disabled, independent of mode). The website's existing dropdown
+   (AUTO / IRRIGATION_ONLY / blank-for-unchanged) already matches this exactly -- confirmed correct,
+   not being changed.
+4. Exact valid columns, read from source, not assumed: exactly 3, fixed in firmware -- A, B, C --
+   matching the website's existing zone ids one-to-one. There is no firmware concept of
+   adding/removing/renaming a column beyond these 3 (a 4th zone would require new firmware/hardware,
+   out of scope).
+5. Preset, reusing the existing column-settings command with one additive field (unchanged from the
+   prior round's plan): add one new optional field to that command's payload; if supplied, resolve it
+   server-side against firmware's REAL 4-entry preset table (PECHAY, TOMATO_S1, TOMATO_S2, TOMATO_S3),
+   applying N/P/K/pH exactly like the existing text-message preset command already does; reject
+   unknown names. This stays entirely separate from the website's own 7-crop database / "Fill targets
+   from crop profile" feature, which is untouched and not replaced.
+
+NO CONFLICT WITH FIRMWARE ARCHITECTURE OR SAFETY WAS FOUND for this design -- reporting as required,
+this is the one place a genuine design judgment call was made (dropdown vs. cards), and it's flagged
+above with reasoning rather than silently decided.
+
+
+NEW APPROVED CHANGE -- FORCE RUN RACE FIX
+----------------------------------------------
+ROOT CAUSE, CONFIRMED PRECISELY: the Force Run arm-phase state is ALREADY a single shared
+authoritative variable that both the LCD and the website/Firebase arm paths read and write -- there
+are not two competing states needing unification, just one missing check. The Firebase Force Run
+handler already refuses to arm a new run over an existing armed one, replying "rejected -- another
+forced run is already armed." The LCD's own Force Run commit code has NO equivalent check -- it
+unconditionally arms, silently overwriting a web-armed run's countdown and parameters, with no
+rejection ever posted back to the dashboard.
+
+THE FIX (small, surgical, additive): add the exact same guard to the top of the LCD's Force Run
+commit code -- if a run is already armed or running, log it and show a clear local message instead of
+overwriting. This makes both entry points consistently respect the one shared state that already
+exists, rather than inventing a new one. The reverse direction (web silently overwriting a local arm)
+is ALREADY safe today -- the Firebase handler already has this exact check -- confirmed only the LCD
+side was missing it.
+
+ON-SCREEN MESSAGE: implemented using the LCD's existing pattern for brief status feedback rather than
+inventing a new UI subsystem -- exact rendering mechanics finalized against the live render function
+during implementation, but the guard condition and the exact block point are already identified and
+final.
+
+NOT otherwise redesigning Force Run sequencing -- the arm/countdown/fire-time re-check mechanism,
+delay bounds, and everything else about how a forced run actually executes stays untouched.
+
+
+FULL 15-FUNCTION MAPPING TABLE (RESTATED, UNCHANGED FROM PRIOR APPROVAL)
+----------------------------------------------------------------------------
+
+#1  Set Clock         | none                          | NEW               | new command -> RTC set   | No persistence today beyond the RTC chip itself; wrong/dead clock silently breaks scheduling
+#2  Schedule           | Zone Profiles                 | REUSE             | existing column command  | none; now gets a current-state readout too
+#3  Column Mode        | Zone Profiles                 | REUSE + enhanced  | existing column command  | see Major Revision above
+#4  Preset             | "Fill targets" (different)    | NEW (added field) | extends column command   | must not be confused with website's own crop database
+#5  Thresholds         | none                          | NEW               | new command -> existing threshold-save function | reuse exact firmware clamps, don't weaken
+#6  Pump Exercise      | Manual/Test                   | REUSE             | existing commands         | cosmetic-only label nuance noted, no code change
+#7  Force Run          | Controls tab                  | REUSE + race fix  | existing commands         | see Force Run fix above
+#8  Sensor Diag        | Diagnostics tab                | REUSE             | existing sweep command    | none -- website already shows more than the LCD page can
+#9  Testing            | Manual/Test                    | REUSE, no additions | existing pulse command  | keep all previously-identified exclusions unless architecture changes
+#10 WiFi ON/OFF        | read-only status               | NOT implementing write | n/a                  | self-disconnect risk, no existing safeguard for it
+#11 Setup AP ON/OFF    | none                            | NOT implementing  | n/a                       | same risk class + command polling itself pauses while it's active
+#12 Restore Defaults   | none                            | NEW               | new command -> existing restore function | idle-gated, strong confirm, irreversible
+#13 Lock Screen        | none                            | NEW, read-only only | new telemetry field    | no write control -- no real remote use case
+#14 Reboot ESP1        | already implemented            | REUSE             | existing command          | none
+#15 Exit               | n/a                             | NOT APPLICABLE    | n/a                       | pure local navigation, no state
+
+
+FULL STACK OF CHANGES (WEBSITE, FIREBASE, VERCEL, ESP1, ESP2, NANO)
+-------------------------------------------------------------------------
+
+ESP1 -- all additive, zero existing branch or logic modified:
+  - Already done: colMode buffer widened.
+  - New Firebase command branches: SET_CLOCK, SET_THRESH, RESTORE_DEFAULTS.
+  - Extend the existing column-settings command with one new optional field: preset.
+  - New guard (2-3 lines) in the existing LCD Force Run commit code: the race fix.
+  - New read-only telemetry fields: current device date/time + RTC health, LCD-lock state, and
+    per-column mode/enabled/schedule-mode/window-start-end/N-P-K-pH targets.
+  - NOT touched: any existing command branch, FLOW_FAIL/PWR_FAIL/PZEM thresholds, relay mappings,
+    emergency stop, actuator cutoff, calibration constants, the pump sequence.
+
+ESP2 -- already done: inverter warm-up time set to 5000ms. No further changes. Rebuilt anyway
+alongside ESP1 so both binaries are a fresh matched pair.
+
+NANO -- not touched, not rebuilt, per explicit instruction.
+
+WEBSITE:
+  - Zone Profiles cards: add the "Current configuration" readout + Preset dropdown to each of the 3
+    existing cards (no new page, no duplicate fields).
+  - New "System" tab (next to Diagnostics): Set Clock (current-time readout + picker + Send),
+    Thresholds (fields + Send), Restore Defaults (confirm-gated button), Lock Screen (read-only
+    tile).
+  - No changes to Manual/Test, Force Run's UI shape, Sensor Diag, or the Reboot buttons -- reused
+    as-is. Force Run gets no new UI beyond what already exists; the race fix is entirely
+    firmware-side.
+  - All new sends go through the exact same existing command-sending function (same approval gate as
+    everything else).
+
+FIREBASE (Realtime Database):
+  - Rules: inspected fresh -- NO CHANGES. The rule governing command writes doesn't restrict by
+    type, so all 3 new command types plus the extended column-settings command need nothing new.
+  - Data structure: only additive fields under the existing live-telemetry node (the new fields
+    listed above) -- no new top-level nodes, no schema-breaking changes to the commands or config
+    nodes.
+
+VERCEL -- not applicable to this work. The project's one Vercel-hosted piece is a separate,
+unrelated account-deletion microservice and is not touched by anything here. The dashboard itself
+deploys via GitHub Pages -- no deployment-config changes are needed for plain HTML/JS edits.
+
+
+BUILD / VALIDATION PLAN
+---------------------------
+1. Build both ESP1 and ESP2 via PlatformIO -- 0 errors, 0 new warnings required.
+2. Run the website's syntax-check command plus a manual structural read-through of the
+   new/changed HTML.
+3. Static safety re-audit: confirm every new/changed block is additive and nowhere near
+   FLOW_FAIL/PWR_FAIL/PZEM-thresholds/emergency-stop/relay-mapping/pump-sequence code; confirm
+   IRRIGATION_ONLY still round-trips; confirm all new commands still require the same
+   approved-operator gate as everything else.
+4. Do not flash ESP1, ESP2, or Nano.
+
+
+THE FINAL REPORT (AFTER IMPLEMENTATION) WILL COVER
+-------------------------------------------------------
+Files modified; ESP1 changes (each new command + telemetry field + the race-fix guard, with
+old-to-new / added-code detail); ESP2 changes (already done, reconfirmed); website changes; the full
+15-function mapping table above; detailed Column Mode implementation + how selection/status works;
+the exact valid columns (A/B/C) and modes (AUTO/IRRIGATION_ONLY) as read from source; which functions
+were reused vs. newly implemented vs. intentionally excluded; Force Run race fix details;
+Firebase/API changes (the 3 new command types + the extended column-settings command); Firebase
+rules changes (none, and why); ESP1 and ESP2 build results; website validation result; exact firmware
+binary file locations; confirmation nothing was flashed; limitations (the WiFi/Setup-AP
+non-implementation, restated with reasoning); and what to physically test at the site next week
+(Set Clock's effect on that same day's schedule; Restore Defaults' idle gate; the Force Run race fix
+-- arm from the website, then attempt to arm from the LCD, and confirm it's rejected with a message
+instead of silently overwriting; and that the new per-column status readout matches reality on the
+physical LCD for all 3 columns, including disabled Column C).
+
+
+STATUS: This is the plan only. Nothing has been implemented yet, and nothing has been flashed. Say
+the word and implementation + build + the full final report will follow.

@@ -1,0 +1,310 @@
+SMART IRRIGATION & FERTIGATION SYSTEM
+Battery Telemetry Fix (Implemented) + Full-Stack Deep Bug Scan Findings & Remediation Plan
+Date: 2026-09-08
+
+
+====================================================================
+PART 1 — BATTERY-SENSOR TELEMETRY FIX (IMPLEMENTED, BUILT, NOT FLASHED)
+====================================================================
+
+STATUS: DONE. ESP1 built successfully — 0 errors, 0 warnings. Not flashed to hardware.
+
+Problem recap: `sensors.batteryVoltage/batteryPercent/batteryCurrent` never published to
+Firebase/website because the gating flag (`t.inaValid`, sourced from a dead leftover variable
+`inaOk` left over from the removed INA226 chip) was permanently false. This was unrelated to
+whether the physical sensor is installed — the real ADC/I2C reading code was already computing
+values every cycle, just never being allowed to publish.
+
+Fix applied to ESP1/src/main.cpp:
+  1. Removed the dead `inaOk` flag entirely (line 388) — confirmed via exhaustive search it was
+     never assigned anywhere except its own dead read.
+  2. Split the shared `battCalLoaded` flag into independent `battVCalLoaded` / `battICalLoaded`
+     (line ~1042), so voltage and current calibration status are tracked separately.
+  3. `loadBattCal()` now sets each flag independently from its own NVS blob ("v"/"i" under
+     namespace "adccal"), and derives `battCalLoaded = battVCalLoaded || battICalLoaded` so the
+     existing boot log line still works unchanged.
+  4. Renamed the `TelemetrySnapshot` struct's dead `inaValid` field to `battVCalValid`, sourced
+     from the real `battVCalLoaded` flag (not the dead one).
+  5. Publish gate now uses two independent, honest signals:
+       - Voltage + percent gate on `battVCalValid` (a real calibration was loaded from NVS).
+       - Current gates on the already-live, already-correct `acsOk_` (ADS1115/ACS758 I2C health).
+
+Behavior today (sensor not installed, NVS "adccal" empty): identical to before the fix — all
+three fields stay absent, website shows "Unavailable". The moment the sensor is installed and the
+bench calibration tool's output is saved to NVS, voltage/percent will start publishing
+automatically; current activates independently the first time the ACS758 responds on I2C. No
+further code change is needed at install time, and nothing is fabricated in the meantime.
+
+Not touched (by design): `readBatteryAdc()`, `acsConfigure()`/`acsReadVolts()`, ADC pin/attenuation
+config, `calBattV`/`calBattI` default polynomials, `BATTERY_SAFETY_ENABLED`, the separate
+`diagnostics.power` block, and the website (its existing "Unavailable" fallback already does the
+right thing with no changes needed).
+
+One related dead-code item was found during this session's bug scan (see ESP1 finding #3 below,
+"calBattI never used") — flagged for awareness, deliberately NOT fixed in this pass since it's
+adjacent to the battery-sensing code this fix intentionally left alone.
+
+
+====================================================================
+PART 2 — DEEP BUG SCAN FINDINGS (READ-ONLY; NOTHING BELOW HAS BEEN FIXED)
+====================================================================
+
+Three independent audits were run: ESP1 (full file), ESP2 + Nano (full files), and
+Website + Firebase rules + the Vercel delete-user-api function. Each was told to skip anything
+CLAUDE.md already documents as known/intentional (e.g. BATTERY_SAFETY_ENABLED=0, the mixTankL NVS
+staleness gap, pH validation-only dosing, the ESP2 comm-recovery ladder — all confirmed correct
+and NOT re-reported here). Findings below are new, ranked most severe first across the whole stack.
+
+--------------------------------------------------------------------
+[1] CRITICAL (safety gap) — ESP2: EXERCISE and PRIME_START pump runs bypass ALL
+    overcurrent/power-fault protection
+--------------------------------------------------------------------
+File: ESP2/src/main.cpp
+Where: safetyMonitor() ~line 1355; EXERCISE handler ~lines 866-889; setupPrime()/primeSafety()
+       ~lines 1561-1604
+
+safetyMonitor() — the function implementing PZEM overcurrent (PWR_FAIL), no-current stall
+detection, and out-of-window-voltage protection — is gated entirely on the sequence-engine's own
+bookkeeping (`step`, `sgPumpOn`, `sgIsAC`), which are only set inside the SEQ_FILL/DOSE/MIX/
+DELIVER/... work-order state machine.
+
+Two other code paths energize the same AC pumps directly via pcfOn(), entirely outside that
+machinery, and therefore never trip safetyMonitor():
+  - EXERCISE,<TRANSFER|BOOSTER|MIXER> (line 866): energizes the pump for a millis()-based timer
+    only (1-10s cap). No PZEM/ACS712 read happens anywhere in this path.
+  - PRIME_START,<...> (line 1561): energizes the transfer or booster pump for up to 45s
+    (PRIME_CAP_MS), again with zero current/power validation — only a dead-man keep-alive timeout
+    and the fixed cap.
+
+EXERCISE is a scheduled, UNATTENDED maintenance action fired automatically by ESP1 every 2 days —
+unlike Testing mode (which CLAUDE.md explicitly documents as intentionally fault-suppressed
+*because* an operator is present and is the safety). A locked-rotor/seized pump or wiring short
+during an automatic overnight EXERCISE or a PRIME_START purge can draw fault current for the full
+run duration (up to 10s / 45s) with no software protective stop — only whatever external
+fuse/breaker exists downstream.
+
+Trigger: ESP1's normal 2-day EXERCISE schedule fires on a pump with a hardware fault, or an
+operator/ESP1 issues PRIME_START on a faulted pump.
+
+Suggested fix direction (not applied — needs your review since it touches ESP2 safety logic):
+route EXERCISE/Prime through the same stageBegin-style bookkeeping so safetyMonitor() covers them,
+or add an explicit PZEM/current check inside the exercise/prime tick functions themselves.
+
+--------------------------------------------------------------------
+[2] HIGH (correctness bug, real crash potential) — ESP1: cross-core String race on Firebase
+    auth state
+--------------------------------------------------------------------
+File: ESP1/src/main.cpp
+Write (core 1, under netMux): FBASE,SIGNOUT handler ~line 3789 — clears fbPassword/fbRefresh/
+  fbIdToken/fbUid/fbAuthErr.
+Reads (core 0 / netTask, UNGUARDED by netMux):
+  - fbBuildUrl() ~line 5377 (fbIdToken)
+  - fbEnsureToken() ~line 5516 (fbIdToken.length())
+  - firebaseUploadLive() diagnostics ~lines 5678/5683 (fbIdToken, fbAuthErr)
+  - portalAdminHtml() ~lines 6982-7016 (fbApiKey, fbEmail, fbPassword, fbAuthOk, fbAuthHttp,
+    fbRefresh, fbHandshakes, fbUrl, fbAuthErr, fbUid, fbPinCa) — no lock at all
+
+The code already recognizes this exact class of hazard elsewhere (a fix was applied to the
+FBASE,STATUS SMS handler at ~line 3806 that takes netMux before reading these same Strings), but
+the fix was not extended to the several core-0 read sites listed above. Arduino/ESP32 String
+reassignment can free/realloc the underlying heap buffer, so a FBASE,SIGNOUT SMS arriving from
+core 1 while netTask (core 0) is mid-read of any of these Strings is a genuine (if infrequent)
+heap-corruption/crash risk on ESP1, the master controller.
+
+Trigger: owner texts FBASE,SIGNOUT while netTask is concurrently building a Firebase request, or
+while the SoftAP admin page is open and being rendered.
+
+Suggested fix direction: wrap the core-0 read sites in the same netMux take/release pattern
+already used at the FBASE,STATUS fix site.
+
+--------------------------------------------------------------------
+[3] MAJOR (correctness bug) — ESP2: readMixerCurrent() single-samples an AC signal
+--------------------------------------------------------------------
+File: ESP2/src/main.cpp, lines 1406-1411 (used at lines 1232, 1241, 1535)
+
+The mixer is documented as an AC motor, so its instantaneous current through the ACS712 sensor is
+a mains-frequency sinusoid crossing zero twice per cycle. readMixerCurrent() takes exactly ONE
+analogRead() sample — no RMS accumulation, no averaging over even a half-cycle.
+
+- End-of-mix no-load check (SEQ_MIX, ~line 1238-1241): runs exactly once, at the single instant
+  the mix window ends. If that one sample lands near a zero-crossing of an otherwise healthy
+  waveform, it reports a false DEGRADED,MIXER_NOLOAD for a mixer that's working fine.
+- Real-time overcurrent trip (~line 1232-1236, checked every loop pass through the whole mix
+  duration): lower risk since it's checked continuously, but still validates a single ADC sample
+  against a fixed threshold rather than a proper current magnitude — the exact trip point depends
+  on sampling-phase luck, not physical load.
+- The same single-sample value is what's published to ESP1 in TELE,...,ACS,... (line 1535), so
+  logged/dashboard mixer-current data isn't a meaningful physical quantity for this AC load.
+
+Trigger: any fertigation run reaching SEQ_MIX's end-of-window check — false DEGRADED,MIXER_NOLOAD
+can fire on a perfectly healthy mixer purely from ADC-sample timing.
+
+Suggested fix direction: sample multiple times across at least one full AC cycle (10-20ms at
+50/60Hz) and compute RMS or peak/sqrt(2) rather than a bare instantaneous analogRead().
+
+--------------------------------------------------------------------
+[4] MEDIUM (security/access-control gap) — Website/Firebase: "Blocked" users still receive
+    full live telemetry + command-history reads
+--------------------------------------------------------------------
+Files: Website/script.js:319-374, Website/firebase-rules.json:4-10,16-17
+
+`irrigation/live`, `irrigation/config`, and `irrigation/commands` are read-gated only on
+`auth != null` — no status check. Only WRITES check `status === 'approved'`. An operator who
+"Blocks" a user only stops that account from sending hardware commands; the Auth credential itself
+is never disabled (no admin.auth().updateUser({disabled:true}) call anywhere), so a blocked user
+with still-valid credentials continues to receive the full live telemetry snapshot, fault/event
+log, and command history the instant they sign in — visible in browser devtools, no script needed
+— even though the dashboard UI paints over it with a "blocked" screen. This contradicts the stated
+intent in Website/index.html:55-60 that a blocked account should see nothing else at all.
+
+Suggested fix direction: gate the read rules on `status === 'approved'` as well as `auth != null`
+(matches the write-side pattern already in use), or explicitly disable the Auth account on Block
+(admin.auth().updateUser) via a new Vercel function alongside delete-user-api.
+
+--------------------------------------------------------------------
+[5] MEDIUM (security gap) — Website/Firebase: command write rule validates no shape/bounds
+--------------------------------------------------------------------
+File: Website/firebase-rules.json:16-20
+
+The `irrigation/commands/$commandId` create rule only checks `!data.exists()`,
+`source === 'dashboard'`, `status === 'queued'` — no constraint on `type` (any string) or
+`payload` (any shape/values). All the client-side bounds in script.js (FORCE_MAX_LITERS/DOSE_ML,
+0-2000ppm/3-9pH clamps, pulse/sweep duration clamps, the 10s command cooldown) are enforced only
+in the browser. Any approved (non-operator) account can write directly to the RTDB path with an
+out-of-range payload or unrecognized type, relying entirely on ESP1 firmware to reject what the
+rules don't — and there's no server-side rate limit or size cap on the commands node.
+
+Suggested fix direction: add Firebase rule-level validation on `type` (enum) and key payload
+fields' ranges where practical; this is a defense-in-depth improvement, not a proven active
+exploit, since ESP1 already validates every command field before acting (per this session's
+earlier parity-implementation audit).
+
+--------------------------------------------------------------------
+[6] MEDIUM (race condition, data-loss) — Website: renderZonesUI() full teardown can silently
+    wipe unsaved zone-config form edits
+--------------------------------------------------------------------
+File: Website/script.js:355-374 (listener), 709-819 (renderZonesUI)
+
+The live (`.on`) listener on `irrigation/config/zones` calls renderZonesUI() on every remote or
+local change, which does `container.innerHTML = ""` and rebuilds all three zone cards from
+scratch — including any in-progress, not-yet-sent form fields (targets, schedule window, preset)
+which have no backing data model, only DOM state.
+
+Trigger: an operator is mid-edit on one zone's form (not yet sent via "Send to ESP1") when any
+zone's crop/stage dropdown is changed (writeZoneProfile fires immediately) — either by the same
+operator or a second tab/operator — and the round-trip write silently wipes every zone's unsaved
+form fields with no warning.
+
+Suggested fix direction: preserve in-progress form values across a re-render (e.g. only rebuild
+the specific zone card that changed, or diff-and-patch rather than full teardown), or warn before
+discarding dirty form state.
+
+--------------------------------------------------------------------
+[7] MINOR — ESP1: SMS "WIFI,ON"/"WIFI,OFF" toggle is case-sensitive
+--------------------------------------------------------------------
+File: ESP1/src/main.cpp, tokenizer ~3963-3968 vs. WIFI handler ~4040
+
+The WIFI SMS handler compares `tok[1] == "ON" || tok[1] == "OFF"` against the raw (non-
+uppercased) token array, unlike every other command path which either self-uppercases or compares
+against the pre-uppercased `U`/`k0`. `WIFI,on` or `WIFI,off` (plausible from a phone keyboard)
+silently falls through to the SSID/password parser and returns `ERR,WIFI` instead of toggling.
+
+Suggested fix: uppercase tok[1] before the ON/OFF comparison, matching the pattern used elsewhere.
+
+--------------------------------------------------------------------
+[8] MINOR — ESP1: calBattI / battICalLoaded is loaded from NVS but never used
+--------------------------------------------------------------------
+File: ESP1/src/main.cpp, calBattI/battICalLoaded declared ~1037-1042, loadBattCal() still reads
+the "i" blob ~4839, but readBatteryAdc() (~4887-4902) computes battery current entirely from the
+ACS758-via-ADS1115 I2C path and never reads calBattI or the opto-ADC current pin at all (this was
+confirmed correct and left alone during this session's Part 1 battery fix — current's *validity*
+gate is correctly acsOk_-based; this finding is about a separate, harmless piece of dead
+calibration-loading code, not the fix that was just made).
+
+An operator who re-runs the bench calibration tool for the current channel and pastes/stores the
+result would see "loaded from NVS" reported with zero actual effect — a silent no-op that looks
+like a successful calibration but changes nothing.
+
+Suggested fix direction: either remove the dead "i" NVS load path and the PIN_BATT_I attenuation
+config entirely (since current now comes from ACS758/ADS1115), or clearly comment it as vestigial.
+Low priority, no safety/telemetry impact — current already flows through the correct path
+regardless of this dead code.
+
+--------------------------------------------------------------------
+[9] MINOR — ESP1: SET_CLOCK day-of-month validated 1-31 regardless of month/leap-year
+--------------------------------------------------------------------
+File: ESP1/src/main.cpp — LCD editor ~8733, Firebase command handler ~6511 (same gap in both)
+
+Both paths validate day as 1-31 with no month-aware bound, so e.g. "Feb 30" can be set via either
+the LCD or the new website Set Clock control; the RTC has no validation of its own and would
+silently store the impossible date, which could subtly corrupt day-rollover/summary-day logic
+until corrected.
+
+Suggested fix: add a small days-in-month(year, month) helper and use it in both validators.
+
+--------------------------------------------------------------------
+[10] MINOR — ESP2: RESUME,NORMAL doesn't re-emit a STAGE,... update
+--------------------------------------------------------------------
+File: ESP2/src/main.cpp, resumeWork() ~1109-1125
+
+RESUME,IRRIGATE and RESUME,RELEASE both call goStep() and send a fresh STAGE,<ordinal>,<total>,
+<name> line to ESP1; RESUME,NORMAL only clears stepInit without calling goStep(), so no fresh
+stage notice is sent. Purely cosmetic — the LCD run-progress screen may show stale stage info
+after a NORMAL resume. No actuator/safety impact.
+
+--------------------------------------------------------------------
+[11] MINOR — Website: writeZoneProfile() missing the isApprovedUser() gate used everywhere else
+--------------------------------------------------------------------
+File: Website/script.js:639-647
+
+Unlike queueCommand() and writeManualHold(), writeZoneProfile() only checks
+currentUserIsSignedIn(), not approval status. The Firebase rule still rejects the write for a
+non-approved account, so there's no actual security impact, but a pending/rejected account
+changing a crop/stage dropdown gets a raw PERMISSION_DENIED error surfaced via setCommandStatus
+instead of the friendly "awaiting approval" message shown everywhere else in the UI.
+
+Suggested fix: add the same isApprovedUser() short-circuit used elsewhere, for a consistent error
+message.
+
+--------------------------------------------------------------------
+[12] LOW (informational leak) — Vercel: delete-user-api leaks raw Admin SDK error text to
+     unauthenticated callers
+--------------------------------------------------------------------
+File: delete-user-api/api/delete-user.js:39-63
+
+verifyIdToken() (line 46) can throw before the OPERATOR_UIDS check (line 47); any caller — no
+valid token required at all (e.g. Authorization: Bearer garbage) — reaches the single catch block
+at line 60-63, which responds 500 { error: error.message }. Reachable by a fully unauthenticated
+caller, not just an authenticated non-operator as previously assumed. Leaked strings are generic
+Firebase Admin SDK messages ("Firebase ID token has invalid signature"), not credentials or PII —
+fingerprinting/probing value only.
+
+Suggested fix: return a generic "Invalid or expired token" message for the auth-verification
+failure branch specifically, keep detailed logging server-side only (console.error already does
+this).
+
+
+====================================================================
+PART 3 — RECOMMENDED PRIORITY ORDER FOR FIXES
+====================================================================
+
+If/when you want to proceed with fixes, this is the order I'd recommend based on severity and
+blast radius:
+
+  1. [1] EXERCISE/PRIME_START bypass overcurrent protection (ESP2) — genuine unattended safety
+     gap, touches ESP2 safety-critical code, needs your explicit sign-off on the approach before
+     any implementation given the standing rule to never weaken/bypass safety logic.
+  2. [2] Firebase auth cross-core String race (ESP1) — small, mechanical fix (extend the existing
+     netMux pattern to a few more read sites), low risk, addresses a real crash potential.
+  3. [3] readMixerCurrent() single-sampling (ESP2) — moderate fix (needs a short sampling loop),
+     touches safety-adjacent code so also warrants explicit sign-off.
+  4. [4]+[5] Firebase rules hardening (read-gate blocked users, validate command shape) —
+     Firebase-rules-only change; per standing instruction this needs proof it's technically
+     required before changing, which this scan provides, but still needs your explicit go-ahead
+     since "do not change Firebase rules unless proven necessary" is a standing constraint.
+  5. [6] renderZonesUI() re-render data loss (Website) — self-contained JS fix, low risk.
+  6. [7]-[11] Minor items — safe, self-contained, low-risk fixes; can be batched together.
+  7. [12] delete-user-api error-message hardening — self-contained, low risk.
+
+Nothing in this report has been implemented. No hardware has been flashed. Awaiting direction on
+which items (if any) to proceed with, and in what order.

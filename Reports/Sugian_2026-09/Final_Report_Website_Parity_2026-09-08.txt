@@ -1,0 +1,335 @@
+FINAL REPORT: PLAN v2 IMPLEMENTATION -- ESP1/ESP2 FIRMWARE + WEBSITE LCD-PARITY
+================================================================================
+Date: 2026-09-08
+Status: IMPLEMENTED, BUILT, VALIDATED. NOTHING FLASHED TO HARDWARE.
+
+
+1. EVERY MODIFIED FILE
+--------------------------
+  - Smart-Irrigation-main\ESP1\src\main.cpp          (extensive additions, detailed below)
+  - Smart-Irrigation-main\ESP2\src\main.cpp           (NO changes this round -- already-approved
+                                                        INVERTER_WARMUP_MS=5000 from the prior
+                                                        session re-verified intact, rebuilt fresh)
+  - Smart-Irrigation-main\Website\index.html          (new "System" tab + section; Preset dropdown
+                                                        and Current-configuration line added inside
+                                                        the existing Zone Profiles card template
+                                                        lives in script.js, not this file)
+  - Smart-Irrigation-main\Website\script.js           (extensive additions, detailed below)
+  - Nano: NOT touched, NOT rebuilt.
+  - Website\firebase-rules.json: NOT touched (confirmed not required -- see section 8).
+
+
+2. ESP1 FIRMWARE CHANGES (all additive; no existing branch, gate, or safety check modified)
+------------------------------------------------------------------------------------------------
+
+2a. Already-approved, reconfirmed intact:
+    ESP1/src/main.cpp:727   char colMode[14] -> char colMode[20]   (unchanged from prior session)
+
+2b. FirebaseCommand struct (ESP1/src/main.cpp:719-736) -- new fields added at the end:
+    char  preset[16];                              // SET_COLUMN: crop preset name ("" = absent)
+    int16_t clkY; int8_t clkMo, clkD, clkH, clkMi;  // SET_CLOCK (all required together)
+    int   thStart, thStop; float thGap;             // SET_THRESH (all required together)
+
+2c. firebasePollCommands() (ESP1/src/main.cpp:5953+) -- extended:
+    - JSON filter (~line 6007-6010): added "preset", "clkY","clkMo","clkD","clkH","clkMi",
+      "thStart","thStop","thGap" as allowed payload keys (a filter that doesn't list a key
+      silently drops it -- these had to be added or the new fields would parse as absent no
+      matter what the website sent).
+    - Field population (~line 6095-6106): added strlcpy for preset and direct reads for the
+      clock/threshold fields, following the exact same "| -1 / | ''" absent-sentinel pattern
+      every existing field already uses.
+
+2d. SET_COLUMN (ESP1/src/main.cpp, existing block, ~line 6359-6494) -- EXTENDED, not duplicated:
+    - New Pass-1 step: if c.preset[0] is non-empty, it is uppercased and matched against the
+      firmware's real CROP_PRESETS[] table (PECHAY, TOMATO_S1, TOMATO_S2, TOMATO_S3) -- exactly
+      the same table and matching logic the existing SMS "SET,COL_x,PRESET,<name>" command
+      already uses. A match sets newTgt[]/setTgt[] (the SAME variables the manual N/P/K/pH path
+      already uses), so it flows through the existing, unmodified Pass-2 apply/save/log code.
+      An explicit targetN/P/K/PH field sent in the SAME command still overrides its own single
+      field afterward -- same precedence a human filling in a box after picking a preset would
+      expect. An unknown preset name is rejected exactly like every other bad field already is.
+    - Pass-2 logging: if a preset was applied, "preset=<NAME>" is prepended to the existing
+      change-log string (cosmetic, for clearer SD-log/command-history records).
+    - Every existing mode/enabled/schedMode/window/target validation and error message is
+      UNCHANGED -- verified by direct comparison against the pre-edit source.
+
+2e. Three new command branches, inserted between the existing SET_COLUMN and REBOOT branches
+    (ESP1/src/main.cpp, ~line 6497-6534), each following the identical
+    validate-then-call-the-existing-function-then-reply pattern every other branch already uses:
+
+    SET_CLOCK   -- rejects if RTC not present or any field out of range (year 2020-2099, month
+                   1-12, day 1-31, hour 0-23, minute 0-59), otherwise calls rtc.adjust(...) --
+                   the exact same RTClib call the LCD's own Set Clock editor makes. No new NVS
+                   key (there never was one -- the DS3231's own battery-backed register is the
+                   only store, same as the local path).
+
+    SET_THRESH  -- clamps start/stop to 0-100 with the same "stop must exceed start" bump the
+                   LCD and SMS paths already apply, clamps gap to 0-500, then calls the existing
+                   saveThresholds() function directly (which itself still contains its own
+                   additional NPK_MIN_MOIST_PCT safety warning, untouched).
+
+    RESTORE_DEFAULTS -- rejects unless sysState == IDLE_STATE (the identical gate the LCD's
+                   Restore Defaults menu item already enforces), then calls the existing
+                   restoreDefaults() function directly. No new reset logic of any kind.
+
+2f. Force Run race fix (the new approved change):
+    - Two new state variables added next to the existing ForcePhase declarations
+      (ESP1/src/main.cpp, ~line 1190-1196): bool forceBlockedFlash; unsigned long
+      forceBlockedUntilMs;
+    - Guard added at the top of commitEditor()'s SET_FORCE case (~line 8514-8523): if
+      fcPhase != FP_NONE (i.e. a run -- web-armed OR LCD-armed -- is already armed/running), the
+      LCD no longer arms at all. It logs FORCE_BLOCKED|ALREADY_ARMED, sets the new flash flag for
+      3 seconds, and returns to the home screen -- the EXISTING arm code is now unreachable in
+      that case. This is the exact same fcPhase check the Firebase FORCE_RUN handler has already
+      had for other reasons; only the LCD side was missing it.
+    - Render block added (~line 9032-9046), placed immediately before the existing "FORCE RUN
+      ARMED" screen: while the flash is active, the LCD shows "FORCE RUN BLOCKED / A run is
+      already / armed/running." for 3 seconds, then automatically falls through to whatever
+      screen is actually current (e.g. the still-live web-armed countdown, unaffected).
+    - The reverse direction (a web request silently overwriting an LCD-armed run) was ALREADY
+      prevented before this change -- the Firebase handler's existing
+      "another forced run is already armed" rejection (unchanged, still in place) already covers
+      it. Confirmed only one side needed the fix.
+    - Nothing about forceTick()'s countdown/fire-time re-check, delay bounds, or the sequential
+      SEQ_FILL-then-SEQ_DELIVER pump sequencing was touched.
+
+2g. New READ-ONLY telemetry (firebaseUploadLive(), no new command, cannot be written to):
+    - system["rtcOk"] and system["deviceTime"] (~line 5610-5613) -- reuses the EXISTING
+      tsString() function (the same one every log line and the LCD clock page already use) for
+      formatting; no new time source.
+    - diagnostics.system["lcdLocked"] (~line 5686-5687) -- publishes the existing lcdLocked
+      variable as-is. No write path exists anywhere for this field.
+    - Per-column config fields inside the existing sensors.zones loop (~line 5834-5849) --
+      MODIFIED the existing loop (not a pure addition -- documented plainly): previously this
+      loop skipped disabled columns entirely (COLUMN_ENABLED[c] check at the top), so a disabled
+      column published NO entry at all. Now every column gets an entry with enabled/mode/
+      schedMode/winStart/winEnd/targetN/P/K/PH populated unconditionally (all values ESP1 already
+      holds in RAM), and the enabled-check moved to AFTER those fields, gating only the sensor
+      readings (moisture/NPK/etc.) exactly as before. Every already-published field, for every
+      already-enabled column, is completely unchanged in meaning and value -- verified by
+      inspection. The only behavioural change is that a disabled column (Column C, by default)
+      now gets a config-only entry instead of no entry at all.
+
+
+3. ESP2 FIRMWARE CHANGES
+----------------------------
+NONE this round. INVERTER_WARMUP_MS = 5000 (ESP2/src/main.cpp:166) was re-verified present and
+unchanged from the previously-approved session. ESP2 was rebuilt fresh anyway so both binaries are
+a matched pair from the same session.
+
+
+4. WEBSITE CHANGES
+-----------------------
+index.html:
+  - New tab button: data-view="system" ("System"), placed after "Diagnostics".
+  - New <section class="view" id="system"> with four panels: Set Clock (current-time/RTC-health
+    readout + date/time picker + Send), Thresholds (three fields + Send), LCD Lock status
+    (read-only), Restore Defaults (warning text + confirm-gated button).
+  - No changes to any existing tab/section. The generic existing tab-click handler
+    (querySelectorAll(".tab")/.view toggle) required no changes to support the new tab -- it is
+    driven entirely by matching data-view attributes, already generic.
+
+script.js:
+  - Dashboard-contract comment (top of file) updated to document SET_COLUMN's new "preset" field
+    and the three brand-new command types, keeping this file's own self-documented command
+    inventory accurate (it explicitly says it must be, having drifted once before).
+  - New FIRMWARE_PRESETS = ["PECHAY","TOMATO_S1","TOMATO_S2","TOMATO_S3"] constant, placed next to
+    (and explicitly commented as separate from) the existing cropDatabase, mirroring firmware's
+    real preset table the same way FORCE_MAX_LITERS/FORCE_MAX_DOSE_ML already mirror other
+    firmware constants.
+  - Zone Profiles card template (renderZonesUI()): added a "Current configuration" read-only line
+    and a "Firmware preset" dropdown (populated from FIRMWARE_PRESETS) to each of the existing 3
+    column cards -- no new cards, no new page.
+  - New updateZoneConfigDisplay(zone) function: renders the current-configuration line per column
+    from the new live telemetry, called every refresh from the existing updateDashboard() zone
+    loop. Shows "Unavailable" field-by-field if the snapshot hasn't reported it yet -- never
+    invents a value.
+  - submitColumnConfig(): now also reads the new preset dropdown and adds it to the SET_COLUMN
+    payload when set. Every existing field's logic (mode/enabled/sched/window/targets, and the
+    "at least one field must be filled in" check) is unchanged.
+  - New minutesToHhmm() helper (inverse of the existing hhmmToMinutes()) for formatting the
+    current-configuration line's schedule window.
+  - New System-tab handlers: Set Clock send (client-side date/time validation + confirm, since it
+    affects scheduling), Thresholds send (client-side range check mirroring the firmware clamp),
+    Restore Defaults (strong confirm dialog naming exactly what is kept vs. reset, matching the
+    existing Reboot-button confirm() convention already used elsewhere on this page).
+  - New updateSystemTab() function: refreshes the read-only current-time/RTC-health/LCD-lock
+    displays, called every refresh from the existing updateDashboard().
+  - syncControlAvailability(): Restore Defaults button added to the same signed-in+approved gate
+    the Reboot buttons already use, PLUS a dedicated idle-state check (disabled with an explicit
+    tooltip whenever ESP1 reports anything other than IDLE_STATE) -- matching the LCD's own gate.
+  - Every new send goes through the existing queueCommand() -- the same single choke point (and
+    therefore the same isApprovedUser() gate) every existing command already uses. No new
+    authentication or authorization logic was written anywhere.
+
+NOT added, per the plan: no WiFi ON/OFF write control, no Setup AP control, no Lock Screen write
+control, no duplicate Force Run/Pump Exercise/Sensor Diag/Testing/Reboot implementation -- all of
+those remain exactly as they were.
+
+
+5. FULL 15-FUNCTION MAPPING (final state)
+----------------------------------------------
+ #1  Set Clock         -> NEW: System tab, SET_CLOCK command, calls rtc.adjust()
+ #2  Schedule           -> REUSE (already existed): Zone Profiles, SET_COLUMN
+ #3  Column Mode        -> REUSE + ENHANCED: Zone Profiles, SET_COLUMN, now with a live
+                            current-configuration readout per column (see section 6)
+ #4  Preset             -> NEW: Zone Profiles' new Preset dropdown, extends SET_COLUMN
+ #5  Thresholds         -> NEW: System tab, SET_THRESH command, calls saveThresholds()
+ #6  Pump Exercise      -> REUSE (already existed): Manual/Test tab, unchanged
+ #7  Force Run          -> REUSE (already existed) + RACE FIX applied (section 7)
+ #8  Sensor Diag        -> REUSE (already existed, already a superset of the LCD page): Diagnostics
+ #9  Testing            -> REUSE (already existed, deliberately not expanded): Manual/Test
+ #10 WiFi ON/OFF        -> NOT IMPLEMENTED (write control) -- read-only status unchanged
+ #11 Setup AP ON/OFF    -> NOT IMPLEMENTED
+ #12 Restore Defaults   -> NEW: System tab, RESTORE_DEFAULTS command, calls restoreDefaults()
+ #13 Lock Screen        -> NEW (read-only only): System tab status tile, new telemetry field
+ #14 Reboot ESP1        -> REUSE (already existed): Controls tab, unchanged
+ #15 Exit               -> NOT APPLICABLE (confirmed no server-side meaning, nothing to expose)
+
+
+6. EXACT COLUMN A/B/C BEHAVIOUR + COLUMN SELECTION/ACTIVATION
+--------------------------------------------------------------------
+Exactly 3 physical columns exist in firmware, tagged A, B, C (ESP1/src/main.cpp:105,
+const char COL_TAG[NUM_COLUMNS] = {'A','B','C'}; NUM_COLUMNS=3 at line 100). There is no firmware
+concept of a 4th column, of renaming these, or of a website-only "active column" -- the website's
+3 zone ids map one-to-one onto these exact 3 tags.
+
+Column enabled/disabled default (ESP1/src/main.cpp:104):
+  COLUMN_ENABLED[NUM_COLUMNS] = { true, true, false };   -- Columns A and B enabled, COLUMN C
+  DISABLED by default today. This is a real firmware state, not a website concept.
+
+"Selection for editing" vs. "enabled for operation" are kept distinct exactly as required: the
+website's 3-cards-at-once layout (unchanged from before -- see the plan's design-decision note)
+means "which column are you configuring" is simply "which card you are looking at/typing into" --
+a pure UI navigation concept with no firmware counterpart and no effect on anything until you press
+that card's own "Send to ESP1" button. "Enabled/disabled" is its own explicit field/dropdown inside
+each card (cfgEnabled), completely separate from merely viewing or scrolling to a card. Sending a
+card's form only ever affects that ONE column (col := that card's own A/B/C tag) -- there is no way
+for editing one card to affect another column's real state.
+
+Each of the 3 cards now ALSO shows a live "Current configuration: Enabled/Disabled -- MODE --
+Schedule: ... -- Targets: ..." line, sourced from the new read-only telemetry (section 2g/8),
+refreshed on every snapshot, completely independent of whatever is currently typed into that
+card's edit form. This satisfies "see current status of each column" and "clearly see which
+columns are active" without inventing a second, competing UI paradigm -- see the approved plan's
+explicit design-decision note on why the existing simultaneous-3-cards layout was kept rather than
+replaced with a single hide-others dropdown.
+
+
+7. EXACT VALID MODES (read from source, not assumed)
+----------------------------------------------------------
+ESP1/src/main.cpp:429 (unchanged, re-verified): enum ColMode { MODE_AUTO = 0,
+MODE_IRRIGATION_ONLY = 1 };
+
+There are exactly TWO real mode values: AUTO and IRRIGATION_ONLY. No third mode value exists
+anywhere in firmware. The LCD's apparent "3rd state" shown in its Column Mode editor is NOT a mode
+value at all -- it is the entirely separate COLUMN_ENABLED[] flag (disabled), independent of
+`mode`. The website's existing mode dropdown (AUTO / IRRIGATION_ONLY / blank-for-unchanged) already
+matched this exactly before this round of work and was not changed.
+
+
+8. FIREBASE/API CHANGES
+----------------------------
+Three brand-new command types added to the existing command dispatcher: SET_CLOCK, SET_THRESH,
+RESTORE_DEFAULTS. One existing command type extended with one new optional field: SET_COLUMN now
+also accepts "preset". Three new read-only fields added to the existing live-telemetry payload:
+system.rtcOk, system.deviceTime, diagnostics.system.lcdLocked, plus per-column config fields added
+to the existing sensors.zones.<id> objects (enabled, mode, schedMode, winStart, winEnd, targetN/P/
+K/PH). No new top-level Firebase nodes. No changes to irrigation/manual, irrigation/config, or the
+overall database shape.
+
+
+9. FIREBASE-RULE CHANGES
+-----------------------------
+NONE. Website/firebase-rules.json was inspected fresh (not assumed from the earlier audit) and
+confirmed unchanged: the rule governing writes to irrigation/commands/$commandId only checks that
+the writer is an approved user (or one of two admin UIDs, or the device's own UID for status
+replies), that the node is new, and that source=="dashboard"/status=="queued" -- it never inspects
+the command's "type" string or the shape of "payload" at all. This means all 3 new command types,
+and the extended SET_COLUMN, are already covered by the existing rule with zero changes. Confirmed
+by re-reading the actual rules file, not by assumption.
+
+
+10. ESP1 BUILD RESULT
+--------------------------
+pio run in Smart-Irrigation-main\ESP1: SUCCESS -- 0 errors, 0 warnings. ~33 seconds.
+  RAM:   23.6% (77,296 / 327,680 bytes)   -- unchanged from the Part-1-only build
+  Flash: 41.1% (1,294,241 / 3,145,728 bytes)   -- +3,592 bytes vs. the Part-1-only build, consistent
+         with the new command branches + telemetry code + race-fix logic added this round
+
+
+11. ESP2 BUILD RESULT
+--------------------------
+pio run in Smart-Irrigation-main\ESP2: SUCCESS -- 0 errors, 0 warnings. No recompilation needed
+(source unchanged since the last build), re-linked/re-checked in ~2.6 seconds.
+  RAM:   7.1%  (23,112 / 327,680 bytes)
+  Flash: 25.7% (336,345 / 1,310,720 bytes)
+
+
+12. WEBSITE VALIDATION RESULT
+----------------------------------
+node --check Website/script.js: PASSED (exit code 0, no syntax errors).
+Manual structural read-through of every new/changed HTML block: balanced tags, correctly nested,
+follows the existing panel/section markup conventions exactly. No JS console/runtime test was
+possible in this environment (no browser available here) -- see section 14 for what to check live.
+
+
+13. EXACT FIRMWARE BINARY LOCATIONS
+----------------------------------------
+ESP1: Smart-Irrigation-main\ESP1\.pio\build\esp32dev\firmware.bin  (1,300,816 bytes, freshly built
+      this session)
+ESP2: Smart-Irrigation-main\ESP2\.pio\build\esp32dev\firmware.bin  (336,704 bytes, from the
+      previously-approved build this same session -- unchanged since, as expected)
+
+
+14. CONFIRMATION -- NO HARDWARE WAS FLASHED
+------------------------------------------------
+Only "pio run" (compile) was executed for ESP1 and ESP2, twice each. No "pio run --target upload"
+or any other upload/flash command was ever invoked. No serial/USB communication with any board
+occurred. Nano was never opened, edited, or built.
+
+
+15. REMAINING LIMITATIONS
+------------------------------
+  - WiFi ON/OFF and Setup AP remote control remain intentionally NOT implemented, exactly as
+    approved -- both can sever the very connection needed to confirm the command, with no existing
+    safeguard for WiFi and a command-polling pause during an active Setup AP session. Read-only
+    WiFi status remains available in Diagnostics.
+  - Lock Screen remains read-only by design -- no remote way to lock or unlock the physical LCD,
+    which is the intended, approved behaviour (protects a local-only scenario).
+  - This environment has no ESP32/browser hardware to test against -- everything above is verified
+    by source inspection, static analysis, and successful compilation/syntax-check, not by live
+    device or live-browser behaviour. Section 16 lists what that leaves for physical testing.
+  - The Force Run race-fix message ("FORCE RUN BLOCKED...") is new LCD text that has not been seen
+    on a physical screen; the wording/layout should be glanced at on the actual 20x4 display once
+    flashed, though it follows the exact same rendering pattern (snprintf into a 21-byte buffer,
+    lcd.setCursor/print per row) as the existing, working "FORCE RUN ARMED" screen it sits next to.
+
+
+16. PHYSICAL TESTS REQUIRED NEXT WEEK (once flashed at the site)
+------------------------------------------------------------------------
+  1. Force Run race fix: arm a Force Run from the website, then walk up to the LCD and try to
+     arm one locally -- confirm the LCD shows "FORCE RUN BLOCKED..." for ~3 seconds and does NOT
+     overwrite the web-armed countdown, then confirm the LCD falls back to showing that same
+     still-live web-armed countdown correctly afterward.
+  2. Set Clock: send a new date/time from the website; confirm the LCD's own clock page reflects
+     it, and confirm that same day's schedule window opens/closes at the newly-set time rather
+     than the old one.
+  3. Thresholds: send new start/stop/gap values from the website; confirm the LCD's Thresholds
+     screen shows the same numbers, and confirm sending stop <= start from the website still gets
+     auto-bumped exactly like the LCD/SMS paths already do.
+  4. Preset: apply a firmware preset (e.g. TOMATO_S1) to a column from the new dropdown; confirm
+     the column's N/P/K/pH on the LCD match the preset table exactly.
+  5. Restore Defaults: confirm the button is disabled/greyed out with an explanatory tooltip
+     whenever the system is not idle, and that a real idle-state restore matches what the LCD's own
+     Restore Defaults produces (and that calibration/column-enabled/WiFi setup are genuinely
+     untouched afterward).
+  6. Column Mode / current-configuration readout: confirm all 3 cards (including disabled Column C)
+     show a live "Current configuration" line matching LCD reality, and that it updates correctly
+     within one telemetry refresh after any change is sent.
+  7. LCD Lock status: lock the physical LCD (Settings > Lock Screen) and confirm the website's
+     status tile flips to "Locked" (and back to "Unlocked" after UP+DOWN), with no way to affect it
+     from the website itself.
+  8. General regression: re-run the existing Force Run, Pump Exercise, Sensor Diag, and Testing
+     flows once more post-flash to confirm none of the surrounding additions changed their existing
+     behaviour (none of that code was touched, but a live confirmation costs little).

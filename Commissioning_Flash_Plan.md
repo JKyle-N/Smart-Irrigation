@@ -117,8 +117,25 @@ Walk every state that can trap an operator:
   screens with the hold intact; "Interrupt web" clears it, bounces the page to Dashboard, and stops
   any in-flight pulse.
 - With the hold active, confirm LCD Settings → Force Run refuses and names the hold.
+- **New (2026-09-10) — Proceed-gate fix:** open Manual/Test with a stale/no ESP1 snapshot → Proceed
+  now reveals the screen anyway, but every test button (Timed Pulses, hold-to-run, exercise, sweep)
+  stays disabled with an "ESP1 appears offline" banner. Once ESP1 reconnects, confirm the buttons
+  enable and the banner switches to "Direct hardware control — this tab drives the hardware
+  directly."
+- **New (2026-09-10) — hold-to-run buttons:** press and hold each relay-target button, confirm the
+  relay stays energised only while held and drops within ~1 s of release (ESP1 polls `testHold`
+  every 1 s during a hold), within ~4 s of switching away, hiding the tab or losing network
+  (`TEST_HOLD_BROWSER_TIMEOUT_MS`), and at 15 s of continuous holding (`TEST_HOLD_MAX_MS`) even
+  with the button still down. After a cap, confirm that holding on does **not** re-arm: only
+  release-and-press-again does. Confirm a pH button requires the confirm() dialog first and does
+  nothing on a plain tap. **Then do the Stage-C-style test specifically for this feature:** start a hold, cut
+  ESP1's power mid-hold, confirm ESP2's own 400 ms dead-man drops the relay unaided within ~400 ms —
+  this is the actual safety guarantee the whole feature rests on, prove it before trusting it for
+  real use.
 
-> **Abort if** Emergency Stop is ever blocked, or the hold cannot be revoked from the LCD.
+> **Abort if** Emergency Stop is ever blocked, the hold cannot be revoked from the LCD, a held relay
+> outlives its button release by more than ~2 s or a lost connection by more than ~5 s, any hold
+> runs past 15 s, or ESP2 fails to drop the relay within ~400 ms of ESP1 losing power mid-hold.
 
 ### G — NPK blending, then real dosing
 
@@ -163,18 +180,20 @@ Bisecting costs about six flash cycles, which is why it is the fallback rather t
 
 ## Known-good reference
 
-The tip of `main` builds clean on both controllers:
+`main` builds clean on all three controllers (confirmed 2026-10-26, after merging Sugian's
+2026-09 work and the hold-to-run cap / PZEM warmup / battery-gate adjustments):
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 23.6 % (77,176 B) | 40.8 % (1,283,709 B) |
-| ESP2 | 7.1 % (23,104 B) | 25.5 % (334,829 B) |
+| ESP1 | 23.6 % (77,304 B) | 41.2 % (1,297,133 B) |
+| ESP2 | 7.1 % (23,228 B) | 25.8 % (337,705 B) |
+| Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 A build that differs sharply from these has picked up something unintended.
 
 ## Still outstanding
 
-- `research123` (the device account password) has never been rotated.
+- The device account password (see `Firebase infos.txt`) has never been rotated.
 - The SMS Summary/Status feature was specified but never implemented.
 
 ## Host test suite

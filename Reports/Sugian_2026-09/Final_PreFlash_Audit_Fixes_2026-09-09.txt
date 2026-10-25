@@ -1,0 +1,116 @@
+SMART IRRIGATION & FERTIGATION SYSTEM
+Final Pre-Flash / Pre-Publish Deep Scan — Fixes Applied
+Date: 2026-09-09
+
+Follow-up to Battery_Fix_and_DeepScan_Report_2026-09-08.txt and Fixes_Applied_2026-09-08.txt. This
+round re-scanned ESP1, ESP2, Nano, Website, Firebase rules, and the Vercel function fresh (three
+independent read-only audits), specifically re-verifying every fix from the prior round plus looking
+for anything new, ahead of eventually flashing hardware and finalizing everything.
+
+Per your answers: no hardware was flashed this session (you said you're not ready today), the
+project's own Commissioning_Flash_Plan.md staged A-G process is confirmed as the agreed procedure for
+whenever flashing does happen, and Website git publishing is left to you going forward -- I did not
+commit/push anything to the Website repo.
+
+
+====================================================================
+1. URGENT — LIVE PRODUCTION REGRESSION, FOUND AND FIXED IMMEDIATELY
+====================================================================
+The re-audit found that yesterday's own Firebase-rules fix (the `type` whitelist added to
+`commands/$commandId`) was missing `RUN_PUMP_TEST` — the command the Manual/Test tab's three
+"Exercise transfer/booster/mixer pump" buttons actually send. Because the rules reject any `type` not
+on the list, those three buttons were completely broken in production for every user from the moment
+yesterday's rules deployed.
+
+Fixed immediately and redeployed: `Website/firebase-rules.json`'s whitelist now includes
+`RUN_PUMP_TEST`, pushed live via `firebase deploy --only database` to `smart-irrigation-web2`. The
+three Exercise-pump buttons work again.
+
+
+====================================================================
+2. ESP1 FIRMWARE — 4 fixes applied, built clean (0 errors/warnings, size unchanged from baseline)
+====================================================================
+1. `SET_THRESH` (Firebase command) now rejects a missing/negative `thGap` instead of silently
+   defaulting it to 0 — previously a partial payload could silently make the system "fertigate on
+   any positive shortfall at all" instead of only past a meaningful one, with no log/alert
+   distinguishing it from a deliberate 0.
+2. ThingSpeak upload (`tsUpload()`) now uses the same validity gates (`envValid`/`tankValid`/
+   `lightValid`/`battVCalValid`/`acsOk_`) as the Firebase live snapshot already did — previously it
+   published every field unconditionally, including a possibly-fabricated placeholder battery
+   voltage/power before the sensor is ever calibrated. A field is now simply omitted from that
+   update when its backing sensor isn't valid, matching Firebase's "absent, not fabricated" behavior.
+3. SMS `WIFIPORTAL,STOP` is no longer case-sensitive — `WIFIPORTAL,stop` (lowercase) previously fell
+   through and (re-)started the SoftAP portal instead of stopping it. Fixed the same way as
+   yesterday's `WIFI,ON/OFF` case fix.
+4. A per-column MANUAL schedule window with start >= end (e.g. accidentally configuring an overnight
+   window) previously passed validation and then silently, permanently disabled that column with
+   only a routine, non-alerting log line. Now rejected on the Firebase `SET_COLUMN` path, and
+   auto-corrected in real time on the LCD editor (same live-correction approach as the day-of-month/
+   leap-year fix from yesterday) so an invalid window can never be committed from either surface.
+
+
+====================================================================
+3. ESP2 FIRMWARE — 3 fixes applied, built clean (0 errors/warnings, size unchanged from baseline)
+====================================================================
+1. **MAJOR — closes the same safety gap yesterday's EXERCISE/PRIME fix was meant to close, in the
+   one path it didn't reach.** `SEQ_MIX` (the mixing stage of every fertigation run) drives the
+   mixer directly via `pcfOn()` without ever calling `stageBegin()`, so it was invisible to
+   yesterday's widened `safetyMonitor()` gate exactly the same way EXERCISE/PRIME_START used to be —
+   meaning every fertigation run's mix stage (up to several minutes) ran with zero PZEM AC
+   voltage-window/overcurrent/stall protection; only a mixer-specific overcurrent check that never
+   watches supply voltage at all. Fixed by adding a `mixActive` context to `safetyMonitor()`'s gate,
+   with its own fault-teardown branch (turns off the mixer, holds the fault) mirroring the pattern
+   already used for the existing mixer-overcurrent fault right next to it.
+2. **MAJOR — closes a genuine simultaneous-actuation possibility.** `EXERCISE` (ESP1's own
+   unattended, automatic 2-day preventive-maintenance pump run) could previously start concurrently
+   with an active `PRIME_START` purge, `CAL_START` calibration stream, or a dispatched work order —
+   each of those three already correctly refused each other, but none of them checked whether an
+   EXERCISE run was in progress, and EXERCISE itself didn't check them either. This could have
+   energized two actuators at once, against the project's locked sequential-never-simultaneous pump
+   architecture. Fixed by adding the missing mutual-exclusion checks on both sides.
+3. **MINOR** — a `PWR_FAIL` (or other non-flow fault) occurring while already running a flow-blind
+   recovery no longer erases the "flow sensor is known dead" memory; it's preserved across that fault
+   instead of being clobbered back to false, avoiding one unnecessary extra operator RESUME cycle in
+   an already-rare double-fault scenario.
+
+**Nano: no changes.** Confirmed clean by the fresh scan — sensor-hub-only design fully intact.
+
+
+====================================================================
+4. VERIFICATION
+====================================================================
+- ESP1: `pio run` — SUCCESS, RAM 23.6% / Flash 41.2% (matches the project's own known-good baseline
+  table in Commissioning_Flash_Plan.md/SESSION_HANDOFF.md, no unexpected size jump).
+- ESP2: `pio run` — SUCCESS, RAM 7.1% / Flash 25.7% (same, matches baseline).
+- Firebase rules: redeployed live, JSON validated before and after.
+- Native host unit tests (`pio test -e native`) could not be run in this environment — confirmed no
+  gcc/g++ toolchain is on PATH here, despite the project's own docs claiming it's installed (those
+  docs describe a different machine/user path entirely — see the note below). The ESP32 cross-build
+  success remains the verification path used throughout, consistent with every fix this session.
+- No hardware flashed. No Website git commits made.
+
+
+====================================================================
+5. HOUSEKEEPING NOTE — project docs reference a different machine/user
+====================================================================
+While reading `SESSION_HANDOFF.md` and `Commissioning_Flash_Plan.md` for the pre-flash process (which
+IS still followed as-is — the staged A-G methodology is sound and hardware-independent), both docs
+reference a working path (`C:\Users\johnb\...`) and a GitHub repo (`JKyle-N/Smart-Irrigation`) that
+don't match this machine (`C:\Users\johnm\...`, `Jmhatake123/Website`), and both claim a MinGW-w64
+host compiler is installed that isn't present here. Worth knowing if you ever compare notes against
+those docs' environment-specific claims — the staged flash process itself is unaffected either way.
+
+
+====================================================================
+6. STILL OUTSTANDING (not code bugs — pre-existing, documented, no action taken)
+====================================================================
+Per the project's own Calibration_Worksheet.md and SESSION_HANDOFF.md, unrelated to this scan:
+`PUMP_FLOWRATE_MLPM` is still an uncalibrated guess, 61 calibration constants remain [MEASURE]/[TBD]/
+[CONFIRM], the device account password has never been rotated, and SMS Summary/Status was specified
+but never built. None of these are bugs to fix in code — they're commissioning/calibration work that
+happens on the actual rig, per Commissioning_Flash_Plan.md.
+
+
+NEXT STEP: whenever you're ready to flash, `Commissioning_Flash_Plan.md`'s Stages A through G (each
+with its own abort condition — Stage C's ESP2 power-loss dead-man test is explicitly "the one that
+must not be skipped") is the confirmed process to follow.

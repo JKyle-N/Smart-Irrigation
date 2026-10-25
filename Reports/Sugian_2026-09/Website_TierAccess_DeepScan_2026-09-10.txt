@@ -1,0 +1,132 @@
+================================================================================
+ DEEP SCAN -- Website / Firebase / Vercel / Tier Access & Privilege
+ Date: 2026-09-10 (follow-up round, after the Sub-operator + Activity features)
+================================================================================
+
+SCOPE
+--------------------------------------------------------------------------------
+Requested: re-check the whole tier-access system end to end (Main operator,
+Creator/backup operator, Sub-operator, 1h temp-access, plain approved "others",
+and non-approved accounts) plus a general pass over Website/Firebase/Vercel for
+anything else introduced by tonight's Sub-operator and Recent-Activity features.
+
+This follows immediately after the previous turn's access-gap trace (which found
+and fixed the Proceed-button and tab-click-handler reveal gaps, and the
+/irrigation/manual server-rule gap) -- this round specifically hunts for
+anything THOSE fixes, or the newer Sub-operator/Activity features, might
+themselves have introduced.
+
+RESULT: 3 more real issues found, all fixed. All are either narrow/low-severity
+or pure correctness/documentation issues -- nothing as serious as the previous
+round's access-reveal or /irrigation/manual gaps, which are now closed.
+================================================================================
+
+1. [FIXED] queueCommand()'s new activity-logging line could report a false
+   "Could not queue command" failure
+--------------------------------------------------------------------------------
+The Recent-Activity feature added this line inside queueCommand()'s success
+callback:
+    db.ref(`activity/${auth.currentUser.uid}`).push({...})
+If the user signs out in the brief window between the command push starting
+and this callback running, auth.currentUser is null there, and .uid throws
+SYNCHRONOUSLY inside the .then() -- which the chain's own .catch() then reports
+to the user as "Could not queue command: ...", even though the real command had
+ALREADY succeeded moments earlier. Narrow (needs a sign-out mid-flight) but a
+real, misleading-failure-message bug.
+Fix: capture `const myUid = auth.currentUser?.uid;` first and skip the activity
+write entirely if it's null, instead of letting a null access blow up the whole
+callback.
+
+2. [FIXED] Deleting a user left /presence/{uid} and /activity/{uid} behind
+   forever
+--------------------------------------------------------------------------------
+delete-user-api's delete-user.js only ever removed /users/{uid} after deleting
+the Auth account. /presence/{uid} and /activity/{uid} (both added this session)
+are SEPARATE top-level nodes, not children of /users, so they were silently
+orphaned on every delete. Harmless as dead data (neither is ever displayed
+again once the uid drops out of /users, which is what every reader keys off),
+but cleaned up anyway now that this call already holds the Admin SDK's
+rules-bypassing access to do it properly in the same trusted operation.
+Fix: the delete now removes /users/{uid}, /presence/{uid}, and /activity/{uid}
+together via Promise.all(). NOT YET DEPLOYED -- this project is served via
+`vercel --prod` from a local, non-git-tracked folder (confirmed via
+.vercel/project.json), so it needs an explicit Vercel deploy, separate from the
+website publish and the Firebase rules deploy. Ask before running it.
+
+3. [FIXED] README.md's RTDB node-layout table had drifted out of sync
+--------------------------------------------------------------------------------
+Missing entirely: presence/$uid, activity/$uid, and users/$uid's
+tempAccessUntil/subOperator fields (all added this session, never documented).
+Also a factual error: claimed testHold's `bit` whitelist has 9 targets: it
+actually has 10 (transfer/colA/colB/colC/mixer/nutA/nutB/nutC/phUp/phDn) --
+recounted directly against both the rule text and index.html's dropdown.
+Also corrected a stale claim that the Proceed button "stays disabled" without
+the manual rule -- no longer true since the 2026-09-10 Proceed-gate revision
+(it now reveals the panel independent of ESP1/the manual hold's state; the
+individual test buttons are the actual freshness gate).
+Fix: table entries added for presence/activity/users' two grant fields, target
+count corrected, Proceed-button claim updated to match current behaviour.
+
+================================================================================
+DELIBERATELY VERIFIED, NOT CHANGED -- traced fully, found already correct
+================================================================================
+- Suspected an 8-second window where withholding Sub-operator (or a temp grant
+  expiring) mid-hold-to-run-press wouldn't stop the relay immediately, only
+  after ESP1's own browser-timeout. Traced it fully: a hold-to-run press can
+  only be physically in progress while the operator is actually viewing the
+  Manual/Test tab, and refreshOperatorUI() (called synchronously within the
+  SAME account-status listener callback that updates mySubOperator/
+  myTempAccessUntil, built earlier this session for the tab-hiding
+  requirement) already bounces the view back to Dashboard the instant
+  privilege drops while that tab is active -- which itself calls
+  mtHoldStop(true) as part of the same click-simulated navigation. No gap;
+  adding a second, redundant stop here would have been unnecessary complexity
+  for a problem that doesn't exist. Confirmed correct, no change made.
+- Re-verified the new /irrigation/manual rule (from the previous round) against
+  every tier once more, character by character: release (want:false) stays
+  open to anyone signed in; acquire (want:true) now requires approved-or-
+  operator AND the same operator/temp-access/sub-operator check testHold and
+  the six privileged commands already use. Matches exactly.
+- Re-verified subOperator's rule needs no separate .exists() guard the way
+  tempAccessUntil's does -- `root.child(...).child('subOperator').val() ===
+  true` correctly evaluates false (not an error) when the field is absent,
+  unlike a numeric comparison against a possibly-null value, which is why
+  tempAccessUntil's check is written differently. Both are correct for their
+  own value type.
+- Re-verified detachUserManagementListener() tears down BOTH new watches
+  (presence and activity), not just the users listener -- confirmed present.
+- Re-verified Kick + Sub-operator/temp-access interaction: Kick force-signs-out
+  only, does not clear either grant, so a kicked sub-operator regains their
+  grant on the next sign-in -- confirmed this is intentional (Kick has never
+  been a revocation of anything, consistent with how it already worked before
+  Sub-operator existed) not a new gap.
+- Re-read the entire tightened /irrigation/manual, /irrigation/testHold, and
+  /irrigation/commands rules once more fresh, full text, checking for any
+  paren-balance or logic slip introduced while stacking three OR'd privilege
+  checks (operator / temp-access / sub-operator) across three different rule
+  strings this session -- all three balance and read identically in intent.
+- delete-user-api's OTHER logic (operator-only, can't delete itself/ESP1/the
+  other operator, generic error on token-verification failure,
+  checkRevoked=true) re-confirmed unchanged and correct.
+- firebase-config.js re-confirmed pointing at the correct, already-deployed
+  project (smart-irrigation-web2).
+
+================================================================================
+VERIFICATION
+================================================================================
+- node --check script.js -> clean.
+- node --check delete-user.js -> clean.
+- JSON.parse on firebase-rules.json -> clean (unchanged this round, still the
+  version already deployed live from the previous turn).
+- git diff --stat (Website/): README.md +13/-4, script.js +16/-4 lines only --
+  scoped exactly to the 3 fixes above.
+
+================================================================================
+WHAT'S LEFT
+================================================================================
+  [ ] Deploy delete-user-api's fix: `vercel --prod` from delete-user-api/ (not
+      yet run -- ask before running, it's a production deploy).
+  [ ] Publish the website as usual (script.js, README.md changed).
+  [ ] Firebase rules: NOT changed this round -- the previous round's deploy
+      already covers everything currently in firebase-rules.json.
+================================================================================

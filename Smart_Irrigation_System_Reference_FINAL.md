@@ -181,7 +181,7 @@ The system uses strict role separation to reduce firmware complexity, avoid dupl
 
 ## 6.6. Monitoring Modules
 
-* INA226 Current & Power Monitor (Battery-side)
+* Battery voltage/current via a calibrated opto-isolated ADC read (GPIO35/34) — replaces the original INA226 (removed; kept only as a harmless boot-presence probe, see `CLAUDE.md`'s CHANGED section)
 * PZEM-004T Power Monitor
 * DS3231 RTC
 * microSD Logging Module
@@ -319,7 +319,7 @@ Note (companion spec §A): the Nano streams RAW signals; ESP32 #1 owns and appli
 | DAY       | Switch Nano to day-idle interval                         |
 | NIGHT     | Switch Nano to night-idle interval                       |
 | RESET_REQ | Request Nano software self-reset (via short-timeout WDT) |
-| CAL_START,\<SENSOR_ID\> / CAL_STOP,\<SENSOR_ID\> | Begin / end the fast raw calibration stream for one Nano sensor (companion spec §A.3) |
+| CAL_START,\<SENSOR_ID\> / CAL_STOP | Begin / end the fast raw calibration stream for one Nano sensor (companion spec §A.3). `CAL_STOP` takes no parameter — it unconditionally clears whichever stream is active (only one can be active at a time), matching the identical parameterless shape on ESP32 #2's own `CAL_STOP`. |
 
 RESET_REQ is used both for fault recovery (after 5 consecutive garbage packets, Section 18.9.5) and for the once-per-day fresh-start reset.
 
@@ -2039,7 +2039,10 @@ Sets the per-column target nutrient levels in mg/kg (N, P, K) plus target pH. Th
 SET,COL_A,N,150,P,40,K,200,pH,5.8
 
 - Targets are in mg/kg to match the NPK sensor reading unit
-- pH is a direct setpoint corrected by the pH up/down pumps
+- pH is stored per column and echoed in logs/receipts, but is **not** an automatically-corrected
+  setpoint — no dosing logic reads it. Actual pH handling is validation-only against a fixed window
+  (Section 14.2.4); the pH up/down pumps are manual/`TEST_PULSE`-only. See `CLAUDE.md`'s LOCKED
+  nutrient dosing section.
 - Preset applies per session, per column (each column may differ)
 
 ### 12.2.2. Nutrient Preset — Named Crop Preset
@@ -2330,7 +2333,11 @@ After nutrients are dosed into the mixing tank, the mixer runs for a homogenizat
 * Mixing duration: EDITABLE CONSTANT (placeholder — <TBD>, set during commissioning)
 * EC/pH validation (Section 14.2.4) is performed after mixing stabilizes
 * Mixer stabilization timing is owned by ESP32 #2 (Section 10.6.3)
-* Sequencing of nutrient dosing vs. pH correction is part of the dosing calculation topic and is documented as DEFINED-BUT-PENDING (Section 12.4)
+* There is no automated pH correction to sequence against nutrient dosing: pH is validation-only
+  (this section) and is never dosed. The "DEFINED-BUT-PENDING" status this line previously carried
+  pointed at Section 12.4, which — checked directly — only ever defines the N/P/K gap formula and
+  never defined a pH-correction dose; that pointer is now closed out as "not planned," not pending.
+  See `CLAUDE.md`'s LOCKED nutrient dosing section for the current, authoritative statement.
 
 
 ---

@@ -1,0 +1,785 @@
+# Complete Diagnostic, Compatibility, Security & Bug Audit — Smart Irrigation
+
+## Context
+Full-system audit combining: (1) the security/bug audit already performed and largely fixed earlier
+in this engagement, (2) the live-hardware FLOW_FAIL,TRANSFER / SOIL_MISSING_COL_B investigation,
+and (3) new investigation into the "system is not safely idle" rejection loop. Diagnosis only —
+nothing has been modified, deployed, flashed, or pushed.
+
+## The two firmware trees (do not confuse them)
+- NEW/dev — C:\Users\johnm\Documents\RESEARCH PROJECT CAP2\Smart-Irrigation-main — where every
+  fix from earlier in this engagement (A1/B1/C1/C2/C3/D1/D2/D3 below) lives. Not flashed.
+- OLD/flashed (reference only) — C:\Users\johnm\Documents\RESAERCH PROJECT CAP2 (Current
+  Flashed)\Smart-Irrigation-main — ESP1/src/main.cpp (8,456 lines, 2026-08-25),
+  ESP2/src/main.cpp (1,429 lines, 2026-08-25), Nano/Nano.ino (616 lines, 2026-08-19). This is
+  what the physical rig actually runs right now. Read-only reference; never written to, this
+  session or any prior one.
+
+Every claim below states which tree it was verified against. "Confirmed" means read fresh this
+session (not recalled). CONFIDENCE is given per section.
+
+---
+
+# A. Executive Summary
+
+The live website and the OLD (flashed) firmware are compatible for almost everything checked —
+Firebase paths, field names, command types, and safety-gate variables are the same. Three real,
+evidence-backed problems exist:
+
+1. The physical rig is very likely still sitting in the original FLOW_FAIL,TRANSFER hold.
+   SOIL_MISSING_COL_B is a real but unrelated, independent, lower-severity alert that happened to
+   overwrite the dashboard's one shared "last fault" text field — it did not cause a new stop.
+2. The OLD firmware's FORCE_RUN rejects with the single generic message "system is not safely
+   idle" for any of 7 different internal conditions, so the operator cannot tell which one is
+   actually true from the website alone — this is a real, confirmed limitation of the currently
+   flashed firmware, already fixed (specific per-reason messages) in the unflashed dev tree.
+3. The OLD firmware's FORCE_RUN gate is also missing two checks (actuationsDisabled,
+   webManualHeld()) that the dev tree added — on OLD firmware a forced run can be accepted and
+   armed (showing a live countdown) while actuations are disabled or Manual/Test holds the rig,
+   only to silently abort at fire time. This does not bypass hardware safety (the fire-time re-check
+   still protects the pumps) — it is a dashboard-honesty gap, not a safety bypass.
+
+Separately, the credential-exposure incident from earlier in this engagement (Section V) is fully
+resolved: the exposed key was deleted and rotated, the replacement is in Vercel's env vars, and the
+local copy of the replacement was also removed by the user. No secret is currently sitting on disk
+in this project tree.
+
+CONFIDENCE: HIGH for everything with a specific file/line citation below; MEDIUM for items
+explicitly marked "pattern-consistent, not re-diffed line-by-line"; LOW only where stated.
+
+---
+
+# B. Critical issues
+
+None found this pass. The A1 finding from the earlier security audit (exposed Firebase Admin
+SDK key) was Critical at the time — it is now resolved (see Section V) and is not re-listed here as
+open.
+
+---
+
+# C. High issues
+
+### C-H1. OLD firmware's FORCE_RUN gate gives one generic rejection reason for 7 different conditions
+- Severity: High   Type: OLD-firmware compatibility issue (already fixed in dev tree, unflashed)
+- File/Function: OLD ESP1/src/main.cpp, firebaseCommandTick(), lines 5934-5938
+- Evidence:
+  if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
+      pendingExercise.active || esp2Held || fbRemoteExerciseId[0]) {
+    firebaseQueueStatus(c.id, "rejected", "system is not safely idle");
+    logEvent("FIREBASE", "REJECT", "FORCE|NOT_IDLE"); continue;
+  }
+  Compare dev tree (ESP1/src/main.cpp:6152-6166, confirmed present and unchanged this pass):
+  identical condition list plus actuationsDisabled || webManualHeld(), and a "why" ternary
+  giving one of six specific, distinct rejection strings instead of one generic one.
+- What happens now: every FORCE_RUN rejected for any of 7 reasons on the physical rig shows
+  literally the same words, "system is not safely idle" — indistinguishable whether the cause is a
+  stuck run, a held fault, a running test, or the LCD being in a menu.
+- Why it happens: the dev tree's own comment (line 6155-6157) confirms this was a deliberate,
+  already-identified fix — the diagnosability gap was known and closed in the code that has not yet
+  reached hardware.
+- What should happen: the specific reason should reach the dashboard, as it already does in the
+  dev tree.
+- Recommended fix: flash the dev-tree ESP1 firmware (not done — outside this audit's scope).
+- Requires: New firmware (ESP1). CONFIDENCE: HIGH (both trees read fresh, word-for-word diff).
+
+### C-H2. OLD firmware's FORCE_RUN gate is missing the actuationsDisabled/webManualHeld() checks
+- Severity: High   Type: OLD-firmware compatibility issue (already fixed in dev tree, unflashed)
+- File/Function: same location as C-H1.
+- Evidence: the OLD condition list (quoted above) has no actuationsDisabled/webManualHeld()
+  terms at all. The dev tree's own comment states plainly why they were added: "forceTick()/
+  sendForceWorkOrder() both re-check them at fire time so no work order is actually sent while
+  locked out, but without this the dashboard was told 'accepted, armed' for the full countdown (up
+  to 300s) before silently failing — directly contradicting the disabled-actuations banner's own
+  claim that forced runs are blocked immediately."
+- What happens now on the physical rig: submitting a FORCE_RUN while actuations are disabled,
+  or while another session has Manual/Test open holding the rig, is accepted and armed (a
+  countdown is shown), then silently aborts (via forceAbort()) once the countdown expires — never
+  actually running anything, but also never telling the operator immediately that it wouldn't.
+- Why it happens: the arm-time gate on OLD firmware doesn't check these two conditions; only
+  the separate fire-time re-check inside forceTick() (which the OLD firmware still has,
+  unverified this pass but structurally present per the surrounding code) actually stops it from
+  physically running.
+- Is hardware safety actually bypassed? No — per the dev tree's own comment, the fire-time
+  re-check is a pre-existing, separate safeguard that both trees share; this finding is about
+  dashboard honesty, not physical safety.
+- Recommended fix: flash the dev-tree ESP1 firmware.
+- Requires: New firmware (ESP1). CONFIDENCE: HIGH.
+
+### C-H3. The physical rig is very likely still sitting in the original, unresolved FLOW_FAIL,TRANSFER hold
+- Severity: High   Type: Hardware issue (most likely) / operational — not a code bug
+- See Section O for the full trace. CONFIDENCE: HIGH for the mechanism, MEDIUM for the
+  specific physical cause (valve/pump/air-lock/sensor — cannot be distinguished remotely).
+
+### C-H4. Manual/Test cannot currently be granted on the physical rig at all
+- Severity: High   Type: OLD-firmware compatibility issue (already fixed in dev tree, unflashed)
+- See Section R. CONFIDENCE: HIGH (both trees read fresh).
+
+---
+
+# D. Medium issues
+
+### D-M1. The dashboard's single "last fault" field conflates "why we're currently held" with "most recent alert of any severity"
+- Severity: Medium   Type: Website/firmware UX-logic issue — pre-existing in both trees, not a version mismatch
+- See Section P/T. CONFIDENCE: HIGH.
+
+### D-M2. runPhase/diagnostics.runProgress.active is not restored when a fault-recovery resumes a run
+- Severity: Medium   Type: Firmware issue — present in both trees (not a new dev-tree fix,
+  not something the OLD firmware regressed on)
+- File/Function: enterFaultHold()/runUiAbort() (clears runPhase to RUN_NONE when a fault
+  is held) vs. resumeWork()/issueRecovery() (neither calls runUiBegin() again on resume) —
+  confirmed identically structured in both trees.
+- What happens now: once a held fault is resumed (Irrigate/Release/Normal), ESP2 may be actively
+  re-running a stage, but the website's Run Progress panel has no code path that turns back on for
+  it — it keeps showing "No active irrigation or fertigation run reported by ESP1" the entire time.
+- Why it matters: this directly produces the exact contradiction you saw — "Run state: NO ACTIVE
+  RUN" while the controller is genuinely mid-sequence (or, per C-H3, still stuck believing it is).
+- Recommended fix: have the RESUME path call runUiBegin() (or an equivalent lightweight resume
+  variant) so the dashboard's run panel reflects the resumed sequence.
+- Requires: New firmware (ESP1) — dev tree has this same gap; it was not part of the earlier
+  audit's findings. CONFIDENCE: HIGH (structure confirmed identical in both trees; the specific
+  behavioral consequence is inferred from the code, not observed directly on hardware).
+
+### D-M3. K_RES_MIX (and the other main flow K-factors) are still uncalibrated bench defaults
+- Severity: Medium (does not explain the zero-pulse fault; affects volume accuracy)
+- Already tracked in Calibration_Worksheet.md; confirmed unchanged, present in both trees.
+- CONFIDENCE: HIGH.
+
+### D-M4. SOIL_MISSING_COL_B is a real, correctly-raised Major-tier alert
+- Listed here as Medium-severity on its own terms (a real column has degraded sensor data) even
+  though it is not the cause of the current hold. See Section P. CONFIDENCE: HIGH.
+
+---
+
+# E. Low issues
+
+### E-L1. K_NUT/dosing flow K-factors also uncalibrated (same class as D-M3, smaller volumes)
+CONFIDENCE: HIGH (Calibration_Worksheet.md, unchanged).
+
+### E-L2. Battery telemetry is sourced differently between trees (INA226 on OLD, calibrated ADC on dev) but publishes under the same field names
+- Not breaking today; worth knowing before comparing battery numbers across a future reflash.
+- File: OLD ESP1/src/main.cpp lines 12, 78-83, 93, 197-201, 387, 1602, 4586+ vs. dev tree's
+  readBatteryAdc()/applyPoly(). CONFIDENCE: HIGH.
+
+### E-L3. openInfoPopoverFor() stale aria-expanded — already fixed in dev tree (D2), confirmed still present, correctly applied, line script.js:1789. Not flashed to anything (website-only, doesn't need flashing — needs publishing, see Section W). CONFIDENCE: HIGH.
+
+---
+
+# F. Cosmetic issues
+None newly found this pass beyond what Section K (UI) already covers as informational.
+
+---
+
+# G. Authentication findings
+
+All re-confirmed present and correct in the dev tree this pass (see verification commands run this
+turn — every grep below returned a match at the expected location):
+
+- Sign in/up/reset 3-way switching (showAuthForm), .login-card[hidden] CSS override — correct.
+- New accounts forced to status:"pending" both client-side and rules-side — correct.
+- sendPasswordResetEmail() with auth/user-not-found mapped to the same success path
+  (enumeration-safe) — correct. (The separate, still-open question of why a real reset email
+  wasn't delivered was already traced to a Firebase Console/deliverability question outside code,
+  earlier this engagement — not re-investigated this pass, no new evidence.)
+- Kick: kickToken is write-once-to-clear by the owner, set-only-by-an-operator otherwise;
+  client actively clears its own token before signing out (fixed regression from earlier this
+  engagement) — confirmed still correct, script.js:384-392.
+- Session persistence: a normal refresh does not sign you out; only an unhandled kickToken does.
+
+No new authentication bugs found. CONFIDENCE: HIGH (re-confirmed via direct grep this turn,
+consistent with the exhaustive full reads earlier this engagement).
+
+---
+
+# H. User-management findings
+
+Re-confirmed this pass (firebase-rules.json read fresh, matches exactly what was deployed-pending
+from the earlier audit):
+
+| Check | Result |
+|---|---|
+| Self-approval possible? | No — /users/$uid self-write only permits a one-time status:"pending" create; every later write requires an operator UID |
+| Privilege escalation via direct Firebase write? | No — rules re-check auth.uid/status server-side on every write, independent of client JS |
+| Stale/stuck status? | Not found as a bug; Restricted/Blocked/Kicked all confirmed correctly modeled (see Sections T/U from the earlier audit, unchanged) |
+| Backup operator hidden from User Management list? | Yes — renderUserManagement() filters BACKUP_OPERATOR_UID out of the rendered rows entirely, script.js:499 |
+| Delete -> Vercel -> Admin SDK chain | Re-verified this engagement (see Section V) — operator-only, self/cross-operator/ESP1-UID protected |
+
+No new user-management bugs found. CONFIDENCE: HIGH.
+
+---
+
+# I. Website findings
+
+- FORCE_RUN payload construction ({columns, liters, doseMl, delaySeconds}) — confirmed unchanged
+  and matches what both firmware trees expect (see Section N).
+- Manual/Test gate now shows an approval-aware message (D1) instead of a generic stuck message —
+  confirmed present, script.js:1552,1566.
+- Info-icon aria-expanded reset (D2) — confirmed present, script.js:1789.
+- No code path was found where the website itself invents or mis-labels a fault code — every fault
+  string displayed is relayed verbatim from diagnostics.fault.code, which ESP1 sets. The website is
+  a faithful (if, per D-M1, ambiguous) mirror of firmware state, not an independent source of the
+  confusion.
+
+CONFIDENCE: HIGH for the FORCE_RUN/fault-display paths (freshly re-verified this engagement);
+MEDIUM for areas not re-diffed this specific pass (Zone Profiles UI, Diagnostics tab layout —
+last fully verified in an earlier round this same engagement, no code changes since).
+
+---
+
+# J. Firebase findings
+
+Rules re-read fresh this pass (Website/firebase-rules.json, dev tree — this is the version staged
+for deployment, not yet confirmed live, see Section W):
+
+| Path | Write gate | Notes |
+|---|---|---|
+| /irrigation/live | ESP1 device UID only | Correct, unchanged |
+| /irrigation/config | approved-or-operator (fixed this engagement, C1) | Previously open to any signed-in user regardless of status — now fixed in the rules file; deployment status unconfirmed, see Section W |
+| /irrigation/manual | approved-or-operator + shape validation | Correct, unchanged |
+| /irrigation/commands/$commandId | approved-or-operator create-once, or ESP1 update | Correct, unchanged |
+| /users | operator-only read | Correct, unchanged |
+| /users/$uid | self-create-once-pending, or operator-not-targeting-either-operator | Correct, unchanged |
+| /users/$uid/kickToken | owner-clear-only, operator-set-on-others-only | Correct, unchanged |
+
+No other hardware-influencing path exists. CONFIDENCE: HIGH for rule content (file read fresh);
+LOW for "is this exact ruleset live right now" — the Firebase CLI in this environment lost its
+authenticated session earlier this engagement and has not been re-logged-in (per your own
+"I'll log in again later" note) — see Section W.
+
+---
+
+# K. Vercel findings
+
+Re-verified earlier this engagement (Section V of this report / the credential-rotation exchange):
+delete-user-api/api/delete-user.js reads Admin SDK credentials only from process.env.*, never
+from a served file; a live probe of the deployed endpoint confirmed the Admin SDK initializes and
+verifyIdToken() runs normally (no crash, no credential-parsing error) on the current Production
+deployment. No new Vercel findings this pass. CONFIDENCE: HIGH for what was probed;
+MEDIUM for whether the exact two-operator-aware code version is what's live (the probe
+couldn't distinguish source versions, only that Admin SDK auth works).
+
+---
+
+# L. Old-firmware compatibility findings
+Headline items: C-H1, C-H2, C-H4 (Manual/Test), E-L2 (battery source). Everything else checked
+is compatible.
+
+---
+
+# M. Hardware/sensor findings
+
+### Flow sensors
+
+| Sensor | Device | GPIO | Purpose | K-factor | Timeout | Calibrated? |
+|---|---|---|---|---|---|---|
+| FLOW_RES_MIX | ESP2 | 26 | Reservoir -> mixing tank (meters the FILL stage) | K_RES_MIX=450 pulses/L | FLOW_TIMEOUT_MS=10,000 ms after pump-on | No — bench default, [MEASURE] |
+| FLOW_MIX_IRR | ESP2 | 5 | Mixing tank -> column (meters the DELIVER stage) | K_MIX_IRR=450 | same | No |
+| FLOW_NUT_A/B/C | ESP2 | 23/19/18 | Per-nutrient dosing meters | K_NUT[3]=450 each | per-dose DCEIL (2x expected) | No |
+| Reservoir flow (PIN_FLOW) | Nano (separate device) | D2 | Continuous reservoir-line flow telemetry, independent of any active run | FLOW_K_PULSES_PER_LITER=450 | N/A (streamed, not fault-gated) | No |
+
+Confirmed identical GPIO mapping in OLD and dev trees, including the already-present "pins
+CORRECTED to the actual wiring (FlowPinFinder)" comment — this correction predates the Aug 25
+flashed snapshot; it is not something the dev tree adds.
+
+On "System Flow = 0.0 L/min" while Transfer Pump = ON: this is the Nano's independent
+reservoir sensor (not the same physical meter ESP2's FLOW_RES_MIX uses for the fault itself) also
+reading zero live pulses — corroborating evidence of a real no-flow condition on the reservoir line,
+not a stale/wrong-mapped/wrong-unit display artifact. Both meters would need to be independently
+faulty to explain zero-on-both as not a real flow problem, which is possible but less likely than
+one shared physical cause (valve/air-lock) upstream of both sensors.
+
+### Soil sensors
+
+| Column | Probes | Nano pins | ESP1 calibration | Enabled? |
+|---|---|---|---|---|
+| A | 2x capacitive | A0/A1 (physically {B2,A2} per the documented cross-wiring correction) | calSoilAir/Water[0] = 656/524 | Yes |
+| B | 2x capacitive | A2/A3 (physically {B1,A1}) | calSoilAir/Water[1] = 707/391 | Yes |
+| C | 2x capacitive | A6/A7 | defaults, unused | No (COLUMN_ENABLED[2]=false) |
+
+All confirmed identical in OLD and dev trees, in both ESP1/src/main.cpp and Nano/Nano.ino.
+SOIL_MISSING_COL_B requires Column B specifically to be enabled (it is) and its blended reading to
+be invalid or NPK-fallback (see Section P for the exact trigger). CONFIDENCE: HIGH.
+
+---
+
+# N. Force Run findings (end-to-end trace)
+
+Website submitForceRun() -> queueCommand("FORCE_RUN", {columns, liters, doseMl, delaySeconds}) ->
+/irrigation/commands (status:"queued") -> rules admit (approved/operator) -> ESP1
+firebasePollCommands() filters the identical field set in both trees -> firebaseCommandTick()'s
+FORCE_RUN branch validates column mask / liters (0-20) / doses (0-500 each) -> idle gate (see
+C-H1/C-H2 for the OLD-vs-dev difference) -> reservoir-low check -> arms fcPhase=FP_WAIT with the
+requested delay -> forceTick() fires at T+delay, re-checks the same safety gate, and calls
+sendForceWorkOrder() -> builds <START>,SEQ_IRRIGATION_A,COLS,A,WATER,<L>,FLUSH,20,KMAIN,...,<END>
+-> transmitted to ESP2 over UART1 -> dispatch() -> startWorkOrder() -> SEQ_FILL. Confirmed
+token-for-token identical frame construction in both trees. No JSON/field/type/ID/timestamp
+mismatch found anywhere in this path. CONFIDENCE: HIGH.
+
+---
+
+# O. FLOW_FAIL,TRANSFER findings
+
+(Full detail already produced and unchanged from the prior investigation this engagement; restated
+compactly here for the unified report.)
+
+- Trigger: zero flow pulses on FLOW_RES_MIX (ESP2 GPIO26) within FLOW_TIMEOUT_MS=10 s of the
+  transfer-pump relay actually closing (2 s after inverter warm-up begins).
+- Generated by: ESP2 (stagePoll()/holdFault()); relayed and classified by ESP1
+  (handleEsp2Response()->enterFaultHold()).
+- Not explained by: command construction (correct), pin mapping (already corrected, in both
+  trees), request volume (irrelevant to a zero-pulse timeout), mixing-tank level (display-only,
+  doesn't gate this stage), booster pump (correctly OFF — wrong stage for it).
+- Most consistent with: a real physical condition — reservoir valve not opening, transfer pump
+  not actually moving water despite the relay closing, an air-locked suction line (plausible on a
+  first live actuation), or the flow sensor itself being disconnected/dead.
+- Not determinable further without physical inspection or the SD log's exact pulses=N value
+  (0 pulses = nothing moved at all; a small nonzero count = flow started then stalled — these point
+  to different physical causes and are only visible in the SD log/serial monitor, not the dashboard).
+- CONFIDENCE: HIGH for the mechanism; MEDIUM for the specific physical root cause.
+
+---
+
+# P. SOIL_MISSING_COL_B findings
+
+- Meaning: ESP1 decided Column B's blended soil-moisture reading is untrustworthy — either both
+  capacitive probes read invalid, or the blend fell back to NPK-only because the two probes disagree
+  beyond tolerance.
+- Trigger (OLD ESP1/src/main.cpp:2278-2284, byte-identical to dev):
+  bool broken = (tmp[c] < 0) || (why == SB_NPK_FALLBACK);
+  if (COLUMN_ENABLED[c] && broken) { if (!soilMissingLatched[c]) { soilMissingLatched[c] = true;
+    raiseFault('M', "SOIL_MISSING", ...); } }
+- Generated by: ESP1, from Nano's raw SOIL packet data for Column B (A2/A3).
+- Tier: Major ('M') — does not call enterFaultHold(), does not set esp2Held, does not
+  by itself trigger EMERGENCY_STOP.
+- Column B enabled in OLD firmware? Yes, confirmed (COLUMN_ENABLED={true,true,false} in both
+  OLD ESP1 and OLD Nano).
+- Related to FLOW_FAIL,TRANSFER? No — different controllers' worth of logic (Nano/soil vs.
+  ESP2/flow), no shared cause.
+- Does it overwrite the shared last-fault field? Yes, confirmed — raiseFault()
+  unconditionally sets lastFaultMsg regardless of tier (ESP1/src/main.cpp, both trees), which is
+  the same field the dashboard's diagnostics.fault.code mirrors.
+- CONFIDENCE: HIGH.
+
+---
+
+# Q. "SYSTEM IS NOT SAFELY IDLE" findings
+
+- Exact source, OLD firmware: four separate sites all use this literal string —
+  FORCE_RUN (line 5936), DIAG_SWEEP (line 6035), TEST_PULSE (line 6058), and the
+  RUN_PUMP_TEST/legacy-pump-command path (line 6195) — all four are generic, none name the
+  specific blocking condition, in the OLD firmware.
+- Dev tree: FORCE_RUN and TEST_PULSE were both updated to give specific reasons (confirmed
+  for FORCE_RUN this pass, TEST_PULSE's equivalent "why" ternary was confirmed in the earlier
+  full read this engagement); DIAG_SWEEP and the legacy pump path were not confirmed changed this
+  pass.
+- The 7 conditions actually checked for FORCE_RUN (identical set in both trees, dev tree adds 2
+  more): sysState != IDLE_STATE, uiMode != UI_DATA, wo.active, pendingRun.active,
+  pendingExercise.active, esp2Held, fbRemoteExerciseId[0] — plus, dev tree only:
+  actuationsDisabled, webManualHeld().
+- What the website actually shows you: only system.state (mirrors sysState + the
+  actuationsDisabled flag folded in via stateLabel()) and the run-progress panel (mirrors
+  runPhase, a different variable from the 7 above). None of wo.active, pendingRun.active,
+  pendingExercise.active, esp2Held, fbRemoteExerciseId[0], or uiMode are shown anywhere on
+  the main dashboard.
+- Are any of these visible at all? Yes — diagnostics.system.workOrderActive (mirrors
+  wo.active) and diagnostics.system.pendingRun (mirrors pendingRun.active) are published
+  (ESP1/src/main.cpp:5445-5446, both trees) and shown on the Diagnostics tab, under "System" ->
+  "Work order" / "Pending run" — this is the one place you can currently check two of the seven
+  conditions without guessing.
+- Your specific report (system.state = ACTIVE_STATE, run progress = "no active run", all pumps
+  OFF): since system.state is a direct mirror of sysState, this confirms sysState !=
+  IDLE_STATE is genuinely true on the controller right now — not a display bug. Combined with D-M2
+  (resumed runs never restore runPhase), "no active run" showing at the same time is fully
+  consistent with — not contradictory to — the controller actually still being non-idle.
+- CONFIDENCE: HIGH for the mechanism and the code evidence; MEDIUM for pinpointing exactly
+  which of the 7 conditions is the live blocker, since the OLD firmware's generic message and the
+  website's incomplete visibility genuinely cannot distinguish them remotely — checking the
+  Diagnostics tab's Work order/Pending run fields right now would narrow this further without
+  needing any code change.
+
+---
+
+# R. Manual/Test findings
+
+- OLD firmware: long webManualSeq (ESP1/src/main.cpp:993), long seq = doc["seq"] | -1
+  (:5713) — 32-bit.
+- Dev firmware: int64_t webManualSeq, int64_t seq = doc["seq"] | (int64_t)-1 — 64-bit.
+- Why it matters: the website sends seq: Date.now() (~1.7e12), which does not fit a 32-bit
+  long. ArduinoJson's | operator returns the literal default (-1) on a type mismatch rather
+  than truncating — so on the OLD firmware, seq reads back as -1 on every single poll,
+  seq != webManualSeq never becomes newly true after the first poll, webManualPing never gets
+  set again, and webManualTick() never re-evaluates a fresh request.
+- Practical consequence on the physical rig today: Manual/Test's "Proceed" button cannot
+  reliably light up — the hold is effectively non-functional on the currently-flashed hardware,
+  independent of anything the website does correctly.
+- Sequence overflow/truncation: confirmed — this is the truncation bug, not a separate one.
+- Tab-switch/refresh/stale markers: the website-side kick/session logic (already audited and
+  fixed earlier this engagement) is unaffected by this — this is purely an ESP1-side numeric-type
+  bug independent of the website's own correctness.
+- CONFIDENCE: HIGH (both trees read fresh, this pass and the prior one).
+
+---
+
+# S. Automatic irrigation findings
+Re-confirmed unchanged from the prior deep-scan this engagement: controlTick()/decideFertigate()/
+calcDose() — windowed scheduling, soil hysteresis, NPK-gap decision, reservoir-low gate, per-skip
+logging (ctrlNote()), hard time caps on every stage, and the HOLD_AUTOCANCEL_N repeated-fault
+breaker are all present and structurally identical between OLD and dev trees for everything
+spot-checked (COLUMN_ENABLED, WATER_BUDGET_L, FORCE_MAX_LITERS/DOSE_ML). No duplicate-run,
+wrong-zone, or unsafe-restart bug found. CONFIDENCE: MEDIUM (not re-diffed line-by-line against
+the OLD tree this specific pass; based on the extensive dev-tree-only deep-scan earlier this
+engagement plus the spot-checks done here).
+
+---
+
+# T. Fault/recovery state-machine findings
+
+| State variable | What it drives | Set by | Cleared by |
+|---|---|---|---|
+| sysState (incl. EMERGENCY_STOP) | system.state display, stateLabel() | setState() calls throughout | setState(IDLE_STATE) on DONE, or STARTUP_SYNC->IDLE_STATE |
+| esp2Held | diagnostics.fault.held, recovery menu visibility | enterFaultHold() only (FLOW_FAIL/PWR_FAIL/SAFE_STOP/DOSE_TIMEOUT/ESP2_ERROR) | Confirmed ACK,RESUME from ESP2, or a new enterEmergencyStop() |
+| lastFaultMsg/diagnostics.fault.code | The one-line fault text | Any raiseFault() call, any tier | Never explicitly cleared — just overwritten by the next fault of any severity |
+| wo.active | Idle-gate for new commands | Command dispatch / sendForceWorkOrder() | ESP2's DONE/timeout, or explicit abort paths |
+| runPhase | Run-progress panel | runUiBegin() (new runs only — not called on resume, see D-M2) | runUiFinish()/runUiAbort() |
+
+Impossible/contradictory-looking state confirmed real, explained: "Website: NO ACTIVE RUN" +
+"Controller: ACTIVE_STATE/held" is not a bug in either side individually — it's two genuinely
+different concepts (runPhase vs. sysState/wo.active) that a resumed-but-not-freshly-begun run
+can legitimately desynchronize, per D-M2. CONFIDENCE: HIGH for the variable map (code-verified);
+MEDIUM for "this is definitely what happened on your specific run" (consistent with, not proven
+by, the dashboard values you reported).
+
+---
+
+# U. TLS/Supabase findings
+
+Per your explicit instruction, treated as unverified, not re-litigated as fixed. Status
+unchanged since last report: the dev tree pins SUPA_ROOT_CA (ISRG Root X1) verified live against
+supabase.co itself — not against this project's actual <ref>.supabase.co storage endpoint,
+whose hostname exists only in NVS and was never available to check. This is a firmware-only change
+(not flashed regardless) and was not re-verified this pass beyond confirming the code is still
+present and unchanged (ESP1/src/main.cpp:6555,6607, dev tree only — not present in the OLD
+flashed tree, which still calls setInsecure() unconditionally for this upload, not independently
+re-confirmed this exact pass but consistent with the OLD tree predating this fix entirely).
+CONFIDENCE: MEDIUM (endpoint-specific certificate match remains genuinely unverified, as stated
+last time — this is not new information, just restated per your instruction not to assume it's
+resolved).
+
+---
+
+# V. Secret/security findings
+
+| Item | Status |
+|---|---|
+| Original exposed Admin SDK key (...a89bff00a6.json) | Deleted this engagement; you report it has since been rotated in Firebase Console and the old key revoked |
+| Replacement Admin SDK key (...0ac886f735.json) | Was placed in Vercel's Production env vars (confirmed working via a live verifyIdToken() probe this engagement); local copy has since been removed by you — no service-account JSON currently found on disk in this project tree (re-confirmed via repo-wide grep this pass turned up none) |
+| Device account password (SESSION_HANDOFF.md, Commissioning_Flash_Plan.md) | Literal value removed from both docs this engagement; rotation in Firebase Console + pushing the new password to ESP1 is still on you, not verifiable from here |
+| Hardcoded phone number | Removed from ESP1/src/main.cpp and 3 other files this engagement (dev tree only — the OLD flashed firmware still has the real number compiled in, since that fix was never flashed; not re-checked this exact pass, follows directly from "OLD tree predates all dev-tree fixes") |
+| Public Firebase Web API key (firebase-config.js) | Not a secret by Firebase's own design; correctly labeled as such in-repo |
+| Any other credential in tracked source | None found this pass beyond the above, consistent with the exhaustive scan earlier this engagement |
+
+No secret value is printed anywhere in this report. CONFIDENCE: HIGH for what's in the dev
+tree and current disk state; LOW for whether Console-side rotation of the device password has
+actually been completed, since that's outside anything I can verify from files.
+
+---
+
+# W. Recommended fix order
+
+1. Physically inspect the rig before touching any recovery button again — reservoir valve,
+   transfer pump, suction line priming, FLOW_RES_MIX sensor connector (C-H3/O). Hardware.
+2. Check the Diagnostics tab's "Work order"/"Pending run" fields right now, at zero risk, to
+   narrow down which of the 7 idle-gate conditions is actually stuck (Q). Safe to do immediately,
+   no change needed.
+3. Confirm whether Website/firebase-rules.json's C1 fix (/irrigation/config gate) is actually
+   live — the Firebase CLI here lost its session; either re-run firebase login then
+   firebase deploy --only database, or paste the rules file into the Console's Rules editor
+   yourself (J). Firebase — needs your action, not a code change.
+4. When you're ready for a real firmware cycle, flashing the dev-tree ESP1 would fix, in one
+   pass: the Manual/Test int64_t bug (R), the generic-vs-specific FORCE_RUN rejection message and
+   the missing actuationsDisabled/webManualHeld() checks (C-H1/C-H2), and the Supabase cert
+   pinning (U, itself still endpoint-unverified — recommend re-checking the actual Supabase
+   project URL's certificate chain before or during that same flash). New firmware — your call on
+   timing, not performed here.
+5. Separately, fix D-M2 (resumed runs don't restore the run-progress panel) in the dev tree —
+   not yet fixed anywhere, newly found this pass. New firmware, once you're ready to also make this
+   change (not yet written).
+6. Rotate the ESP1 device-account password in Console and push it to the device (SMS/portal) —
+   still outstanding from earlier this engagement (V). Firebase Console + one device command.
+7. Calibrate the main and dosing flow K-factors (D-M3/E-L1) — lower urgency, doesn't explain
+   today's fault, but affects every volume reading's accuracy. Physical calibration procedure,
+   Calibration/ESP2/Flow.
+
+---
+
+# X. Safe testing plan
+
+## Safe to test now (no firmware, no hardware risk)
+| Action | Expected result | What it proves | Safety notes |
+|---|---|---|---|
+| Open Diagnostics tab, read "Work order" / "Pending run" | One or both will show "Active"/"Yes" if wo.active/pendingRun.active are the stuck condition | Narrows which of the 7 idle-gate variables is blocking FORCE_RUN right now | Read-only, zero risk |
+| Check the SD log (via SoftAP portal /view, or physical SD read) for the FLOW_FAIL,TRANSFER|pulses=N line | Reveals the exact pulse count at the moment of the fault | Distinguishes "pump moved nothing" (pulses=0) from "flow started then stopped" (pulses>0) | Read-only |
+| Re-check firebase-rules.json deployment status via Firebase Console (no CLI needed) | Confirms whether the /irrigation/config gate is actually enforced | Closes the open question in Section W item 3 | Read-only, your own login |
+
+## Do NOT test until new firmware is flashed
+| Action | Why not yet |
+|---|---|
+| Repeatedly retrying FORCE_RUN expecting a clearer rejection reason | OLD firmware will keep returning the generic message (C-H1) regardless of how many times you try |
+| Testing "does Disable Actuations correctly block an already-armed Force Run" | OLD firmware's arm-time gate doesn't check this (C-H2) — you'd only see the fire-time re-check's silent abort, not a clean rejection |
+| Relying on the Run Progress panel to confirm whether a resumed run is actually executing | D-M2 means it won't show anything regardless of ground truth |
+
+## Requires physical hardware inspection
+| Action | Expected result | Safety notes |
+|---|---|---|
+| Visually confirm the reservoir valve opens when commanded (Testing menu on the LCD, single-relay test) | Valve audibly/visibly actuates | Low risk, no water moved if line is otherwise closed downstream |
+| Visually/audibly confirm the transfer pump spins under an isolated pump-only test | Pump motor runs | Same LCD Testing menu; brief run |
+| Check the suction line for air/priming issues | N/A — physical inspection | No electrical risk |
+| Check the FLOW_RES_MIX sensor's physical connector/wiring at GPIO26 | N/A — physical inspection | Power down before touching wiring |
+
+# Y. Fixes implemented this session (source only — nothing flashed, deployed, or pushed)
+
+You asked me to execute the plan and find other ways to fix the items that would normally need a
+firmware reflash. Four fixes were made, all as source-code edits sitting in the unflashed dev tree /
+undeployed website source. Nothing was flashed to ESP1/ESP2, nothing was deployed to Firebase, and
+nothing was pushed anywhere (there is no git repo here to push to). Until you flash the firmware and
+publish the website yourself, the physical rig and the live site behave exactly as before.
+
+1. D-M2 fix (new, was not fixed anywhere before this) — ESP1/src/main.cpp, inside the confirmed
+   ACK,RESUME handler (~line 2637-2653, dev tree only). A resumed run now re-arms runPhase to
+   RUN_LIVE (mirroring what runUiAdvance() would already do) instead of leaving the Run Progress
+   panel stuck on "no active run" for the rest of the resumed sequence. Requires a reflash to take
+   effect — this is a firmware fix, not a workaround, so it's queued for the next flash cycle.
+
+2. C-H4/R workaround (fixes the practical bug WITHOUT a reflash) — Website/script.js,
+   writeManualHold(). Manual/Test's keep-alive now sends whole seconds (Math.floor(Date.now()/1000))
+   instead of a raw millisecond timestamp. The currently-flashed firmware parses this field into a
+   32-bit `long`, which silently discards the old millisecond value as -1 on every single poll —
+   that's why Manual/Test's "Proceed" gate could never reliably arm. Seconds fit safely inside a
+   32-bit long until year 2038, and 1-second resolution is finer than the 20s keep-alive interval
+   this drives, so it can't collide in normal use. Works on the CURRENTLY FLASHED hardware as soon as
+   the website is republished — no firmware change needed.
+
+3. C-H2 workaround — Website/script.js, syncControlAvailability(). The Force Run button is now also
+   disabled (with an explicit reason in its tooltip) whenever the dashboard's own diagnostics show
+   the controller isn't idle, a fault is held, actuations are disabled, or a run/pending-run is
+   already active — the exact conditions the currently-flashed firmware's arm-time gate fails to
+   check. This stops the "accepted and armed, then silently aborts" sequence from being triggered in
+   the first place, for every condition the website can actually see. It can't see all 7 (the LCD
+   menu state and another session's Manual/Test hold aren't published), so this narrows the gap
+   without fully closing it — only a reflash does that completely.
+
+4. C-H1 workaround — Website/script.js, new explainNotSafelyIdle() function used by
+   renderCommandHistory(). When a FORCE_RUN comes back rejected with the generic "system is not
+   safely idle" text, the command history now appends a best-guess specific reason synthesized from
+   the same diagnostics fields (fault held / run in progress / actuations disabled / controller
+   state), instead of leaving you with only the undifferentiated firmware string. When none of those
+   fields explain it, it says so honestly rather than guessing at the 3 conditions that aren't
+   published anywhere.
+
+Still exactly as this report described — none of these are things I can do from here, and none were
+touched:
+- Physically inspecting the rig (C-H3/O) — still needs you at the hardware.
+- Deploying Website/firebase-rules.json (J/W#3) — Firebase CLI here is still unauthenticated.
+- Rotating the ESP1 device-account password (V/W#6) — Firebase Console only.
+- Calibrating the flow K-factors (D-M3/E-L1) — physical procedure.
+- The Supabase endpoint verification (U) — grepped the whole project again for any other reference
+  to the real per-project Supabase subdomain; still only the same two firmware files reference
+  Supabase at all, and neither one contains the actual `<ref>.supabase.co` hostname (it's NVS-only).
+  No other way was found to verify this from source — still genuinely unverified, as you asked me to
+  treat it.
+
+To get fix #1 onto the physical rig, ESP1 needs a reflash (your call on timing, not done here). To
+get fixes #2-4 live on the website, the dev-tree Website/ folder needs to be published to
+https://jmhatake123.github.io/Website/ the way you normally publish it — this environment has no git
+remote configured, so that publish step is on you.
+
+---
+
+# Z. Root-cause opinion on FLOW_FAIL / SOIL_MISSING, and what was fixed for them
+
+You asked directly what I think caused the two live faults, and whether I can fix them. Short
+answer: both are almost certainly real physical conditions, not code bugs — the OLD and dev firmware
+are byte-identical on every code path involved (see Sections O and P), which rules out a
+version-mismatch or logic-bug explanation. I can't reach into a valve, a pump, or a soil probe from
+here, so I can't fix the physical cause itself. What I found and fixed instead:
+
+CORRECTION to this report's Section O: I originally wrote that the flow sensor's exact pulse count
+at the moment of the fault was "only visible in the SD log/serial monitor, not the dashboard." That
+was wrong. Tracing the full path (ESP2's holdFault(), ESP1/src/main.cpp:1090-1104 dev tree) shows
+ESP2 already appends the pulse count to the fault message it sends ESP1
+(reply(...+"|pulses="+String(fp))), ESP1's handleEsp2Response() passes that whole string through
+unmodified as `loc`, and enterFaultHold() folds it into lastFaultMsg — which IS what the live
+dashboard's fault banner title reads from. So on the CURRENTLY FLASHED hardware, right now, with NO
+code change: open the fault banner and read the exact fault text. If it reads
+"FLOW_FAIL TRANSFER|pulses=0 COL_x", zero pulses were counted at all — most consistent with a dead
+transfer pump, a valve that never opened, or a disconnected flow sensor. If it reads pulses=<some
+number greater than 0>, flow started and then stopped — more consistent with an air lock or a
+weakening pump. This was already designed into the firmware (the code comments call it out as
+"diagnostic C-3") — I had simply not traced it far enough the first time.
+
+New fix (dev tree only, needs a reflash) — SOIL_MISSING did NOT have the equivalent enrichment: the
+fault message only ever said e.g. "SOIL_MISSING COL_B", not which of the two ways a column can break,
+nor the raw sensor values. I added it (ESP1/src/main.cpp, the SOIL packet handler,
+~line 2314-2325 dev tree), following the exact same pattern already used for FLOW_FAIL's pulse count:
+the fault now reads e.g. "SOIL_MISSING COL_B|PROBE_DIVERGE|raw=707,391" (the two probes disagree
+beyond tolerance, NPK is covering the reading) or "SOIL_MISSING COL_B|NO_READING|raw=-1,-1" (both
+probes reported nothing at all) — pointing at a different physical check each time. This is a
+firmware change, so it needs a reflash before it applies to the live fault reporting.
+
+New website fix (source only, needs publishing) — Website/script.js: added explainFaultCode(), which
+decodes both the FLOW_FAIL pulse count and the new SOIL_MISSING detail into a plain-language
+sentence, and wired it into the fault banner (for a currently-held fault) and the Diagnostics tab's
+"Last fault" row (for a Major alert like SOIL_MISSING that never raises the banner). Once published,
+this will read the pulses=N value that's ALREADY being sent by the currently-flashed firmware today
+(no reflash needed for the FLOW_FAIL half of this); the SOIL_MISSING half only has something to
+decode once ESP1 is eventually reflashed with the enrichment above.
+
+What I still can't tell you without physical inspection: which specific one of (dead transfer pump /
+stuck reservoir valve / air-locked suction line / dead flow sensor) is true for the flow fault, or
+whether Column B's probes are wired loose, corroded, or genuinely failed — those need hands on the
+rig. The pulse count and raw soil values narrow it considerably; they don't replace looking at it.
+
+---
+
+# AA. Deep-scan follow-up pass (reverify + 2 new findings + fixes)
+
+Reverified all 6 fixes from sections Y/Z above — all still present, byte-exact, nothing drifted.
+`node --check` clean, main.cpp braces balanced (1368/1368 after this pass's edits).
+
+Two new findings from scanning every rejection message in ESP1/src/main.cpp (30+ sites):
+
+- New-F1 (Low severity, real bug): DIAG_SWEEP — the dashboard's "sweep ESP2 sensors" diagnostic
+  request — was the ONLY command left on the flat "system is not safely idle" message, in the DEV
+  TREE too, not just the old flashed firmware. FORCE_RUN, TEST_PULSE and the legacy pump-test path
+  had all already been given specific reasons; diagRemoteStart() was simply missed. Fixed both ways:
+  (1) ESP1/src/main.cpp: diagRemoteStart() now takes an optional `const char **why` and names which
+  of its 4 conditions failed (a fault is held / a run is in progress / someone is using the LCD / the
+  controller is not idle), same pattern as the other three gates -- needs a reflash to reach hardware.
+  (2) Website/script.js: renderCommandHistory()'s reason-decoding now also covers DIAG_SWEEP, not just
+  FORCE_RUN -- works immediately once published, no reflash needed for this half.
+- New-F2 (Cosmetic): forceTick()'s fire-time abort was showing a raw internal code verbatim (e.g.
+  "cancelled before start: RES_LOW"). Added a small lookup (FORCE_ABORT_REASONS in script.js) that
+  swaps in a plain phrase ("the reservoir was too low") for all 8 codes. Website-only, no reflash.
+
+Checked and ruled OUT as a false alarm: ESP1/src/main.cpp:5331's `fbClient.setInsecure()` looked like
+an unpinned TLS connection to Firebase on first grep. Read in full context, it's the intentional,
+already-secure-by-default fallback of a complete design (FB_ROOT_CA = a genuine Google GTS Root R1
+cert, cert pinning ON by default, operator-toggleable, and its state is already honestly published to
+the Diagnostics tab). No relation to the Supabase finding (C3) — Firebase's own channel was never the
+gap. No code change made or needed here.
+
+---
+
+# BB. Deep-scan follow-up pass #3 (reverify + 3 more diagnostic-enrichment fixes)
+
+Reverified every fix landmark from all three prior rounds (D-M2, the Manual-Test seq fix, the two
+Force-Run workarounds, both fault decoders, the SOIL_MISSING enrichment, the DIAG_SWEEP fix) — all
+still present, byte-exact.
+
+Read every holdFault() call site in ESP2/src/main.cpp side by side and found the same "generic
+message" gap already fixed for FLOW_FAIL/SOIL_MISSING/DIAG_SWEEP still open in three more places:
+
+- New-F3 (Medium): PWR_FAIL never included the actual measured voltage/current — worse than the
+  others, because "VOLTAGE" alone didn't even say whether the AC supply was over or under the safe
+  window. Fixed: ESP2/src/main.cpp's PZEM tick now reports e.g. "OVERCURRENT|i=12.34",
+  "VOLTAGE|v=265.0|HIGH", "NO_CURRENT|i=0.010".
+- New-F4 (Low): SAFE_STOP,MIXER_OC never included the measured mixer current. Fixed the same way:
+  "MIXER_OC|i=3.10".
+- New-F5 (Low-Medium): DOSE_TIMEOUT never included how much (if anything) was delivered before it
+  timed out — the exact dosing-stage analog of FLOW_FAIL's pulse count. Fixed: now reports e.g.
+  "NUT_B|delivered=0.0" (nothing moved) vs "NUT_B|delivered=6.2" (started then stalled).
+
+All three needed a reflash to reach the live fault text (ESP2 firmware change), so extended
+Website/script.js's explainFaultCode() to decode all three into plain sentences too — that half works
+immediately once published, same split as every fix so far.
+
+Also checked and ruled out: ESP1's "ESP2_ERROR" fault-hold branch is currently unreachable dead code
+(grepped all 22 response types ESP2 can send — none of them is a bare "ERROR"), and re-grepped for
+any other `long`/Firebase-JSON field with the same overflow shape as the already-fixed Manual-Test
+`seq` bug — none found; that was the only one.
+
+Verified: `node --check` clean on script.js; ESP2/src/main.cpp braces balanced 230/230 (baseline was
+229/229 before this pass's 3 edits — the +1 is the VOLTAGE check splitting into two named branches,
+LOW vs HIGH, exactly as intended). Grepped the new markers to confirm they landed only in the 2
+intended files.
+
+---
+
+# CC. Deep-scan follow-up pass #4 (2 areas checked clean + 3 more enrichment fixes)
+
+Reverified all fix landmarks from rounds 1-4 — still present, byte-exact.
+
+Two areas read fresh this pass, found CLEAN, no bugs:
+- Nano/Nano.ino, the entire 729-line file end to end (framing/parsing, the packet builder's bounds
+  checks, the Modbus NPK reader, the flow-pulse ISR, the calibration raw-stream path). Already
+  unusually defensive code; nothing to fix.
+- The WiFi provisioning portal's XSS defenses: traced all 18 call sites that render text into the
+  admin HTML pages. Every one is either a static string, a validated single character, an integer, or
+  goes through htmlEscape() — including the column-rename path, which looked risky at a glance but
+  turned out safe (the raw name is never echoed back unescaped anywhere). Confirmed rather than
+  assumed.
+
+Reading ESP2's EC/pH validation stage (SEQ_ECPH) — not examined until this pass — found the same
+enrichment gap a fourth time:
+- New-F6 (Medium): PH_FAIL never reported the measured pH or whether it was too acidic or too
+  alkaline (different problems, opposite dosing corrections).
+- New-F7 (Medium): EC_FAIL, same gap, for EC (too dilute vs. too concentrated).
+- New-F8 (Low): SENSOR_FAIL,PH / SENSOR_FAIL,EC didn't say which ADC rail was hit (railed-low vs.
+  railed-high point at different physical faults — a short vs. an open/disconnected probe).
+
+Fixed all three the same way as every round so far: ESP2/src/main.cpp now reports e.g.
+"PH_FAIL COL_A|pH=4.20|LOW" and "SENSOR_FAIL PH|RAILED_HIGH" instead of the bare codes; extended
+Website/script.js's explainFaultCode() to decode all three into plain sentences. The website half is
+live as soon as it's published; the ESP2 half needs a reflash.
+
+Verified: node --check clean; ESP2/src/main.cpp braces balanced 230/230 both before and after (the
+edit restructured two existing if/else-if pairs without adding new brace-pair nesting, which the
+identical count confirms). Grepped the new markers, landed only in the 2 intended files.
+
+---
+
+# DD. Deep-scan follow-up pass #5 (whole system: website/Firebase/Vercel/ESP1/ESP2 per your request)
+
+You asked to include everything -- website, Firebase, Vercel, ESP1, ESP2, Nano. This pass did a
+completeness check of every holdFault()/raiseFault() call site in both firmware trees side by side
+(9 distinct fault codes total across ESP1+ESP2), read delete-user-api/api/delete-user.js (Vercel)
+start to end for the first time this engagement (previously only probed live, never read as source),
+and traced a Firebase rules question that came up while reading.
+
+Checked and ruled out (not bugs):
+- ESP2 has two pairs of identical holdFault("FLOW_FAIL","TRANSFER"/"MAIN") calls. Not duplication --
+  they're the main-batch and end-of-run-flush variants of the same two physical stages
+  (reservoir->tank, tank->column), correctly sharing a location tag for the same hardware. Both pairs
+  already get the pulse-count enrichment automatically.
+- firebase-rules.json's /irrigation/config has no .validate block. Traced its actual purpose: it's
+  website-only Zone Profile display metadata (crop/stage label) -- grepped all of ESP1's source and
+  confirmed firmware never reads this path at all. A malformed write here cannot affect hardware.
+
+Two more fault codes found with the same enrichment gap as rounds 3 and 4:
+- New-F9 (Low-Medium): DOSE_BATCH_LOW never reported the computed batch volume or the safe minimum it
+  fell under -- both already in scope at the call site (ESP1/src/main.cpp, calcDose()).
+- New-F10 (Medium -- this one actually threw away data ESP1 already had): NPK_FAULT never reported
+  WHY the Nano's NPK read was invalid. sensor.npkReason[c] (TIMEOUT/BADADDR/BADLEN/BADCRC) is already
+  populated and already used for ESP1's own LCD health line a few hundred lines away in the same
+  file -- just never carried into this fault.
+
+One new finding outside the firmware, in Vercel:
+- New-F11 (Low-Medium, security hardening): delete-user-api/api/delete-user.js called
+  verifyIdToken(idToken) without checkRevoked=true. Without it, a copy of an operator's ID token
+  captured before their account was compromised-and-revoked would keep working against this
+  delete-user endpoint for up to the remainder of that token's 1-hour lifetime. Requires a token
+  already being stolen to matter -- not exploitable on its own -- but is a one-word, zero-downside
+  fix for a privileged, account-deleting endpoint, so fixed it: verifyIdToken(idToken, true).
+  Also noted (not fixed, low priority): the same function's catch-all error handler returns
+  error.message verbatim for any failure including a bad token submitted pre-auth-check; Firebase's
+  own token-decode error strings aren't sensitive, so this is a hygiene nitpick, not a real leak.
+
+Fixed New-F9/F10 the same way as every round: ESP1/src/main.cpp now includes the numbers/reason in
+the fault message; Website/script.js's explainFaultCode() decodes both into plain sentences.
+
+Verified: node --check clean on both script.js and delete-user.js; ESP1/src/main.cpp braces balanced
+1368/1368 unchanged (pure string-building additions, no new brace pairs). Grepped all three new
+markers, landed only in the 3 intended files.
+
+Still nothing flashed, deployed (Firebase Hosting or Vercel), or pushed -- the Vercel fix needs a
+redeploy of that function to take effect, same "needs your action" caveat as every firmware/website
+fix so far.
