@@ -115,15 +115,16 @@ static inline float levelPct(float distCm, float emptyCm, float fullCm) {
 /* ---- dashboard pulse target -> ESP2 TEST row ------------------------------ */
 
 /* Map a dashboard TEST_PULSE target name to the ESP2 TEST row it drives. -1 = unknown.
- * Transfer maps to the FILL COMBO (16), not the bare transfer relay: running that pump against a
- * shut reservoir valve dead-heads it. The push targets are the combos that open the mixing valve,
- * the column valve and the booster together -- the same rows the LCD Testing screen offers. */
+ * Transfer maps to the FILL COMBO (16), not the bare transfer relay, so the inverter comes with it
+ * (and the reservoir valve too, if ESP2's RES_VALVE_FITTED puts one back on P0). The push targets
+ * are the combos that run the column valve and the booster together (there is no mixing valve any
+ * more) -- the same rows the LCD Testing screen offers. */
 static inline int pulseRowForTarget(const char *t) {
   if (!t)                     return -1;
   if (!strcmp(t, "colA"))     return 17;
   if (!strcmp(t, "colB"))     return 18;
   if (!strcmp(t, "colC"))     return 19;
-  if (!strcmp(t, "transfer")) return 16;   // Fill combo: inverter + reservoir valve + transfer pump
+  if (!strcmp(t, "transfer")) return 16;   // Fill combo: inverter + transfer pump
   if (!strcmp(t, "mixer"))    return 8;
   if (!strcmp(t, "nutA"))     return 9;
   if (!strcmp(t, "nutB"))     return 10;
@@ -132,6 +133,14 @@ static inline int pulseRowForTarget(const char *t) {
   if (!strcmp(t, "phUp"))     return 13;
   if (!strcmp(t, "phDn"))     return 14;
   return -1;
+}
+
+/* Does this ESP2 TEST row switch the inverter on? Row 5 is the bare inverter relay; 16..19 are the
+ * Fill / Push>Col combos, which include it. Those are the Testing uses that move the boards to the
+ * secondary battery, so they are the ones a low/unmonitored secondary must refuse. (Single pump rows
+ * 6/7/8 do not raise the inverter on their own.) */
+static inline bool testRowUsesInverter(int row) {
+  return row == 5 || (row >= 16 && row <= 19);
 }
 
 #endif // PURE_MATH_H
