@@ -65,7 +65,7 @@ cd ESP2 && pio run
 cd Nano && pio run
 
 # host unit tests -- ~10 seconds each, no hardware needed
-cd ESP1 && pio test -e native     # 27 cases
+cd ESP1 && pio test -e native     # 29 cases
 cd ESP2 && pio test -e native     #  7 cases
 
 # website
@@ -75,18 +75,33 @@ node -e "JSON.parse(require('fs').readFileSync('Website/firebase-rules.json','ut
 firebase deploy --only database --dry-run   # validates rules WITHOUT deploying (run from Website/)
 ```
 
-Known-good build sizes after the 2026-10-26 merge — a sharp deviation means something unintended
-was picked up:
+Known-good build sizes after the 2026-10-26 secondary-battery change (both `SECONDARY_BATT_ENABLED 0`)
+— a sharp deviation means something unintended was picked up. With both flags at 1: ESP1 1,301,913 B
+flash, ESP2 338,921 B. Host tests: ESP1 29 cases, ESP2 7.
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 23.6 % (77,304 B) | 41.2 % (1,297,133 B) |
-| ESP2 | 7.1 % (23,228 B) | 25.8 % (337,705 B) |
+| ESP1 | 23.6 % (77,368 B) | 41.3 % (1,299,925 B) |
+| ESP2 | 7.1 % (23,228 B) | 25.8 % (337,937 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
 ## 4. What the last sessions added
+
+**2026-10-26 — Secondary battery isolation (P4 DPDT) + INA226 monitor.** See `CLAUDE.md` and reference
+§19.4.7.1. The user's decisions:
+- **Relays:** P4 (the condemned mix valve) drives the DPDT. The mix valve is removed from delivery,
+  prime and combos (tank → booster → column valve). P0 (reservoir valve) is a spare, with
+  `RES_VALVE_FITTED` (default 0) to restore it.
+- **Switching:** every inverter use switches. Timing is 500 ms settle / 1000 ms return, with the P17
+  drop deferred until the return on normal ends.
+- **Secondary battery:** 4S Li-ion (16.8 V), charged from main while idle. INA226 at 0x40 on ESP1.
+- **Block:** a low secondary (< 13.6 V, recover 14.0, critical 12.8) **or a missing INA226** blocks
+  AC runs.
+- **Readings shown on:** LCD, website and STATUS. Testing row P4 is `Batt->2nd`.
+- **Compiled OFF** (`SECONDARY_BATT_ENABLED 0` in ESP1 and ESP2) because the controllers have **no
+  hold-up** through the DPDT transfer yet.
 
 **2026-10-26 — Sugian merge.** Sugian's copy forked `main` at `de4b079` (2026-08-19). It was merged
 as reference, not source of truth, in reviewable pairs ("port as-is", then "adjust"):
@@ -136,6 +151,14 @@ Roughly in priority order.
 8. **Website operators** — decide whether the user's own account should be an operator; that is a
    rules + `delete-user-api` edit and a redeploy, and needs explicit approval.
 9. **Nothing has been flashed or hardware-validated** (§1).
+10. **Secondary-battery switching needs hardware before it can be enabled.** Without a hold-up after the
+    DPDT, every switch resets all three controllers, and the P4/DPDT coils drop the boards straight
+    back to main. Fit a hold-up stage that also keeps the coils powered. Then bench-test with the
+    Testing `Batt->2nd` row, calibrate the INA226 (worksheet Tier 3), and set
+    `SECONDARY_BATT_ENABLED 1` in **both** ESP1 and ESP2.
+11. **The dashboard's `mixer` Timed Pulse / hold drives TEST row 8 alone, without the inverter.** The
+    mixer is an AC load, so it probably gets no power that way. This was found while mapping inverter
+    rows for this change and left unchanged; confirm on the rig.
 
 ---
 

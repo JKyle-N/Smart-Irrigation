@@ -334,7 +334,7 @@ RESET_REQ is used both for fault recovery (after 5 consecutive garbage packets, 
 | RESET_SELF        | Soft reset ESP32 #2 |
 | STATUS_REQ        | Request status      |
 | TEST,ENTER        | Enter manual TEST mode (Settings>Testing, sec.18.10.8): ESP32 #2 forces SAFE (all OFF) and arms the dead-man. Idle-only (BUSY during a sequence). |
-| TEST,HOLD,\<idx\> | Dead-man keep-alive: ESP32 #1 streams this (~every 150 ms) while the operator holds ENTER. `idx` 0..15 = a single PCF8575 OUT_* relay (one-at-a-time). `idx` 16..19 = a **valve+pump priming combo** run together (16 = Fill: inverter+reservoir valve+transfer pump; 17/18/19 = Push>Col A/B/C: inverter+mix valve+column valve+booster pump) with a longer ~30 s cap. Switching the selection turns the previous one OFF. |
+| TEST,HOLD,\<idx\> | Dead-man keep-alive: ESP32 #1 streams this (~every 150 ms) while the operator holds ENTER. `idx` 0..15 = a single PCF8575 OUT_* relay (one-at-a-time). `idx` 16..19 = a **valve+pump priming combo** run together (16 = Fill: inverter+transfer pump; 17/18/19 = Push>Col A/B/C: inverter+column valve+booster pump; the inverter in each also moves the boards to the secondary battery when `SECONDARY_BATT_ENABLED`) with a longer ~30 s cap. Switching the selection turns the previous one OFF. |
 | TEST,RELEASE      | Operator released ENTER — turn the held relay OFF immediately. |
 | TEST,EXIT         | Leave TEST mode, all outputs OFF. |
 | CAL_START,\<SENSOR_ID\> / CAL_STOP | Begin/end the fast raw calibration stream for an ESP2 sensor (pH/EC/ACS712/FLOW_*) — companion spec §A.3 |
@@ -2430,8 +2430,8 @@ IF reservoir level too low
 
 
 IF mixing tank below target level
-→ Open reservoir valve
-→ Start transfer pump
+→ Start transfer pump (it draws straight from the reservoir; the reservoir valve is no longer fitted —
+  P0 is a spare, and `RES_VALVE_FITTED` would open it here again)
 
 
 ---
@@ -3392,11 +3392,11 @@ Stop at Target Volume
 
 | Output | Device            |
 | ------ | ----------------- |
-| P0     | Reservoir Valve   |
+| P0     | Spare relay (was the Reservoir Valve; `RES_VALVE_FITTED` re-enables it in every fill path) |
 | P1     | Column A Valve    |
 | P2     | Column B Valve    |
 | P3     | Column C Valve    |
-| P4     | Mixing Tank Valve |
+| P4     | DPDT board-supply select: de-energized = main battery, energized = secondary battery (was the condemned Mixing Tank Valve; see §19.4.7.1) |
 | P5     | Inverter Relay    |
 | P6     | Transfer Pump     |
 | P7     | Booster Pump      |
@@ -3410,6 +3410,34 @@ Stop at Target Volume
 | P17    | **Master Actuator-Power Cutoff** (gates power to the P0–P16 relay bank; see Section 19.4.8) |
 
 Note: P17 is no longer the Nano hardware-reset line. It is now a master cutoff that controls power to ALL control relays (P0–P16). Consequently the Nano no longer has a hardware-reset path — its recovery is limited to its internal watchdog and the RESET_REQ software reset (Section 18.9.5, recovery ladder reduced to 2 layers).
+
+### 19.4.7.1. 🔹 Secondary Battery Isolation (P4 DPDT) — additional feature
+
+**Purpose.** While the inverter runs the AC motors (transfer, booster, mixer), the controllers are momentarily moved off the main solar battery onto a **secondary battery**, so they share no electrical connection with the battery the inverter is loading. A **DPDT** breaks **both** the positive and the negative conductor, so no ground path remains either, and the sensor readings taken during a run stay clean.
+
+**Hardware.**
+- **Secondary battery:** 4S Li-ion, 16.8 V full (14.8 V nominal). It is charged from the main battery while the DPDT is in the main position (idle).
+- **What moves to it:** ESP1, ESP2, the Nano, the sensors and the relay coils.
+- **Switch:** P4, the relay of the condemned mixing-tank valve, drives the DPDT. De-energized = main battery, which is the fail-safe position. A fault, an E-stop, an ESP2 reboot, or ESP1 cutting ESP2's power (GPIO4) all return the boards to main.
+- **Monitor:** an **INA226 with an R010 shunt** on **ESP1's I²C at 0x40** measures the secondary's voltage and current. The bench tool is `Test Code/Arduino R3/INA226_R010/`.
+- **Plumbing:** the mixing tank feeds the booster directly and the column valves select the column. The reservoir valve is no longer fitted, so P0 is a spare.
+
+**Sequencing (ESP2).** The rule is that inverter ON implies the secondary battery, for every inverter use (run stages, mixing, exercise, AC prime, and Testing / Timed Pulse / hold-to-run):
+1. P4 switches the boards to the secondary.
+2. After `BATT_SWITCH_SETTLE_MS` (500 ms), the inverter starts.
+3. The existing `INVERTER_WARMUP_MS` follows, extended by the settle time (`AC_WARMUP_MS`).
+4. When the inverter stops, P4 returns the boards to main after `BATT_RETURN_DELAY_MS` (1000 ms). On a normal end, P17 stays up until that return; faults cut everything at once.
+
+ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 logs them, publishes them, and holds off cutting ESP2's power until the return (`ESP2_BATT_RETURN_WAIT_MS`, 2.5 s bound).
+
+**Policy (ESP1).** Thresholds are [CONFIRM]:
+- **Block:** with switching enabled, no inverter use may *start* when either of these holds. A run already in progress is never aborted.
+  - The secondary is **low**: below 13.6 V, released again at 14.0 V.
+  - The INA226 is not answering.
+- **Alerts (Major):** `BATT2_LOW`, `BATT2_CRIT` (below 12.8 V) and `SENSOR_FAIL,INA226`.
+- **Readings:** published to the Firebase live snapshot (`sensors.secondaryBattery*`, `system.boardSupply`), the LCD power page (`B2:` line), the SMS `STATUS` report (`BAT2`) and the SD log (`PWR2`).
+
+**Prerequisite — not yet fitted.** A DPDT transfer leaves the boards unpowered for about 10–20 ms. A hold-up stage after the DPDT (e.g. a supercapacitor or UPS module) must keep all three controllers, the P4 relay module's coil and the DPDT coil powered through the transfer. Without it, every switch resets the controllers and the relay falls back to main. For that reason the switching is compiled **off** in both firmwares (`SECONDARY_BATT_ENABLED 0`, ESP1 and ESP2 — set both together). Monitoring works regardless.
 
 ### 19.4.8. 🔹 P17 Master Actuator-Power Cutoff & Fault Hold
 

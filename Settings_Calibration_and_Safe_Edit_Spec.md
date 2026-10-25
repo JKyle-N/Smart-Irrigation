@@ -99,8 +99,8 @@ Line → (valve, pump) pairing for Prime:
 
 | Prime target | Valve(s) opened | Pump run | Path |
 |---|---|---|---|
-| Reservoir → Mixing | Reservoir Valve (P0) | Transfer Pump (P6) | Reservoir into mixing tank |
-| Mixing → Irrigation | Mixing Tank Valve (P4) + a column valve (P1/P2/P3) | Booster Pump (P7) | Mixing tank out to a column |
+| Reservoir → Mixing | none (the reservoir valve is no longer fitted; P0 is a spare, re-enabled by `RES_VALVE_FITTED`) | Transfer Pump (P6) | Reservoir into mixing tank |
+| Mixing → Irrigation | a column valve (P1/P2/P3) — the mixing-tank valve is condemned; P4 now selects the board battery | Booster Pump (P7) | Mixing tank out to a column |
 | Nutrient A / B / C | (doses into mixing tank — no column valve) | Nut A/B/C Pump (P11/P12/P13) | Bottle → mixing tank |
 | pH Up / pH Down | (doses into mixing tank) | pH Up/Down Pump (P15/P16) | Bottle → mixing tank |
 | [Nutrient D if used] | (doses into mixing tank) | Nut D Pump (P14) | Bottle → mixing tank |
