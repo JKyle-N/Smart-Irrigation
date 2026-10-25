@@ -49,7 +49,7 @@
  *         PCF_FAIL,I2C (relay bus dead -> ESP1 Major) + PCF_OK (recovered);
  *         SENSOR_FAIL,EC / SENSOR_FAIL,PH (probe railed/disconnected -> ESP1 Major,
  *         distinct from EC_FAIL/PH_FAIL = out-of-window); STATUS,ESP2,OK; READY,ESP2;
- *         DONE,EXERCISE,<pump>; DONE,RESUME,<mode>
+ *         DONE,EXERCISE,<pump>; ACK,RESUME,<mode> (not DONE -- resumeWork() only ever sends ACK)
  *
  *  P17 MASTER ACTUATOR-POWER CUTOFF & FAULT HOLD (sec.19.4.8): PCF8575 P17 (bit 15) is
  *  a master relay gating power to the whole P0-P16 actuator bank (fail-safe: loss of P17 =
@@ -163,10 +163,15 @@ bool COLUMN_ENABLED[3] = { true, true, false };        // [CONFIRM] mirror ESP1/
 
 /* ---- Stage timings ------------------------------------------------------- */
 const unsigned long VALVE_SWITCH_MS   = 1000;   // valve settle before pump (DC stages)
-const unsigned long INVERTER_WARMUP_MS = 2000;  // inverter+valve settle before AC pump
+const unsigned long INVERTER_WARMUP_MS = 5000;  // inverter+valve settle before AC pump
 const unsigned long FLOW_TIMEOUT_MS   = 10000;  // no-flow after pump start -> FLOW_FAIL
 const unsigned long STAGE_MAX_MS      = 180000; // hard safety cap per metered stage
 const unsigned long MIX_DEFAULT_MS    = 30000;  // used if work order omits MIX
+// Outer defensive cap on the MIX token, not a commissioning value: a generous multiple of the current
+// [TBD] 30s placeholder above, so a corrupted/oversized token can't leave the mixer running with no
+// backstop (SEQ_MIX has none of stagePoll's FLOW_TIMEOUT_MS/sgCapMs -- only this and overcurrent).
+// Revisit once ESP1's MIXING_DURATION_MS is finalized at commissioning.
+const unsigned long MIX_MAX_MS = 10 * MIX_DEFAULT_MS;  // 300000 (5 min)
 
 /* ---- Flow-independent (timed) recovery -- escape hatch when the FLOW SENSOR is dead -------- *
  * A held FLOW_FAIL can never clear via a flow-metered resume (the stage re-detects no-flow and
@@ -358,8 +363,17 @@ unsigned long lastHeartbeat = 0;
 // (always-on, RTC); ESP2 just runs the named pump briefly when told to. Non-blocking:
 // turn the pump on, note the off-time, and complete it in loop() (like the Nano-RST pulse).
 int  exRunBit = -1;                        // PCF bit being exercised (-1 = none)
-unsigned long exRunOffAt = 0;
+unsigned long exRunOffAt = 0;              // 0 = no exercise pending/active (covers warmup AND run)
 String exRunName;
+// Audit fix (2026-09-10): EXERCISE previously energized OUT_INVERTER and the pump bit in the same
+// call, giving it none of the INVERTER_WARMUP_MS settle time every automated work-order stage gets
+// via stageBegin()/stagePoll() -- exactly the protection that constant exists for, and EXERCISE is
+// the one AC path that runs fully unattended (ESP1's own 2-day preventive schedule, no operator
+// present). exRunOffAt now spans the WHOLE warmup+run window (so the busy-slot/mutual-exclusion
+// guards and safetyMonitor()'s exerciseActive correctly cover warmup too); these two track whether
+// the pump bit itself has been energized yet.
+bool exRunPumpOn = false;
+unsigned long exRunPumpAtMs = 0;
 String rxLine;
 
 /* ---- Forward declarations ------------------------------------------------ */
@@ -396,6 +410,7 @@ void finishOk();
 float endMeteredStage();
 void safetyMonitor();
 float readMixerCurrent();
+void  resetMixerCurrentRing();
 void heartbeat();
 void idleResetTick();
 void testSafety();
@@ -498,11 +513,17 @@ void loop() {
   // non-blocking preventive-exercise completion (5 s pump run commanded by ESP1)
   // Signed difference, not a plain >=: exRunOffAt is a millis() sum, so near the 49.7-day wrap the
   // plain comparison fires immediately and cuts the exercise short (or never fires).
+  // Energize the exercise pump itself only after the same inverter-settle time an automated stage
+  // gets -- see the declaration comment above. Checked every loop() pass, non-blocking.
+  if (exRunBit >= 0 && !exRunPumpOn && (long)(millis() - exRunPumpAtMs) >= 0) {
+    pcfOn(exRunBit);
+    exRunPumpOn = true;
+  }
   if (exRunOffAt && (long)(millis() - exRunOffAt) >= 0) {
     pcfOff(exRunBit);
     pcfOff(OUT_INVERTER);
     cutoffDeenergize();                  // drop the master cutoff again (back to safe idle)
-    exRunOffAt = 0; exRunBit = -1;
+    exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;
     reply("DONE,EXERCISE," + exRunName);
   }
 }
@@ -668,6 +689,9 @@ void reply(const String &body) {
  *  FLOW METERING (stage-based interrupt)
  * ========================================================================== */
 void attachFlow(int pin) {
+  // A prior selection's interrupt must be detached before a new one is attached, or its ISR keeps
+  // firing on the old pin forever, permanently contaminating flowPulses with an unrelated source.
+  if (activeFlowPin >= 0 && activeFlowPin != pin) detachInterrupt(digitalPinToInterrupt(activeFlowPin));
   flowPulses = 0;
   activeFlowPin = pin;
   pinMode(pin, INPUT_PULLUP);
@@ -730,13 +754,22 @@ void dispatch(const String &payload) {
     // Cancel any in-flight one-shot timers so loop() can't emit a stray late DONE
     // (DONE,EXERCISE) after the stop. NOTE: mixTankL is kept (persisted) -- the tank may
     // still physically hold water, and the next run must account for it (no overfill).
-    exRunOffAt = 0; exRunBit = -1;
+    exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;
     reply("DONE,STOP_ALL");
     return;
   }
   if (cmd == "STATUS_REQ") { reply("STATUS,ESP2,OK"); return; }
   if (cmd == "RESET_SELF") {                 // soft reboot on ESP1 request (spec sec.9.7.2)
     reply("ACK,RESET_SELF");
+    // If genuinely still mid-sequence (reachable via a narrow ESP1-side race after a recovery-
+    // confirmation ambiguity -- ESP1 can conclude "ESP2 restarted" and eventually escalate to
+    // RESET_SELF while ESP2 is in fact still executing correctly), persist whatever mixTankL
+    // already holds before the reboot discards RAM state. This only saves what's already been
+    // safely metered via tankApply() up to this point -- it does not attempt to finish/credit the
+    // currently in-flight stage, which stays the same documented gap as any other GPIO4-class cut
+    // (CLAUDE.md's P17 section). RESET_SELF otherwise never persisted at all, unlike every other
+    // exit path (normal completion, fault-hold), so this is a strict improvement, never a regression.
+    if (wo.active || step != SEQ_NONE) tankSave();
     stopAll();                               // force SAFE (all outputs OFF) before reboot
     esp1Serial.flush();                      // shift the ACK out before we reset (no delay(); we reboot next)
     ESP.restart();
@@ -753,7 +786,16 @@ void dispatch(const String &payload) {
   // ---- Calibration Mode (companion spec §A): raw stream / push const / prime ----
   if (cmd == "CAL_START") {
     if (wo.active || faultHeld || testMode) { reply("BUSY,ACTIVE"); return; }
+    // Audit fix (2026-09-09): this guard checked wo.active/faultHeld/testMode but never
+    // exRunOffAt (an EXERCISE run in progress) -- PRIME_START/SEQ_ dispatch already refuse each
+    // other correctly; EXERCISE was the one command missing from every side of this mutual
+    // exclusion, which could energize an EXERCISE pump concurrently with a calibration stream.
+    if (exRunOffAt != 0) { reply("BUSY,EXERCISE"); return; }
     if (n < 2) { reply("INVALID,CAL_START"); return; }
+    // Drop whatever flow ISR a previous calId may have left armed -- CAL_STOP only detaches when the
+    // id being stopped starts with "FLOW_", so switching straight from a flow id to a non-flow id
+    // (no intervening CAL_STOP) used to leave that ISR silently counting on the old pin forever.
+    detachFlow();
     calId = tok[1];
     int fp = flowPinForId(calId);
     if (fp >= 0) attachFlow(fp);             // arm + zero this flow ISR (pulses accumulate across bursts)
@@ -774,6 +816,10 @@ void dispatch(const String &payload) {
   }
   if (cmd == "PRIME_START") {
     if (wo.active || faultHeld || testMode) { reply("BUSY,ACTIVE"); return; }
+    // Audit fix (2026-09-09): same missing exRunOffAt check as CAL_START above -- without it, an
+    // EXERCISE pump run and a PRIME_START purge could energize two actuators simultaneously,
+    // violating the locked sequential-never-simultaneous pump architecture.
+    if (exRunOffAt != 0) { reply("BUSY,EXERCISE"); return; }
     if (n < 2) { reply("INVALID,PRIME"); return; }
     if (primeLine == "" || primeLine != tok[1]) setupPrime(tok[1], (n >= 3) ? tok[2] : "");
     primeLastMs = millis();                   // (re)arm the dead-man keep-alive
@@ -786,14 +832,25 @@ void dispatch(const String &payload) {
     String sub = (n >= 2) ? tok[1] : "";
     if (sub == "ENTER") {                                  // enter TEST_MODE, force SAFE
       if (wo.active || step != SEQ_NONE) { reply(faultHeld ? "BUSY,HELD" : "BUSY,ACTIVE"); return; }
+      // A Prime or Calibration session is still live (its own dead-man hasn't force-dropped P17 yet)
+      // -- refuse rather than let Testing start under it and get its power pulled out from under it
+      // by Prime's dead-man once ESP1 stops sending PRIME_START keep-alives.
+      if (primeLine != "" || calId != "") { reply(primeLine != "" ? "BUSY,PRIME" : "BUSY,CAL"); return; }
+      // Audit fix (2026-09-10): this force-clear previously discarded an in-flight EXERCISE with no
+      // reply at all, leaving ESP1 believing the exercise was still outstanding until whatever
+      // timeout it uses elapses. Report the same DONE,EXERCISE it would have gotten from a normal
+      // completion, just early -- read exRunName BEFORE the reset below clears it.
+      bool hadExercise = (exRunOffAt != 0);
+      String discardedExName = exRunName;
       stopAll(); testMode = true; testHeldBit = -1; testCapped = false;
       cutoffEnergize();                                    // power the bank so manual relay control works (sec.19.4.8.4)
-      exRunOffAt = 0; exRunBit = -1;                       // drop any pending one-shot timers
+      exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;                       // drop any pending one-shot timers
+      if (hadExercise) reply("DONE,EXERCISE," + discardedExName);
       reply("ACK,TEST,ENTER"); return;
     }
     if (sub == "EXIT") {
       stopAll(); detachFlow(); testMode = false; testHeldBit = -1;  // all OFF incl. master cutoff de-energized
-      exRunOffAt = 0; exRunBit = -1;                       // drop any pending one-shot timers
+      exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;                       // drop any pending one-shot timers
       reply("DONE,TEST"); return;
     }
     if (sub == "RELEASE") {                                // explicit button-up
@@ -841,6 +898,14 @@ void dispatch(const String &payload) {
   if (cmd == "EXERCISE") {
     if (faultHeld) { reply("BUSY,HELD"); return; }
     if (wo.active || step != SEQ_NONE || testMode) { reply("BUSY,ACTIVE"); return; }
+    // A previous EXERCISE is still running its own one-shot timer -- refuse a second one rather than
+    // overwrite exRunBit/exRunOffAt and orphan the first pump's relay ON with nothing left tracking it.
+    if (exRunOffAt != 0) { reply("BUSY,EXERCISE"); return; }
+    // Audit fix (2026-09-09): this guard never checked primeLine/calId, so an EXERCISE run could be
+    // started concurrently with an already-active PRIME_START purge or calibration stream, energizing
+    // two actuators at once. PRIME_START/CAL_START/the SEQ_ dispatch already refuse each other and
+    // now refuse EXERCISE too (see the exRunOffAt checks added there); this is the other half.
+    if (primeLine != "" || calId != "") { reply(primeLine != "" ? "BUSY,PRIME" : "BUSY,CAL"); return; }
     if (n < 2) { reply("INVALID,EXERCISE"); return; }
     int bit = (tok[1] == "TRANSFER") ? OUT_TRANSFER
             : (tok[1] == "BOOSTER")  ? OUT_BOOSTER
@@ -848,15 +913,21 @@ void dispatch(const String &payload) {
     if (bit < 0) { reply("INVALID,EXERCISE_DEV"); return; }
     reply("ACK,EXERCISE");
     cutoffEnergize();                                  // power the bank (sec.19.4.8)
-    pcfOn(OUT_INVERTER); pcfOn(bit);                   // AC source on, then the pump
-    exRunBit = bit; exRunName = tok[1];
+    pcfOn(OUT_INVERTER);                                // AC source on; the pump follows after warmup (see loop())
+    exRunBit = bit; exRunName = tok[1]; exRunPumpOn = false;
     // ESP1 may carry the operator-set run length as a third token. Clamped HERE too: ESP1 already
     // bounds it, but this is the side that actually energises the relay, so it does not take a
     // duration on trust from the wire.
     unsigned long runMs = (n >= 3) ? (unsigned long)tok[2].toInt() : PUMP_EXERCISE_RUN_MS;
     if (runMs < PUMP_EX_RUN_MIN_MS) runMs = PUMP_EX_RUN_MIN_MS;
     if (runMs > PUMP_EX_RUN_MAX_MS) runMs = PUMP_EX_RUN_MAX_MS;
-    exRunOffAt = millis() + runMs;                     // loop() turns it off + reports DONE
+    // Audit fix (2026-09-10): give the pump the same INVERTER_WARMUP_MS settle time an automated
+    // work-order stage gets (stageBegin()/stagePoll()) -- previously the pump bit energized in the
+    // same instant as the inverter, with none of that protection, on the one AC path that runs fully
+    // unattended. exRunOffAt spans warmup+run so the busy-slot/mutual-exclusion guards and
+    // safetyMonitor()'s exerciseActive correctly cover the warmup window too.
+    exRunPumpAtMs = millis() + INVERTER_WARMUP_MS;
+    exRunOffAt = exRunPumpAtMs + runMs;                 // loop() energizes the pump, then later turns it off + reports DONE
     return;
   }
 
@@ -867,6 +938,13 @@ void dispatch(const String &payload) {
   if (faultHeld) { reply("BUSY,HELD"); return; }                 // a held fault must be resolved (RESUME) first
   if (testMode) { reply("BUSY,TEST"); return; }                  // never auto-run during a manual test
   if (wo.active || step != SEQ_NONE) { reply("BUSY,ACTIVE"); return; }
+  // Same reasoning as the TEST,ENTER guard above: a live Prime/Cal session must be stopped
+  // (PRIME_STOP / CAL_STOP) before a new work order can safely start.
+  if (primeLine != "" || calId != "") { reply(primeLine != "" ? "BUSY,PRIME" : "BUSY,CAL"); return; }
+  // Audit fix (2026-09-09): this dispatch guard never checked exRunOffAt (an EXERCISE run in
+  // progress) either -- ESP1's own unattended 2-day EXERCISE schedule landing at the same moment as
+  // a scheduled/forced work order could energize both concurrently.
+  if (exRunOffAt != 0) { reply("BUSY,EXERCISE"); return; }
 
   char colCh = cmd.charAt(cmd.length() - 1);
   int c = (colCh == 'A') ? 0 : (colCh == 'B') ? 1 : (colCh == 'C') ? 2 : -1;
@@ -902,9 +980,22 @@ void dispatch(const String &payload) {
       float v = tok[++i].toFloat();
       if (v > 0.0f && v <= MIXING_TANK_MAX_L) wo.waterL = v;   // out-of-range -> ignore, use the table
     }
-    else if (tok[i] == "EC" && i + 2 < n)    { wo.ecLo = tok[++i].toFloat(); wo.ecHi = tok[++i].toFloat(); }
-    else if (tok[i] == "PH" && i + 2 < n)    { wo.phLo = tok[++i].toFloat(); wo.phHi = tok[++i].toFloat(); }
-    else if (tok[i] == "MIX" && i + 1 < n)   { wo.mixMs = (unsigned long)tok[++i].toInt(); }
+    else if (tok[i] == "EC" && i + 2 < n) {
+      float lo = tok[++i].toFloat(), hi = tok[++i].toFloat();
+      if (lo < hi) { wo.ecLo = lo; wo.ecHi = hi; } else reply("INVALID,EC_WINDOW");   // keep the wide default set above
+    }
+    else if (tok[i] == "PH" && i + 2 < n) {
+      float lo = tok[++i].toFloat(), hi = tok[++i].toFloat();
+      if (lo < hi) { wo.phLo = lo; wo.phHi = hi; } else reply("INVALID,PH_WINDOW");   // keep the wide default set above
+    }
+    else if (tok[i] == "MIX" && i + 1 < n) {
+      unsigned long m = (unsigned long)tok[++i].toInt();
+      // Audit fix (2026-09-10): 0 now falls back to the same MIX_DEFAULT_MS already set above before
+      // this loop runs, instead of literally meaning "mix for 0 ms" -- matches DCEIL's own "0 = use
+      // the default" convention a few lines up, rather than silently skipping mixing on a malformed
+      // or missing MIX token.
+      wo.mixMs = (m == 0) ? MIX_DEFAULT_MS : (m <= MIX_MAX_MS) ? m : MIX_MAX_MS;
+    }
     // Job-critical calibration carried in the work order (§A.5.1 #3): never run a dose on stale K/cal.
     // Range checked (see kSane): an implausible K is ignored so metering keeps the last known-good
     // value, and ESP1 is told, so a corrupted frame is visible instead of silently mis-metering.
@@ -1055,7 +1146,13 @@ void holdFault(const char *resp, const char *loc) {
   stopAll();                         // all OFF, master cutoff de-energized
   faultHeld = true;
   stepInit  = false;                 // on RESUME the paused step re-inits with the updated tank volume
-  lastHoldFlow = isFlow;             // a dead flow sensor enables timed IRRIGATE/RELEASE recovery
+  // Audit fix (2026-09-09): unconditionally overwriting this erased the "flow sensor is dead"
+  // diagnosis if an unrelated fault (e.g. PWR_FAIL) occurred while already running a flow-blind
+  // (resumeTimed) recovery -- the next RESUME would then retry a flow-metered stage against a
+  // sensor that's still dead, immediately re-raise FLOW_FAIL, and self-correct, but that's one
+  // avoidable extra operator RESUME cycle. Keep the prior true value across a same-hold, non-flow
+  // fault instead of clobbering it.
+  lastHoldFlow = isFlow || (resumeTimed && lastHoldFlow);   // a dead flow sensor enables timed IRRIGATE/RELEASE recovery
   // For FLOW_FAIL, append the pulse count: pulses=0 means the pump/sensor produced NOTHING (dead pump,
   // dead sensor, or no water); pulses>0 means flow started then stalled (air, weak pump, sensor half in
   // path). That single number tells the field team which hardware to inspect (diagnostic C-3).
@@ -1079,7 +1176,11 @@ void resumeWork(const String &mode) {
     wo.fertigate = false; wo.flushPct = 0;     // skip fill/dose: just DELIVER whatever is in the tank
     goStep(SEQ_DELIVER);
   } else {                                     // NORMAL: continue the paused sequence as-is
-    stepInit = false;                          // re-init the current step with the updated tank volume
+    // Audit fix (2026-09-08): goStep(step) is a no-op on which step is active (s == step already)
+    // but also re-sends the STAGE,... notice, matching what the IRRIGATE/RELEASE branches above
+    // already do -- previously NORMAL alone left ESP1's run-progress LCD showing stale stage info
+    // after a resume.
+    goStep(step);                              // re-init the current step with the updated tank volume
   }
   reply("ACK,RESUME," + mode);
 }
@@ -1172,8 +1273,15 @@ void runSequence() {
       } else if (r == -1) {
         // Dosing pump ran past its timed ceiling (or never flowed) -> DOSE_TIMEOUT, NOT a fallback
         // (dosing spec §2.3/§5): stuck-low flow sensor or unprimed line. Stop and HOLD for the user.
-        endMeteredStage();                   // credit whatever partial volume did make it into the tank
-        String nut = String("NUT_") + (char)('A' + doseIdx);
+        float deliveredML = endMeteredStage() * 1000.0f;  // credit whatever partial volume did make it into the tank
+        // Don't re-dose what already went in: a RESUME,NORMAL re-enters this step and re-reads
+        // wo.dose[doseIdx] from scratch, so it must already reflect only what's still owed, not the
+        // original full target (doseIdx itself isn't advanced on this path -- same step retries).
+        wo.dose[doseIdx] = (wo.dose[doseIdx] > deliveredML) ? (wo.dose[doseIdx] - deliveredML) : 0.0f;
+        // New-F5 (audit): same distinction FLOW_FAIL's pulse count already makes -- 0 mL delivered
+        // means the dosing pump/sensor never moved anything; a partial mL means it started then
+        // stalled. deliveredML was already computed above and previously discarded here.
+        String nut = String("NUT_") + (char)('A' + doseIdx) + "|delivered=" + String(deliveredML, 1);
         holdFault("DOSE_TIMEOUT", nut.c_str());
       }
       break;
@@ -1181,9 +1289,13 @@ void runSequence() {
 
     /* ---- MIX: homogenize; validate mixer current (ACS712) ---------------- */
     case SEQ_MIX: {
-      if (!stepInit) { pcfOn(OUT_INVERTER); pcfOn(OUT_MIXER); stepStart = millis(); stepInit = true; }
+      if (!stepInit) { pcfOn(OUT_INVERTER); pcfOn(OUT_MIXER); stepStart = millis(); stepInit = true; resetMixerCurrentRing(); }
       float mi = readMixerCurrent();
-      if (mi > MIXER_OVERCURRENT_A) { pcfOff(OUT_MIXER); holdFault("SAFE_STOP", "MIXER_OC"); break; }
+      if (mi > MIXER_OVERCURRENT_A) {   // New-F4 (audit): same enrichment as PWR_FAIL -- include the reading
+        pcfOff(OUT_MIXER);
+        char b[32]; snprintf(b, sizeof(b), "MIXER_OC|i=%.2f", mi);
+        holdFault("SAFE_STOP", b); break;
+      }
       if (millis() - stepStart >= wo.mixMs) {
         // no-load check at end of mix window (spec sec.23.2.2.4). DEGRADED (not ERROR):
         // Major condition, ESP1 must not critical-stop -- the batch still delivers.
@@ -1202,10 +1314,19 @@ void runSequence() {
       // HARDWARE fault first (railed ADC = probe disconnected/shorted) -> SENSOR_FAIL, distinct
       // from an in-range value that is merely outside the safe window (EC_FAIL/PH_FAIL). Both
       // are Major on ESP1; check EC and pH independently so a double-fault reports both.
-      if (phRaw <= PH_ADC_FAULT_LO || phRaw >= PH_ADC_FAULT_HI) { reply("SENSOR_FAIL,PH"); }
-      else if (ph < wo.phLo || ph > wo.phHi)                    { reply(String("PH_FAIL,") + colLoc); }
-      if (ecRaw <= EC_ADC_FAULT_LO || ecRaw >= EC_ADC_FAULT_HI) { reply("SENSOR_FAIL,EC"); }
-      else if (ec < wo.ecLo || ec > wo.ecHi)                    { reply(String("EC_FAIL,") + colLoc); }
+      // New-F6/F7/F8 (audit): same "diagnostic enrichment" pattern as holdFault()'s "|pulses=" --
+      // fold the measured value and which bound it crossed into the message instead of a bare code.
+      // "too acidic" vs "too alkaline" (or railed-low vs railed-high) are different physical causes.
+      if (phRaw <= PH_ADC_FAULT_LO || phRaw >= PH_ADC_FAULT_HI) {
+        reply(String("SENSOR_FAIL,PH|") + (phRaw <= PH_ADC_FAULT_LO ? "RAILED_LOW" : "RAILED_HIGH"));
+      } else if (ph < wo.phLo || ph > wo.phHi) {
+        reply(String("PH_FAIL,") + colLoc + "|pH=" + String(ph, 2) + "|" + (ph < wo.phLo ? "LOW" : "HIGH"));
+      }
+      if (ecRaw <= EC_ADC_FAULT_LO || ecRaw >= EC_ADC_FAULT_HI) {
+        reply(String("SENSOR_FAIL,EC|") + (ecRaw <= EC_ADC_FAULT_LO ? "RAILED_LOW" : "RAILED_HIGH"));
+      } else if (ec < wo.ecLo || ec > wo.ecHi) {
+        reply(String("EC_FAIL,") + colLoc + "|EC=" + String(ec, 2) + "|" + (ec < wo.ecLo ? "LOW" : "HIGH"));
+      }
       // Plumbing has no drain: deliver the mixed batch regardless, fault already reported.
       goStep(SEQ_DELIVER);
       break;
@@ -1243,6 +1364,10 @@ void runSequence() {
     case SEQ_FLUSH_FILL: {
       if (!stepInit) {
         float remaining = ((wo.waterL > 0.0f) ? wo.waterL : WATER_BUDGET_L[c]) * (wo.flushPct / 100.0f) - mixTankL;
+        // Same headroom clamp as SEQ_FILL above, for the same reason: never ask for more than the
+        // tank can still hold, so a stage-overshoot's hard cap is the only overshoot, not the target.
+        float flushHeadroom = MIXING_TANK_MAX_L - mixTankL;
+        if (remaining > flushHeadroom) remaining = flushHeadroom;
         if (remaining < TANK_EPS_L) { goStep(SEQ_FLUSH_DELIVER); break; }
         pcfOn(OUT_RES_VALVE);
         stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
@@ -1277,9 +1402,67 @@ void runSequence() {
 /* =============================================================================
  *  SAFETY MONITOR  --  immediate local protective stops (spec sec.9.8.1.2)
  * ========================================================================== */
+// Debounced report for a persistently unreadable PZEM (same counting shape as pcfFailCount/PCF_FAIL_LIMIT).
+// No paired recovery token: PZEM validation only runs while an AC pump is active (like EC_FAIL/PH_FAIL),
+// unlike PCF health which is continuously probed even idle, so there's no idle moment to announce
+// recovery in. Reuses the existing SENSOR_FAIL wire token -- ESP1's handler is already generic on arg.
+uint8_t pzemFailCount = 0;
+unsigned long lastPzemReportMs = 0;
+const uint8_t PZEM_FAIL_LIMIT      = 3;      // mirrors PCF_FAIL_LIMIT
+const unsigned long PZEM_REPORT_MS = 10000;  // mirrors PCF_REPORT_MS
+
+// Stops whichever AC load safetyMonitor() found the fault under. A work-order stage uses the
+// existing holdFault()/RESUME machinery (tank bookkeeping applies); EXERCISE and an AC PRIME_START
+// line are simple direct-energize actions with no tank/work-order state to preserve, so they just
+// abort the actuator immediately and report -- there is nothing for an operator to RESUME.
+static void auxPowerFaultStop(bool seqActive, bool exerciseActive, bool mixActive, const char *msg) {
+  if (seqActive) {
+    endMeteredStage();
+    holdFault("PWR_FAIL", msg);
+  } else if (exerciseActive) {
+    pcfOff(exRunBit); pcfOff(OUT_INVERTER); cutoffDeenergize();
+    exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;
+    reply(String("PWR_FAIL,") + msg);
+  } else if (mixActive) {
+    // SEQ_MIX never calls stageBegin() (no flow target -- there's nothing to meter), so sgPump is
+    // still -1 from the previous stage and holdFault()'s own stageEnd()/stopAll() wouldn't otherwise
+    // know to drop the mixer bit specifically. Mirror the existing MIXER_OC overcurrent fault right
+    // above this function (same explicit pcfOff(OUT_MIXER) before holdFault()), no endMeteredStage()
+    // -- MIX doesn't move tank water, so there's nothing to credit.
+    pcfOff(OUT_MIXER);
+    holdFault("PWR_FAIL", msg);
+  } else {                                  // AC prime line
+    stopPrime();
+    reply(String("PWR_FAIL,") + msg);
+  }
+}
+
 void safetyMonitor() {
-  // PZEM validation only while an AC pump is actively running
-  if (step == SEQ_NONE || !sgPumpOn || !sgIsAC) { acNoCurrentSince = 0; return; }
+  // Audit fix (2026-09-08): EXERCISE (ESP1's own unattended 2-day preventive-maintenance schedule,
+  // sec.14.9.1) and an AC PRIME_START line (RESMIX/MIXIRR) both energize a pump directly via
+  // pcfOn(), bypassing this monitor entirely because it previously gated only on the work-order
+  // state machine's own step/sgPumpOn/sgIsAC bookkeeping. Neither path had ANY overcurrent/voltage
+  // protection -- a locked-rotor pump or wiring short during an unattended overnight EXERCISE or a
+  // PRIME purge could draw fault current for the full run (up to 10 s / 45 s) undetected. Now
+  // covered by the same PZEM checks below.
+  // Audit fix (2026-09-09): SEQ_MIX has the exact same gap -- it also drives OUT_MIXER directly via
+  // pcfOn() without ever calling stageBegin(), so sgPumpOn/sgIsAC never go true during mixing and
+  // `seqActive` stayed false for the entire mix window (up to several minutes), leaving zero PZEM
+  // voltage-window/overcurrent/stall protection during every fertigation run's mix stage -- the only
+  // prior protection was the mixer-specific ACS712 overcurrent check, which never watches AC supply
+  // voltage at all. Added as its own `mixActive` context, same pattern as exercise/prime above.
+  bool seqActive      = (step != SEQ_NONE && sgPumpOn && sgIsAC);
+  bool exerciseActive = (exRunOffAt != 0);
+  bool primeAcActive  = (primeLine != "" && primeIsAC);
+  // Audit fix (2026-09-10): unlike seqActive/exerciseActive/primeAcActive, which all self-clear as a
+  // side effect of their own fault teardown (sgPumpOn->false, exRunOffAt->0, primeLine->""), `step`
+  // is DELIBERATELY left at SEQ_MIX across a held fault so RESUME,NORMAL can goStep(step) back into
+  // it -- so without this `!faultHeld` term, mixActive stayed true for the entire hold, and with the
+  // mixer/inverter correctly off (near-zero PZEM current), safetyMonitor() re-tripped NO_CURRENT and
+  // re-fired holdFault()/PWR_FAIL roughly every PZEM_POLL_MS, indefinitely, until RESUME. Mirrors
+  // runSequence()'s own `if (faultHeld) return;` guard.
+  bool mixActive      = (step == SEQ_MIX && !faultHeld);
+  if (!seqActive && !exerciseActive && !primeAcActive && !mixActive) { acNoCurrentSince = 0; return; }
 
   // Throttle the (blocking) Modbus reads so we don't poll every loop iteration.
   if (millis() - lastPzemMs < PZEM_POLL_MS) return;
@@ -1287,26 +1470,70 @@ void safetyMonitor() {
 
   float v = pzem.voltage();
   float i = pzem.current();
-  if (isnan(v) || isnan(i)) return;         // PZEM absent/unreadable -> skip (graceful)
+  if (isnan(v) || isnan(i)) {               // PZEM absent/unreadable -> skip actuation checks (graceful),
+    if (pzemFailCount < 250) pzemFailCount++;   // but no longer silent: debounced alert past the limit
+    if (pzemFailCount >= PZEM_FAIL_LIMIT && millis() - lastPzemReportMs >= PZEM_REPORT_MS) {
+      lastPzemReportMs = millis();
+      reply("SENSOR_FAIL,PZEM");            // ESP1 = Major (alert + log); other safeties still apply
+    }
+    return;
+  }
+  pzemFailCount = 0;
 
   // Credit the partial liters this metered stage moved before holding (overfill guard), then
   // PAUSE on the master cutoff awaiting RESUME (sec.19.4.8) -- ESP2 stays alive holding the tank.
-  if (i > PZEM_OVERCURRENT_A)        { endMeteredStage(); holdFault("PWR_FAIL", "OVERCURRENT"); return; }
-  if (v < PZEM_V_MIN || v > PZEM_V_MAX) { endMeteredStage(); holdFault("PWR_FAIL", "VOLTAGE"); return; }
+  // New-F3 (audit): fold the actual PZEM reading into the fault message, same "diagnostic enrichment"
+  // pattern as holdFault()'s own "|pulses=" for FLOW_FAIL -- a bare "VOLTAGE" didn't even say whether
+  // the AC supply was over or under the safe window, which point at different physical causes.
+  if (i > PZEM_OVERCURRENT_A) {
+    char b[32]; snprintf(b, sizeof(b), "OVERCURRENT|i=%.2f", i);
+    auxPowerFaultStop(seqActive, exerciseActive, mixActive, b); return;
+  }
+  if (v < PZEM_V_MIN) {
+    char b[32]; snprintf(b, sizeof(b), "VOLTAGE|v=%.1f|LOW", v);
+    auxPowerFaultStop(seqActive, exerciseActive, mixActive, b); return;
+  }
+  if (v > PZEM_V_MAX) {
+    char b[32]; snprintf(b, sizeof(b), "VOLTAGE|v=%.1f|HIGH", v);
+    auxPowerFaultStop(seqActive, exerciseActive, mixActive, b); return;
+  }
 
   if (i < PZEM_MIN_CURRENT_A) {             // pump ON but drawing no current
     if (acNoCurrentSince == 0) acNoCurrentSince = millis();
-    else if (millis() - acNoCurrentSince > PZEM_NO_CURRENT_MS) { endMeteredStage(); holdFault("PWR_FAIL", "NO_CURRENT"); return; }
+    else if (millis() - acNoCurrentSince > PZEM_NO_CURRENT_MS) {
+      char b[32]; snprintf(b, sizeof(b), "NO_CURRENT|i=%.3f", i);
+      auxPowerFaultStop(seqActive, exerciseActive, mixActive, b); return;
+    }
   } else {
     acNoCurrentSince = 0;
   }
 }
 
+// Audit fix (2026-09-08): the mixer is an AC (mains-frequency) load, so a single instantaneous
+// analogRead() sample is essentially a random point on a sine wave -- it can read near zero on a
+// perfectly healthy, loaded mixer purely because that one sample landed near a zero-crossing,
+// causing spurious DEGRADED,MIXER_NOLOAD and an overcurrent trip point that depends on ADC-sampling
+// luck rather than the physical load. Fixed with a small non-blocking ring buffer (one new sample
+// per call -- no busy-wait, no delay(), keeps the file's "non-blocking everywhere" rule) that
+// reports an RMS magnitude across the most recent samples; at normal sub-millisecond loop() cadence
+// this converges to a true RMS reading within a handful of calls, well before any real fault check
+// needs to act on it.
+static const int MIXER_I_RING_N = 24;
+static float mixerIRing[MIXER_I_RING_N] = {0};
+static int   mixerIRingIdx = 0, mixerIRingCount = 0;
+
+void resetMixerCurrentRing() { mixerIRingIdx = 0; mixerIRingCount = 0; }
+
 float readMixerCurrent() {
   int raw = analogRead(PIN_MIXER_I);
   float v = (raw / 4095.0f) * 3.3f;
   float a = (v - ACS712_ZERO_V) / ACS712_SENS_V_PER_A;
-  return fabs(a);
+  mixerIRing[mixerIRingIdx] = a;
+  mixerIRingIdx = (mixerIRingIdx + 1) % MIXER_I_RING_N;
+  if (mixerIRingCount < MIXER_I_RING_N) mixerIRingCount++;
+  double sumSq = 0.0;
+  for (int k = 0; k < mixerIRingCount; k++) sumSq += (double)mixerIRing[k] * (double)mixerIRing[k];
+  return sqrtf((float)(sumSq / mixerIRingCount));
 }
 // (EC/pH are read inline in the SEQ_ECPH stage; standalone readPH()/readEC() removed as unused.)
 
