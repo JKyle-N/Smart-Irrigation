@@ -95,6 +95,7 @@ A successful command echoes back as `ACK,…`:
 | `ERR,WIFI` / `ERR,TSKEY` / `ERR,TSCH` | Bad WiFi/ThingSpeak syntax; `TSCH` = channel not 1–3. |
 | `ERR,SUMDATE` | Bad `<day>` token for SUMMARY. |
 | `ERR,CMD` | Unknown command keyword. |
+| `ERR,RESUME,BATT2` | A held run can't resume yet: the secondary battery is low or its monitor isn't answering (only while secondary-battery switching is enabled). The run stays held with the tank volume kept; Hold and Cancel still work. |
 | `BUSY,local edit; applied after` | Someone is editing the same setting on the LCD right now; your change is queued and applied when they finish. |
 
 ### 4.3 Run notice
@@ -127,6 +128,9 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | `NPK_FAULT` | MAJ | A column's NPK sensor read invalid; that column won't fertigate this cycle. | Check the RS485/NPK probe. |
 | `RES_LOW` | MAJ | Reservoir below the low threshold — runs blocked until refilled. | Refill the reservoir. |
 | ~~`BATTERY_LOW`~~ | — | **Removed** — battery low no longer disables fertigation or alerts. Monitoring only. | Watch the battery voltage yourself. |
+| `BATT2_LOW` | MAJ | Secondary battery below 13.6 V. While secondary-battery switching is enabled, no run, exercise, AC prime or inverter Testing row may **start** until it is back above 14.0 V (a run already going finishes). | It recharges from the main battery while idle; check the charger if it stays low. |
+| `BATT2_CRIT` | MAJ | Secondary battery below 12.8 V (3.2 V/cell). | Charge or replace it before the next run. |
+| `SENSOR_FAIL,INA226…` | MAJ | The secondary battery's INA226 monitor isn't answering; inverter use is blocked (switching enabled) because the battery can't be checked. | Check the INA226 wiring on ESP1's I²C (address 0x40). |
 | `NANO_GARBAGE` | MAJ | Sensor hub kept sending garbage after a software reset; running on last-valid data. | Check the Nano / sensor wiring. |
 | `NANO_RESET` | WARN | The sensor hub was told to self-reset (after 5 bad packets, or the daily fresh-start). | Informational. |
 | `NANO_SILENCE` | MIN | The sensor hub went quiet (its own watchdog restarts it). | Informational; check if it persists. |
@@ -151,6 +155,7 @@ FLT,C0M1m0,RST,1,ST,IDLE_STATE,BAT,12.6V,CONS,180Wh,CHG,240Wh
 | `RST,1` | Sensor-hub resets today. |
 | `ST,IDLE_STATE` | Current system state. |
 | `BAT,12.6V` | Battery voltage. |
+| `BAT2,15.9V` | Secondary battery voltage (`LOW` appended when below its low threshold; `--` if its monitor isn't answering). |
 | `CONS,180Wh` / `CHG,240Wh` | Energy consumed / charged today. |
 
 ### 4.6 Summary — `SUM,<day> …` (averages)
@@ -212,7 +217,7 @@ full emergency stop is done at the LCD fault screen.
 **Buttons:** UP, DOWN, ENTER, BACK, MODE.
 
 - **MODE** toggles between the live data pages and the **Settings** menu (and exits Testing/Calibration).
-- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (battery via opto ADC),
+- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (main battery V/I, plus a `B2:` line for the secondary battery; `*` marks the one the controllers are running from),
   **GSM + WiFi** health, **Fault** (last fault / recovery prompts).
 
 ### 6.1 Settings menu
@@ -272,11 +277,21 @@ actually moves through the pipes (hard cap ~30 s; re-hold to keep going):
 
 | Combo row | Energizes | Use |
 |---|---|---|
-| **Fill Res>Mix** | Inverter + Reservoir valve + Transfer pump | Prime/fill reservoir → mixing tank. |
-| **Push>Col A / B / C** | Inverter + Mix valve + that Column's valve + Booster pump | Prime mixing tank → the chosen column. **All** columns (A/B/C) are shown here regardless of the run config, so you can bench-test any column's wiring — scroll (UP/DOWN) to the one you want. |
+| **Fill Res>Mix** | Inverter + Transfer pump (draws straight from the reservoir) | Prime/fill reservoir → mixing tank. |
+| **Push>Col A / B / C** | Inverter + that Column's valve + Booster pump | Prime mixing tank → the chosen column. **All** columns (A/B/C) are shown here regardless of the run config, so you can bench-test any column's wiring — scroll (UP/DOWN) to the one you want. |
 
 Hold ENTER to run a combo; release (or the 30 s cap) stops the pump and closes the valves immediately.
 This replaces the idea of a separate "Prime Lines" menu.
+
+Two single-relay rows changed meaning with the secondary-battery feature:
+- **Spare P0** — formerly the reservoir valve, now an unused relay. Holding it only clicks the relay.
+- **Batt->2nd** — formerly the mix valve. Holding it energizes the DPDT and moves the controllers onto
+  the secondary battery. **Until the hold-up stage is fitted, this resets all three controllers** — use
+  it only to verify the wiring on the bench.
+
+When the secondary-battery switching is enabled, any row that raises the inverter (**Inverter**, **Fill**,
+**Push>Col**) is refused while the secondary battery is low or its monitor is not answering. The header
+shows `TEST:BATT2 LOW/NOMON` for 3 s.
 
 ### 6.5 Restore Defaults (Settings → Restore Defaults; idle only)
 Double-confirm (NO/YES). Resets operational settings (modes, targets, names, schedules, thresholds) to

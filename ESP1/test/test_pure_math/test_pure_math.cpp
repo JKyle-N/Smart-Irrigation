@@ -183,6 +183,25 @@ void test_pulse_row_rejects_unknown_and_null(void) {
   TEST_ASSERT_EQUAL_INT(-1, pulseRowForTarget(NULL));
 }
 
+/* ---- testRowUsesInverter (secondary-battery gate) ------------------------- */
+
+void test_inverter_rows_are_exactly_the_ac_rows(void) {
+  // The bare inverter relay and every Fill/Push combo raise the inverter -> secondary battery.
+  TEST_ASSERT_TRUE(testRowUsesInverter(5));
+  for (int r = 16; r <= 19; r++) TEST_ASSERT_TRUE(testRowUsesInverter(r));
+  // Spare P0, the column valves, the battery select itself, pumps alone, DC pumps, P17: no inverter.
+  int none[] = { 0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, -1 };
+  for (unsigned k = 0; k < sizeof(none) / sizeof(none[0]); k++) TEST_ASSERT_FALSE(testRowUsesInverter(none[k]));
+}
+
+void test_pulse_targets_that_need_the_inverter(void) {
+  // A dashboard pulse is blocked on a low secondary only when its row raises the inverter.
+  TEST_ASSERT_TRUE(testRowUsesInverter(pulseRowForTarget("transfer")));
+  TEST_ASSERT_TRUE(testRowUsesInverter(pulseRowForTarget("colA")));
+  TEST_ASSERT_FALSE(testRowUsesInverter(pulseRowForTarget("nutA")));
+  TEST_ASSERT_FALSE(testRowUsesInverter(pulseRowForTarget("phUp")));
+}
+
 /* ---- clampi -------------------------------------------------------------- */
 
 void test_clampi(void) {
@@ -251,6 +270,8 @@ int main(int, char **) {
   RUN_TEST(test_level_pct_returns_whole_percents);
   RUN_TEST(test_pulse_row_maps_every_known_target);
   RUN_TEST(test_pulse_row_rejects_unknown_and_null);
+  RUN_TEST(test_inverter_rows_are_exactly_the_ac_rows);
+  RUN_TEST(test_pulse_targets_that_need_the_inverter);
   RUN_TEST(test_clampi);
   RUN_TEST(test_days_in_month_ordinary_year);
   RUN_TEST(test_days_in_month_leap_year_rules);

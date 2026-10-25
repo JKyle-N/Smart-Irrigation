@@ -197,8 +197,34 @@ const float MIX_MAX_PCT      = 95.0f;   // mixing tank overflow guard       [TBD
 /* ---- Battery (INA226) (spec sec.21.1) ------------------------------------ */
 const float BATT_LOW_V       = 11.8f;   // disable fertigation below        [TBD]
 const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD]
-const float INA226_SHUNT_OHMS   = 0.002f;   // shunt resistor value         [MEASURE]
-const float INA226_MAX_CURRENT_A = 10.0f;   // expected max current         [MEASURE]
+
+/* ---- SECONDARY battery: INA226 (R010 shunt) on this I2C bus at INA226_ADDR ------------------- *
+ * A 4S Li-ion battery (16.8 V full) that powers ESP1, ESP2, the Nano, the sensors and the relay
+ * coils while the inverter runs the AC motors. ESP2's P4 (the old mix-valve relay) drives a DPDT
+ * that breaks BOTH + and - from the main solar battery for that time, so no electrical link to
+ * the inverter's battery remains and the sensor readings stay clean; idle, the boards run from
+ * the main battery, which also charges the secondary. ESP1 owns the monitor and the policy:
+ * while SECONDARY_BATT_ENABLED, no inverter use may START if the secondary is low or its INA226
+ * is not answering (secBattBlocksAc), and both raise Major alerts. ESP2 holds the matching flag
+ * (it drives the switch) -- set both together, and only once the hold-up stage that rides the
+ * boards through the ~10-20 ms DPDT transfer is fitted. At 0 the INA226 is still read, logged
+ * (PWR2) and published, but nothing is blocked or alerted.
+ * Calibration follows the bench tool Test Code/Arduino R3/INA226_R010 (same CAL/offset/factor). */
+#define SECONDARY_BATT_ENABLED 0
+const float    SEC_CURRENT_LSB      = 0.00025f;  // 0.25 mA/bit -> 8.192 A full scale
+const uint16_t SEC_INA_CAL          = 2048;      // 0.00512/(LSB*0.010 R); trim x (meter A/INA A) [MEASURE]
+const float    SEC_CURRENT_OFFSET_A = 0.014f;    // no-load reading, subtracted                 [MEASURE]
+const float    SEC_BUS_V_FACTOR     = 1.000f;    // meter V / INA V                             [MEASURE]
+const bool     SEC_INVERT_CURRENT   = false;     // true if IN+/IN- are wired reversed
+const uint16_t SEC_INA_CONFIG       = 0x4527;    // AVG16, 1.1 ms bus/shunt, continuous
+const float SEC_BATT_FULL_V    = 16.8f;          // 4.20 V/cell -> 100 %                         [CONFIRM]
+const float SEC_BATT_EMPTY_V   = 12.8f;          // 3.20 V/cell ->   0 %                         [CONFIRM]
+const float SEC_BATT_LOW_V     = 13.6f;          // 3.40 V/cell: block inverter use below this   [CONFIRM]
+const float SEC_BATT_RECOVER_V = 14.0f;          // 3.50 V/cell: allow it again (hysteresis)    [CONFIRM]
+const float SEC_BATT_CRIT_V    = 12.8f;          // 3.20 V/cell: critical alert                  [CONFIRM]
+const unsigned long SEC_READ_MS  = 2000;         // read cadence once found
+const unsigned long SEC_RETRY_MS = 10000;        // re-probe cadence while missing
+const unsigned long ESP2_BATT_RETURN_WAIT_MS = 2500;  // keep ESP2 powered for its secondary->main return
 
 /* ---- Battery CURRENT: ACS758-050B via ADS1115 (replaces the opto ADC) ------ *
  * The GPIO34 opto path logged I=0.00 on all 44,303 samples across 16 days -- battery %, the daily
@@ -958,6 +984,8 @@ struct TelemetrySnapshot {
   bool     pendRun, pendEx;
   int      pendExIdx;
   bool     rtcOk_, sdOk_, acsOk_;
+  bool     secOk_, secLow_, onSecondary_;           // secondary battery (INA226) + supply in use
+  float    secV_, secI_, secP_;
   bool     simOk, netReg;
   int      rssi, creg;
   bool     battLow, battCrit;
@@ -1084,6 +1112,12 @@ bool   battVCalLoaded = false;                       // see loadBattCal() and th
 float battV = 0, battI = 0, battP = 0;
 bool  batteryLow = false, batteryCritical = false;
 unsigned long lastInaMs = 0;                         // ADC read throttle (kept name to avoid churn)
+// Secondary battery (INA226). Core 1 only; the snapshot carries copies to core 0.
+bool  secInaOk = false, secHaveV = false;          // monitor answering / have a reading
+float secV = 0, secI = 0, secP = 0;                // filtered V, signed current, power
+bool  secLow = false, secCrit = false;             // low latch (hysteresis) / critical
+bool  esp2OnSecondary = false;                     // ESP2 reported INFO,BATT,SECONDARY (boards isolated)
+unsigned long esp2BattWaitUntil = 0;               // ESP2 power-off held for the secondary->main return
 // Energy integration for the daily report (sec.12.1.3). The opto current is MAGNITUDE only, so all
 // energy is counted as consumption (charge/discharge split removed with the INA226).
 double energyConsumedWh = 0.0;   // energy today (Wh)
@@ -1273,12 +1307,13 @@ const unsigned long FAULT_REPROMPT_MS = 120000;     // 2 minutes, per the operat
 String pendingCfgSms = "";   // queued config SMS, applied when the local edit exits
 // Testing submenu: PCF8575 OUT_* bit -> short name (MUST match ESP2 OUT_* numbering)
 const char *TEST_NAMES[16] = {
-  "ResValve", "Col A Vlv", "Col B Vlv", "Col C Vlv", "Mix Valve", "Inverter",
+  "Spare P0", "Col A Vlv", "Col B Vlv", "Col C Vlv", "Batt->2nd", "Inverter",
   "Transfer", "Booster", "Mixer", "Nut A", "Nut B", "Nut C", "Nut D",
   "pH Up", "pH Down", "Mast Cutoff"
 };
 int  testSel   = 0;          // selected component row
 int  testOnBit = -1;         // which bit is currently ON (-1 = none)
+unsigned long testBlockedUntilMs = 0;   // header shows the secondary-battery refusal until this
 // Testing rows: 16 single relays (0..15) + Fill combo (16) + one Push>Col combo per column (17+c).
 // These extra indices double as the TEST,HOLD value; ESP2 treats idx>15 as a valve+pump priming combo.
 const int TEST_FILL_ROW = 16;
@@ -1567,6 +1602,8 @@ void stateMachineTick();
 void controlTick();
 bool decideFertigate(int c);
 void powerTick();
+void secBattTick();
+bool secBattBlocksAc(const char **why = nullptr);
 void loadBattCal();
 void readBatteryAdc();
 void batterySafetyTick();
@@ -1760,7 +1797,8 @@ void loop() {
   g_lastStage = 'C'; controlTick();
   g_lastStage = 'X'; exerciseTick();       // preventive pump exercise (sec.14.9.1)
   g_lastStage = 'f'; forceTick();          // Settings force run: countdown -> gate re-check -> fire
-  g_lastStage = 'P'; powerTick();          // INA226 I2C read
+  g_lastStage = 'P'; powerTick();          // main battery: opto ADC voltage + ACS758 current
+  g_lastStage = 'b'; secBattTick();        // secondary battery: INA226 I2C read + run-block policy
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
   g_lastStage = 'p'; esp2PowerTick();      // ESP2 min-on hold + periodic idle heartbeat poll (sec.18.8)
@@ -2636,7 +2674,14 @@ void handleEsp2Response(const String &payload) {
     return;
   }
   if (resp == "STATUS") return;                                // heartbeat
-  if (resp == "INFO") { logEvent("ESP2", "RESP", payload); return; }  // e.g. INFO,IDLE_RESET (self-heal notice)
+  if (resp == "INFO") {                                       // e.g. INFO,IDLE_RESET (self-heal notice)
+    logEvent("ESP2", "RESP", payload);
+    // Secondary-battery switch notices: track which battery the boards are on. MAIN also releases a
+    // power-off that was being held for exactly this return (see esp2SetPower).
+    if (arg == "BATT,SECONDARY") esp2OnSecondary = true;
+    else if (arg == "BATT,MAIN") { esp2OnSecondary = false; if (esp2OffPending && esp2BattWaitUntil) esp2OffAt = millis(); }
+    return;
+  }
 
   if (resp == "STAGE") {                                    // STAGE,<ord>,<total>,<Name> -> run-progress LCD
     String t[4]; int nt = 0, st = 0;
@@ -2990,6 +3035,7 @@ void forceTick() {
   else if (webManualHeld())                                     bad = "WEB_MANUAL";
   else if (wo.active || pendingRun.active || pendingExercise.active) bad = "BUSY";
   else if (esp2Held)                                            bad = "HELD";
+  else if (secBattBlocksAc())                                   bad = "BATT2";
   else if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT)    bad = "RES_LOW";
   if (bad) { forceAbort(bad); return; }
 
@@ -3018,6 +3064,12 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
     if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "web manual mode is active");
     return;
   }
+  { const char *bw;
+    if (secBattBlocksAc(&bw)) {                      // every run uses the AC pumps -> needs the secondary
+      logEvent("ESP1", "ACT", "FORCE|BLOCKED|BATT2");
+      if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", bw);
+      return;
+    } }
   if (actuationsDisabled) {                          // last line of defence, as in sendWorkOrder
     logEvent("ESP1", "ACT", "FORCE|BLOCKED|ACTUATIONS_OFF");
     if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "actuations are disabled");
@@ -3548,18 +3600,29 @@ void esp2CommRetryTick() {
 void esp2SetPower(bool on, bool force) {
   if (on) {
     esp2OffPending = false;                      // a new power-up cancels a pending graceful off
+    esp2BattWaitUntil = 0;
     if (esp2Powered) return;
     digitalWrite(ESP2_PWR_PIN, HIGH);
     esp2Powered = true; esp2OnMs = millis();
     return;
   }
   if (!esp2Powered) { esp2OffPending = false; return; }
+#if SECONDARY_BATT_ENABLED
+  // ESP2 has the boards on the secondary and returns them to main ~1 s after the inverter stops.
+  // Cutting its power now would drop the DPDT at once instead, so hold a graceful off until it
+  // reports INFO,BATT,MAIN, bounded by ESP2_BATT_RETURN_WAIT_MS. force (E-stop) never waits.
+  if (!force && esp2OnSecondary) {
+    if (!esp2BattWaitUntil) esp2BattWaitUntil = millis() + ESP2_BATT_RETURN_WAIT_MS;
+    if ((long)(millis() - esp2BattWaitUntil) < 0) { esp2OffPending = true; esp2OffAt = esp2BattWaitUntil; return; }
+  }
+#endif
   if (!force && millis() - esp2OnMs < ESP2_MIN_ON_MS) {    // hold the minimum on-time before turning off
     esp2OffPending = true; esp2OffAt = esp2OnMs + ESP2_MIN_ON_MS;
     return;
   }
   digitalWrite(ESP2_PWR_PIN, LOW);
   esp2Powered = false; esp2OffPending = false;
+  esp2OnSecondary = false; esp2BattWaitUntil = 0;   // PCF unpowered -> P4 drops -> boards on main
   esp2Available = false; testArmPending = false; esp2TestArmed = false; testArmTries = 0;
 }
 
@@ -3649,6 +3712,7 @@ void exerciseTick() {
   if (sysState != IDLE_STATE) return;
   if (uiMode != UI_DATA) return;
   if (wo.active || pendingRun.active || pendingExercise.active) return;
+  if (secBattBlocksAc()) return;           // the exercise runs the inverter -> needs the secondary
 #if BATTERY_SAFETY_ENABLED
   if (batteryLow || batteryCritical) return;   // don't exercise on a weak battery (READY, not active)
 #endif
@@ -4237,6 +4301,7 @@ void sendDailyReport() {
   r += ",RST," + String(nanoResetsToday);
   r += ",ST," + String(stateLabel(sysState, actuationsDisabled));
   r += ",BAT," + String(battV, 1) + "V";
+  r += ",BAT2," + ((secInaOk && secHaveV) ? String(secV, 1) + "V" + (secLow ? "LOW" : "") : String("--"));
   // Daily energy (sec.12.1.3): integrated discharge (CONS) + charge (CHG), Wh.
   r += ",CONS," + String((int)(energyConsumedWh + 0.5)) + "Wh";
   r += ",CHG," + String((int)(energyChargedWh + 0.5)) + "Wh";
@@ -4693,6 +4758,7 @@ void controlTick() {
   if (batteryCritical) return;             // battery-critical -> hold all runs (READY, not active)
 #endif
   if (!rtcOk) return;
+  if (secBattBlocksAc()) return;           // secondary battery low / unmonitored: no inverter use may start
   // NOTE: ESP2 is OFF during idle (sec.18.8) -- do NOT gate on esp2Available here; a due
   // column powers ESP2 up on demand below and the work order is sent once it reports READY.
 
@@ -5000,6 +5066,107 @@ void powerTick() {
 }
 
 /* =============================================================================
+ *  SECONDARY BATTERY  (INA226 at INA226_ADDR, R010 shunt) -- see SECONDARY_BATT_ENABLED
+ * ========================================================================== */
+static bool secInaWrite(uint8_t reg, uint16_t v) {
+  Wire.beginTransmission(INA226_ADDR); Wire.write(reg); Wire.write(v >> 8); Wire.write(v & 0xFF);
+  return Wire.endTransmission() == 0;
+}
+static bool secInaRead(uint8_t reg, uint16_t &out) {
+  Wire.beginTransmission(INA226_ADDR); Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)INA226_ADDR, (uint8_t)2) != 2) { while (Wire.available()) Wire.read(); return false; }
+  out = ((uint16_t)Wire.read() << 8) | Wire.read();
+  return true;
+}
+// Probe + configure. The manufacturer/die IDs prove it is really an INA226 (0x40 is a common
+// address); the calibration read-back proves the bus carries writes. No reset/delay(): writing
+// CONFIG and CAL sets every register this code reads.
+static bool secInaInit() {
+  uint16_t mfg, die, calBack;
+  if (!secInaRead(0xFE, mfg) || !secInaRead(0xFF, die)) return false;
+  if (mfg != 0x5449 || die != 0x2260) return false;
+  if (!secInaWrite(0x00, SEC_INA_CONFIG) || !secInaWrite(0x05, SEC_INA_CAL)) return false;
+  return secInaRead(0x05, calBack) && calBack == SEC_INA_CAL;
+}
+
+// Low latch with hysteresis, critical flag, and (only when switching is live) the alerts. One-shot
+// per episode, like resLowLatched, so a sagging battery can't storm SMS.
+static void secBattPolicy() {
+  bool valid = secInaOk && secHaveV;
+  if (valid) {
+    if (!secLow && secV < SEC_BATT_LOW_V) secLow = true;
+    else if (secLow && secV >= SEC_BATT_RECOVER_V) secLow = false;
+    secCrit = (secV < SEC_BATT_CRIT_V);
+  }
+#if SECONDARY_BATT_ENABLED
+  static bool missAlerted = false, lowAlerted = false, critAlerted = false;
+  if (!valid) {
+    if (!missAlerted) { missAlerted = true; raiseFault('M', "SENSOR_FAIL", "INA226|SECONDARY_BATT|AC_BLOCKED"); }
+    return;
+  }
+  missAlerted = false;
+  if (secLow && !lowAlerted) {
+    lowAlerted = true;
+    raiseFault('M', "BATT2_LOW", (String("V=") + String(secV, 2) + "|AC_BLOCKED").c_str());
+  } else if (!secLow && lowAlerted) {
+    lowAlerted = false; logEvent("ESP1", "PWR2", "BATT2|RECOVERED|V=" + String(secV, 2));
+  }
+  if (secCrit && !critAlerted) { critAlerted = true; raiseFault('M', "BATT2_CRIT", (String("V=") + String(secV, 2)).c_str()); }
+  else if (!secCrit) critAlerted = false;
+#endif
+}
+
+void secBattTick() {
+  static unsigned long lastTryMs = 0, lastReadMs = 0, lastLogMs = 0;
+  static uint8_t failN = 0;
+  static bool prevLow = false;
+  unsigned long now = millis();
+  if (!secInaOk) {
+    if (lastTryMs == 0 || now - lastTryMs >= SEC_RETRY_MS) {
+      lastTryMs = now;
+      secInaOk = secInaInit();
+      if (secInaOk) { failN = 0; lastReadMs = 0; logEvent("ESP1", "PWR2", "INA226|FOUND"); }
+    }
+    if (!secInaOk) { secBattPolicy(); return; }
+  }
+  if (lastReadMs && now - lastReadMs < SEC_READ_MS) return;
+  lastReadMs = now;
+  uint16_t rBus, rCur;
+  if (!secInaRead(0x02, rBus) || !secInaRead(0x04, rCur)) {
+    if (++failN >= 3) {                                   // debounced: one NAK is bus noise, three is gone
+      secInaOk = false; secHaveV = false; lastTryMs = now;
+      logEvent("ESP1", "PWR2", "INA226|LOST");
+    }
+    secBattPolicy(); return;
+  }
+  failN = 0;
+  float v = rBus * 0.00125f * SEC_BUS_V_FACTOR;           // 1.25 mV/bit
+  float i = (int16_t)rCur * SEC_CURRENT_LSB;
+  if (SEC_INVERT_CURRENT) i = -i;
+  i -= SEC_CURRENT_OFFSET_A;
+  secV = secHaveV ? secV + 0.3f * (v - secV) : v;        // light filter so a load step can't flap the latch
+  secHaveV = true; secI = i; secP = secV * i;
+  secBattPolicy();
+  if (secLow != prevLow || lastLogMs == 0 || now - lastLogMs >= PWR_LOG_INTERVAL_MS) {
+    lastLogMs = now; prevLow = secLow;
+    logEvent("ESP1", "PWR2", "BATT2|V=" + String(secV, 2) + "|I=" + String(secI, 3) + "|P=" + String(secP, 1) +
+             "|LOW=" + String(secLow ? 1 : 0) + "|SRC=" + (esp2OnSecondary ? "SECONDARY" : "MAIN"));
+  }
+}
+
+// True when no inverter use may START: switching is live and the secondary is low or unmonitored.
+// A run already in progress is never aborted by this -- only new work is refused.
+bool secBattBlocksAc(const char **why) {
+#if SECONDARY_BATT_ENABLED
+  if (!secInaOk || !secHaveV) { if (why) *why = "the secondary battery monitor (INA226) is not responding"; return true; }
+  if (secLow)                  { if (why) *why = "the secondary battery is low"; return true; }
+#endif
+  (void)why;
+  return false;
+}
+
+/* =============================================================================
  *  SCHEDULE  (daily report, daily Nano reset, day rollover)
  * ========================================================================== */
 void scheduleTick() {
@@ -5247,6 +5414,8 @@ void telemetryCollect() {
   telem.pendRun = pendingRun.active; telem.pendEx = pendingExercise.active;
   telem.pendExIdx = pendingExercise.idx;
   telem.rtcOk_ = rtcOk; telem.sdOk_ = sdOk; telem.acsOk_ = acsOk;
+  telem.secOk_ = secInaOk && secHaveV; telem.secLow_ = secLow; telem.onSecondary_ = esp2OnSecondary;
+  telem.secV_ = secV; telem.secI_ = secI; telem.secP_ = secP;
   telem.simOk = simReady; telem.netReg = netRegistered;
   telem.rssi = lastRssi; telem.creg = lastCreg;
   telem.battLow = batteryLow; telem.battCrit = batteryCritical;
@@ -5701,6 +5870,9 @@ static bool firebaseUploadLive() {
   // The dashboard has a Power Source tile; without this key it reads "--". The rig runs from the
   // battery bank, with the inverter raised only for AC pumps during a run.
   system["powerSource"] = t.woActive ? "Battery + inverter (run)" : "Battery";
+  // Which battery the boards are on right now (ESP2's INFO,BATT reports) and whether the switch is live.
+  system["boardSupply"] = t.onSecondary_ ? "secondary" : "main";
+  system["secondaryBattSwitching"] = (bool)SECONDARY_BATT_ENABLED;
   // For the new Set Clock control: show the operator what ESP1 currently reads before they decide
   // to change it. Reuses the exact same tsString()/rtcOk the LCD's own clock page and every log
   // timestamp already use -- no new time source.
@@ -5726,6 +5898,16 @@ static bool firebaseUploadLive() {
   }
   if (t.acsOk_) {
     sensors["batteryCurrent"] = t.battI;                 // ACS758, magnitude (see readBatteryAdc)
+  }
+  // Secondary battery (INA226). Absent, not fabricated, while the monitor is not answering.
+  if (t.secOk_) {
+    sensors["secondaryBatteryVoltage"] = t.secV_;
+    sensors["secondaryBatteryCurrent"] = t.secI_;        // signed: + = discharging (SEC_INVERT_CURRENT)
+    sensors["secondaryBatteryPower"]   = t.secP_;
+    float sp = (t.secV_ - SEC_BATT_EMPTY_V) * 100.0f / (SEC_BATT_FULL_V - SEC_BATT_EMPTY_V);
+    if (sp < 0) sp = 0; if (sp > 100) sp = 100;
+    sensors["secondaryBatteryPercent"] = (int)(sp + 0.5f);
+    sensors["secondaryBatteryLow"]     = t.secLow_;
   }
   // Mixing-tank chemistry from ESP2's TELE. Only ever measured during a run, so this is the last
   // batch -- published only if we have actually seen a value, never as a placeholder zero.
@@ -5794,6 +5976,7 @@ static bool firebaseUploadLive() {
 
   JsonObject dpe = dg.createNestedObject("peripherals");
   dpe["rtcOk"] = t.rtcOk_; dpe["sdOk"] = t.sdOk_; dpe["batterySensorOk"] = t.acsOk_;
+  dpe["secondaryBatterySensorOk"] = t.secOk_;
 
   JsonObject dgs = dg.createNestedObject("gsm");
   dgs["simReady"]          = t.simOk;
@@ -6334,6 +6517,8 @@ void firebaseCommandTick() {
         firebaseQueueStatus(c.id, "rejected", "liters out of range");
         logEvent("FIREBASE", "REJECT", "FORCE|LITERS=" + String(c.liters, 1)); continue;
       }
+      { const char *bw;
+        if (secBattBlocksAc(&bw)) { firebaseQueueStatus(c.id, "rejected", bw); logEvent("FIREBASE", "REJECT", "FORCE|BATT2"); continue; } }
       bool overDose = false;
       for (int i = 0; i < 3; i++) if (c.doseMl[i] < 0.0f || c.doseMl[i] > FORCE_MAX_DOSE_ML) overDose = true;
       if (overDose) {
@@ -6480,6 +6665,8 @@ void firebaseCommandTick() {
       }
       if (actuationsDisabled) { firebaseQueueStatus(c.id, "rejected", "actuations are disabled"); continue; }
       if (puPhase != PU_NONE) { firebaseQueueStatus(c.id, "rejected", "a pulse is already running"); continue; }
+      { const char *bw;
+        if (testRowUsesInverter(row) && secBattBlocksAc(&bw)) { firebaseQueueStatus(c.id, "rejected", bw); continue; } }
       if (sysState != IDLE_STATE || uiMode != UI_DATA || wo.active || pendingRun.active ||
           pendingExercise.active || esp2Held || fcPhase != FP_NONE || fbRemoteExerciseId[0]) {
         const char *why = (sysState != IDLE_STATE || wo.active || pendingRun.active) ? "a run is in progress"
@@ -6742,6 +6929,8 @@ void firebaseCommandTick() {
       logEvent("FIREBASE", "REJECT", String("NOT_IDLE|") + why);
       continue;
     }
+    { const char *bw;                                   // the pump exercise always runs the inverter
+      if (secBattBlocksAc(&bw)) { firebaseQueueStatus(c.id, "rejected", bw); logEvent("FIREBASE", "REJECT", "EXERCISE|BATT2"); continue; } }
 
     // Rate-limit only ACTUAL actuations, and only AFTER every other check has passed. Starting the
     // cooldown earlier (before validation, as a naive placement does) means a command rejected for
@@ -7758,6 +7947,15 @@ void issueRecovery(int sel) {
     lastFaultMsg = "Resume already in progress - waiting for ESP2";
     return;
   }
+  // Every resume mode drives the AC pumps. Stay held (the tank volume is kept) until the secondary
+  // recovers; Hold and Cancel stay available.
+  { const char *bw;
+    if (secBattBlocksAc(&bw)) {
+      lastFaultMsg = String("Resume refused: ") + bw;
+      sendSMS("ERR,RESUME,BATT2");
+      logEvent("ESP1", "ACT", String("RESUME|BLOCKED|BATT2|") + mode);
+      return;
+    } }
   sendEsp2(String("RESUME,") + mode);                  // ESP2 re-energizes P17 and resumes/rewrites the run
   logEvent("ESP1", "ACT", String("RESUME|SENT|") + mode + "|COL_" +
            (wo.colIdx >= 0 ? String(COL_TAG[wo.colIdx]) : String("?")));
@@ -8037,9 +8235,14 @@ void calHoldTick() {
   if (down) {
     if (millis() - lastHold >= 150) {
       lastHold = millis();
-      String c = String("PRIME_START,") + ln;
-      if (col >= 0) c += String(",") + COL_TAG[col];
-      sendEsp2(c);
+      bool acLine = !strcmp(ln, "RESMIX") || !strcmp(ln, "MIXIRR");   // transfer / booster = inverter
+      if (acLine && secBattBlocksAc()) {
+        calMsg = "BATT2 low: no prime";
+      } else {
+        String c = String("PRIME_START,") + ln;
+        if (col >= 0) c += String(",") + COL_TAG[col];
+        sendEsp2(c);
+      }
     }
     calEnterWasDown = true;
   } else if (calEnterWasDown) {
@@ -9012,7 +9215,7 @@ void settingsButton(int i) {
  * ==========================================================================
  * The LCD Testing screen is a dead-man: testHoldTick() streams TEST,HOLD only while the physical
  * ENTER button is down. A browser cannot hold a dead-man switch, so this drives the SAME ESP2 combo
- * rows (17/18/19 = inverter + mix valve + column valve + booster) from a timer instead.
+ * rows (17/18/19 = inverter + column valve + booster) from a timer instead.
  *
  * That is safe because the dead-man is enforced on ESP2, not here: ESP2's TEST_HOLD_TIMEOUT_MS (400 ms)
  * drops the relay if the HOLD stream stops for any reason -- ESP1 crashing, WiFi dying, the loop
@@ -9082,7 +9285,8 @@ void pulseTick() {
       int row = pulseRowForTarget(testHoldReqBit);
       if (row >= 0 && !(row >= 17 && row <= 19 && !COLUMN_ENABLED[row - 17]) &&
           !actuationsDisabled && sysState == IDLE_STATE && uiMode == UI_DATA && !wo.active &&
-          !pendingRun.active && !pendingExercise.active && !esp2Held && fcPhase == FP_NONE && !fbRemoteExerciseId[0]) {
+          !pendingRun.active && !pendingExercise.active && !esp2Held && fcPhase == FP_NONE && !fbRemoteExerciseId[0] &&
+          !(testRowUsesInverter(row) && secBattBlocksAc())) {
         puRow = row; puHoldMode = true; puCmdId[0] = '\0';
         esp2SetPower(true);
         esp2TestArmed = false; testArmPending = false; testArmTries = 0; lastTestArmMs = 0;
@@ -9174,21 +9378,30 @@ void testHoldTick() {
     sendEsp2("TEST,ENTER");                                    // sent repeatedly until ACK (or cap)
   }
 
-  static bool wasHeld = false;
+  static bool wasHeld = false, pressBlocked = false;
   static unsigned long lastSendMs = 0;
   bool held = (digitalRead(BTN_ENTER) == LOW);
 
   if (held) {
     if (!wasHeld) {                                            // press edge
-      wasHeld = true; lastSendMs = 0; testOnBit = testSel;
-      logEvent("ESP1", "ACT", String("TEST|START|") + testRowName(testSel));
+      wasHeld = true; lastSendMs = 0;
+      pressBlocked = testRowUsesInverter(testSel) && secBattBlocksAc();
+      if (pressBlocked) {                                      // inverter row on a low/unmonitored secondary
+        testBlockedUntilMs = millis() + 3000;
+        logEvent("ESP1", "ACT", String("TEST|BLOCKED|BATT2|") + testRowName(testSel));
+      } else {
+        testOnBit = testSel;
+        logEvent("ESP1", "ACT", String("TEST|START|") + testRowName(testSel));
+      }
     }
+    if (pressBlocked) return;                                  // nothing was started, nothing to keep alive
     if (millis() - lastSendMs >= 150) {                        // keep-alive stream (< ESP2 timeout)
       lastSendMs = millis();
       sendEsp2(String("TEST,HOLD,") + testSel);
     }
   } else if (wasHeld) {                                        // release edge
     wasHeld = false; testOnBit = -1;
+    if (pressBlocked) { pressBlocked = false; return; }
     sendEsp2("TEST,RELEASE");
     logEvent("ESP1", "ACT", "TEST|STOP");
   }
@@ -9370,9 +9583,12 @@ void lcdTick() {
       snprintf(l, 21, "ESP2:%s", esp2Available ? "OK" : "--"); lcdRow(3, l);
       break;
     case PAGE_POWER:
-      lcdRow(0, "Power (ADC)");
-      snprintf(l, 21, "V:%.2f", battV); lcdRow(1, l);
-      snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP); lcdRow(2, l);
+      snprintf(l, 21, "Main V:%.2f%s", battV, esp2OnSecondary ? "" : " *"); lcdRow(0, l);
+      snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP); lcdRow(1, l);
+      if (secInaOk && secHaveV)
+        snprintf(l, 21, "B2:%.2fV %.2fA%s", secV, secI, esp2OnSecondary ? " *" : (secLow ? " L" : ""));
+      else snprintf(l, 21, "B2: no INA226");
+      lcdRow(2, l);                                  // '*' = the boards are on that battery now
       snprintf(l, 21, "SD:%s RTC:%s", sdOk ? "OK" : "--", rtcOk ? "OK" : "--"); lcdRow(3, l);
       break;
     case PAGE_GSM:   // GSM (SIM800L) + WiFi/ThingSpeak link health
@@ -9518,7 +9734,8 @@ void lcdRenderSettings() {
     //  ARMING...   = ESP2 alive, waiting for it to confirm TEST mode (priming/retrying)
     //  NO ACK!     = ESP2 alive but not ACKing TEST,ENTER after several tries (suspect ESP1->ESP2 TX)
     //  (dead-man)  = confirmed in TEST mode, relays controllable
-    const char *hdr = !esp2Available     ? "TESTING: ESP2 DOWN  "
+    const char *hdr = ((long)(millis() - testBlockedUntilMs) < 0) ? "TEST:BATT2 LOW/NOMON"
+                    : !esp2Available     ? "TESTING: ESP2 DOWN  "
                     : esp2TestArmed       ? "TESTING (dead-man)  "
                     : (testArmTries >= TEST_ARM_NOACK_HINT) ? "TEST NO ACK-chk link"
                     :                        "TESTING: ARMING...  ";

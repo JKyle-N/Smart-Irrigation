@@ -155,6 +155,26 @@ column. **Weigh or measure what actually comes out** and compare with what the f
 
 ---
 
+### H — Secondary battery isolation  *(only after a hold-up stage is fitted)*
+
+The firmware ships with `SECONDARY_BATT_ENABLED 0` in both ESP1 and ESP2. At that setting the INA226
+readings must already appear: the LCD Power page `B2:` line, the dashboard tiles, `BAT2` in `STATUS`,
+and `PWR2` in the log. Do this stage only once the controllers ride through the DPDT transfer.
+
+- Bench: hold Testing **Batt->2nd**. Every controller must stay up (no reboot in the logs, LCD not
+  reset) and the secondary's current must rise. Release and confirm the same on the way back.
+- Calibrate the INA226 (worksheet Tier 3), then set `SECONDARY_BATT_ENABLED 1` in **both** firmwares
+  and reflash both.
+- Hold **Inverter**: `INFO,BATT,SECONDARY` is logged, the inverter starts ~0.5 s later, and on release
+  `INFO,BATT,MAIN` follows ~1 s after the inverter stops.
+- Forced irrigation run: the boards go to secondary for fill/deliver and back to main between AC
+  stages. No controller resets and no `PWR_FAIL`.
+- Pull the INA226 connector: expect `SENSOR_FAIL,INA226…`, and a forced run, exercise and Testing
+  Inverter must all be refused. Reconnect and confirm they work again.
+
+> **Abort if** any controller reboots on a switch, the DPDT chatters, or the boards are ever left on
+> the secondary after a run ends (`boardSupply` stuck at `secondary`).
+
 ## After stage G
 
 Unattended fertigation on all three columns is what stage G *graduates to*, not part of it. Run

@@ -105,11 +105,12 @@
 #define PCF_ADDR     0x20
 
 /* ---- PCF8575 output bits (active-LOW; spec sec.19.4.7) -------------------- */
-#define OUT_RES_VALVE  0    // P0  reservoir valve
+#define OUT_SPARE_P0   0    // P0  SPARE relay (was the reservoir valve -- see RES_VALVE_FITTED)
 #define OUT_COL_A      1    // P1
 #define OUT_COL_B      2    // P2
 #define OUT_COL_C      3    // P3
-#define OUT_MIX_VALVE  4    // P4  mixing-tank valve
+#define OUT_BATT_SEL   4    // P4  DPDT board-supply select (was the condemned mixing-tank valve):
+                            //     de-energized = main solar battery, energized = secondary battery
 #define OUT_INVERTER   5    // P5  inverter relay (AC source)
 #define OUT_TRANSFER   6    // P6  transfer pump (AC)
 #define OUT_BOOSTER    7    // P7  booster pump  (AC)
@@ -123,6 +124,30 @@
 #define OUT_MASTER_CUTOFF 15 // P17 master actuator-power cutoff (sec.19.4.8; was Nano RESET).
                              // Gates power to the whole P0-P16 bank. Fail-safe: de-energized = all OFF.
 const uint8_t COL_VALVE_BIT[3] = { OUT_COL_A, OUT_COL_B, OUT_COL_C };
+
+/* ---- Reservoir valve (P0) -- now a SPARE relay --------------------------- *
+ * The reservoir valve is no longer part of the plumbing: the transfer pump draws straight from
+ * the reservoir. Set RES_VALVE_FITTED to 1 to put a valve back on P0; every fill path (SEQ_FILL,
+ * SEQ_FLUSH_FILL, Prime RESMIX, the Testing Fill combo) then opens it again. At 0 nothing drives
+ * P0 except a direct Testing hold of the 'Spare P0' row.                                       */
+#define RES_VALVE_FITTED 0
+
+/* ---- Secondary battery: DPDT board-supply isolation (P4) ------------------------------------ *
+ * While the inverter runs the AC motors, the DPDT on P4 moves ESP1, ESP2, the Nano, the sensors
+ * and the relay coils off the main solar battery onto a secondary 4S Li-ion battery, breaking
+ * BOTH + and - so there is no electrical link to the inverter's battery and the sensor readings
+ * stay clean. Rule: inverter ON implies secondary. pcfOn(OUT_INVERTER) first selects the
+ * secondary, waits BATT_SWITCH_SETTLE_MS, then starts the inverter (battPathTick); pcfOff(
+ * OUT_INVERTER) stops it and returns to main BATT_RETURN_DELAY_MS later. A normal end keeps P17 up
+ * until that return has happened (stopAllGraceful/cutoffDeenergizeGraceful); faults, STOP_ALL
+ * and RESET_SELF still cut everything at once (fail-safe = main battery).
+ * HARDWARE PREREQUISITE -- keep this 0 until it is fitted: a DPDT transfer leaves the boards
+ * unpowered for ~10-20 ms, so a hold-up stage after the DPDT (and a coil supply for the P4
+ * module/DPDT that rides through it) must exist, or every switch resets all three controllers
+ * and the relay drops straight back to main. At 0, P4 is never driven automatically and the
+ * inverter is switched exactly as before. ESP1 holds the matching flag (it owns the INA226 and
+ * the low-secondary run block) -- set both together.                                          */
+#define SECONDARY_BATT_ENABLED 0
 const uint8_t NUT_PUMP_BIT[3]  = { OUT_NUT_A, OUT_NUT_B, OUT_NUT_C };
 
 /* ---- Flow sensors (interrupt, stage-based; spec sec.19.4.5) --------------- *
@@ -164,6 +189,14 @@ bool COLUMN_ENABLED[3] = { true, true, false };        // [CONFIRM] mirror ESP1/
 /* ---- Stage timings ------------------------------------------------------- */
 const unsigned long VALVE_SWITCH_MS   = 1000;   // valve settle before pump (DC stages)
 const unsigned long INVERTER_WARMUP_MS = 5000;  // inverter+valve settle before AC pump
+// Secondary-battery switch timing [TBD -- confirm at commissioning]: settle after the DPDT moves the
+// boards to the secondary before the inverter starts, and the wait after the inverter stops before
+// they go back to main.
+const unsigned long BATT_SWITCH_SETTLE_MS = 500;
+const unsigned long BATT_RETURN_DELAY_MS  = 1000;
+// Every AC warmup counts from the inverter REQUEST, so with the switch in the path the inverter
+// itself starts BATT_SWITCH_SETTLE_MS late -- add it, so the inverter still gets its full warmup.
+const unsigned long AC_WARMUP_MS = INVERTER_WARMUP_MS + (SECONDARY_BATT_ENABLED ? BATT_SWITCH_SETTLE_MS : 0);
 const unsigned long FLOW_TIMEOUT_MS   = 10000;  // no-flow after pump start -> FLOW_FAIL
 const unsigned long STAGE_MAX_MS      = 180000; // hard safety cap per metered stage
 const unsigned long MIX_DEFAULT_MS    = 30000;  // used if work order omits MIX
@@ -277,10 +310,15 @@ const unsigned long TEST_COMBO_CAP_MS    = 30000;   // longer cap for valve+pump
 /* ---- Testing valve+pump priming combos (TEST,HOLD idx > 15) --------------- *
  * idx 16 = Fill (Reservoir -> Mixing), 17/18/19 = Push (Mixing -> Column A/B/C). Each lists the
  * PCF8575 OUT_* bits energized together (inverter first, then valve(s), then the pump).            */
-const uint8_t COMBO_FILL[]   = { OUT_INVERTER, OUT_RES_VALVE, OUT_TRANSFER };
-const uint8_t COMBO_PUSH_A[] = { OUT_INVERTER, OUT_MIX_VALVE, OUT_COL_A, OUT_BOOSTER };
-const uint8_t COMBO_PUSH_B[] = { OUT_INVERTER, OUT_MIX_VALVE, OUT_COL_B, OUT_BOOSTER };
-const uint8_t COMBO_PUSH_C[] = { OUT_INVERTER, OUT_MIX_VALVE, OUT_COL_C, OUT_BOOSTER };
+#if RES_VALVE_FITTED
+const uint8_t COMBO_FILL[]   = { OUT_INVERTER, OUT_SPARE_P0, OUT_TRANSFER };
+#else
+const uint8_t COMBO_FILL[]   = { OUT_INVERTER, OUT_TRANSFER };   // transfer draws straight from the reservoir
+#endif
+// Mixing tank -> booster -> column valve: no mix valve any more (P4 is the battery select).
+const uint8_t COMBO_PUSH_A[] = { OUT_INVERTER, OUT_COL_A, OUT_BOOSTER };
+const uint8_t COMBO_PUSH_B[] = { OUT_INVERTER, OUT_COL_B, OUT_BOOSTER };
+const uint8_t COMBO_PUSH_C[] = { OUT_INVERTER, OUT_COL_C, OUT_BOOSTER };
 
 /* ---- Calibration: raw stream + Prime (companion spec §A) ----------------- */
 String   calId = "";                  // active CAL sensor id ("" = none)
@@ -387,6 +425,9 @@ void stopAll();
 void stopKeepBank();
 void cutoffEnergize();
 void cutoffDeenergize();
+void cutoffDeenergizeGraceful();
+void stopAllGraceful();
+void battPathTick();
 void tankSave();
 void tankLoad();
 void holdFault(const char *resp, const char *loc);
@@ -506,6 +547,7 @@ void loop() {
   teleTick();                  // power telemetry (PZEM V/I/P + ACS) while a run executes -> ESP1 logs it
   progTick();                  // live liters into the current stage -> ESP1 run-progress LCD
   primeSafety();               // Prime dead-man + generous cap (§A.4.2)
+  battPathTick();              // secondary-battery switch: delayed inverter start / return to main
   pcfHealth();                 // PCF8575 bus watchdog -> PCF_FAIL / PCF_OK
   heartbeat();
   idleResetTick();             // self-heal: reboot after prolonged idle (30 min)
@@ -522,7 +564,7 @@ void loop() {
   if (exRunOffAt && (long)(millis() - exRunOffAt) >= 0) {
     pcfOff(exRunBit);
     pcfOff(OUT_INVERTER);
-    cutoffDeenergize();                  // drop the master cutoff again (back to safe idle)
+    cutoffDeenergizeGraceful();          // drop the master cutoff again (back to safe idle)
     exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;
     reply("DONE,EXERCISE," + exRunName);
   }
@@ -582,24 +624,125 @@ bool pcfWrite(uint16_t s) {
   else     { pcfFailCount = 0; }
   return ok;
 }
-void pcfOn(uint8_t bit)  { pcfWrite(pcfShadow & ~(1 << bit)); }   // clear bit = ON
-void pcfOff(uint8_t bit) { pcfWrite(pcfShadow |  (1 << bit)); }   // set bit  = OFF
+void pcfRawOn(uint8_t bit)  { pcfWrite(pcfShadow & ~(1 << bit)); }   // clear bit = ON
+void pcfRawOff(uint8_t bit) { pcfWrite(pcfShadow |  (1 << bit)); }   // set bit  = OFF
+static inline bool pcfBitOn(uint8_t bit) { return !(pcfShadow & (1 << bit)); }
+
+/* ---- Secondary-battery power path (see SECONDARY_BATT_ENABLED) ------------------------------ */
+bool          invWanted = false;          // inverter requested ON (may still be waiting on the switch)
+bool          battByInverter = false;     // P4 was selected BY the inverter path (not a Testing hold)
+unsigned long battSelOnMs = 0;            // when P4 last moved the boards to the secondary
+bool          battReturnPending = false;  // inverter is off; return to main at battReturnAt
+unsigned long battReturnAt = 0;
+bool          cutoffDropPending = false;  // a normal end is waiting for that return before dropping P17
+
+static void battReturnSchedule() {
+  if (!battReturnPending) { battReturnPending = true; battReturnAt = millis() + BATT_RETURN_DELAY_MS; }
+}
+// A whole-port write is about to force P4 off (stopAll): forget every pending step of the path.
+static void battPathReset() {
+  if (battByInverter && pcfBitOn(OUT_BATT_SEL)) reply("INFO,BATT,MAIN");
+  invWanted = false; battByInverter = false; battReturnPending = false; cutoffDropPending = false;
+}
+// Inverter ON implies the secondary battery. Never blocks: the inverter itself is energized by
+// battPathTick() once BATT_SWITCH_SETTLE_MS has passed since P4 switched.
+void inverterRequest(bool on) {
+  if (on) {
+    invWanted = true; battReturnPending = false; cutoffDropPending = false;
+    if (!pcfBitOn(OUT_BATT_SEL)) {
+      pcfRawOn(OUT_BATT_SEL); battSelOnMs = millis(); battByInverter = true;
+      reply("INFO,BATT,SECONDARY");
+    } else {
+      battByInverter = true;
+      if (millis() - battSelOnMs >= BATT_SWITCH_SETTLE_MS) pcfRawOn(OUT_INVERTER);
+    }
+  } else {
+    invWanted = false;
+    pcfRawOff(OUT_INVERTER);
+    if (battByInverter && pcfBitOn(OUT_BATT_SEL)) battReturnSchedule();
+  }
+}
+void battPathTick() {
+#if SECONDARY_BATT_ENABLED
+  if (invWanted && !pcfBitOn(OUT_INVERTER) && pcfBitOn(OUT_BATT_SEL) &&
+      millis() - battSelOnMs >= BATT_SWITCH_SETTLE_MS) pcfRawOn(OUT_INVERTER);
+  if (battReturnPending && (long)(millis() - battReturnAt) >= 0) {
+    battReturnPending = false; battByInverter = false;
+    pcfRawOff(OUT_BATT_SEL);
+    reply("INFO,BATT,MAIN");
+    if (cutoffDropPending) { cutoffDropPending = false; cutoffDeenergize(); }
+  }
+#endif
+}
+
+void pcfOn(uint8_t bit) {
+#if SECONDARY_BATT_ENABLED
+  if (bit == OUT_INVERTER) { inverterRequest(true); return; }
+#endif
+  pcfRawOn(bit);
+}
+void pcfOff(uint8_t bit) {
+#if SECONDARY_BATT_ENABLED
+  if (bit == OUT_INVERTER) { inverterRequest(false); return; }
+#endif
+  pcfRawOff(bit);
+}
+// Reservoir valve, only if one is fitted again (RES_VALVE_FITTED); otherwise P0 stays a spare.
+void resValveSet(bool on) {
+#if RES_VALVE_FITTED
+  if (on) pcfOn(OUT_SPARE_P0); else pcfOff(OUT_SPARE_P0);
+#else
+  (void)on;
+#endif
+}
 // Retry the two SAFE-ing writes. Every caller discards pcfWrite's status, so a single NAK here used
 // to mean "emergency stop issued, relays still energized, nobody the wiser". No delay(): the I2C
 // transaction is already bounded by Wire.setTimeOut(50), so 3 tries is <=150 ms -- far inside the 8 s
 // WDT and still non-blocking per spec sec.10.6.5.
-void stopAll()           { for (uint8_t a = 0; a < 3; a++) if (pcfWrite(0xFFFF)) return; }
+void stopAll()           { battPathReset(); for (uint8_t a = 0; a < 3; a++) if (pcfWrite(0xFFFF)) return; }
+// Normal-completion version of stopAll(): identical unless the inverter path is holding the boards
+// on the secondary battery -- then every actuator goes off NOW, but P4 and P17 stay up until the
+// BATT_RETURN_DELAY_MS return, after which battPathTick() drops P17. Faults keep using stopAll().
+void stopAllGraceful() {
+#if SECONDARY_BATT_ENABLED
+  if (battByInverter && pcfBitOn(OUT_BATT_SEL)) {
+    invWanted = false;
+    uint16_t keep = 0x7FFF & ~(uint16_t)(1 << OUT_BATT_SEL);   // only P4 + P17 energized
+    for (uint8_t a = 0; a < 3; a++) if (pcfWrite(keep)) break;
+    battReturnSchedule(); cutoffDropPending = true;
+    return;
+  }
+#endif
+  stopAll();
+}
 // All actuators OFF but the master cutoff kept ENERGIZED (bank stays powered). One atomic write
 // (bit15=0 -> P17 on), so switching Testing components never pulses P17 off->on (sec.19.4.8.4).
-void stopKeepBank()      { pcfWrite(0x7FFF); }
+void stopKeepBank() {
+#if SECONDARY_BATT_ENABLED
+  if (battByInverter && pcfBitOn(OUT_BATT_SEL)) {   // inverter was on: keep the secondary, return later
+    invWanted = false;
+    pcfWrite(0x7FFF & ~(uint16_t)(1 << OUT_BATT_SEL));
+    battReturnSchedule();
+    return;
+  }
+#endif
+  battPathReset(); pcfWrite(0x7FFF);
+}
 
 /* ---- P17 master actuator-power cutoff (sec.19.4.8) ----------------------- *
  * Active-LOW: clearing bit 15 ENERGIZES the master relay (bank powered); setting it
  * DE-energizes (whole P0-P16 bank goes hardware-dead, fail-safe). Energize before any
  * actuation; de-energize on fault / completion / idle.                                */
-void cutoffEnergize()    { pcfOn(OUT_MASTER_CUTOFF); }
+void cutoffEnergize()    { cutoffDropPending = false; pcfOn(OUT_MASTER_CUTOFF); }   // new work: keep P17 up
 // De-energizing is the fail-safe direction -- retry it like stopAll() (see note above).
 void cutoffDeenergize()  { for (uint8_t a = 0; a < 3; a++) if (pcfWrite(pcfShadow | (1 << OUT_MASTER_CUTOFF))) return; }
+// Normal-end P17 drop: deferred until the secondary-battery return has happened (see stopAllGraceful).
+void cutoffDeenergizeGraceful() {
+#if SECONDARY_BATT_ENABLED
+  if (battByInverter && pcfBitOn(OUT_BATT_SEL)) { battReturnSchedule(); cutoffDropPending = true; return; }
+#endif
+  cutoffDeenergize();
+}
 
 // Energize all PCF bits of a Testing priming combo (idx 16=Fill, 17/18/19=Push>Col A/B/C).
 void testComboOn(int idx) {
@@ -849,7 +992,7 @@ void dispatch(const String &payload) {
       reply("ACK,TEST,ENTER"); return;
     }
     if (sub == "EXIT") {
-      stopAll(); detachFlow(); testMode = false; testHeldBit = -1;  // all OFF incl. master cutoff de-energized
+      stopAllGraceful(); detachFlow(); testMode = false; testHeldBit = -1;  // all OFF incl. master cutoff de-energized
       exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;                       // drop any pending one-shot timers
       reply("DONE,TEST"); return;
     }
@@ -926,7 +1069,7 @@ void dispatch(const String &payload) {
     // same instant as the inverter, with none of that protection, on the one AC path that runs fully
     // unattended. exRunOffAt spans warmup+run so the busy-slot/mutual-exclusion guards and
     // safetyMonitor()'s exerciseActive correctly cover the warmup window too.
-    exRunPumpAtMs = millis() + INVERTER_WARMUP_MS;
+    exRunPumpAtMs = millis() + AC_WARMUP_MS;
     exRunOffAt = exRunPumpAtMs + runMs;                 // loop() energizes the pump, then later turns it off + reports DONE
     return;
   }
@@ -1092,7 +1235,7 @@ float endMeteredStage() {
 }
 int stagePoll() {
   if (!sgPumpOn) {                          // valve/inverter settle, then start pump
-    if (millis() - sgT0 >= (sgIsAC ? INVERTER_WARMUP_MS : VALVE_SWITCH_MS)) {
+    if (millis() - sgT0 >= (sgIsAC ? AC_WARMUP_MS : VALVE_SWITCH_MS)) {
       attachFlow(sgFlow); pcfOn(sgPump); sgPumpOn = true; sgT0 = millis();
     }
     return 0;
@@ -1120,7 +1263,7 @@ void stageEnd() {
 }
 
 void finishOk() {
-  stopAll();                         // all OFF + master cutoff de-energized
+  stopAllGraceful();                 // all OFF + master cutoff de-energized (after any battery return)
   mixTankL = 0.0f; tankSave();       // tank emptied to the column -> clear the persisted volume
   String name = wo.cmdName;
   float water = woWaterL;
@@ -1229,7 +1372,7 @@ void runSequence() {
         if (remaining < TANK_EPS_L) {                 // already enough in the tank -> skip the fill
           goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); break;
         }
-        pcfOn(OUT_RES_VALVE);
+        resValveSet(true);
         stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
         sgTankSign = +1;                              // this stage adds water to the mix tank
         if (resumeTimed) {                            // flow sensor dead -> run the transfer pump on a timer
@@ -1240,8 +1383,8 @@ void runSequence() {
         stepInit = true;
       }
       int r = stagePoll();
-      if (r == 1)      { endMeteredStage(); pcfOff(OUT_RES_VALVE); goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); }
-      else if (r == -1){ endMeteredStage(); pcfOff(OUT_RES_VALVE); holdFault("FLOW_FAIL", "TRANSFER"); }
+      if (r == 1)      { endMeteredStage(); resValveSet(false); goStep(wo.fertigate ? SEQ_DOSE : SEQ_DELIVER); }
+      else if (r == -1){ endMeteredStage(); resValveSet(false); holdFault("FLOW_FAIL", "TRANSFER"); }
       break;
     }
 
@@ -1338,7 +1481,7 @@ void runSequence() {
     case SEQ_DELIVER: {
       if (!stepInit) {
         if (mixTankL < TANK_EPS_L) { finishOk(); break; }   // nothing to deliver
-        pcfOn(OUT_MIX_VALVE); colValves(wo.colMask, true);
+        colValves(wo.colMask, true);
         stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
         sgTankSign = -1;                                     // this stage drains the mix tank
         if (resumeTimed) {                                   // flow sensor dead -> run the booster on a timer
@@ -1350,11 +1493,11 @@ void runSequence() {
       }
       int r = stagePoll();
       if (r == 1) {
-        endMeteredStage(); pcfOff(OUT_MIX_VALVE); colValves(wo.colMask, false);
+        endMeteredStage(); colValves(wo.colMask, false);
         if (wo.fertigate && wo.flushPct > 0) goStep(SEQ_FLUSH_FILL);
         else finishOk();
       } else if (r == -1) {
-        endMeteredStage(); pcfOff(OUT_MIX_VALVE); colValves(wo.colMask, false);
+        endMeteredStage(); colValves(wo.colMask, false);
         holdFault("FLOW_FAIL", "MAIN");
       }
       break;
@@ -1369,14 +1512,14 @@ void runSequence() {
         float flushHeadroom = MIXING_TANK_MAX_L - mixTankL;
         if (remaining > flushHeadroom) remaining = flushHeadroom;
         if (remaining < TANK_EPS_L) { goStep(SEQ_FLUSH_DELIVER); break; }
-        pcfOn(OUT_RES_VALVE);
+        resValveSet(true);
         stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
         sgTankSign = +1;
         stepInit = true;
       }
       int r = stagePoll();
-      if (r == 1)      { endMeteredStage(); pcfOff(OUT_RES_VALVE); goStep(SEQ_FLUSH_DELIVER); }
-      else if (r == -1){ endMeteredStage(); pcfOff(OUT_RES_VALVE); holdFault("FLOW_FAIL", "TRANSFER"); }
+      if (r == 1)      { endMeteredStage(); resValveSet(false); goStep(SEQ_FLUSH_DELIVER); }
+      else if (r == -1){ endMeteredStage(); resValveSet(false); holdFault("FLOW_FAIL", "TRANSFER"); }
       break;
     }
 
@@ -1384,14 +1527,14 @@ void runSequence() {
     case SEQ_FLUSH_DELIVER: {
       if (!stepInit) {
         if (mixTankL < TANK_EPS_L) { finishOk(); break; }
-        pcfOn(OUT_MIX_VALVE); colValves(wo.colMask, true);
+        colValves(wo.colMask, true);
         stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
         sgTankSign = -1;
         stepInit = true;
       }
       int r = stagePoll();
-      if (r == 1)      { endMeteredStage(); pcfOff(OUT_MIX_VALVE); colValves(wo.colMask, false); finishOk(); }
-      else if (r == -1){ endMeteredStage(); pcfOff(OUT_MIX_VALVE); colValves(wo.colMask, false); holdFault("FLOW_FAIL", "MAIN"); }
+      if (r == 1)      { endMeteredStage(); colValves(wo.colMask, false); finishOk(); }
+      else if (r == -1){ endMeteredStage(); colValves(wo.colMask, false); holdFault("FLOW_FAIL", "MAIN"); }
       break;
     }
 
@@ -1458,7 +1601,7 @@ void safetyMonitor() {
   // exRunOffAt already set but the pump not yet on).
   bool seqActive      = (step != SEQ_NONE && sgPumpOn && sgIsAC);
   bool exerciseActive = (exRunOffAt != 0 && exRunPumpOn);
-  bool primeAcActive  = (primeLine != "" && primeIsAC && millis() - primeOnMs >= INVERTER_WARMUP_MS);
+  bool primeAcActive  = (primeLine != "" && primeIsAC && millis() - primeOnMs >= AC_WARMUP_MS);
   // Audit fix (2026-09-10): unlike seqActive/exerciseActive/primeAcActive, which all self-clear as a
   // side effect of their own fault teardown (sgPumpOn->false, exRunOffAt->0, primeLine->""), `step`
   // is DELIBERATELY left at SEQ_MIX across a held fault so RESUME,NORMAL can goStep(step) back into
@@ -1467,7 +1610,7 @@ void safetyMonitor() {
   // re-fired holdFault()/PWR_FAIL roughly every PZEM_POLL_MS, indefinitely, until RESUME. Mirrors
   // runSequence()'s own `if (faultHeld) return;` guard.
   // stepInit too: until SEQ_MIX's own init runs, stepStart still holds the previous step's start.
-  bool mixActive      = (step == SEQ_MIX && !faultHeld && stepInit && millis() - stepStart >= INVERTER_WARMUP_MS);
+  bool mixActive      = (step == SEQ_MIX && !faultHeld && stepInit && millis() - stepStart >= AC_WARMUP_MS);
   if (!seqActive && !exerciseActive && !primeAcActive && !mixActive) { acNoCurrentSince = 0; return; }
 
   // Throttle the (blocking) Modbus reads so we don't poll every loop iteration.
@@ -1601,8 +1744,8 @@ void testSafety() {
  * flow sensor" must not read as "this pump moved nothing". */
 int flowPinForBit(int bit) {
   switch (bit) {
-    case OUT_TRANSFER: case 16:                 return FLOW_RES_MIX;   // 16 = Fill combo (res valve + transfer)
-    case OUT_BOOSTER:  case 17: case 18: case 19: return FLOW_MIX_IRR; // 17..19 = Push combos (mix valve + col + booster)
+    case OUT_TRANSFER: case 16:                 return FLOW_RES_MIX;   // 16 = Fill combo (transfer pump)
+    case OUT_BOOSTER:  case 17: case 18: case 19: return FLOW_MIX_IRR; // 17..19 = Push combos (col + booster)
     case OUT_NUT_A:                             return FLOW_NUT_A;
     case OUT_NUT_B:                             return FLOW_NUT_B;
     case OUT_NUT_C:                             return FLOW_NUT_C;
@@ -1693,9 +1836,9 @@ bool applySetCal(const String &id, const String *tok, int n, int i) {
 void setupPrime(const String &line, const String &col) {
   if (primeLine != "") stopPrime();
   int valveA = -1, valveB = -1, pump = -1; bool isAC = false;
-  if      (line == "RESMIX") { valveA = OUT_RES_VALVE; pump = OUT_TRANSFER; isAC = true; }
+  if      (line == "RESMIX") { valveA = RES_VALVE_FITTED ? OUT_SPARE_P0 : -1; pump = OUT_TRANSFER; isAC = true; }
   else if (line == "MIXIRR") {
-    valveA = OUT_MIX_VALVE; pump = OUT_BOOSTER; isAC = true;
+    pump = OUT_BOOSTER; isAC = true;                // no mix valve any more: booster + column valve
     int c = (col == "A") ? 0 : (col == "B") ? 1 : (col == "C") ? 2 : -1;
     if (c >= 0) valveB = COL_VALVE_BIT[c];
   }
@@ -1723,7 +1866,7 @@ void stopPrime() {
   if (primeValveA >= 0) pcfOff(primeValveA);
   if (primeValveB >= 0) pcfOff(primeValveB);
   if (primeIsAC) pcfOff(OUT_INVERTER);
-  cutoffDeenergize();
+  cutoffDeenergizeGraceful();
   primeLine = ""; primeValveA = primeValveB = primePump = -1; primeIsAC = false; primeCapped = false;
 }
 
