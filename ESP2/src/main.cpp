@@ -194,9 +194,14 @@ const unsigned long INVERTER_WARMUP_MS = 5000;  // inverter+valve settle before 
 // they go back to main.
 const unsigned long BATT_SWITCH_SETTLE_MS = 500;
 const unsigned long BATT_RETURN_DELAY_MS  = 1000;
+// Before every switch ESP2 announces it (INFO,BATT,SWITCHING,<to>) and waits for ESP1's BATTSW,GO
+// -- ESP1 flushes its SD log and journals the switch first -- or this long, whichever comes first,
+// so a silent/absent ESP1 can never stall the run.
+const unsigned long BATT_HANDSHAKE_MS     = 800;
 // Every AC warmup counts from the inverter REQUEST, so with the switch in the path the inverter
 // itself starts BATT_SWITCH_SETTLE_MS late -- add it, so the inverter still gets its full warmup.
-const unsigned long AC_WARMUP_MS = INVERTER_WARMUP_MS + (SECONDARY_BATT_ENABLED ? BATT_SWITCH_SETTLE_MS : 0);
+const unsigned long AC_WARMUP_MS = INVERTER_WARMUP_MS +
+    (SECONDARY_BATT_ENABLED ? (BATT_HANDSHAKE_MS + BATT_SWITCH_SETTLE_MS) : 0);   // worst-case switch lead
 const unsigned long FLOW_TIMEOUT_MS   = 10000;  // no-flow after pump start -> FLOW_FAIL
 const unsigned long STAGE_MAX_MS      = 180000; // hard safety cap per metered stage
 const unsigned long MIX_DEFAULT_MS    = 30000;  // used if work order omits MIX
@@ -419,6 +424,9 @@ void wdtSetup();
 void feedWDT();
 void i2cBusRecover();
 bool pcfWrite(uint16_t s);
+extern uint8_t bswBootReport;          // battery-switch reset journal (power-path block)
+extern uint8_t bswNv;
+static void bswJournal(uint8_t v);
 void pcfOn(uint8_t bit);
 void pcfOff(uint8_t bit);
 void stopAll();
@@ -521,12 +529,19 @@ void setup() {
   rxLine.reserve(260);   // headroom for the longest (fertigation) work order (~200B)
 
   tankLoad();                               // restore persisted mixing-tank volume (overfill guard)
+  // Battery-switch journal (see the power-path block): set means the last boot ended in the middle
+  // of a P4 switch, i.e. the hold-up did not carry the boards through it. Clear it now (so this
+  // boot can never count twice) and keep reporting it until ESP1 acknowledges.
+  bswNv = prefs.getUChar("bsw", 0);
+  if (bswNv == 1 || bswNv == 2) { bswBootReport = bswNv; bswJournal(0); }
+  else if (bswNv != 0) bswJournal(0);
   Serial.printf("Restored mixing-tank volume: %.2f L\n", mixTankL);
 
   // Announce READY as early as possible -- BEFORE the (non-critical) PZEM Modbus probe, which is only
   // used during a run and could otherwise slow/block the boot handshake if the meter is absent/slow.
   feedWDT();
   reply("READY,ESP2");                      // tell ESP32 #1 we are up & SAFE (sec.10.7.4)
+  if (bswBootReport) reply(String("INFO,BATT,RESET,") + (bswBootReport == 1 ? "SECONDARY" : "MAIN"));
 
   analogReadResolution(12);                 // 0..4095
   pzem.setAddress(0x01);                    // default PZEM Modbus address (begins Serial1) -- deferred, post-READY
@@ -628,49 +643,107 @@ void pcfRawOn(uint8_t bit)  { pcfWrite(pcfShadow & ~(1 << bit)); }   // clear bi
 void pcfRawOff(uint8_t bit) { pcfWrite(pcfShadow |  (1 << bit)); }   // set bit  = OFF
 static inline bool pcfBitOn(uint8_t bit) { return !(pcfShadow & (1 << bit)); }
 
-/* ---- Secondary-battery power path (see SECONDARY_BATT_ENABLED) ------------------------------ */
+/* ---- Secondary-battery power path (see SECONDARY_BATT_ENABLED) ------------------------------ *
+ * MAIN -> PRE_SEC -> SETTLE_SEC -> SEC -> RETURN_WAIT -> PRE_MAIN -> SETTLE_MAIN -> MAIN.
+ * Reset-proofing, because a hold-up that cannot carry the boards through the DPDT transfer resets
+ * every controller at exactly this point:
+ *  1. Announce: INFO,BATT,SWITCHING,<to>. ESP1 flushes its SD log, journals the switch in its own
+ *     NVS, pauses SD/radio/GSM bursts and answers BATTSW,GO (or BATT_HANDSHAKE_MS passes).
+ *  2. Journal: NVS "bsw" = 1 (to secondary) / 2 (to main) and mixTankL saved, THEN P4 moves.
+ *  3. Confirm: only after the boards survived BATT_SWITCH_SETTLE_MS -- journal cleared,
+ *     INFO,BATT,SECONDARY|MAIN sent.
+ * A boot that finds the journal set knows the switch reset it, and reports INFO,BATT,RESET,<to> until
+ * ESP1 answers BATTSW,ACK. ESP1 counts those resets and latches the switch fault (no inverter use)
+ * on the second within 24 h, so a failing hold-up can reset the rig at most twice -- never in a loop.
+ * stopAll() (faults) still drops P4 at once, but journals it first so a reset there is counted too. */
+enum BattPhase { BP_MAIN, BP_PRE_SEC, BP_SETTLE_SEC, BP_SEC, BP_RETURN_WAIT, BP_PRE_MAIN, BP_SETTLE_MAIN };
+BattPhase     battPhase = BP_MAIN;
+unsigned long battPhaseMs = 0;
+bool          battGo = false;             // ESP1 answered BATTSW,GO for the announced switch
 bool          invWanted = false;          // inverter requested ON (may still be waiting on the switch)
-bool          battByInverter = false;     // P4 was selected BY the inverter path (not a Testing hold)
-unsigned long battSelOnMs = 0;            // when P4 last moved the boards to the secondary
-bool          battReturnPending = false;  // inverter is off; return to main at battReturnAt
-unsigned long battReturnAt = 0;
-bool          cutoffDropPending = false;  // a normal end is waiting for that return before dropping P17
+bool          cutoffDropPending = false;  // a normal end is waiting for the return before dropping P17
+uint8_t       bswBootReport = 0;          // boot found the journal set: 1/2, reported until ESP1 ACKs
+uint8_t       bswNv = 0xFF;               // last journal value written (skip redundant flash writes)
 
-static void battReturnSchedule() {
-  if (!battReturnPending) { battReturnPending = true; battReturnAt = millis() + BATT_RETURN_DELAY_MS; }
+static void bswJournal(uint8_t v) {
+  if (v == bswNv) return;
+  prefs.putUChar("bsw", v); bswNv = v;
 }
-// A whole-port write is about to force P4 off (stopAll): forget every pending step of the path.
+static void battEnter(BattPhase ph) { battPhase = ph; battPhaseMs = millis(); }
+static void battAnnounce(BattPhase ph, const char *to) {
+  battEnter(ph); battGo = false;
+  reply(String("INFO,BATT,SWITCHING,") + to);
+}
+// The only place P4 moves on the inverter path.
+static void battToggle(bool toSecondary) {
+  bswJournal(toSecondary ? 1 : 2);
+  tankSave();                                  // tank bookkeeping on flash before the risky moment
+  if (toSecondary) pcfRawOn(OUT_BATT_SEL); else pcfRawOff(OUT_BATT_SEL);
+  battEnter(toSecondary ? BP_SETTLE_SEC : BP_SETTLE_MAIN);
+}
+// An announced switch that never happened (P4 did not move): tell ESP1 so it clears its journal.
+static void battAbortAnnounce() { battEnter(BP_MAIN); reply("INFO,BATT,MAIN"); }
+
+// Called by stopAll() just before its all-OFF write drops P4 unannounced (a fault).
 static void battPathReset() {
-  if (battByInverter && pcfBitOn(OUT_BATT_SEL)) reply("INFO,BATT,MAIN");
-  invWanted = false; battByInverter = false; battReturnPending = false; cutoffDropPending = false;
+  invWanted = false; cutoffDropPending = false;
+  if (battPhase == BP_PRE_SEC) { battAbortAnnounce(); return; }
+  if (battPhase != BP_MAIN && battPhase != BP_SETTLE_MAIN) {   // P4 is on: this write is a switch
+    bswJournal(2); tankSave();
+    battEnter(BP_SETTLE_MAIN);                                 // battPathTick confirms survival
+  }
 }
-// Inverter ON implies the secondary battery. Never blocks: the inverter itself is energized by
-// battPathTick() once BATT_SWITCH_SETTLE_MS has passed since P4 switched.
+// Inverter ON implies the secondary battery. Never blocks: battPathTick() switches first.
 void inverterRequest(bool on) {
   if (on) {
-    invWanted = true; battReturnPending = false; cutoffDropPending = false;
-    if (!pcfBitOn(OUT_BATT_SEL)) {
-      pcfRawOn(OUT_BATT_SEL); battSelOnMs = millis(); battByInverter = true;
-      reply("INFO,BATT,SECONDARY");
-    } else {
-      battByInverter = true;
-      if (millis() - battSelOnMs >= BATT_SWITCH_SETTLE_MS) pcfRawOn(OUT_INVERTER);
-    }
+    invWanted = true; cutoffDropPending = false;
+    if      (battPhase == BP_SEC)         pcfRawOn(OUT_INVERTER);
+    else if (battPhase == BP_RETURN_WAIT) { battEnter(BP_SEC); pcfRawOn(OUT_INVERTER); }
+    else if (battPhase == BP_PRE_MAIN)    { battEnter(BP_SEC); reply("INFO,BATT,SECONDARY"); pcfRawOn(OUT_INVERTER); }
+    // MAIN / PRE_SEC / SETTLE_SEC / SETTLE_MAIN: battPathTick() switches, then starts the inverter
   } else {
     invWanted = false;
     pcfRawOff(OUT_INVERTER);
-    if (battByInverter && pcfBitOn(OUT_BATT_SEL)) battReturnSchedule();
+    if (battPhase == BP_SEC) battEnter(BP_RETURN_WAIT);
   }
 }
 void battPathTick() {
 #if SECONDARY_BATT_ENABLED
-  if (invWanted && !pcfBitOn(OUT_INVERTER) && pcfBitOn(OUT_BATT_SEL) &&
-      millis() - battSelOnMs >= BATT_SWITCH_SETTLE_MS) pcfRawOn(OUT_INVERTER);
-  if (battReturnPending && (long)(millis() - battReturnAt) >= 0) {
-    battReturnPending = false; battByInverter = false;
-    pcfRawOff(OUT_BATT_SEL);
-    reply("INFO,BATT,MAIN");
-    if (cutoffDropPending) { cutoffDropPending = false; cutoffDeenergize(); }
+  unsigned long dt = millis() - battPhaseMs;
+  switch (battPhase) {
+    case BP_MAIN:
+      if (invWanted) battAnnounce(BP_PRE_SEC, "SECONDARY");
+      break;
+    case BP_PRE_SEC:
+      if (!invWanted) { battAbortAnnounce(); break; }
+      if (battGo || dt >= BATT_HANDSHAKE_MS) battToggle(true);
+      break;
+    case BP_SETTLE_SEC:
+      if (dt >= BATT_SWITCH_SETTLE_MS) {                        // the boards survived the transfer
+        bswJournal(0);
+        reply("INFO,BATT,SECONDARY");
+        battEnter(BP_SEC);
+        if (invWanted) pcfRawOn(OUT_INVERTER);
+        else           battEnter(BP_RETURN_WAIT);
+      }
+      break;
+    case BP_SEC:
+      if (!invWanted && !pcfBitOn(OUT_INVERTER)) battEnter(BP_RETURN_WAIT);   // belt and braces
+      break;
+    case BP_RETURN_WAIT:
+      if (dt >= BATT_RETURN_DELAY_MS) battAnnounce(BP_PRE_MAIN, "MAIN");
+      break;
+    case BP_PRE_MAIN:
+      if (battGo || dt >= BATT_HANDSHAKE_MS) battToggle(false);
+      break;
+    case BP_SETTLE_MAIN:
+      if (dt >= BATT_SWITCH_SETTLE_MS) {
+        bswJournal(0);
+        reply("INFO,BATT,MAIN");
+        battEnter(BP_MAIN);
+        if (cutoffDropPending) { cutoffDropPending = false; cutoffDeenergize(); }
+      }
+      break;
   }
 #endif
 }
@@ -700,16 +773,19 @@ void resValveSet(bool on) {
 // transaction is already bounded by Wire.setTimeOut(50), so 3 tries is <=150 ms -- far inside the 8 s
 // WDT and still non-blocking per spec sec.10.6.5.
 void stopAll()           { battPathReset(); for (uint8_t a = 0; a < 3; a++) if (pcfWrite(0xFFFF)) return; }
-// Normal-completion version of stopAll(): identical unless the inverter path is holding the boards
-// on the secondary battery -- then every actuator goes off NOW, but P4 and P17 stay up until the
-// BATT_RETURN_DELAY_MS return, after which battPathTick() drops P17. Faults keep using stopAll().
+// Normal-completion version of stopAll(): identical unless the inverter path is mid-switch or holding
+// the boards on the secondary -- then every actuator goes off NOW, but P4 (while on) and P17 stay up
+// until the return to main, after which battPathTick() drops P17. Faults keep using stopAll().
 void stopAllGraceful() {
 #if SECONDARY_BATT_ENABLED
-  if (battByInverter && pcfBitOn(OUT_BATT_SEL)) {
+  if (battPhase != BP_MAIN) {
     invWanted = false;
-    uint16_t keep = 0x7FFF & ~(uint16_t)(1 << OUT_BATT_SEL);   // only P4 + P17 energized
+    if (battPhase == BP_PRE_SEC) { battAbortAnnounce(); stopAll(); return; }   // P4 never moved
+    uint16_t keep = 0x7FFF;                                     // all actuators off, P17 on ...
+    if (pcfBitOn(OUT_BATT_SEL)) keep &= ~(uint16_t)(1 << OUT_BATT_SEL);   // ... and P4 while it is on
     for (uint8_t a = 0; a < 3; a++) if (pcfWrite(keep)) break;
-    battReturnSchedule(); cutoffDropPending = true;
+    if (battPhase == BP_SEC) battEnter(BP_RETURN_WAIT);         // SETTLE_SEC gets there via the tick
+    cutoffDropPending = true;
     return;
   }
 #endif
@@ -719,14 +795,17 @@ void stopAllGraceful() {
 // (bit15=0 -> P17 on), so switching Testing components never pulses P17 off->on (sec.19.4.8.4).
 void stopKeepBank() {
 #if SECONDARY_BATT_ENABLED
-  if (battByInverter && pcfBitOn(OUT_BATT_SEL)) {   // inverter was on: keep the secondary, return later
+  if (battPhase != BP_MAIN) {                     // inverter path busy: keep P4, return to main later
     invWanted = false;
-    pcfWrite(0x7FFF & ~(uint16_t)(1 << OUT_BATT_SEL));
-    battReturnSchedule();
+    if (battPhase == BP_PRE_SEC) { battAbortAnnounce(); pcfWrite(0x7FFF); return; }
+    uint16_t keep = 0x7FFF;
+    if (pcfBitOn(OUT_BATT_SEL)) keep &= ~(uint16_t)(1 << OUT_BATT_SEL);
+    pcfWrite(keep);
+    if (battPhase == BP_SEC) battEnter(BP_RETURN_WAIT);
     return;
   }
 #endif
-  battPathReset(); pcfWrite(0x7FFF);
+  pcfWrite(0x7FFF);
 }
 
 /* ---- P17 master actuator-power cutoff (sec.19.4.8) ----------------------- *
@@ -735,11 +814,28 @@ void stopKeepBank() {
  * actuation; de-energize on fault / completion / idle.                                */
 void cutoffEnergize()    { cutoffDropPending = false; pcfOn(OUT_MASTER_CUTOFF); }   // new work: keep P17 up
 // De-energizing is the fail-safe direction -- retry it like stopAll() (see note above).
-void cutoffDeenergize()  { for (uint8_t a = 0; a < 3; a++) if (pcfWrite(pcfShadow | (1 << OUT_MASTER_CUTOFF))) return; }
+void cutoffDeenergize() {
+  uint16_t s = pcfShadow | (1 << OUT_MASTER_CUTOFF);
+#if SECONDARY_BATT_ENABLED
+  // Dropping P17 with the inverter path still holding P4 (a fault path, e.g. a PZEM trip during an
+  // exercise) is a switch to main too -- P17 may gate the DPDT coil. Journal it like stopAll() does and
+  // drop P4 in the same write, so the shadow says main and a resulting reset is still counted.
+  if (battPhase != BP_MAIN && battPhase != BP_SETTLE_MAIN && pcfBitOn(OUT_BATT_SEL)) {
+    battPathReset();
+    s |= (1 << OUT_BATT_SEL);
+  }
+#endif
+  for (uint8_t a = 0; a < 3; a++) if (pcfWrite(s)) return;
+}
 // Normal-end P17 drop: deferred until the secondary-battery return has happened (see stopAllGraceful).
 void cutoffDeenergizeGraceful() {
 #if SECONDARY_BATT_ENABLED
-  if (battByInverter && pcfBitOn(OUT_BATT_SEL)) { battReturnSchedule(); cutoffDropPending = true; return; }
+  if (battPhase != BP_MAIN) {
+    if (battPhase == BP_PRE_SEC) { invWanted = false; battAbortAnnounce(); cutoffDeenergize(); return; }
+    if (battPhase == BP_SEC) { invWanted = false; pcfRawOff(OUT_INVERTER); battEnter(BP_RETURN_WAIT); }
+    cutoffDropPending = true;
+    return;
+  }
 #endif
   cutoffDeenergize();
 }
@@ -902,6 +998,14 @@ void dispatch(const String &payload) {
     return;
   }
   if (cmd == "STATUS_REQ") { reply("STATUS,ESP2,OK"); return; }
+  // Battery-switch handshake from ESP1: GO = prepared for the announced switch, ACK = it has
+  // recorded our switch-caused reset report.
+  if (cmd == "BATTSW") {
+    String sub = (n >= 2) ? tok[1] : "";
+    if (sub == "GO")  { battGo = true; return; }
+    if (sub == "ACK") { bswBootReport = 0; return; }
+    reply("INVALID,BATTSW"); return;
+  }
   if (cmd == "RESET_SELF") {                 // soft reboot on ESP1 request (spec sec.9.7.2)
     reply("ACK,RESET_SELF");
     // If genuinely still mid-sequence (reachable via a narrow ESP1-side race after a recovery-
@@ -914,6 +1018,7 @@ void dispatch(const String &payload) {
     // exit path (normal completion, fault-hold), so this is a strict improvement, never a regression.
     if (wo.active || step != SEQ_NONE) tankSave();
     stopAll();                               // force SAFE (all outputs OFF) before reboot
+    bswJournal(0);                           // a deliberate reboot, not a battery-switch failure
     esp1Serial.flush();                      // shift the ACK out before we reset (no delay(); we reboot next)
     ESP.restart();
   }
@@ -1693,6 +1798,9 @@ void heartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
     lastHeartbeat = millis();
     reply("STATUS,ESP2,OK");
+    // Keep reporting a switch-caused reset until ESP1 answers BATTSW,ACK (the first report can be
+    // lost while ESP1 is itself still booting).
+    if (bswBootReport) reply(String("INFO,BATT,RESET,") + (bswBootReport == 1 ? "SECONDARY" : "MAIN"));
   }
 }
 
