@@ -40,6 +40,7 @@
  *   SET_CLOCK          { clkY, clkMo, clkD, clkH, clkMi }   all required together; sets ESP1's RTC
  *   SET_THRESH         { thStart, thStop, thGap }   all required together; same clamps as the LCD
  *   RESTORE_DEFAULTS   {}   idle-only; runs the same reset function the LCD's Restore Defaults does
+ *   CLEAR_BATT_SWITCH  {}   clears a latched battery-switch fault (same as LCD / SMS BATTSW,CLEAR)
  * Anything else is rejected by ESP1 as "not a remotely safe control", so this page does not offer
  * it. In particular there is no standalone valve command (valves are sequenced inside a work order)
  * and no pH Up/Down dosing target anywhere -- pH is validation-only in the current design; the pH
@@ -385,6 +386,15 @@ function syncControlAvailability() {
     restoreBtn.title = !signedIn ? "Sign in to use the system controls."
                       : !approved ? notApprovedTitle
                       : notIdle ? "ESP1 must be idle to restore defaults, same as the LCD menu."
+                      : "";
+  }
+  const clearSwBtn = document.getElementById("sysClearBattSwitchBtn");
+  if (clearSwBtn) {
+    const latched = liveData.system?.battSwitchFault === true;
+    clearSwBtn.disabled = !signedIn || !approved || !latched;
+    clearSwBtn.title = !signedIn ? "Sign in to use the system controls."
+                      : !approved ? notApprovedTitle
+                      : !latched ? "No battery-switch fault is latched."
                       : "";
   }
 }
@@ -1461,9 +1471,9 @@ function updateDashboard() {
     setText("secondaryBattery", "Unavailable");
   }
   setText("secondaryCurrent", numberText(sensors.secondaryBatteryCurrent, 2, "A"));
-  setText("boardSupply", system.boardSupply === "secondary" ? "Secondary battery (isolated)"
+  setText("boardSupply", (system.boardSupply === "secondary" ? "Secondary battery (isolated)"
     : system.boardSupply === "main" ? (system.secondaryBattSwitching ? "Main battery" : "Main battery (switching off)")
-    : "Unavailable");
+    : "Unavailable") + (system.battSwitchFault ? " — SWITCH FAULT, inverter use blocked" : ""));
   setText("liveAge", snapshotAgeText());
 
   const fresh = deviceIsFresh();
@@ -2327,12 +2337,27 @@ document.getElementById("sysRestoreDefaultsBtn")?.addEventListener("click", () =
   queueCommand("RESTORE_DEFAULTS", {}, { operatorOnly: true });
 });
 
+document.getElementById("sysClearBattSwitchBtn")?.addEventListener("click", () => {
+  const result = document.getElementById("sysClearBattSwitchResult");
+  const show = (text, error = true) => { if (result) { result.textContent = text; result.className = `control-result${error ? " error" : ""}`; } };
+  if (!confirm("Clear the battery-switch fault? Switching to the secondary battery is re-armed; if the " +
+               "hold-up still cannot carry the controllers, the next two switch resets latch it again.")) return;
+  show("Sending to ESP1…", false);
+  queueCommand("CLEAR_BATT_SWITCH", {}, { operatorOnly: true });
+});
+
 // Read-only: current device time/RTC health (for Set Clock) and LCD Lock status. No write path is
 // offered for the lock -- see the info tooltip on that panel for why.
 function updateSystemTab() {
   setText("sysClockCurrent", rawText(liveData.system?.deviceTime, "Unavailable"));
   setText("sysClockRtcOk", booleanText(liveData.system?.rtcOk, "OK", "Not OK"));
   setText("sysLockStatus", booleanText(liveData.diagnostics?.system?.lcdLocked, "Locked", "Unlocked"));
+  const sys = liveData.system || {};
+  setText("sysBattSwitchStatus",
+    sys.battSwitchFault === true ? `FAULT: inverter use blocked (${sys.battSwitchStrikes ?? "?"} switch resets)`
+    : sys.battSwitchFault === false ? (sys.secondaryBattSwitching
+        ? `OK (${sys.battSwitchStrikes ?? 0} switch resets in the last 24 h)` : "Switching compiled off")
+    : "Unavailable");
 }
 
 /* ---- Manual/Test tab -------------------------------------------------------------------------

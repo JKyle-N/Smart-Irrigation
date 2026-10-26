@@ -37,6 +37,7 @@ ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS 
 | `SUMMARY[,<day>]` | `SUMMARY` / `SUMMARY,YESTERDAY` | The day's **averages** (per-column NPK + moisture, power, water/nutrient totals, counts), parsed from the SD log. | `SUM,…` (see §4) |
 | `FULL SUMMARY[,<day>]` | `FULL SUMMARY,20260625` | The day's **hour-by-hour** record + de-duplicated errors + run/dose events + peaks. Can span several texts. | `FULL,… (i/N)` |
 | `NET` | `NET` | WiFi / ThingSpeak link status. | `NET,WiFi:…` (see §4) |
+| `BATTSW` / `BATTSW,CLEAR` | `BATTSW,CLEAR` | Battery-switch status, or clear a latched `BATT_SWITCH_FAULT` (re-arms switching to the secondary battery). | `BATTSW,ON,OK,strikes=0/2,supply=MAIN` / `ACK,BATTSW,CLEARED` |
 | `SET,COL_x,N,..,P,..,K,..,pH,..` | `SET,COL_A,N,150,P,40,K,200,pH,5.8` | Set per-column nutrient targets (mg/kg) + pH. Any subset of N/P/K/pH may be given. | `ACK,SET,COL_A` |
 | `SET,COL_x,PRESET,<CROP>` | `SET,COL_B,PRESET,LETTUCE` | Apply a built-in crop preset (see §7). | `ACK,SET,COL_B,PRESET,LETTUCE` |
 | `MODE,COL_x,AUTO` | `MODE,COL_A,AUTO` | Column decides irrigate-vs-fertigate automatically (by the nutrient gap). | `ACK,MODE,COL_A,AUTO` |
@@ -130,6 +131,9 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | ~~`BATTERY_LOW`~~ | — | **Removed** — battery low no longer disables fertigation or alerts. Monitoring only. | Watch the battery voltage yourself. |
 | `BATT2_LOW` | MAJ | Secondary battery below 13.6 V. While secondary-battery switching is enabled, no run, exercise, AC prime or inverter Testing row may **start** until it is back above 14.0 V (a run already going finishes). | It recharges from the main battery while idle; check the charger if it stays low. |
 | `BATT2_CRIT` | MAJ | Secondary battery below 12.8 V (3.2 V/cell). | Charge or replace it before the next run. |
+| `BATT_SWITCH_RESET` | MAJ | Moving the controllers to/from the secondary battery reset them: the hold-up didn't carry them through the switch. The text says which direction and the count (`n=1/2`). The interrupted run re-runs on its own when still due (the tank volume is kept). | Check the hold-up stage / DPDT coil supply. |
+| `BATT_SWITCH_FAULT` | MAJ | A **second** switch reset within 24 h. Switching is latched off and **every run that needs the inverter is refused** (runs, exercise, AC prime, inverter Testing rows). This stops a weak hold-up from resetting the rig over and over. | Fix the hold-up, then clear it: LCD **Settings → Batt Switch**, SMS `BATTSW,CLEAR`, or the dashboard System tab. It also clears itself 24 h after the last reset (if the clock is good). |
+| `ESP2_RESTARTED` | MAJ | The actuator controller rebooted in the middle of a run, test or held fault (a battery switch, a power glitch, or its watchdog). The job is released at once; the tank volume is kept and a still-due column re-runs on its own. | Look for the cause in the log just before it (`BATTSW`, `PWR_FAIL`, …). |
 | `SENSOR_FAIL,INA226…` | MAJ | The secondary battery's INA226 monitor isn't answering; inverter use is blocked (switching enabled) because the battery can't be checked. | Check the INA226 wiring on ESP1's I²C (address 0x40). |
 | `NANO_GARBAGE` | MAJ | Sensor hub kept sending garbage after a software reset; running on last-valid data. | Check the Nano / sensor wiring. |
 | `NANO_RESET` | WARN | The sensor hub was told to self-reset (after 5 bad packets, or the daily fresh-start). | Informational. |
@@ -292,6 +296,12 @@ Two single-relay rows changed meaning with the secondary-battery feature:
 When the secondary-battery switching is enabled, any row that raises the inverter (**Inverter**, **Fill**,
 **Push>Col**) is refused while the secondary battery is low or its monitor is not answering. The header
 shows `TEST:BATT2 LOW/NOMON` for 3 s.
+
+### 6.4.1 Batt Switch (Settings → Batt Switch; idle only)
+The row only appears when secondary-battery switching is compiled in (or a fault is latched). It shows
+`Batt Switch [OK]`, or `BattSw FAULT>clear` after two switch resets in 24 h. **ENTER** on the FAULT row
+clears the latch and re-arms switching. The LCD **Power** page shows `SWFLT` on its last line while
+the fault is latched.
 
 ### 6.5 Restore Defaults (Settings → Restore Defaults; idle only)
 Double-confirm (NO/YES). Resets operational settings (modes, targets, names, schedules, thresholds) to

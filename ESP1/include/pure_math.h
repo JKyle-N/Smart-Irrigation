@@ -143,4 +143,22 @@ static inline bool testRowUsesInverter(int row) {
   return row == 5 || (row >= 16 && row <= 19);
 }
 
+/* ---- battery-switch reset strikes ------------------------------------------ */
+
+/* Strike count after one more switch-caused reset at `now` (RTC unix seconds; 0 = unknown), given the
+ * previous count and the time of the last strike. Counts towards the latch while inside `window`.
+ * Anything that makes the window uncheckable -- unknown time on either side, or a clock that went
+ * backwards -- is treated as INSIDE it: the safe error is latching early, never resetting forever. */
+static inline uint8_t bswNextStrikes(uint8_t prev, uint32_t lastT, uint32_t now, uint32_t window) {
+  bool inWindow = prev > 0 && (now == 0 || lastT == 0 || now < lastT || now - lastT < window);
+  if (!inWindow) return 1;
+  return (prev < 255) ? (uint8_t)(prev + 1) : prev;
+}
+
+/* Auto re-arm is due only when both times are known, the clock has not gone backwards, and a full
+ * window has passed since the last strike. */
+static inline bool bswAutoClearDue(uint32_t lastT, uint32_t now, uint32_t window) {
+  return lastT != 0 && now != 0 && now >= lastT && now - lastT >= window;
+}
+
 #endif // PURE_MATH_H

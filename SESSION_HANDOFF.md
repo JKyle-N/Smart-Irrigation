@@ -65,7 +65,7 @@ cd ESP2 && pio run
 cd Nano && pio run
 
 # host unit tests -- ~10 seconds each, no hardware needed
-cd ESP1 && pio test -e native     # 29 cases
+cd ESP1 && pio test -e native     # 33 cases
 cd ESP2 && pio test -e native     #  7 cases
 
 # website
@@ -75,19 +75,34 @@ node -e "JSON.parse(require('fs').readFileSync('Website/firebase-rules.json','ut
 firebase deploy --only database --dry-run   # validates rules WITHOUT deploying (run from Website/)
 ```
 
-Known-good build sizes after the 2026-10-26 secondary-battery change (both `SECONDARY_BATT_ENABLED 0`)
-— a sharp deviation means something unintended was picked up. With both flags at 1: ESP1 1,301,913 B
-flash, ESP2 338,921 B. Host tests: ESP1 29 cases, ESP2 7.
+Known-good build sizes after the 2026-10-26 switch-reset protection (both `SECONDARY_BATT_ENABLED 0`)
+— a sharp deviation means something unintended was picked up. With both flags at 1: ESP1 1,307,881 B
+flash, ESP2 340,393 B. Host tests: ESP1 33 cases, ESP2 7.
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 23.6 % (77,368 B) | 41.3 % (1,299,925 B) |
-| ESP2 | 7.1 % (23,228 B) | 25.8 % (337,937 B) |
+| ESP1 | 23.6 % (77,400 B) | 41.5 % (1,305,861 B) |
+| ESP2 | 7.1 % (23,236 B) | 25.9 % (339,081 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
 ## 4. What the last sessions added
+
+**2026-10-26 (later) — switch-reset protection + review fixes.** See CLAUDE.md "LOCKED: switch-reset
+protection".
+- **Handshake and journals:** every P4 switch is announced, journaled in both controllers' NVS, and
+  confirmed. The handshake is `BATTSW,GO` / `ACK`, and the quiet window holds SD, WiFi and SMS.
+- **Latch:** 2 switch-caused resets in 24 h latch `BATT_SWITCH_FAULT`, which blocks AC runs. It
+  clears from the LCD, SMS, the website, or automatically after 24 h.
+- **Fixed — `READY` during a run** (any ESP2 reboot) now releases the job at once. Before, it ended
+  in a 10-min `ESP2_DONE_TIMEOUT` E-stop.
+- **Fixed — 2 cases where a reset wasn't counted, or was counted when it shouldn't be:** an
+  unjournaled P4 drop on a fault P17 cut, and a false strike after ESP2 `RESET_SELF`.
+- **Corrected — CLAUDE.md:** an ESP1 reboot cuts ESP2 (GPIO4 LOW at boot); it does not keep running.
+- **Rules not deployed yet:** `Website/firebase-rules.json` now whitelists `CLEAR_BATT_SWITCH`
+  (privileged tier). Until it is deployed, the dashboard's Clear button is rejected by the live rules.
+  See §5 item 12; the deploy needs the user's approval.
 
 **2026-10-26 — Secondary battery isolation (P4 DPDT) + INA226 monitor.** See `CLAUDE.md` and reference
 §19.4.7.1. The user's decisions:
@@ -159,6 +174,14 @@ Roughly in priority order.
 11. **The dashboard's `mixer` Timed Pulse / hold drives TEST row 8 alone, without the inverter.** The
     mixer is an AC load, so it probably gets no power that way. This was found while mapping inverter
     rows for this change and left unchanged; confirm on the rig.
+12. **Deploy the RTDB rules** (`firebase deploy --only database`, after a `--dry-run`) so the
+    `CLEAR_BATT_SWITCH` dashboard command is accepted. The LCD and SMS clears work without it.
+13. **An ESP1 reboot (manual, remote, or self-reset) during a run or held fault also cuts ESP2**
+    (`setup()` drives GPIO4 LOW). The run is lost and the hold is forgotten; the tank volume survives
+    in ESP2's NVS. This is documented, not changed. A fix would mean keeping GPIO4 high across a
+    software reset, or refusing reboots while busy — a design decision.
+14. **A dashboard command in flight when ESP1 itself resets** stays `accepted` forever: ESP1 keeps
+    the command id in RAM only. Also documented, not changed.
 
 ---
 

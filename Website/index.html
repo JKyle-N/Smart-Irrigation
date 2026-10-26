@@ -463,6 +463,13 @@
         <button id="sysRestoreDefaultsBtn" class="danger" type="button">Restore Defaults…</button>
         <p id="sysRestoreResult" class="control-result" aria-live="polite"></p>
       </article>
+
+      <article class="panel">
+        <div class="panel-heading"><div><h3>Battery switch<button type="button" class="info-icon" aria-haspopup="dialog" aria-expanded="false" aria-label="About Battery switch" data-info-title="Battery switch" data-info-text="If moving the controllers to or from the secondary battery resets them twice within 24 hours (the hold-up could not carry them through the switch), switching is latched off and every run that needs the inverter is refused. Clear it here once the hold-up is fixed; it also clears itself 24 h after the last switch reset.">i</button></h3></div>
+        <p>Status: <strong id="sysBattSwitchStatus">Unavailable</strong></p>
+        <button id="sysClearBattSwitchBtn" type="button">Clear battery-switch fault</button>
+        <p id="sysClearBattSwitchResult" class="control-result" aria-live="polite"></p>
+      </article>
     </section>
 
     <!-- Only ever shown to the operator UID -- see refreshOperatorUI() in script.js. Real enforcement
