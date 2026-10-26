@@ -3439,6 +3439,19 @@ ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 log
 
 **Prerequisite — not yet fitted.** A DPDT transfer leaves the boards unpowered for about 10–20 ms. A hold-up stage after the DPDT (e.g. a supercapacitor or UPS module) must keep all three controllers, the P4 relay module's coil and the DPDT coil powered through the transfer. Without it, every switch resets the controllers and the relay falls back to main. For that reason the switching is compiled **off** in both firmwares (`SECONDARY_BATT_ENABLED 0`, ESP1 and ESP2 — set both together). Monitoring works regardless.
 
+**When the hold-up fails anyway (reset-proofing).** Every switch is handled as a moment at which the controllers may reset:
+1. **Announce:** ESP2 sends `INFO,BATT,SWITCHING,<to>`.
+2. **ESP1 prepares:** it flushes its SD log, writes a switch journal to NVS, and stops SD writes, new WiFi/TLS requests and SMS sends for up to 3 s. That keeps the load on the hold-up low and leaves nothing half-written. Then it replies `BATTSW,GO`.
+3. **ESP2 prepares:** it saves the mixing-tank volume and its own journal to NVS, and only then moves P4.
+4. **Confirm:** once the boards have survived the 500 ms settle, both journals are cleared (`INFO,BATT,SECONDARY|MAIN`).
+
+**Counting resets.** A boot that finds a journal still set knows the switch reset it. ESP2 reports `INFO,BATT,RESET,<to>` until ESP1 acknowledges. A `READY` from ESP2 while a switch is pending counts the same way. Each such event is one **strike**:
+- **Two strikes within 24 h** latch `BATT_SWITCH_FAULT`, and every inverter use is refused. A failing hold-up can therefore reset the rig at most twice, never in a loop.
+- **The interrupted run re-runs when still due.** ESP2's tank volume survived in NVS, so it only tops up what is missing.
+- **Clearing the latch:** LCD Settings → Batt Switch, SMS `BATTSW,CLEAR`, or the dashboard System tab (`CLEAR_BATT_SWITCH`). It also clears itself 24 h after the last strike when the RTC is good.
+
+Independently of the battery switch, any `READY` from ESP2 during a live run, held fault or exercise is now handled as "ESP2 restarted". The job is released at once (`ESP2_RESTARTED`, then `STARTUP_SYNC`). Before this, it waited for the 10-minute completion timeout and ended in an emergency stop.
+
 ### 19.4.8. 🔹 P17 Master Actuator-Power Cutoff & Fault Hold
 
 P17 drives a master relay that supplies power to the entire P0–P16 control-relay bank. When P17 is de-energized, ALL actuators (pumps, valves, mixer) lose power regardless of their individual PCF output states. This is a single, reliable hardware cutoff for fault conditions.

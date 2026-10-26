@@ -172,8 +172,19 @@ and `PWR2` in the log. Do this stage only once the controllers ride through the 
 - Pull the INA226 connector: expect `SENSOR_FAIL,INA226…`, and a forced run, exercise and Testing
   Inverter must all be refused. Reconnect and confirm they work again.
 
-> **Abort if** any controller reboots on a switch, the DPDT chatters, or the boards are ever left on
-> the secondary after a run ends (`boardSupply` stuck at `secondary`).
+- **Prove the loop protection** (do this deliberately, once, with no water in the lines). Disconnect
+  the hold-up so a switch *does* reset the boards, then force an irrigation run:
+  - First reset: expect `BATT_SWITCH_RESET … n=1/2`, and the run re-starts on its own.
+  - Second reset: expect `BATT_SWITCH_FAULT`. After it, a forced run, exercise and Testing Inverter
+    must all be refused, and nothing may reset a third time.
+  - Reconnect the hold-up, clear it with SMS `BATTSW,CLEAR` (and once each from the LCD row and the
+    dashboard), and confirm a run switches cleanly again.
+- `READY` mid-run: pull ESP2's power for 2 s during a run. ESP1 must raise `ESP2_RESTARTED` within
+  seconds (not wait 10 min for `ESP2_DONE_TIMEOUT`), go through `STARTUP_SYNC`, and re-run the column.
+
+> **Abort if** any controller reboots on a switch *with the hold-up fitted*, the DPDT chatters, the
+> boards are ever left on the secondary after a run ends (`boardSupply` stuck at `secondary`), or a
+> third switch reset happens after `BATT_SWITCH_FAULT` latched.
 
 ## After stage G
 
