@@ -183,6 +183,39 @@ void test_pulse_row_rejects_unknown_and_null(void) {
   TEST_ASSERT_EQUAL_INT(-1, pulseRowForTarget(NULL));
 }
 
+/* ---- battery-switch strike / latch policy ---------------------------------- */
+
+static const uint32_t DAY = 86400;
+static const uint32_t T0  = 1790000000UL;   // an arbitrary 2026 timestamp
+
+void test_bsw_two_strikes_in_a_day_latch(void) {
+  uint8_t n = bswNextStrikes(0, 0, T0, DAY);
+  TEST_ASSERT_EQUAL_UINT8(1, n);                              // first strike: tolerated
+  n = bswNextStrikes(n, T0, T0 + 3600, DAY);
+  TEST_ASSERT_EQUAL_UINT8(2, n);                              // second within 24 h: latch threshold
+}
+
+void test_bsw_strike_after_the_window_starts_over(void) {
+  TEST_ASSERT_EQUAL_UINT8(1, bswNextStrikes(1, T0, T0 + DAY, DAY));        // exactly 24 h later
+  TEST_ASSERT_EQUAL_UINT8(1, bswNextStrikes(1, T0, T0 + 3 * DAY, DAY));
+}
+
+void test_bsw_uncheckable_time_counts_towards_the_latch(void) {
+  // A loop must not escape the latch because the RTC is dead or was set backwards.
+  TEST_ASSERT_EQUAL_UINT8(2, bswNextStrikes(1, T0, 0, DAY));               // RTC dead now
+  TEST_ASSERT_EQUAL_UINT8(2, bswNextStrikes(1, 0, T0, DAY));               // last strike time unknown
+  TEST_ASSERT_EQUAL_UINT8(2, bswNextStrikes(1, T0, T0 - 5000, DAY));       // clock went backwards
+  TEST_ASSERT_EQUAL_UINT8(255, bswNextStrikes(255, T0, T0 + 10, DAY));     // saturates, never wraps to 0
+}
+
+void test_bsw_auto_clear_only_after_a_full_known_window(void) {
+  TEST_ASSERT_FALSE(bswAutoClearDue(T0, T0 + DAY - 1, DAY));
+  TEST_ASSERT_TRUE(bswAutoClearDue(T0, T0 + DAY, DAY));
+  TEST_ASSERT_FALSE(bswAutoClearDue(0, T0 + 2 * DAY, DAY));               // unknown strike time: manual only
+  TEST_ASSERT_FALSE(bswAutoClearDue(T0, 0, DAY));                          // RTC dead: manual only
+  TEST_ASSERT_FALSE(bswAutoClearDue(T0, T0 - 10, DAY));                    // clock went backwards
+}
+
 /* ---- testRowUsesInverter (secondary-battery gate) ------------------------- */
 
 void test_inverter_rows_are_exactly_the_ac_rows(void) {
@@ -270,6 +303,10 @@ int main(int, char **) {
   RUN_TEST(test_level_pct_returns_whole_percents);
   RUN_TEST(test_pulse_row_maps_every_known_target);
   RUN_TEST(test_pulse_row_rejects_unknown_and_null);
+  RUN_TEST(test_bsw_two_strikes_in_a_day_latch);
+  RUN_TEST(test_bsw_strike_after_the_window_starts_over);
+  RUN_TEST(test_bsw_uncheckable_time_counts_towards_the_latch);
+  RUN_TEST(test_bsw_auto_clear_only_after_a_full_known_window);
   RUN_TEST(test_inverter_rows_are_exactly_the_ac_rows);
   RUN_TEST(test_pulse_targets_that_need_the_inverter);
   RUN_TEST(test_clampi);

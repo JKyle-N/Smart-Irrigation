@@ -224,7 +224,17 @@ const float SEC_BATT_RECOVER_V = 14.0f;          // 3.50 V/cell: allow it again 
 const float SEC_BATT_CRIT_V    = 12.8f;          // 3.20 V/cell: critical alert                  [CONFIRM]
 const unsigned long SEC_READ_MS  = 2000;         // read cadence once found
 const unsigned long SEC_RETRY_MS = 10000;        // re-probe cadence while missing
-const unsigned long ESP2_BATT_RETURN_WAIT_MS = 2500;  // keep ESP2 powered for its secondary->main return
+const unsigned long ESP2_BATT_RETURN_WAIT_MS = 4000;  // keep ESP2 powered for its secondary->main return
+                                                      // (1 s delay + <=0.8 s handshake + 0.5 s settle + margin)
+/* Battery-switch reset protection. A switch whose hold-up fails resets the controllers; each such
+ * reset is a STRIKE. BSW_LATCH_STRIKES within BSW_WINDOW_S latches the switch fault, which blocks
+ * every inverter use (secBattBlocksAc) until cleared from the LCD, SMS BATTSW,CLEAR, the dashboard,
+ * or automatically BSW_WINDOW_S after the last strike. Bounded: at most BSW_LATCH_STRIKES resets per
+ * window, so a hold-up that cannot carry the boards can never reset the rig in a loop.          */
+const uint8_t       BSW_LATCH_STRIKES = 2;
+const uint32_t      BSW_WINDOW_S      = 86400;      // 24 h (RTC time)
+const unsigned long BSW_QUIET_MS      = 3000;       // SD/radio/GSM quiet window around one switch
+const unsigned long BSW_PENDING_MAX_MS = 10000;     // an unconfirmed switch with no reboot = survived
 
 /* ---- Battery CURRENT: ACS758-050B via ADS1115 (replaces the opto ADC) ------ *
  * The GPIO34 opto path logged I=0.00 on all 44,303 samples across 16 days -- battery %, the daily
@@ -985,6 +995,7 @@ struct TelemetrySnapshot {
   int      pendExIdx;
   bool     rtcOk_, sdOk_, acsOk_;
   bool     secOk_, secLow_, onSecondary_;           // secondary battery (INA226) + supply in use
+  bool     bswLatched_; uint8_t bswStrikes_;        // battery-switch fault latch + strike count
   float    secV_, secI_, secP_;
   bool     simOk, netReg;
   int      rssi, creg;
@@ -1118,6 +1129,19 @@ float secV = 0, secI = 0, secP = 0;                // filtered V, signed current
 bool  secLow = false, secCrit = false;             // low latch (hysteresis) / critical
 bool  esp2OnSecondary = false;                     // ESP2 reported INFO,BATT,SECONDARY (boards isolated)
 unsigned long esp2BattWaitUntil = 0;               // ESP2 power-off held for the secondary->main return
+uint8_t  bswPendingDir = 0;        // ESP2 announced a P4 switch not yet confirmed (1 to secondary, 2 to main)
+unsigned long bswPendingMs = 0;
+volatile unsigned long battQuietUntilMs = 0;   // quiet window end (core 1 writes, core 0 reads; 0 = none)
+bool     bswLatched = false;       // battery-switch fault latched: no inverter use until cleared
+uint8_t  bswStrikes = 0;           // switch-caused resets in the current window
+uint32_t bswLastStrikeT = 0;       // RTC unix time of the last strike (0 = unknown)
+unsigned long bswLastStrikeMs = 0; // millis() of the last strike counted THIS boot (report dedupe)
+bool     bswBootStruck = false;    // this boot already counted ESP1's own switch reset: ESP2's report of
+                                   // the same event (it was cut by our boot) must not count again
+static inline bool battQuietActive() {
+  unsigned long u = battQuietUntilMs;
+  return u != 0 && (long)(millis() - u) < 0;
+}
 // Energy integration for the daily report (sec.12.1.3). The opto current is MAGNITUDE only, so all
 // energy is counted as consumption (charge/discharge split removed with the INA226).
 double energyConsumedWh = 0.0;   // energy today (Wh)
@@ -1219,13 +1243,17 @@ void setActuationsEnabled(bool on, const char *why);
 // Settings on a locked-out rig, "Enable Actuations" is the row already under the cursor. The LCD can
 // only RE-ENABLE, never disable: a stray button press must not be able to take the farm offline, so
 // disabling stays a deliberate web/SMS action. See setRowVisible/setRowAt.
-enum SetItem { SET_ENABLE, SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_EXERCISE, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_EXIT, SET_COUNT };
+enum SetItem { SET_ENABLE, SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_EXERCISE, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_BATTSW, SET_EXIT, SET_COUNT };
 // SET_WIFI and SET_SOFTAP show a live [ON]/[OFF] suffix via setRowLabel(); their base names here are placeholders.
-const char *SET_NAMES[SET_COUNT] = { "Enable Actuations", "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Pump Exercise", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Exit" };
+const char *SET_NAMES[SET_COUNT] = { "Enable Actuations", "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Pump Exercise", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Batt Switch", "Exit" };
 // Row visibility + position<->item mapping, so the windowed 3-row render and the UP/DOWN wrap both
 // operate on what is actually on screen rather than on the raw enum.
-static bool setRowVisible(int i)  { return i != SET_ENABLE || actuationsDisabled; }
-static int  setRowCount()         { return SET_COUNT - (actuationsDisabled ? 0 : 1); }
+static bool setRowVisible(int i)  {
+  if (i == SET_ENABLE) return actuationsDisabled;
+  if (i == SET_BATTSW) return SECONDARY_BATT_ENABLED || bswLatched;   // only when switching exists
+  return true;
+}
+static int  setRowCount()         { int k = 0; for (int i = 0; i < SET_COUNT; i++) if (setRowVisible(i)) k++; return k; }
 static int  setRowAt(int pos) {                       // visible position -> SetItem
   for (int i = 0, k = 0; i < SET_COUNT; i++) if (setRowVisible(i)) { if (k == pos) return i; k++; }
   return SET_EXIT;
@@ -1604,6 +1632,12 @@ bool decideFertigate(int c);
 void powerTick();
 void secBattTick();
 bool secBattBlocksAc(const char **why = nullptr);
+void bswBoot();
+void bswTick();
+void bswForgetPending();
+void bswClear(const char *by);
+static void bswSavePending(uint8_t dir);
+static void bswStrike(uint8_t dir, const char *by);
 void loadBattCal();
 void readBatteryAdc();
 void batterySafetyTick();
@@ -1774,6 +1808,7 @@ void setup() {
   // this task (Supabase daily CSV, Firebase every ~60 s) -- they serialize, but the deepest frame wins.
   xTaskCreatePinnedToCore(netTask, "netTask", 28672, NULL, 1, &netTaskHandle, 0);
 
+  bswBoot();                                // battery-switch latch + was THIS boot caused by a switch?
   wdtSetup();                               // arm task watchdog (core-1 loop only)
   setState(STARTUP_SYNC);
   Serial.println(F("Setup complete -> STARTUP_SYNC"));
@@ -1799,6 +1834,7 @@ void loop() {
   g_lastStage = 'f'; forceTick();          // Settings force run: countdown -> gate re-check -> fire
   g_lastStage = 'P'; powerTick();          // main battery: opto ADC voltage + ACS758 current
   g_lastStage = 'b'; secBattTick();        // secondary battery: INA226 I2C read + run-block policy
+  g_lastStage = 'w'; bswTick();            // battery-switch journal expiry + 24 h auto re-arm
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
   g_lastStage = 'p'; esp2PowerTick();      // ESP2 min-on hold + periodic idle heartbeat poll (sec.18.8)
@@ -1851,12 +1887,13 @@ void loop() {
   // device survives a reboot without needing the password again. Never logs the creds themselves.
   if (fbCredsPersistPending) { fbCredsPersistPending = false; saveFbAuth(); logEvent("ESP1", "CFG", "FBASE|AUTH"); }
   // Manual reboot requested (Settings > Reboot or the SoftAP button). Always run on core 1 so logs flush
-  // cleanly (config persists in NVS; ESP2 keeps executing any in-flight run and re-syncs on our return).
+  // cleanly (config persists in NVS). NOTE: setup() drives ESP2_PWR_PIN LOW, so an ESP1 reboot also cuts
+  // ESP2's power -- an in-flight run is lost (ESP2 keeps mixTankL in NVS; a still-due column re-runs).
   if (rebootPending) {
     rebootPending = false;
     logEvent("ESP1", "RESET", "MANUAL|REBOOT");
     logFlush(true); delay(60);
-    ESP.restart();
+    bswForgetPending(); ESP.restart();
   }
   // Remote reboot: hold off until core 0 has PATCHed the "completed" status, so the command cannot
   // still read "queued" after we come back and trigger another reboot. Bounded -- if the link is
@@ -1868,7 +1905,7 @@ void loop() {
     if (flushed || millis() - rebootReqMs > REBOOT_FLUSH_WAIT_MS) {
       logEvent("ESP1", "RESET", flushed ? "REMOTE|REBOOT" : "REMOTE|REBOOT|STATUS_UNFLUSHED");
       logFlush(true); delay(60);
-      ESP.restart();
+      bswForgetPending(); ESP.restart();
     }
   }
   // Drain one portal config command (SET/MODE/NAME/THRESH) through handleSms with SMS muted. Allowed in
@@ -2611,6 +2648,29 @@ void pollESP2() {
   }
 }
 
+/* ESP2 rebooted under a live job. Same release as the INVALID,NOT_HELD path: the work order is gone,
+ * nothing may keep waiting on it. mixTankL survived in ESP2's NVS, so a still-due column re-runs on
+ * its own and ESP2 fills only what the tank is missing. */
+static void esp2LostJob() {
+  int c = wo.colIdx;
+  bool hadHold = esp2Held, hadRun = wo.active, hadEx = pendingExercise.active && pendingExercise.sent;
+  esp2Held = false; resumeAwaitingAck = false;
+  if (hadHold) lastHeldClearReason = "esp2_restarted";
+  lastHoldCode = ""; sameHoldN = 0; steerRelease = false;
+  wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
+  forceAbort("ESP2_RESTARTED");
+  if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", "ESP2 restarted during the run"); forceCmdId[0] = 0; }
+  forceMask = 0;
+  if (hadEx) {
+    pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
+    firebaseRemoteExerciseDone("failed", "ESP2 restarted during the test");
+  }
+  if (hadRun || hadHold) runUiAbort("ESP2_RESTARTED");
+  String loc = (c >= 0 && c < NUM_COLUMNS) ? String("COL_") + COL_TAG[c] : String(hadEx ? "EXERCISE" : "-");
+  logEvent("ESP1", "RESP", String("JOB_LOST|ESP2_RESTARTED|") + loc + (hadHold ? "|WAS_HELD" : ""));
+  raiseFault('M', "ESP2_RESTARTED", (loc + "|tank kept, column re-runs when due").c_str());
+}
+
 void handleEsp2Response(const String &payload) {
   // payload e.g. "DONE,SEQ_IRRIGATION_A" or "ACK,..." or "FLOW_FAIL,MAIN"
   int comma = payload.indexOf(',');
@@ -2647,6 +2707,26 @@ void handleEsp2Response(const String &payload) {
     // ESP2 finished booting (OFF-during-idle model). Fire whatever was waiting on it.
     logEvent("ESP2", "RESP", payload);
     esp2CommRecovered();                                         // any READY = link alive -> clear COMM_LOST latch
+    esp2OnSecondary = false;                                     // a fresh ESP2 boots with P4 off
+    if (bswPendingDir) {                                         // rebooted mid-switch: the switch reset it
+      uint8_t dir = bswPendingDir;
+      bswPendingDir = 0; bswSavePending(0); battQuietUntilMs = 0;
+      bswStrike(dir, "ESP2_REBOOT");
+    }
+    // A READY in the middle of a live job means ESP2 rebooted under it (switch brown-out, WDT, power
+    // glitch). Without this the run would sit until UART_DONE_TIMEOUT_MS (10 min) and then end as an
+    // ESP2_DONE_TIMEOUT emergency stop; a held fault or a sent exercise would be stranded likewise.
+    bool lostJob = (wo.active && (wo.stage == WO_SENT || wo.stage == WO_ACKED)) || esp2Held ||
+                   (pendingExercise.active && pendingExercise.sent);
+    if (lostJob) esp2LostJob();
+    // Only a session ESP2 had already CONFIRMED is lost by a reboot. Every pulse/Testing session starts
+    // by powering ESP2 up, so the READY of that very boot is expected and must not end it (PU_ARM and
+    // an unconfirmed Testing arm simply carry on arming).
+    if (puPhase == PU_RUN || puPhase == PU_REPORT) pulseFinish(false, "ESP2 restarted");
+    else if (sysState == TEST_MODE && esp2TestArmed) {          // armed Testing lost its TEST mode: re-arm
+      esp2TestArmed = false; testArmTries = 0; lastTestArmMs = 0; esp2WarmupMs = millis();
+      logEvent("ESP1", "RESP", "TEST|ESP2_RESTARTED|REARM");
+    }
     // Soft-reset recovery: ESP2 came back after a RESET_SELF -> recovered WITHOUT a power-cycle.
     // (Gated on READY, not esp2Available: ESP2 ACKs RESET_SELF before it reboots, sec.9.7.2.)
     if (esp2SoftResetTried && sysState == RECOVERY_STATE) {
@@ -2658,6 +2738,7 @@ void handleEsp2Response(const String &payload) {
       setState(STARTUP_SYNC);                                     // re-validate before resuming (sec.10.7.7)
       return;
     }
+    if (lostJob) { setState(STARTUP_SYNC); return; }            // re-validate + re-push cal; due work re-runs
     // Testing arming is handled by the primed retry in testHoldTick (the single READY here
     // can be lost on a cold relay boot), so we do NOT send TEST,ENTER from this one message.
     dispatchPendingWorkOrder();                                 // FORCE run parked in WO_PENDING
@@ -2678,8 +2759,33 @@ void handleEsp2Response(const String &payload) {
     logEvent("ESP2", "RESP", payload);
     // Secondary-battery switch notices: track which battery the boards are on. MAIN also releases a
     // power-off that was being held for exactly this return (see esp2SetPower).
-    if (arg == "BATT,SECONDARY") esp2OnSecondary = true;
-    else if (arg == "BATT,MAIN") { esp2OnSecondary = false; if (esp2OffPending && esp2BattWaitUntil) esp2OffAt = millis(); }
+    if (arg.startsWith("BATT,SWITCHING,")) {
+      // ESP2 is about to move P4. Get ready for the rails to drop: log on the card, switch journaled,
+      // quiet window, then let it go.
+      uint8_t dir = arg.endsWith("SECONDARY") ? 1 : 2;
+      logFlush(true);
+      if (bswPendingDir != dir) bswSavePending(dir);
+      bswPendingDir = dir; bswPendingMs = millis();
+      battQuietUntilMs = millis() + BSW_QUIET_MS;
+      sendEsp2("BATTSW,GO");
+      return;
+    }
+    if (arg.startsWith("BATT,RESET,")) {                    // ESP2's own journal: a switch reset it
+      sendEsp2("BATTSW,ACK");
+      if (bswBootStruck) {                                    // same event ESP1 already counted at boot
+        bswBootStruck = false;
+        logEvent("ESP1", "PWR2", "BATTSW|RESET_DUP|by=ESP2_JOURNAL|same_as_ESP1_boot");
+      } else {
+        bswStrike(arg.endsWith("SECONDARY") ? 1 : 2, "ESP2_JOURNAL");
+      }
+      return;
+    }
+    if (arg == "BATT,SECONDARY" || arg == "BATT,MAIN") {   // switch survived (or was called off)
+      esp2OnSecondary = (arg == "BATT,SECONDARY");
+      if (bswPendingDir) { bswPendingDir = 0; bswSavePending(0); }
+      battQuietUntilMs = 0;
+      if (!esp2OnSecondary && esp2OffPending && esp2BattWaitUntil) esp2OffAt = millis();
+    }
     return;
   }
 
@@ -3377,7 +3483,7 @@ void esp1SelfResetOncePerDay(const char *reason) {
   logFlush(true);
   g_lastSelfResetDay = today;
   delay(60);                                            // let the last UART/SD bytes drain
-  ESP.restart();
+  bswForgetPending(); ESP.restart();
 }
 
 /* Core 1: watch netTask's heartbeat (see netBeat). Alarm first, and only self-reset when the rig is
@@ -3521,7 +3627,7 @@ void rtcDeadRebootTick() {
   logEvent("ESP1", "RESET", "SELF|RTC_TS_ZERO|24h_idle");
   logFlush(true);
   delay(60);                                            // let the last UART/SD bytes drain
-  ESP.restart();
+  bswForgetPending(); ESP.restart();
 }
 
 // Returns whether it actually cycled ESP2 (false = suppressed by cooldown). esp2Escalate() uses this so
@@ -3623,6 +3729,7 @@ void esp2SetPower(bool on, bool force) {
   digitalWrite(ESP2_PWR_PIN, LOW);
   esp2Powered = false; esp2OffPending = false;
   esp2OnSecondary = false; esp2BattWaitUntil = 0;   // PCF unpowered -> P4 drops -> boards on main
+  bswForgetPending();                              // our own cut, not a switch failure
   esp2Available = false; testArmPending = false; esp2TestArmed = false; testArmTries = 0;
 }
 
@@ -4013,6 +4120,18 @@ void handleSms(const String &body) {
     }
     return;
   }
+  // BATTSW -- battery-switch status; BATTSW,CLEAR -- clear a latched switch fault (re-arms switching).
+  if (U == "BATTSW" || U == "BATTSW,CLEAR") {
+    if (U == "BATTSW,CLEAR") {
+      bool was = bswLatched;
+      bswClear("SMS");
+      sendSMS(was ? "ACK,BATTSW,CLEARED" : "ACK,BATTSW,NOT_LATCHED");
+      return;
+    }
+    sendSMS(String("BATTSW,") + (SECONDARY_BATT_ENABLED ? "ON" : "OFF") + "," + (bswLatched ? "FAULT" : "OK") +
+            ",strikes=" + bswStrikes + "/" + BSW_LATCH_STRIKES + ",supply=" + (esp2OnSecondary ? "SECONDARY" : "MAIN"));
+    return;
+  }
   // NET -- WiFi/ThingSpeak link status (Part B)
   if (U == "NET") {
     String ss; xSemaphoreTake(netMux, portMAX_DELAY); ss = wifiSsid; xSemaphoreGive(netMux);
@@ -4238,6 +4357,7 @@ void gsmTxTick() {
   switch (gtx) {
     case GTX_IDLE:
       if (smsCount == 0) return;
+      if (battQuietActive()) return;                     // no 2 A GSM burst during a battery switch
       gtxMsg  = smsQueue[smsHead];
       gtxTo   = smsTo[smsHead];
       smsHead = (smsHead + 1) % SMS_QUEUE_SIZE;
@@ -5161,9 +5281,107 @@ bool secBattBlocksAc(const char **why) {
 #if SECONDARY_BATT_ENABLED
   if (!secInaOk || !secHaveV) { if (why) *why = "the secondary battery monitor (INA226) is not responding"; return true; }
   if (secLow)                  { if (why) *why = "the secondary battery is low"; return true; }
+  if (bswLatched)              { if (why) *why = "battery-switch fault: a switch reset the controllers (clear it to retry)"; return true; }
 #endif
   (void)why;
   return false;
+}
+
+/* ---- Battery-switch reset protection (see BSW_LATCH_STRIKES) ------------------------------- *
+ * ESP2 announces every P4 switch (INFO,BATT,SWITCHING,<to>) before it moves it. ESP1 then:
+ * flushes the SD log, journals the switch in NVS ("battsw"/"pend"), opens a short quiet window
+ * (no SD write, no new WiFi request, no SMS -- less load on the hold-up, nothing half-written if
+ * the rails do drop) and answers BATTSW,GO. ESP2 confirms with INFO,BATT,SECONDARY|MAIN once the
+ * boards survived. A strike is counted when:
+ *   - ESP1 boots and finds its own journal set (ESP1 itself was reset by the switch), or
+ *   - ESP2 sends READY while a switch is pending (ESP2 was reset; ESP1 survived), or
+ *   - ESP2 reports INFO,BATT,RESET,<to> from its own journal (covers a lost announcement).
+ * Reports of the same event are folded together (2-minute dedupe within one boot).             */
+static void bswSavePending(uint8_t dir) {
+  Preferences p; p.begin("battsw", false); p.putUChar("pend", dir); p.end();
+}
+static void bswSaveState() {
+  Preferences p; p.begin("battsw", false);
+  p.putUChar("n", bswStrikes); p.putUInt("t", bswLastStrikeT); p.putBool("lat", bswLatched);
+  p.end();
+}
+static uint32_t bswNow() { return rtcOk ? rtc.now().unixtime() : 0; }
+
+static void bswStrike(uint8_t dir, const char *by) {
+  if (bswLastStrikeMs && millis() - bswLastStrikeMs < 120000UL) {
+    logEvent("ESP1", "PWR2", String("BATTSW|RESET_DUP|by=") + by);
+    return;
+  }
+  bswLastStrikeMs = millis() ? millis() : 1;
+  uint32_t now = bswNow();
+  // Unknown time / a clock that went backwards counts as inside the window (fail towards latching).
+  bswStrikes = bswNextStrikes(bswStrikes, bswLastStrikeT, now, BSW_WINDOW_S);
+  bswLastStrikeT = now;
+  bool newlyLatched = !bswLatched && bswStrikes >= BSW_LATCH_STRIKES;
+  if (newlyLatched) bswLatched = true;
+  bswSaveState();
+  String d = String(dir == 1 ? "TO_SECONDARY" : "TO_MAIN") + "|by=" + by + "|n=" + bswStrikes + "/" + BSW_LATCH_STRIKES;
+  logEvent("ESP1", "PWR2", "BATTSW|RESET|" + d);
+  raiseFault('M', "BATT_SWITCH_RESET", d.c_str());
+  if (newlyLatched) {
+    logEvent("ESP1", "PWR2", "BATTSW|LATCHED|AC_BLOCKED");
+    raiseFault('M', "BATT_SWITCH_FAULT", "AC_BLOCKED|clear: LCD, SMS BATTSW,CLEAR, web, or auto 24h");
+  }
+}
+
+// A deliberate cut/restart while a switch is pending is not the switch's fault -- forget it so the
+// next boot / READY does not count a strike.
+void bswForgetPending() {
+  if (!bswPendingDir) return;
+  bswPendingDir = 0; battQuietUntilMs = 0;
+  bswSavePending(0);
+}
+
+void bswClear(const char *by) {
+  bool was = bswLatched;
+  bswLatched = false; bswStrikes = 0; bswLastStrikeT = 0;
+  bswSaveState();
+  logEvent("ESP1", "PWR2", String("BATTSW|CLEARED|by=") + by + (was ? "" : "|was_not_latched"));
+}
+
+// Late in setup(): restore the latch, and count a strike if this very boot was caused by a switch.
+void bswBoot() {
+  Preferences p; p.begin("battsw", true);
+  uint8_t pend = p.getUChar("pend", 0);
+  bswStrikes = p.getUChar("n", 0); bswLastStrikeT = p.getUInt("t", 0); bswLatched = p.getBool("lat", false);
+  p.end();
+  if (bswLatched) logEvent("ESP1", "PWR2", "BATTSW|LATCHED_AT_BOOT|AC_BLOCKED");
+  if (pend == 1 || pend == 2) {
+    bswSavePending(0);                          // clear first: this boot can never count twice
+    String by = String("ESP1_RESET|rr=") + (int)esp_reset_reason();
+    bswStrike(pend, by.c_str());
+    bswBootStruck = true;
+  } else if (pend != 0) bswSavePending(0);
+}
+
+void bswTick() {
+  // A switch that was announced but neither confirmed nor followed by a reboot: ESP2 survived and
+  // only the confirmation was lost. Drop the journal so a much later, unrelated READY can't count.
+  if (bswPendingDir && millis() - bswPendingMs > BSW_PENDING_MAX_MS) {
+    logEvent("ESP1", "PWR2", "BATTSW|UNCONFIRMED|assumed_survived");
+    bswForgetPending();
+  }
+  if (battQuietUntilMs && !battQuietActive()) battQuietUntilMs = 0;
+  // ESP2's journal report of an ESP1-boot strike arrives within seconds of STARTUP_SYNC; after 5 min
+  // any report is a new event again.
+  if (bswBootStruck && millis() > 300000UL) bswBootStruck = false;
+  // Auto re-arm BSW_WINDOW_S after the last strike (needs the RTC; without it only a manual clear).
+  static unsigned long lastCheckMs = 0;
+  if (millis() - lastCheckMs < 60000UL) return;
+  lastCheckMs = millis();
+  if ((bswLatched || bswStrikes) && bswLastStrikeT != 0) {
+    uint32_t now = bswNow();
+    if (bswAutoClearDue(bswLastStrikeT, now, BSW_WINDOW_S)) {
+      bool was = bswLatched;
+      bswClear("AUTO_24H");
+      if (was) sendSMS("INFO,BATT_SWITCH,REARMED,24h since the last switch reset");
+    }
+  }
 }
 
 /* =============================================================================
@@ -5379,7 +5597,7 @@ void deviceHealthTick() {
   logFlush(true);                                               // persist what we can
   g_lastSelfResetDay = today;
   delay(50);                                                    // let the last UART/SD bytes drain
-  ESP.restart();
+  bswForgetPending(); ESP.restart();
 }
 
 /* =============================================================================
@@ -5416,6 +5634,7 @@ void telemetryCollect() {
   telem.rtcOk_ = rtcOk; telem.sdOk_ = sdOk; telem.acsOk_ = acsOk;
   telem.secOk_ = secInaOk && secHaveV; telem.secLow_ = secLow; telem.onSecondary_ = esp2OnSecondary;
   telem.secV_ = secV; telem.secI_ = secI; telem.secP_ = secP;
+  telem.bswLatched_ = bswLatched; telem.bswStrikes_ = bswStrikes;
   telem.simOk = simReady; telem.netReg = netRegistered;
   telem.rssi = lastRssi; telem.creg = lastCreg;
   telem.battLow = batteryLow; telem.battCrit = batteryCritical;
@@ -5873,6 +6092,8 @@ static bool firebaseUploadLive() {
   // Which battery the boards are on right now (ESP2's INFO,BATT reports) and whether the switch is live.
   system["boardSupply"] = t.onSecondary_ ? "secondary" : "main";
   system["secondaryBattSwitching"] = (bool)SECONDARY_BATT_ENABLED;
+  system["battSwitchFault"]   = t.bswLatched_;
+  system["battSwitchStrikes"] = t.bswStrikes_;
   // For the new Set Clock control: show the operator what ESP1 currently reads before they decide
   // to change it. Reuses the exact same tsString()/rtcOk the LCD's own clock page and every log
   // timestamp already use -- no new time source.
@@ -6866,6 +7087,15 @@ void firebaseCommandTick() {
       continue;
     }
 
+    // ---- CLEAR_BATT_SWITCH: clear a latched battery-switch fault (re-arms switching). Same effect as
+    // the LCD row and SMS BATTSW,CLEAR; privileged tier only (RTDB rules).
+    if (!strcmp(c.type, "CLEAR_BATT_SWITCH")) {
+      bool was = bswLatched;
+      bswClear("WEB");
+      firebaseQueueStatus(c.id, "completed", was ? "battery-switch fault cleared" : "no battery-switch fault was latched");
+      continue;
+    }
+
     if (!strcmp(c.type, "REBOOT")) {
       if (!strcmp(c.arg, "nano")) {
         sendNanoCommand("RESET_REQ");
@@ -7684,6 +7914,9 @@ void netTask(void *pv) {
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
+
+    // Battery-switch quiet window (set by core 1): start no new WiFi/TLS request while P4 moves.
+    if (battQuietActive()) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
 
     char ssid[33] = "", pass[65] = "";
     xSemaphoreTake(netMux, portMAX_DELAY);
@@ -9004,6 +9237,10 @@ void settingsButton(int i) {
         uiMode = UI_TEST; testSel = 0; testOnBit = -1;
         // No immediate send: the primed retry in testHoldTick owns arming (after TEST_PRIME_MS).
       }
+      else if (setSel == SET_BATTSW) {                          // clear a latched battery-switch fault
+        if (sysState != IDLE_STATE || !bswLatched) return;      // idle-only; nothing to clear otherwise
+        bswClear("LCD");
+      }
       else if (setSel == SET_WIFI) {                            // toggle STA WiFi + telemetry (persisted)
         wifiEnabled = !wifiEnabled; saveWifiEn();
         logEvent("ESP1", "CMD", wifiEnabled ? "WIFI|ON" : "WIFI|OFF");   // netTask gate acts next iteration
@@ -9589,7 +9826,7 @@ void lcdTick() {
         snprintf(l, 21, "B2:%.2fV %.2fA%s", secV, secI, esp2OnSecondary ? " *" : (secLow ? " L" : ""));
       else snprintf(l, 21, "B2: no INA226");
       lcdRow(2, l);                                  // '*' = the boards are on that battery now
-      snprintf(l, 21, "SD:%s RTC:%s", sdOk ? "OK" : "--", rtcOk ? "OK" : "--"); lcdRow(3, l);
+      snprintf(l, 21, "SD:%s RTC:%s%s", sdOk ? "OK" : "--", rtcOk ? "OK" : "--", bswLatched ? " SWFLT" : ""); lcdRow(3, l);
       break;
     case PAGE_GSM:   // GSM (SIM800L) + WiFi/ThingSpeak link health
       lcdRow(0, "GSM + WiFi");
@@ -9676,6 +9913,7 @@ static void drawList(int sel, int count, const char *const *names) {
 static String setRowLabel(int i) {
   if (i == SET_WIFI)   return String("WiFi        ") + (wifiEnabled ? "[ON]" : "[OFF]");
   if (i == SET_SOFTAP) return String("Setup AP    ") + ((portalActive || portalRequested) ? "[ON]" : "[OFF]");
+  if (i == SET_BATTSW) return bswLatched ? String("BattSw FAULT>clear") : String("Batt Switch  [OK]");
   return SET_NAMES[i];
 }
 
@@ -9940,6 +10178,8 @@ void logEvent(const char *source, const char *type, const String &detail) {
 
 void logFlush(bool force) {
   if (logBuf.length() == 0) return;
+  // Battery-switch quiet window: never be mid-write if the rails drop. Keep buffering (<= 3 s).
+  if (battQuietActive()) return;
   if (!force && millis() - lastLogFlushMs < LOG_FLUSH_INTERVAL_MS && logLineCount < LOG_FLUSH_LINES) return;
   lastLogFlushMs = millis();
   if (!sdOk) { logBuf = ""; logLineCount = 0; return; }   // degraded: drop (mirrored to Serial)
