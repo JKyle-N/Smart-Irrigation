@@ -10028,8 +10028,9 @@ void lcdRenderSettings() {
       snprintf(l, 21, "%cColumn: %c          ", editField==0?'>':' ', COL_TAG[editCol]);
       lcd.print(l);
       lcd.setCursor(0, 2);
-      snprintf(l, 21, "%cMode: %s ", editField==1?'>':' ',
-               editTmp[0]==0 ? "AUTO           " : editTmp[0]==1 ? "IRRIGATION_ONLY" : "OFF            ");
+      // 20 columns: "IRRIGATION_ONLY" after the 7-char prefix used to clip to "IRRIGATION_ON".
+      snprintf(l, 21, "%cMode: %-13s", editField==1?'>':' ',
+               editTmp[0]==0 ? "AUTO" : editTmp[0]==1 ? "IRRIG ONLY" : "OFF");
       lcd.print(l);
       break;
     case SET_PRESET:
@@ -10069,10 +10070,12 @@ void lcdRenderSettings() {
         break;
 
     case SET_THRESH:
-      lcd.setCursor(0, 0); lcd.print("Thresholds          ");
+      // One field per row, no title: Start and Stop on one row ran to 22 chars and the LCD cut a
+      // Stop of 80% to "8". Row 3 is the shared edit hint below.
+      lcd.setCursor(0, 0);
+      snprintf(l, 21, "%cSoil start<%3d%%    ", editField==0?'>':' ', editTmp[0]); lcd.print(l);
       lcd.setCursor(0, 1);
-      snprintf(l, 21, "%cStart<%3d%% %cStop>%3d%%", editField==0?'>':' ', editTmp[0], editField==1?'>':' ', editTmp[1]);
-      lcd.print(l);
+      snprintf(l, 21, "%cSoil stop >%3d%%    ", editField==1?'>':' ', editTmp[1]); lcd.print(l);
       lcd.setCursor(0, 2);
       snprintf(l, 21, "%cFert gap %3d mg/kg  ", editField==2?'>':' ', editTmp[2]); lcd.print(l);
       break;

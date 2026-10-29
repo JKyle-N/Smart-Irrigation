@@ -3,7 +3,9 @@
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 
-Last updated: **2026-10-26**, after merging Sugian's 2026-09 work (branch `merge/sugian-2026-09`).
+Last updated: **2026-10-30** — toolchain pinned after ESP1 stopped linking on the newest platform;
+LCD Thresholds/Column Mode truncation fixed; new open decisions logged in §5 (items 15–18).
+Previous: 2026-10-26, after merging Sugian's 2026-09 work (branch `merge/sugian-2026-09`).
 
 ---
 
@@ -48,7 +50,9 @@ power mid-hold) and Stage F (Manual/Test, including the web hold-to-run cap) mus
 | Thing | Reality |
 |---|---|
 | **PlatformIO** | Not on PATH. It is at `C:\Users\johnb\.platformio\penv\Scripts\pio.exe` — prepend that dir to `$env:PATH` |
-| **Host compiler** | MinGW-w64 g++ 14.2.0 is installed and on the *persisted* PATH. A shell opened before the install still fails with "gcc is not recognized" — open a new one, do not debug it |
+| **Platform versions** | **Pinned** since 2026-10-30: ESP1/ESP2 `espressif32@6.9.0` (Arduino core 2.0.17), Nano `atmelavr@5.3.0`. Unpinned, PlatformIO pulled espressif32 8.0.0 / core 3.3.12 and ESP1 failed to link (EspSoftwareSerial: `dangerous relocation: l32r`). Do not unpin |
+| **Git** | Not on this machine's PATH by default; it is at `E:\Program Files\Git\cmd\git.exe` |
+| **Host compiler** | MinGW-w64 g++ 14.2.0 was installed on the *old* machine (`C:\` paths). On the current machine (project on `E:\`, 2026-10-30) **no gcc is installed**, so `pio test -e native` fails with "gcc is not recognized" — install MinGW (see the `platformio.ini` comment) to run the host tests |
 | **`platformio.ini` (ESP1, ESP2)** | Both have the **skip-worktree** bit set. Git silently ignores your edits to them. Check with `git ls-files -v -- '*platformio.ini'` (an `S` means skip-worktree) |
 | **Why that bit exists** | To keep the local `upload_port = COM5` from overwriting the committed `COM8`. Preserve both: clear the bit, commit with `COM8`, restore `COM5` locally, re-set the bit |
 | **`Firebase infos.txt`** | Gitignored. Holds the RTDB URL, device UID, and the device password. Never commit or transmit it |
@@ -157,7 +161,9 @@ Roughly in priority order.
 3. **Values duplicated across firmwares with nothing checking them at runtime** — `WATER_BUDGET_L`
    (ESP1 + ESP2) and `COLUMN_ENABLED` (all three). Drift is silent.
 4. **The device password (see `Firebase infos.txt`) has never been rotated.**
-5. **SMS Summary/Status** was specified but never implemented.
+5. ~~SMS Summary/Status never implemented~~ — **stale, corrected 2026-10-30:** `STATUS`,
+   `SUMMARY[,<day>]`, `FULL SUMMARY[,<day>]` and the 18:00 daily report all exist in
+   `ESP1/src/main.cpp` (`handleSms`, `sendDailyReport`). Unflashed, like everything else.
 6. Test coverage stops at the pure functions. The FSMs, and anything touching `millis()`, are
    untested — that was a deliberate scope limit, not an oversight.
 7. **`mixTankL` can go stale-low if an emergency stop (GPIO4 cut) interrupts `SEQ_FILL`/`SEQ_DOSE`**
@@ -183,12 +189,33 @@ Roughly in priority order.
 14. **A dashboard command in flight when ESP1 itself resets** stays `accepted` forever: ESP1 keeps
     the command id in RAM only. Also documented, not changed.
 
+Found in the 2026-10-30 review — **left open for the user to decide** (not changed):
+
+15. **Nano WDT boot-loop risk (hardware check).** `RESET_REQ` resets the Nano with a 15 ms WDT
+    (`softwareReset()`). The old non-Optiboot Nano bootloader (what `board = nanoatmega328` targets)
+    does not clear the WDT, so it can reset forever after any WDT reset; `.init3` runs too late to
+    help. Check which bootloader the Nano has (or send one `RESET_REQ` on the bench). If old: burn
+    Optiboot (`nanoatmega328new`) or change the reset method.
+16. **RTDB rules: `testHold` does not require `status === 'approved'`** on its privileged branch
+    (`manual` does). The website clears `tempAccessUntil`/`subOperator` on any status change
+    (`script.js` ~1017), so this is defense-in-depth. Also, any signed-in account — even pending or
+    rejected — may write `want:false` to `manual`/`testHold` and so cancel someone's hold. Fixing
+    either is a rules edit + redeploy (needs approval).
+17. **Commissioning security:** the SoftAP password and default admin PIN `1234` are in this public
+    repo, and the admin page can change the owner number (= full SMS control while the portal is
+    open). Change the PIN at commissioning. The Supabase `service_role` key (full admin) lives on
+    the device and can be set by plaintext SMS — consider a narrowly-scoped key / storage policy.
+18. **Inert Sugian files:** `Website/.github/workflows/static.yml` and `Website/travis.yml` never run
+    in this repo (GitHub only reads root `.github/`). Kept so `Website/` stays in step with Sugian's
+    repo; delete only if that link no longer matters.
+
 ---
 
 ## 6. Working conventions that have been learned the hard way
 
 - **The user's standing constraint:** work only in
-  `C:\Users\johnb\OneDrive\Documents\1RESEARCH\CLAUDE\Claude Code` and the repo
+  `E:\Users\JohnB\OneDrive\Documents\1RESEARCH\CLAUDE\Claude Code` (was `C:\Users\johnb\...` on the
+  old machine) and the repo
   `https://github.com/JKyle-N/Smart-Irrigation`. Commit and push authority is standing.
 - **Sugian's folders are reference, not source of truth.** Find the fork commit first (diff against
   historical blobs, ignoring CR), then port in "as-is" + "adjust" commit pairs, and ask the user
