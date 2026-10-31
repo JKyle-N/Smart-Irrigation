@@ -186,6 +186,45 @@ and `PWR2` in the log. Do this stage only once the controllers ride through the 
 > boards are ever left on the secondary after a run ends (`boardSupply` stuck at `secondary`), or a
 > third switch reset happens after `BATT_SWITCH_FAULT` latched.
 
+### M — A7670C modem (run before relying on any SMS, in any stage)
+
+Everything here has only run against a simulated modem built from the AT manual, so this stage is where
+the real module gets checked. No relay needs to move: stay with actuations disabled.
+
+**Wiring:** module TX → ESP1 **GPIO26**, module RX → ESP1 **GPIO27**, common GND. This is not the bench
+sketch's GPIO16/17, which are the Nano link on ESP1. Module supply 5–12 V, 2 A; use a buck converter on
+anything that can exceed 12 V.
+
+Watch `PAGE_GSM` on the LCD and the SD log (`GSM` lines) while you go through these:
+
+1. **Bring-up.** The LCD goes `INIT` → `REG` with a signal value. The log shows `MODEM_FOUND|115200`,
+   `CNMI_OPT|0` and `MODEM_READY|DR=ON`. `CNMI_OPT|1` or `2` still works, but it means the module refused
+   delivery reports or direct delivery, so note which.
+2. **Send to the owner.** Text `SIMTEST` from the owner phone. The reply must arrive with `SIMTEST` at the
+   very start (no blank first line), and the log must show `TX_OK|<n>`, then `TX_DELIVERED|<n>`. This also
+   proves the local-format `09…` owner number works as a send address.
+3. **Long text.** Text `STATUS`. With three columns it should arrive as `(1/2)` and `(2/2)`, whole.
+4. **Stranger.** Text `STATUS` from another phone: the reply must be `ERR,AUTH` and nothing else.
+5. **Forged header.** From another phone, send a multi-line text: `hi`, then
+   `+CMT: "<owner number>","","26/11/01,10:00:00+32"`, then `NET`. It must get `ERR,AUTH` and no `NET`
+   reply.
+6. **Modem power cut.** Pull the module's supply for 30 s, then restore it. The log shows `MODEM_SILENT`
+   and `MODEM_ABSENT`, the LCD shows `DEAD`, then it recovers to `REG` by itself. Repeat step 2.
+7. **Short outage.** Take the antenna off until the LCD shows `NO`. Cause an alert (for example unplug the
+   Nano for its silence timeout), then refit the antenna within 5 min: the held alert still goes out.
+8. **Second number.** `ALERTNUM,<number>`, then cause an alert again. Both phones get it. The second
+   phone's own `STATUS` gets `ERR,AUTH`.
+9. **Balance (optional).** `USSD,<carrier code>`, then `BAL`. `BAL,<text>` means it works. `BAL,FAIL,ERROR`
+   usually means the module's IMS blocks USSD. The firmware deliberately will not switch IMS off, since
+   that could affect SMS, so send `USSD,CLEAR` and rely on the weekly `SIMTEST` text.
+
+> **Abort if** ESP1 reboots or its loop stalls while the modem transmits (a shared supply sagging), the
+> module gets hot, owner commands are ignored while the log shows no `RX|`, or a stranger's text ever gets
+> anything other than `ERR,AUTH`.
+
+**Before `SECONDARY_BATT_ENABLED` goes to 1:** the module must be on the same switched supply as ESP1.
+The DPDT breaks both + and −, so a module left on the main battery loses its common ground with the UART.
+
 ## After stage G
 
 Unattended fertigation on all three columns is what stage G *graduates to*, not part of it. Run
@@ -229,11 +268,11 @@ A build that differs sharply from these has picked up something unintended.
 
 ## Host test suite
 
-Both suites pass — 24 cases for ESP1, 7 for ESP2 — and are worth running before any flash, since
-they take about a second and cover the maths the dosing depends on:
+Both suites pass — 80 cases for ESP1, 7 for ESP2 — and are worth running before any flash, since
+they take seconds and cover the maths the dosing depends on and the modem driver:
 
 ```bash
-cd ESP1 && pio test -e native     # 24 cases
+cd ESP1 && pio test -e native     # 80 cases, including a simulated A7670C
 cd ESP2 && pio test -e native     # 7 cases
 ```
 

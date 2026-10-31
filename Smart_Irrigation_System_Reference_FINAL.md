@@ -10,7 +10,7 @@ This project aims to develop a **solar-powered automated irrigation and fertigat
 * Reduces manual labor in watering and fertilization
 * Uses sensor-based decision-making for precision agriculture
 * Operates efficiently using renewable energy
-* Enables remote monitoring and control via GSM communication (SIM800L)
+* Enables remote monitoring and control via GSM communication (A7670C)
 
 ---
 
@@ -186,7 +186,7 @@ The system uses strict role separation to reduce firmware complexity, avoid dupl
 * DS3231 RTC
 * microSD Logging Module
 * LCD Display
-* SIM800L GSM Module (remote communication)
+* A7670C GSM Module (remote communication)
 * ACS712 Current Sensor (Mixer Motor Monitoring)
 
 ---
@@ -1952,9 +1952,9 @@ Benefits:
   
 ---
 
-# 12. 📡 GSM Communication System (SIM800L)
+# 12. 📡 GSM Communication System (A7670C)
 
-The SIM800L GSM module is connected to ESP32 #1 (hardware UART2, GPIO27 TX / GPIO26 RX, 9600 baud) and is used for outbound alerts/reports and inbound configuration/commands. SIM800L texts ONLY for errors, warnings, scheduled-run notices, and reports — it is not a continuous telemetry channel (the full event stream lives in the SD log, Section 25).
+The A7670C GSM module is connected to ESP32 #1 (hardware UART2, GPIO27 TX / GPIO26 RX, baud auto-detected, 115200 first) and is used for outbound alerts/reports and inbound configuration/commands. A7670C texts ONLY for errors, warnings, scheduled-run notices, and reports — it is not a continuous telemetry channel (the full event stream lives in the SD log, Section 25).
 
 ---
 
@@ -1962,7 +1962,7 @@ The SIM800L GSM module is connected to ESP32 #1 (hardware UART2, GPIO27 TX / GPI
 
 ### 12.1.1. 🚨 Fault & Warning Alerts (All Three Tiers)
 
-SIM800L sends an SMS for ALL fault tiers (Critical 🔴, Major 🟠, Minor 🟡, per Section 23).
+A7670C sends an SMS for ALL fault tiers (Critical 🔴, Major 🟠, Minor 🟡, per Section 23).
 
 Special-case alert: when ESP32 #1 issues a Nano RESET_REQ software reset after 5 consecutive garbage packets (Section 18.9.5), an alert is sent. If RESET_REQ does not restore valid data, a Major alert is sent and ESP32 #1 continues on last-valid data (there is no hardware-reset layer).
 
@@ -1981,7 +1981,7 @@ Note: Minor-tier alerts (e.g. ultrasonic ripple) may be frequent. Rate-limiting 
 
 ### 12.1.2. 🚜 Scheduled Run Notice
 
-When a scheduled irrigation/fertigation run begins, SIM800L sends ONE consolidated SMS covering all columns scheduled in that run (not one SMS per column, not per sequence).
+When a scheduled irrigation/fertigation run begins, A7670C sends ONE consolidated SMS covering all columns scheduled in that run (not one SMS per column, not per sequence).
 
 - If a single column is scheduled:
   RUN,COL_A,IRRIGATION
@@ -2833,17 +2833,17 @@ This enables:
 
 ## 18.3. 🔹 Communication (UART)
 
-ESP32 has only three hardware UART peripherals (UART0, UART1, UART2). UART0 is the USB/boot/debug port and is KEPT FREE for the USB serial monitor (debugging is done via USB serial monitor and the LCD). The PZEM-004T has been relocated to ESP32 #2 (Section 19.2.1). With UART0 reserved for debug, two hardware UARTs remain for three devices (Nano, ESP32 #2, SIM800L), so the Arduino Nano runs on software serial.
+ESP32 has only three hardware UART peripherals (UART0, UART1, UART2). UART0 is the USB/boot/debug port and is KEPT FREE for the USB serial monitor (debugging is done via USB serial monitor and the LCD). The PZEM-004T has been relocated to ESP32 #2 (Section 19.2.1). With UART0 reserved for debug, two hardware UARTs remain for three devices (Nano, ESP32 #2, A7670C), so the Arduino Nano runs on software serial.
 
 | Device       | TX | RX | Peripheral                |
 | ------------ | -- | -- | ------------------------- |
 | ESP32 #2     | 25 | 33 | UART1 (hardware)          |
-| SIM800L      | 27 | 26 | UART2 (hardware, proven)  |
+| A7670C      | 27 | 26 | UART2 (hardware)  |
 | Arduino Nano | 17 | 16 | SoftwareSerial            |
 | (USB debug)  | 1  | 3  | UART0 (reserved for USB)  |
 
 Notes:
-- SIM800L is kept on a hardware UART (proven working at GPIO27 TX / GPIO26 RX, 9600 baud) because its async incoming-SMS bytes (+CMT) are timing-sensitive.
+- A7670C is kept on a hardware UART (proven working at GPIO27 TX / GPIO26 RX, baud auto-detected, 115200 first) because its async incoming-SMS bytes (+CMT) are timing-sensitive.
 - ESP32 #2 is kept on a hardware UART because the command/response link controls actuators and is safety-relevant.
 - Arduino Nano is placed on software serial because lost sensor packets are recoverable (the next packet arrives within the interval, and the <START>...<END> framing discards corrupted packets cleanly).
 - Software serial for the Nano uses the EspSoftwareSerial (plerup) library; the legacy AVR SoftwareSerial will not work on ESP32.
@@ -2857,10 +2857,10 @@ ESP32 #1 → ESP32 #2 (hardware UART1):
 - ESP#1 GPIO33 (RX) ← ESP#2 GPIO17 (TX)
 - GND must be common
 
-ESP32 #1 → SIM800L (hardware UART2):
+ESP32 #1 → A7670C (hardware UART2):
 
-- ESP#1 GPIO27 (TX) → SIM800L RX
-- ESP#1 GPIO26 (RX) ← SIM800L TX
+- ESP#1 GPIO27 (TX) → A7670C RX
+- ESP#1 GPIO26 (RX) ← A7670C TX
 - Firmware: HardwareSerial(2), begin(9600, SERIAL_8N1, 26, 27)
 
 ESP32 #1 → Arduino Nano (software serial):
@@ -2877,12 +2877,12 @@ UART0 (GPIO1/GPIO3) is intentionally left for the USB serial monitor; no device 
 
 ## 18.4. ⚠️ UART Considerations
 
-- ESP32 #1 hosts ESP32 #2 and SIM800L on hardware UARTs; the Arduino Nano runs on software serial (EspSoftwareSerial)
+- ESP32 #1 hosts ESP32 #2 and A7670C on hardware UARTs; the Arduino Nano runs on software serial (EspSoftwareSerial)
 - UART0 is reserved for the USB serial monitor (debugging)
 - PZEM-004T is no longer on ESP32 #1 (moved to ESP32 #2, Section 19.2.1)
 - Software must handle independent serial streams
 - Avoid blocking reads to prevent data loss
-- SIM800L AT-command exchanges must remain non-blocking and tolerant of unsolicited incoming-SMS bytes (+CMT)
+- A7670C AT-command exchanges must remain non-blocking and tolerant of unsolicited incoming-SMS bytes (+CMT)
 - Software-serial RX (Nano) is the weakest link under heavy interrupt load; rely on the <START>...<END> framing to discard corrupted packets and on the consecutive-garbage counter (Section 18.9.5) rather than reacting to single lost packets
 
 ---
@@ -3577,12 +3577,13 @@ Upon reset or power-up:
 * Do NOT power loads from ESP32
 * Use flyback diodes for pumps and valves
 
-## 20.4. SIM800L Power Requirement
+## 20.4. A7670C Power Requirement
 
-- Requires stable 3.7V–4.2V supply
-- Peak current: up to 2A
-- MUST NOT be powered directly from ESP32 5V pin
-- Use dedicated buck converter or Li-ion source
+- Breakout board takes 5–12 V from its own supply; common GND with ESP32 #1
+- Never above 12 V: a 12 V battery charging or the 16.8 V secondary needs a buck converter
+- Supply rated 2 A
+- MUST NOT be powered from the ESP32 5V pin
+- Must follow the same battery-switched rail as ESP32 #1 once SECONDARY_BATT_ENABLED is on: the DPDT breaks both + and −, and the UART needs that common ground
 
 ---
 

@@ -25,7 +25,7 @@ Layout: PlatformIO, `src/main.cpp` per controller.
 
 **ESP32 #1:**
 - ESP32 #2 → hardware UART1 (GPIO25 TX / GPIO33 RX)
-- SIM800L → hardware UART2 (GPIO27 TX / GPIO26 RX), proven working
+- A7670C → hardware UART2 (GPIO27 TX / GPIO26 RX), baud auto-detected (SIM800L replaced 2026-11; not yet flashed)
 - Arduino Nano → **SoftwareSerial** (EspSoftwareSerial / plerup), GPIO16 RX / GPIO17 TX, 9600
 - UART0 reserved for USB serial monitor (debugging kept)
 
@@ -99,13 +99,24 @@ Daily fresh-start `RESET_REQ` once/day.
 
 ---
 
-## LOCKED: GSM behavior (SIM800L)
+## LOCKED: GSM behavior (A7670C)
 - Texts ONLY for: all-tier fault/warning alerts, scheduled-run notices, daily/on-demand reports. Not continuous telemetry.
 - Scheduled-run notice: ONE consolidated SMS per run (all scheduled columns in one text).
 - Daily summary + on-demand both via `STATUS` keyword. Compact encoded for manual expansion.
 - Inbound: `SET,COL_A,N,150,P,40,K,200,pH,5.8` (explicit, default), `SET,COL_A,PRESET,CARROT` (named), `NAME,COL_A,Lettuce` (persistent NVS), `MODE,...`, `STOP,ALL`.
 - Inbound (added): `SUMMARY[,<day>]`, `FULL SUMMARY[,<day>]`, `NET`, `WIFI,<ssid>,<pass>`, `WIFIPORTAL`, `TSKEY,<1|2|3>,<key>` — see the report/telemetry sections below.
 - **Owner-gating: ALL inbound commands require the owner number** — `handleSms` calls `senderIsOwner()` (sender's last 9 digits must match `PHONE_NUMBER`) up front and replies `ERR,AUTH` to anyone else. This covers STATUS/NET/SUMMARY, recovery (STOP/RELEASE/IRRIGATE/NORMAL), and all config. Internally-generated calls (empty `replyTarget`, e.g. the deferred-config replay) pass.
+- **Modem driver (`ESP1/include/gsm_modem.h`, no Arduino dependency, host-tested against a simulated A7670C in `ESP1/test/test_gsm_modem`).** `main.cpp` only wires it up: bytes in through `pollGSM`, `gsmTxTick` drives it, status mirrored to `lastRssi`/`netRegistered`/`lastCreg`/`simReady`. One AT command in flight at a time, all results checked, nothing blocks.
+  - **Bring-up:** auto-detects the baud (115200 first), retries setup until `OK`, re-runs setup on a modem boot message, and never replays stored messages (`AT+CMGD=1,4` at setup). `CNMI` falls back `2,2,0,1,0` → `2,2,0,0,0` → `2,1,0,0,0`; `+CMTI` is read and deleted.
+  - **Registered** = CREG or CEREG stat 1/5/6/7/9/10 (LTE, and "SMS only").
+  - **Inbound safety:** `AT+CSDH=1` gives the body length in the header and exactly that many characters are consumed as body, so a multi-line SMS cannot forge a `+CMT:` line and pass `senderIsOwner()`. A message with no sender never reaches `handleSms` (an empty `replyTarget` means "internal" there). Only a body's first line is the command.
+  - **Outbound:** texts over 160 septets are split as `(i/N)` (`smsEnqueueSplit`). A failed send retries twice (30 s, 60 s backoff) ahead of later messages; messages hold while unregistered for up to 5 min. `ERR,AUTH` never retries, and alphanumeric senders get no reply. Result wait is 45 s (manual: 40 s).
+  - **Delivery reports** (`AT+CSMP=49…`, `+CDS`) are logged as `TX_DELIVERED`/`TX_PENDING`/`TX_UNDELIVERED` and counted, not re-sent: the SMSC already retries temporary failures, and permanent ones would fail the same way.
+  - **Watchdog:** 3 unanswered queries → `MODEM_SILENT` and re-detect (LCD `INIT`, then `DEAD` after a full sweep). 15 min unregistered or 2 consecutive abandoned messages → `AT+CFUN=1,1`, at most once an hour, never in the battery-switch quiet window. There is **no hardware reset line**, so a truly hung modem needs a power cycle.
+- **Added SMS commands (owner-gated):** `SIMTEST` (also sent weekly with Sunday's report, `SIM_CHECK_WEEKDAY`: a missing weekly text means the SIM or modem needs attention), `BAL`, `USSD,<code>|CLEAR` (carrier balance code, NVS `ussd`, empty by default), `ALERTNUM,<number>|CLEAR` (NVS `owner2`: receives `ALERT,` texts only, **no command rights**).
+- **USSD is best effort:** the manual says `AT+CUSD` can return `ERROR` while IMS is on. The firmware reports `BAL,FAIL,ERROR` and must not switch IMS off, since that could affect SMS.
+- **Hardware:** bench sketch `Test Code/PlatformIO/Projects/A7670C-SMS-ESP32` uses GPIO16/17, which on ESP1 is the Nano link; ESP1 wiring is GPIO26/27. Module supply 5–12 V, 2 A, common GND. With `SECONDARY_BATT_ENABLED 1` it must share ESP1's switched rail, because the DPDT breaks both + and −.
+- Commissioning: `Commissioning_Flash_Plan.md` stage M. Network-time RTC backup (`AT+CTZU`) was offered and **reserved** by the user, not built.
 
 ---
 
