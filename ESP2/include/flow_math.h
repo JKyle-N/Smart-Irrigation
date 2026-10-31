@@ -30,4 +30,29 @@ static inline float pulsesToLiters(unsigned long pulses, float k) {
   return (float)pulses / k;
 }
 
+/* Hard cap for one fill/deliver stage: at least `baseMs`, and longer when the batch itself needs it.
+ * A flat 180 s cap faulted a legal 20 L FORCE delivery (200 s at 6 L/min) with FLOW_FAIL at ~18 L. The
+ * margin leaves room for a pump below its nominal rate; `baseMs` keeps a small batch's cap unchanged. */
+static inline unsigned long stageCapMs(float targetL, float lpm, unsigned long baseMs, float margin) {
+  if (!(targetL > 0.0f) || !(lpm > 0.0f)) return baseMs;
+  unsigned long needMs = (unsigned long)(targetL / lpm * 60000.0f * margin);
+  return needMs > baseMs ? needMs : baseMs;
+}
+
+/* Litres a flow-blind (timed) stage may credit after running `elapsedMs`. Crediting the whole target
+ * regardless made an interrupted or capped stage look finished: a delivery stopped early zeroed the
+ * tank's bookkeeping while water was still in it, and the next fill overfilled. */
+static inline float timedLiters(float targetL, float lpm, unsigned long elapsedMs) {
+  if (!(targetL > 0.0f) || !(lpm > 0.0f)) return 0.0f;
+  float moved = lpm * (float)elapsedMs / 60000.0f;
+  return moved < targetL ? moved : targetL;
+}
+
+/* Flow started, then stopped. Only AC stages: a dosing pump's pulses can legitimately be seconds apart,
+ * and those stages have their own per-dose ceiling. Without this a tank that ran out left the transfer
+ * or booster pump running dry until the stage's hard cap. */
+static inline bool flowStalled(bool sawFlow, bool isAC, unsigned long msSinceLastPulse, unsigned long limitMs) {
+  return sawFlow && isAC && msSinceLastPulse > limitMs;
+}
+
 #endif // FLOW_MATH_H

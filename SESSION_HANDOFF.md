@@ -3,7 +3,8 @@
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 
-Last updated: **2026-11-01** — SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
+Last updated: **2026-11-01** — whole-firmware audit: bugs fixed, new decisions in §5 (items 19–25).
+Earlier the same day: SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
 `CLAUDE.md` "LOCKED: GSM behavior". Commissioning stage M covers it.
 Previous: 2026-10-30, toolchain pinned after ESP1 stopped linking on the newest platform; LCD
 Thresholds/Column Mode truncation fixed; new open decisions logged in §5 (items 15–18).
@@ -71,7 +72,7 @@ cd Nano && pio run
 
 # host unit tests -- ~10 seconds each, no hardware needed
 cd ESP1 && pio test -e native     # 80 cases (33 pure maths + 47 simulated A7670C)
-cd ESP2 && pio test -e native     #  7 cases
+cd ESP2 && pio test -e native     # 13 cases
 
 # website
 node --check Website/script.js
@@ -81,18 +82,25 @@ firebase deploy --only database --dry-run   # validates rules WITHOUT deploying 
 ```
 
 Known-good build sizes after the A7670C swap (both `SECONDARY_BATT_ENABLED 0`) — a sharp deviation
-means something unintended was picked up. ESP1 before the swap: 77,400 B RAM, 1,305,857 B flash. Host
-tests: ESP1 80 cases, ESP2 7.
+means something unintended was picked up. With all optional flags at 1 (ESP1 `SECONDARY_BATT_ENABLED`,
+`BATTERY_SAFETY_ENABLED`; ESP2 `SECONDARY_BATT_ENABLED`, `RES_VALVE_FITTED`) both still compile: ESP1
+1,317,857 B flash, ESP2 341,117 B. Host tests: ESP1 80 cases, ESP2 13.
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 24.6 % (80,600 B) | 41.8 % (1,313,949 B) |
-| ESP2 | 7.1 % (23,236 B) | 25.9 % (339,081 B) |
+| ESP1 | 24.6 % (80,600 B) | 41.8 % (1,315,533 B) |
+| ESP2 | 7.1 % (23,252 B) | 25.9 % (339,665 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
 ## 4. What the last sessions added
+
+**2026-11-01 (later) — whole-firmware audit.** Read in full: Nano, ESP2, and ESP1's run, fault, link and
+modem paths. Checked by targeted search rather than read line by line: ESP1's Firebase upload, portal,
+SD summary and LCD rendering. Fixes are summarized in `CLAUDE.md` ("Link rules" and "Pump protection and
+bookkeeping"), with 6 new host tests on ESP2. The `main.cpp` state-machine changes compile, but only the
+extracted maths and the modem driver are host-tested. **Still unflashed.**
 
 **2026-11-01 — A7670C replaces the SIM800L on ESP1.** The user confirmed the module works with the bench
 sketch, but the integrated firmware is **unflashed**: it is host-tested against a simulated modem only.
@@ -180,9 +188,9 @@ Roughly in priority order.
    `ESP1/src/main.cpp` (`handleSms`, `sendDailyReport`). Unflashed, like everything else.
 6. Test coverage stops at the pure functions. The FSMs, and anything touching `millis()`, are
    untested — that was a deliberate scope limit, not an oversight.
-7. **`mixTankL` can go stale-low if an emergency stop (GPIO4 cut) interrupts `SEQ_FILL`/`SEQ_DOSE`**
-   — documented as a known gap in `CLAUDE.md`'s P17/fault-hold section, deliberately left open pending
-   a design decision.
+7. **`mixTankL` can still go stale-low if a frozen or silent ESP2 is cut during `SEQ_FILL`/`SEQ_DOSE`**
+   — narrowed 2026-11-01 (a responsive ESP2 now records it first), see `CLAUDE.md`'s P17/fault-hold
+   section; closing it still needs a design decision.
 8. **Website operators** — decide whether the user's own account should be an operator; that is a
    rules + `delete-user-api` edit and a redeploy, and needs explicit approval.
 9. **Nothing has been flashed or hardware-validated** (§1).
@@ -222,6 +230,32 @@ Found in the 2026-10-30 review — **left open for the user to decide** (not cha
 18. **Inert Sugian files:** `Website/.github/workflows/static.yml` and `Website/travis.yml` never run
     in this repo (GitHub only reads root `.github/`). Kept so `Website/` stays in step with Sugian's
     repo; delete only if that link no longer matters.
+
+Found in the 2026-11-01 audit — **left open for the user to decide** (not changed):
+
+19. **With the shipped constants, fertigation doses nothing.** Most important item here. `calcDose()`
+    computes a 4 L batch (5 L budget less 20 % flush), under `MIXING_TANK_SAFE_MIN` (5 L), so every
+    scheduled fertigation becomes water-only with one `DOSE_BATCH_LOW` alert per column. Raising the
+    budget alone does not fix it: doses use the fixed lab baseline (N 1060, P 80, K 200), so `PECHAY` and
+    `TOMATO_S1` have no positive gap, `TOMATO_S2` only P +20, `TOMATO_S3` only K +100. `decideFertigate()`
+    meanwhile uses the live NPK reading, so a run can be labelled FERTIGATION with zero doses. These are
+    `WATER_BUDGET_L`, `MIXING_TANK_SAFE_MIN`, `SOIL_BASELINE_*` and the presets: thesis decisions, not
+    firmware bugs, so no value was invented.
+20. **Inrush.** `MIXER_OVERCURRENT_A` (2.5 A) and `PZEM_OVERCURRENT_A` (3 A) have no start-up blanking, so
+    a motor's start current may trip them. Measure at commissioning before adding a blanking time.
+21. **AC Prime and Testing combos start the inverter and the pump together**, with no warmup. Automated
+    stages, exercise and now mix all wait. Left because these are attended and dead-man held; adding the
+    wait means holding the button ~5 s before anything runs.
+22. **An LCD force run with nutrients needs at least 6.25 L**, or the 5 L floor refuses it when the
+    countdown ends (with an alert). The editor's default is 2.0 L. The web path now refuses up front; the
+    LCD editor could too.
+23. **Nano link.** SoftwareSerial on the Nano's NPK bus masks interrupts while its bytes pass, so an
+    inbound command or flow pulses can be lost during the NPK reply. `nanoPaceTick` sends ACTIVE/DAY/NIGHT
+    once on change, so a lost one leaves the wrong cadence until the next change. Display-only impact.
+24. **`SUPA,<url>,<key>` by SMS cannot work for a real key.** A `service_role` JWT plus the URL does not
+    fit one SMS, and each part of a long text arrives as a separate command. Use the portal.
+25. **Every stranger's text gets an `ERR,AUTH` reply**, which costs load (alphanumeric senders are now
+    skipped). A silent drop would be cheaper but gives a mistyped owner number no feedback.
 
 ---
 

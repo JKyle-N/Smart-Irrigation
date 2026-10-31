@@ -31,10 +31,10 @@
  *        <START>,CAL_START,<id>,<END>  begin raw stream for one sensor id (Calibration Mode, idle-only)
  *        <START>,CAL_STOP,<id>,<END>   end it
  *
- *  RECOVERY LADDER (spec sec.17.4.1 / CLAUDE.md) -- the Nano owns step 1 only:
+ *  RECOVERY LADDER (spec sec.17.4.1 / CLAUDE.md), 2 layers:
  *      1. Internal ATmega328 WDT, petted in loop()  <-- primary self-recovery
  *      2. ESP32 #1 RESET_REQ over UART              <-- handled here (self-reset)
- *      3. Hardware reset via ESP32 #2 / PCF8575     <-- not the Nano's concern
+ *      (No hardware reset: PCF8575 P17 became the master actuator cutoff, so RESET is not driven.)
  *
  *  NON-BLOCKING: no delay() in loop() except a single one-time settle in setup() and
  *      one bounded ~5 ms RS485 DE settle inside the NPK read (well under WDTO_4S).
@@ -535,7 +535,7 @@ bool calReadRaw(float &raw) {
     int col = calId[4] - 'A';
     if (col < 0 || col >= NUM_COLUMNS) return false;
     if (!COLUMN_ENABLED[col]) return false;          // no sensor physically present on a disabled column
-    float vals[7];
+    float vals[NPK_REG_COUNT];                      // readNpkColumn fills NPK_REG_COUNT values, as in sendNpk()
     if (readNpkColumn(NPK_ADDR[col], vals) != NPK_OK) return false;
     raw = vals[4];                                  // N (index 4) raw register
     return true;
