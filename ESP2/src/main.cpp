@@ -38,8 +38,8 @@
  *                 under dead-man + generous cap, spec §A.4.2)
  *         TEST,ENTER / TEST,EXIT / TEST,HOLD,<bit> / TEST,RELEASE  (dead-man manual
  *                 relay test, sec.18.10.8): ESP1 streams HOLD while ENTER held; ESP2
- *                 keeps ONE relay ON only while HOLD arrives (timeout), with a 10s
- *                 hard cap. bit = PCF8575 OUT_* index 0..15.
+ *                 keeps ONE relay ON only while HOLD arrives (timeout), with a 30s
+ *                 hard cap. bit = PCF8575 OUT_* index 0..15, 16..19 = priming combos.
  *    OUT: ACK,<cmd> -> DONE,<cmd>[,WATER,<L>[,EST]];  DOSE,NUT_x,<target>,<measured>,COL_y
  *         (,EST = this water total includes a flow-blind timed stage: estimated, not metered)
  *         (per-nutrient result, sec.25.2.1); FLOW_FAIL/PWR_FAIL/EC_FAIL/PH_FAIL/
@@ -203,7 +203,9 @@ const unsigned long BATT_HANDSHAKE_MS     = 800;
 const unsigned long AC_WARMUP_MS = INVERTER_WARMUP_MS +
     (SECONDARY_BATT_ENABLED ? (BATT_HANDSHAKE_MS + BATT_SWITCH_SETTLE_MS) : 0);   // worst-case switch lead
 const unsigned long FLOW_TIMEOUT_MS   = 10000;  // no-flow after pump start -> FLOW_FAIL
-const unsigned long STAGE_MAX_MS      = 180000; // hard safety cap per metered stage
+const unsigned long FLOW_STALL_MS     = 10000;  // AC pump: flow started, then no pulse for this long -> FLOW_FAIL
+const unsigned long STAGE_MAX_MS      = 180000; // hard safety cap per metered stage (longer for a big batch, see stageCapMs)
+const float         STAGE_CAP_MARGIN  = 1.5f;   // cap = this x the batch's expected time at the pump's nominal rate
 const unsigned long MIX_DEFAULT_MS    = 30000;  // used if work order omits MIX
 // Outer defensive cap on the MIX token, not a commissioning value: a generous multiple of the current
 // [TBD] 30s placeholder above, so a corrupted/oversized token can't leave the mixer running with no
@@ -301,11 +303,11 @@ unsigned long lastPcfReportMs = 0;
 /* ---- Manual TEST mode (dead-man, spec sec.18.10.8) ----------------------- *
  * ESP1 streams TEST,HOLD,<bit> while the operator holds ENTER. ESP2 keeps the
  * relay ON only while those keep arriving (dead-man), one relay at a time, with
- * a HARD 10 s cap regardless of ESP1. The cap lives SOLELY here on ESP2.        */
+ * a HARD 30 s cap regardless of ESP1. The cap lives SOLELY here on ESP2.        */
 bool     testMode      = false;
 int      testHeldBit   = -1;          // relay currently driven by the dead-man (-1 = none)
 unsigned long idleSinceMs = 0;        // when ESP2 became idle (0 = not idle now); drives IDLE_RESET_MS self-heal
-bool     testCapped    = false;       // 10 s hard cap reached -> stay OFF until release
+bool     testCapped    = false;       // 30 s hard cap reached -> stay OFF until release
 unsigned long testRelayOnMs = 0;      // when the current relay went ON (for the cap)
 unsigned long testLastHoldMs = 0;     // last TEST,HOLD received (for the release timeout)
 const unsigned long TEST_HOLD_TIMEOUT_MS = 400;     // no HOLD within this -> release (fail-safe)
@@ -395,6 +397,9 @@ bool  sgIsAC = false, sgPumpOn = false, sgSawFlow = false;
 unsigned long sgT0 = 0;
 bool  sgTimed = false;                   // flow-independent stage: complete on a timer, ignore the flow sensor
 unsigned long sgTimedMs = 0;             // computed run time for a timed stage
+float sgTimedLpm = 0;                    // nominal pump rate of a timed stage: what its credit is computed from
+unsigned long sgLastPulses = 0, sgLastPulseMs = 0;   // flow-stall watch for AC stages
+bool  mixRunning = false;                // SEQ_MIX: warmup finished, the mixer relay is on
 bool  lastHoldFlow = false;              // the most recent hold was a FLOW_FAIL (enables timed recovery)
 bool  resumeTimed  = false;              // this RESUME should run FILL/DELIVER timed (flow-blind)
 unsigned long acNoCurrentSince = 0;
@@ -457,8 +462,10 @@ void stageEnd();
 void goStep(SeqStep s);
 void finishOk();
 float endMeteredStage();
+void creditRunningStage();
 void safetyMonitor();
 float readMixerCurrent();
+int  adcAvg(uint8_t pin);
 void  resetMixerCurrentRing();
 void heartbeat();
 void idleResetTick();
@@ -985,6 +992,7 @@ void dispatch(const String &payload) {
 
   // ---- always-honored commands ----
   if (cmd == "STOP_ALL") {
+    creditRunningStage();                    // read the meter before the stop detaches it
     stopAll(); step = SEQ_NONE; wo.active = false; faultHeld = false; detachFlow();
     resumeTimed = false; lastHoldFlow = false;           // clear the timed-recovery latch
     testMode = false; testHeldBit = -1; testCapped = false;
@@ -1012,10 +1020,9 @@ void dispatch(const String &payload) {
     // confirmation ambiguity -- ESP1 can conclude "ESP2 restarted" and eventually escalate to
     // RESET_SELF while ESP2 is in fact still executing correctly), persist whatever mixTankL
     // already holds before the reboot discards RAM state. This only saves what's already been
-    // safely metered via tankApply() up to this point -- it does not attempt to finish/credit the
-    // currently in-flight stage, which stays the same documented gap as any other GPIO4-class cut
-    // (CLAUDE.md's P17 section). RESET_SELF otherwise never persisted at all, unlike every other
-    // exit path (normal completion, fault-hold), so this is a strict improvement, never a regression.
+    // metered up to this point, including the in-flight stage's litres. A raw GPIO4 cut with no STOP_ALL
+    // ahead of it remains the documented gap (CLAUDE.md's P17 section).
+    creditRunningStage();
     if (wo.active || step != SEQ_NONE) tankSave();
     stopAll();                               // force SAFE (all outputs OFF) before reboot
     bswJournal(0);                           // a deliberate reboot, not a battery-switch failure
@@ -1097,6 +1104,9 @@ void dispatch(const String &payload) {
       reply("ACK,TEST,ENTER"); return;
     }
     if (sub == "EXIT") {
+      // A late EXIT must not reach a work order: it would drop the running pump and P17 while the FSM
+      // carried on, and the stage would then report a FLOW_FAIL nothing had caused.
+      if (!testMode) { reply("DONE,TEST"); return; }
       stopAllGraceful(); detachFlow(); testMode = false; testHeldBit = -1;  // all OFF incl. master cutoff de-energized
       exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;                       // drop any pending one-shot timers
       reply("DONE,TEST"); return;
@@ -1329,19 +1339,25 @@ void stageBegin(int pumpBit, bool isAC, int flowPin, float k, float targetL) {
 // volume (and, for a DELIVER, to the per-order water-to-column tally). Reads before stageEnd
 // so it works for both normal completion and a mid-stage fault (partial liters still count).
 float endMeteredStage() {
-  // A timed (flow-blind) stage has no usable pulse count, so credit the ESTIMATED target volume it was
-  // sized to move -- otherwise the tank bookkeeping would think nothing moved and never empty/fill.
-  float liters = sgTimed ? sgTarget : litersSoFar(sgK);
+  // A timed (flow-blind) stage has no usable pulse count, so credit an ESTIMATE from how long the pump
+  // actually ran -- otherwise the tank bookkeeping would think nothing moved and never empty/fill.
+  float liters = sgTimed ? timedLiters(sgTarget, sgTimedLpm, millis() - sgT0) : litersSoFar(sgK);
   if (sgTimed) woEstimated = true;            // this order's water total is no longer purely metered
   if      (sgTankSign > 0) tankApply(+liters);                 // reservoir -> mix
   else if (sgTankSign < 0) { tankApply(-liters); woWaterL += liters; }  // mix -> column
   stageEnd();
   return liters;
 }
+// Keep the litres of a stage that is about to be cut short (STOP_ALL, RESET_SELF). Pump not on yet =
+// nothing moved, and flowPulses would still hold the previous stage's count.
+void creditRunningStage() {
+  if (step != SEQ_NONE && sgPump >= 0 && sgPumpOn) endMeteredStage();
+}
 int stagePoll() {
   if (!sgPumpOn) {                          // valve/inverter settle, then start pump
     if (millis() - sgT0 >= (sgIsAC ? AC_WARMUP_MS : VALVE_SWITCH_MS)) {
       attachFlow(sgFlow); pcfOn(sgPump); sgPumpOn = true; sgT0 = millis();
+      sgLastPulses = 0; sgLastPulseMs = millis();
     }
     return 0;
   }
@@ -1358,6 +1374,9 @@ int stagePoll() {
   if (L >= sgTarget) return 1;
   unsigned long el = millis() - sgT0;
   if (!sgSawFlow && el > FLOW_TIMEOUT_MS) return -1;   // dry run / no flow
+  noInterrupts(); unsigned long pulses = flowPulses; interrupts();
+  if (pulses != sgLastPulses) { sgLastPulses = pulses; sgLastPulseMs = millis(); }
+  if (flowStalled(sgSawFlow, sgIsAC, millis() - sgLastPulseMs, FLOW_STALL_MS)) return -1;   // tank ran out, air, clog
   if (el > sgCapMs) return -1;                          // hard cap (per-dose ceiling for dose stages)
   return 0;
 }
@@ -1369,7 +1388,10 @@ void stageEnd() {
 
 void finishOk() {
   stopAllGraceful();                 // all OFF + master cutoff de-energized (after any battery return)
-  mixTankL = 0.0f; tankSave();       // tank emptied to the column -> clear the persisted volume
+  // A metered delivery emptied the tank to the column. A flow-blind one only estimates that, and a capped
+  // one may have left water behind, so keep what its bookkeeping says or the next fill would overfill.
+  if (!woEstimated) mixTankL = 0.0f;
+  tankSave();
   String name = wo.cmdName;
   float water = woWaterL;
   bool est = woEstimated;
@@ -1480,8 +1502,9 @@ void runSequence() {
         resValveSet(true);
         stageBegin(OUT_TRANSFER, true, FLOW_RES_MIX, K_RES_MIX, remaining);
         sgTankSign = +1;                              // this stage adds water to the mix tank
+        sgCapMs = stageCapMs(remaining, TRANSFER_LPM, STAGE_MAX_MS, STAGE_CAP_MARGIN);
         if (resumeTimed) {                            // flow sensor dead -> run the transfer pump on a timer
-          sgTimed = true;
+          sgTimed = true; sgTimedLpm = TRANSFER_LPM;
           sgTimedMs = (unsigned long)(remaining / TRANSFER_LPM * 60000.0f * TIMED_MARGIN);
           if (sgTimedMs > TIMED_STAGE_CAP_MS) sgTimedMs = TIMED_STAGE_CAP_MS;
         }
@@ -1537,7 +1560,13 @@ void runSequence() {
 
     /* ---- MIX: homogenize; validate mixer current (ACS712) ---------------- */
     case SEQ_MIX: {
-      if (!stepInit) { pcfOn(OUT_INVERTER); pcfOn(OUT_MIXER); stepStart = millis(); stepInit = true; resetMixerCurrentRing(); }
+      // Same inverter settle every other automated AC start gets (the dose stage dropped the inverter,
+      // so it is cold here). The mix window and the current checks count from the mixer actually running.
+      if (!stepInit) { pcfOn(OUT_INVERTER); mixRunning = false; stepStart = millis(); stepInit = true; }
+      if (!mixRunning) {
+        if (millis() - stepStart < AC_WARMUP_MS) break;
+        pcfOn(OUT_MIXER); mixRunning = true; stepStart = millis(); resetMixerCurrentRing();
+      }
       float mi = readMixerCurrent();
       if (mi > MIXER_OVERCURRENT_A) {   // New-F4 (audit): same enrichment as PWR_FAIL -- include the reading
         pcfOff(OUT_MIXER);
@@ -1556,7 +1585,8 @@ void runSequence() {
 
     /* ---- EC/pH validation (local protective check, spec sec.14.2.4) ------ */
     case SEQ_ECPH: {
-      int phRaw = analogRead(PIN_PH), ecRaw = analogRead(PIN_EC);
+      // Averaged: this one reading decides the run's EC/pH verdict, and a single ESP32 ADC sample is noisy.
+      int phRaw = adcAvg(PIN_PH), ecRaw = adcAvg(PIN_EC);
       float ph = PH_CAL_M * phRaw + PH_CAL_B;
       float ec = EC_CAL_M * ecRaw + EC_CAL_B;
       // HARDWARE fault first (railed ADC = probe disconnected/shorted) -> SENSOR_FAIL, distinct
@@ -1589,8 +1619,9 @@ void runSequence() {
         colValves(wo.colMask, true);
         stageBegin(OUT_BOOSTER, true, FLOW_MIX_IRR, K_MIX_IRR, mixTankL);
         sgTankSign = -1;                                     // this stage drains the mix tank
+        sgCapMs = stageCapMs(mixTankL, BOOSTER_LPM, STAGE_MAX_MS, STAGE_CAP_MARGIN);
         if (resumeTimed) {                                   // flow sensor dead -> run the booster on a timer
-          sgTimed = true;
+          sgTimed = true; sgTimedLpm = BOOSTER_LPM;
           sgTimedMs = (unsigned long)(mixTankL / BOOSTER_LPM * 60000.0f * TIMED_MARGIN);
           if (sgTimedMs > TIMED_STAGE_CAP_MS) sgTimedMs = TIMED_STAGE_CAP_MS;
         }
@@ -1715,7 +1746,7 @@ void safetyMonitor() {
   // re-fired holdFault()/PWR_FAIL roughly every PZEM_POLL_MS, indefinitely, until RESUME. Mirrors
   // runSequence()'s own `if (faultHeld) return;` guard.
   // stepInit too: until SEQ_MIX's own init runs, stepStart still holds the previous step's start.
-  bool mixActive      = (step == SEQ_MIX && !faultHeld && stepInit && millis() - stepStart >= AC_WARMUP_MS);
+  bool mixActive      = (step == SEQ_MIX && !faultHeld && stepInit && mixRunning);   // set once the warmup is over
   if (!seqActive && !exerciseActive && !primeAcActive && !mixActive) { acNoCurrentSince = 0; return; }
 
   // Throttle the (blocking) Modbus reads so we don't poll every loop iteration.
@@ -1769,27 +1800,39 @@ void safetyMonitor() {
 // causing spurious DEGRADED,MIXER_NOLOAD and an overcurrent trip point that depends on ADC-sampling
 // luck rather than the physical load. Fixed with a small non-blocking ring buffer (one new sample
 // per call -- no busy-wait, no delay(), keeps the file's "non-blocking everywhere" rule) that
-// reports an RMS magnitude across the most recent samples; at normal sub-millisecond loop() cadence
-// this converges to a true RMS reading within a handful of calls, well before any real fault check
-// needs to act on it.
+// reports an RMS magnitude across the most recent samples.
+// Samples are spaced at least MIXER_I_SAMPLE_US apart so the ring spans a whole mains cycle (24 ms against
+// 16.7-20 ms). Taken every pass of a fast loop(), 24 samples cover only a few ms -- a slice of one half
+// wave, whose "RMS" swings from near 0 to near peak, enough for a false MIXER_OC or MIXER_NOLOAD.
 static const int MIXER_I_RING_N = 24;
+static const unsigned long MIXER_I_SAMPLE_US = 1000;
 static float mixerIRing[MIXER_I_RING_N] = {0};
 static int   mixerIRingIdx = 0, mixerIRingCount = 0;
+static unsigned long mixerILastUs = 0;
 
 void resetMixerCurrentRing() { mixerIRingIdx = 0; mixerIRingCount = 0; }
 
 float readMixerCurrent() {
-  int raw = analogRead(PIN_MIXER_I);
-  float v = (raw / 4095.0f) * 3.3f;
-  float a = (v - ACS712_ZERO_V) / ACS712_SENS_V_PER_A;
-  mixerIRing[mixerIRingIdx] = a;
-  mixerIRingIdx = (mixerIRingIdx + 1) % MIXER_I_RING_N;
-  if (mixerIRingCount < MIXER_I_RING_N) mixerIRingCount++;
+  if (mixerIRingCount == 0 || micros() - mixerILastUs >= MIXER_I_SAMPLE_US) {
+    mixerILastUs = micros();
+    int raw = analogRead(PIN_MIXER_I);
+    float v = (raw / 4095.0f) * 3.3f;
+    float a = (v - ACS712_ZERO_V) / ACS712_SENS_V_PER_A;
+    mixerIRing[mixerIRingIdx] = a;
+    mixerIRingIdx = (mixerIRingIdx + 1) % MIXER_I_RING_N;
+    if (mixerIRingCount < MIXER_I_RING_N) mixerIRingCount++;
+  }
   double sumSq = 0.0;
   for (int k = 0; k < mixerIRingCount; k++) sumSq += (double)mixerIRing[k] * (double)mixerIRing[k];
   return sqrtf((float)(sumSq / mixerIRingCount));
 }
-// (EC/pH are read inline in the SEQ_ECPH stage; standalone readPH()/readEC() removed as unused.)
+// Mean of a short burst of ADC reads (~1 ms). EC/pH are read inline in the SEQ_ECPH stage.
+int adcAvg(uint8_t pin) {
+  const int N = 16;
+  long sum = 0;
+  for (int i = 0; i < N; i++) sum += analogRead(pin);
+  return (int)(sum / N);
+}
 
 /* =============================================================================
  *  HEARTBEAT  (spec sec.10.8.3)

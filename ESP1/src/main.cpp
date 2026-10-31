@@ -9,8 +9,9 @@
  *      (supervisor / work-order model, sec.9.8.1.1) -- then monitors.
  *    - Talks to the user over A7670C SMS (alerts, run notices, daily report).
  *    - Logs every event to microSD (CSV, RTC-stamped, sec.25).
- *    - Monitors battery via INA226 (display/log/telemetry only -- no battery-triggered
- *      stops/alerts); classifies OTHER faults (3 tiers, sec.23).
+ *    - Monitors the main battery via opto ADC + ACS758 (display/log/telemetry only -- no
+ *      battery-triggered stops/alerts) and the secondary battery via INA226; classifies OTHER
+ *      faults (3 tiers, sec.23).
  *    - Drives the LCD UI; owns all recovery escalation (sec.18.9).
  *
  *  AUTHORITY BOUNDARIES: ESP32 #1 decides; ESP32 #2 executes; Nano senses.
@@ -274,7 +275,7 @@ const float BATT_EMPTY_V = 11.20f;
 
 /* ---- Timing / supervisory constants (spec sec.10.14) --------------------- */
 const unsigned long UART_ACK_TIMEOUT_MS   = 3000;    // ESP2 ACK wait
-const unsigned long UART_DONE_TIMEOUT_MS  = 600000;  // ESP2 sequence completion (10 min)
+const unsigned long UART_DONE_TIMEOUT_MS  = 600000;  // ESP2 silent this long mid-run (each PROG restarts it)
 const unsigned long RESUME_ACK_TIMEOUT_MS = 5000;    // recovery RESUME: bounded wait for ACK/INVALID
 const uint8_t       MAX_UART_RETRY        = 3;
 const unsigned long RECOVERY_COOLDOWN_MS  = 30000;
@@ -333,7 +334,7 @@ bool exerciseEnabled = true;    // master on/off                                
 int  exerciseRunS    = 5;       // seconds per exercise, EX_RUN_MIN..EX_RUN_MAX           [TBD]
 const int EX_RUN_MIN = 1, EX_RUN_MAX = 10;
 void saveExercise();
-const unsigned long PUMP_EXERCISE_TIMEOUT_MS  = 20000;        // ESP2 boot + 5 s run + margin
+const unsigned long PUMP_EXERCISE_TIMEOUT_MS  = 20000;        // from dispatch: AC warmup + run (<=10 s) + margin
 
 /* ---- Power logging throttle (B3, spec sec.25.2.1: not every read) --------- */
 const unsigned long PWR_LOG_INTERVAL_MS = 60000;     // log a PWR snapshot ~1/min (+ on state change)
@@ -1602,6 +1603,7 @@ void restoreDefaults();
 void lcdRenderSettings();
 void enterCal();
 void calButton(int i);
+static void calCloseTarget();
 void calHoldTick();
 void lcdRenderCal();
 void enterDiag();
@@ -1992,7 +1994,9 @@ void loadConfig() {
     String nm = prefs.getString((String(key) + "n").c_str(), "");
     strncpy(col[c].name, nm.c_str(), sizeof(col[c].name) - 1);
     col[c].name[sizeof(col[c].name) - 1] = 0;
-    col[c].lastServicedStamp = -1;
+    // Persisted: a reboot inside the window must not re-run (and, for fertigation, re-dose) a column that
+    // already finished today. An interrupted run never reaches DONE, so it still re-runs when due.
+    col[c].lastServicedStamp = prefs.getLong((String(key) + "ls").c_str(), -1);
     // per-column schedule (manual window + AUTO/MANUAL axis) and enable flag
     COL_WIN_START[c] = prefs.getUShort((String(key) + "ws").c_str(), COL_WIN_START[c]);
     COL_WIN_END[c]   = prefs.getUShort((String(key) + "we").c_str(), COL_WIN_END[c]);
@@ -2116,6 +2120,13 @@ void setActuationsEnabled(bool on, const char *why) {
     // (STOP_ALL to ESP2, run UI closed, forceCmdId/forceMask cleared, dashboard command resolved).
     forceAbort("ACTUATIONS_DISABLED");
     if (wo.active || pendingRun.active) cancelRun(-1, "ACTUATIONS_DISABLED");
+    if (pendingExercise.active) {                 // a pump exercise is an actuation too (cancelRun does not own it)
+      sendEsp2("STOP_ALL");
+      pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false; pendingExercise.acked = false;
+      firebaseRemoteExerciseDone("failed", "actuations disabled");
+      if (sysState == ACTIVE_STATE) setState(IDLE_STATE);
+      esp2SetPower(false);
+    }
   }
   // Note: sysState is deliberately NOT touched here. The lockout is reported via stateLabel(), so
   // it cannot be cleared by any of the many setState(IDLE_STATE) sites. See stateLabel().
@@ -2789,6 +2800,10 @@ void handleEsp2Response(const String &payload) {
     if (nt >= 3 && runPhase != RUN_NONE) {
       run.stageL = t[0].toFloat(); run.stageTgt = t[1].toFloat(); run.waterGot = t[2].toFloat();
     }
+    // Proof of life, so the DONE timeout means "ESP2 went silent" and not "this run is long": a legal
+    // FORCE dose of 500 mL takes ~10 min at the pump's rate, and that alone used to end in an
+    // ESP2_DONE_TIMEOUT emergency stop. ESP2's own per-stage caps bound how long a run can go on.
+    if (wo.active && wo.stage == WO_ACKED) wo.sentMs = millis();
     return;
   }
 
@@ -2848,20 +2863,27 @@ void handleEsp2Response(const String &payload) {
       // runUiBegin() here would wrongly reseed the doses and reset progress to "Starting".
       if (runPhase == RUN_NONE && wo.active) { runPhase = RUN_LIVE; runPhaseMs = millis(); runLocked = true; }
     }
-    if (wo.active) { wo.stage = WO_ACKED; wo.sentMs = millis(); }
+    // Only ESP2's ACK of the work order itself (or of a resume) counts. ESP2 also ACKs SET_CAL, CAL_STOP and
+    // TEST frames, and one of those would otherwise mark a parked WO_PENDING order as accepted without it
+    // ever being sent -- leaving the run to die 10 minutes later in ESP2_DONE_TIMEOUT.
+    if (wo.active && (arg.startsWith("SEQ_") || arg.startsWith("RESUME"))) { wo.stage = WO_ACKED; wo.sentMs = millis(); }
   } else if (resp == "DONE") {
     if (arg.startsWith("EXERCISE")) {                          // preventive exercise finished
       int k = pendingExercise.idx;
       if (k >= 0 && k < 3) lastPumpUseMs[k] = millis();        // reset that pump's 2-day clock
       logEvent("ESP1", "ACT", String("EXERCISE|STOP|") + (k >= 0 ? EX_NAME[k] : "?"));
       pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false;
-      firebaseRemoteExerciseDone("completed", "5 second pump test finished");   // no-op if locally initiated
+      firebaseRemoteExerciseDone("completed", "pump test finished");   // no-op if locally initiated
       if (sysState == ACTIVE_STATE) setState(IDLE_STATE);
       esp2SetPower(false);
-    } else if (wo.active) {
+    } else if (wo.active && arg.startsWith("SEQ_")) {
+      // SEQ_ only: ESP2 also sends DONE,STOP_ALL / DONE,TEST / DONE,PRIME / DONE,TEST_CAP, and any of those
+      // landing during a run used to be taken for its completion -- run closed, column marked serviced,
+      // ESP2 powered off mid-sequence.
       int c = wo.colIdx;
       if (c >= 0 && c < NUM_COLUMNS) {
         col[c].lastServicedStamp = currentDayStamp;
+        prefs.putLong((String("c") + c + "ls").c_str(), currentDayStamp);   // see loadConfig
         // B1: optional measured water volume reported as ...,WATER,<liters>[,EST] on DONE. EST means
         // ESP2 hit a flow-blind (timed, not metered) stage somewhere in this run -- String::toFloat()
         // already safely stops at the trailing comma so `liters` itself is unaffected either way, but
@@ -2918,7 +2940,13 @@ void handleEsp2Response(const String &payload) {
       runUiFinish(true);               // -> post-run receipt (+ error table if the run logged problems)
     }
   } else if (resp == "BUSY") {
-    // ESP2 busy; leave work order pending, it will retry/await
+    // ESP2 busy; leave work order pending, it will retry/await. EXCEPT a retry answered BUSY,ACTIVE: our
+    // first copy got through and only its ACK was lost, so the run is live. Treating that as "no answer"
+    // ran out the retries and sent RECOVERY_STATE's RESET_SELF into a healthy run.
+    if (arg == "ACTIVE" && wo.active && wo.stage == WO_SENT && wo.retries > 0) {
+      wo.stage = WO_ACKED; wo.sentMs = millis();
+      logEvent("ESP1", "RESP", "WO|ACK_LOST|ESP2_ALREADY_RUNNING");
+    }
   } else if (resp == "DEGRADED") {
     // ESP2 disabled one channel (nutrient/mixer) but is STILL running the sequence:
     // Major, NOT Critical -- do not abort or cut power, just log+alert (sec.23.2.2.1/.4).
@@ -2928,7 +2956,20 @@ void handleEsp2Response(const String &payload) {
   } else if (resp == "FLOW_FAIL") {
     enterFaultHold("FLOW_FAIL", arg.c_str());
   } else if (resp == "PWR_FAIL") {
-    enterFaultHold("PWR_FAIL", arg.c_str());
+    if (wo.active) enterFaultHold("PWR_FAIL", arg.c_str());
+    else {
+      // Pump exercise or AC prime: ESP2 stopped the load itself and is NOT holding anything. Treating this
+      // as a hold offered recovery choices that could only fail, and stranded pendingExercise (no DONE
+      // ever comes), which blocked all later exercises and tests until a reboot.
+      raiseFault('M', "PWR_FAIL", arg.c_str());
+      if (pendingExercise.active) {
+        int k = pendingExercise.idx; if (k >= 0 && k < 3) lastPumpUseMs[k] = millis();   // next try in 2 days
+        pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false; pendingExercise.acked = false;
+        firebaseRemoteExerciseDone("failed", "power fault during the test");
+        if (sysState == ACTIVE_STATE) setState(IDLE_STATE);
+        esp2SetPower(false);
+      }
+    }
   } else if (resp == "EC_FAIL") {
     raiseFault('M', "EC_FAIL", arg.c_str());
   } else if (resp == "PH_FAIL") {
@@ -2950,11 +2991,29 @@ void handleEsp2Response(const String &payload) {
     // NOT a fallback -- hold for the user (prime the line, then RELEASE/IRRIGATE/NORMAL).
     enterFaultHold("DOSE_TIMEOUT", arg.c_str());
   } else if (resp == "INVALID") {
+    // ESP2 refuses this column outright: the COLUMN_ENABLED tables disagree (ESP1's is editable at runtime,
+    // ESP2's is compiled in). Retrying cannot help, and letting the retries run out would reset a healthy
+    // ESP2 for a config mismatch. Say what is wrong and leave the column alone until tomorrow.
+    if (wo.active && wo.stage == WO_SENT && (arg.startsWith("COL_DISABLED") || arg.startsWith("COLUMN"))) {
+      int c = wo.colIdx;
+      wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
+      if (c >= 0 && c < NUM_COLUMNS) col[c].lastServicedStamp = currentDayStamp;   // RAM only: a reboot may retry
+      forceAbort("COL_MISMATCH");
+      if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", "ESP2 has this column disabled"); forceCmdId[0] = 0; }
+      forceMask = 0;
+      runUiAbort("COL_MISMATCH");
+      String loc = (c >= 0 && c < NUM_COLUMNS) ? String("COL_") + COL_TAG[c] + "|ESP2 has it disabled" : String("COL_?");
+      raiseFault('M', "COL_MISMATCH", loc.c_str());
+      if (sysState == ACTIVE_STATE) setState(IDLE_STATE);
+      esp2SetPower(false);
+      return;
+    }
     // A recovery RESUME was refused. The usual cause is that ESP2 restarted during the hold and
     // lost its paused sequence (the mix-tank volume still survives in its NVS). Clear the held UI
     // and let the still-due column re-run normally -- ESP2 will fill only the remaining liters.
     if (esp2Held && arg.startsWith("NOT_HELD")) {
       esp2Held = false; wo.active = false; wo.stage = WO_IDLE;
+      esp2SetPower(false);                       // nothing left to hold: back to OFF-during-idle
       lastHeldClearReason = "esp2_restarted";
       resumeAwaitingAck = false;
       // Same re-hold-guard reset cancelRun() and the normal DONE-success path already do -- this is
@@ -3138,6 +3197,9 @@ void forceTick() {
   // and failure paths resolve it from there. Leaving a copy here would let a LATER abort (e.g. the
   // A-then-B second leg) report against a command that has already finished.
   fcCmdId[0] = '\0';
+  // Refused (too small a batch to dose, say): no run exists, so nothing would ever move this off
+  // FP_RUNNING, and every later force run, pulse and web manual hold would be refused until a reboot.
+  if (!wo.active && fcPhase == FP_RUNNING) forceAbort("REFUSED");
 }
 
 /* Operator FORCE run: build a work order from explicit litres + explicit per-nutrient mL instead of
@@ -3781,7 +3843,7 @@ void dispatchPendingRun() {
 void dispatchPendingExercise() {
   if (!pendingExercise.active || pendingExercise.sent) return;
   pendingExercise.sent = true;
-  esp2WarmupMs = millis();                       // now timing the 5 s run -> DONE,EXERCISE
+  esp2WarmupMs = millis();                       // now timing warmup + run -> DONE,EXERCISE
   // sendEsp2 logs the CMD,ESP2|EXERCISE intent line. START is logged only once ESP2 confirms receipt
   // (ACK,EXERCISE, handleEsp2Response), so the log reflects a genuine command reception, not just dispatch.
   // Carry the operator-set run length with the command so one setting covers every pump; ESP2
@@ -6703,6 +6765,12 @@ void firebaseCommandTick() {
         firebaseQueueStatus(c.id, "rejected", "nutrient mL out of range");
         logEvent("FIREBASE", "REJECT", "FORCE|DOSE_RANGE"); continue;
       }
+      // Tell the operator now, not after the countdown: sendForceWorkOrder would refuse this at fire time.
+      if ((c.doseMl[0] > 0.0f || c.doseMl[1] > 0.0f || c.doseMl[2] > 0.0f) &&
+          c.liters * (1.0f - FLUSH_PCT / 100.0f) < MIXING_TANK_SAFE_MIN) {
+        firebaseQueueStatus(c.id, "rejected", "batch too small to dose safely -- raise liters or remove nutrients");
+        logEvent("FIREBASE", "REJECT", "FORCE|BATCH_LOW"); continue;
+      }
       // Same hardware gate the local UI honours. Schedule/soil are deliberately NOT checked.
       // actuationsDisabled/webManualHeld() were previously missing here: forceTick()/
       // sendForceWorkOrder() both re-check them at fire time so no work order is actually sent
@@ -7140,7 +7208,7 @@ void firebaseCommandTick() {
     setState(ACTIVE_STATE);
     if (esp2Available && esp2Powered) dispatchPendingExercise();   // already up
     else                              esp2SetPower(true);          // warm up; READY dispatches
-    firebaseQueueStatus(c.id, "accepted", "5 second pump test started");
+    firebaseQueueStatus(c.id, "accepted", (String(exerciseRunS) + " second pump test started").c_str());
     logEvent("FIREBASE", "CMD", String("PUMP_TEST|") + EX_NAME[pump]);
   }
 }
@@ -7986,6 +8054,10 @@ void raiseFault(char tier, const char *code, const char *loc) {
   if (uiMode == UI_DIAG) {                          // fault while in Sensor Diag: stop streams + power ESP2 off
     diagStopStream(); esp2SetPower(false);
   }
+  // Same for Calibration. It has no confirm dialogs, so the preempt below always closes it; left running,
+  // ESP2 stays powered with its CAL stream live, and it then refuses the next work order as BUSY,CAL until
+  // the retries run out and RECOVERY_STATE resets it.
+  if (uiMode == UI_CAL) { if (calOpen) calCloseTarget(); esp2SetPower(false); }
   // Non-critical faults wait BEHIND an open confirm dialog (companion spec §B.3.1); Critical
   // force-dismisses (handled in enterEmergencyStop below). resetConfirm (the Reboot-ESP1 double-
   // confirm) is handled identically to restoreConfirm everywhere else in settingsButton() and is
@@ -8003,8 +8075,13 @@ void raiseFault(char tier, const char *code, const char *loc) {
 
 void enterEmergencyStop(bool cutPower) {
   // stop all actuators (sec.22.3) then optionally cut ESP2 power (sec.23.1.1)
+  if (uiMode == UI_CAL && calOpen) calCloseTarget();   // the Nano keeps its CAL stream otherwise
   esp2Serial.print(FRAME_START); esp2Serial.print(",STOP_ALL,"); esp2Serial.println(FRAME_END);
   logEvent("ESP1", "CMD", "ESP2|STOP_ALL");
+  // Let STOP_ALL actually reach ESP2 before the cut below (~20 ms on the wire, then ESP2 credits the running
+  // stage's litres to its NVS tank volume). Written straight to UART and cut at once, it never arrived, and
+  // the next fill could overfill. One-shot, relays are cut right after, and it is far inside the 8 s WDT.
+  if (cutPower) { esp2Serial.flush(); delay(40); }
   esp2Held = false;                                // a hard E-stop supersedes any held-fault recovery
   lastHeldClearReason = "estop";
   // One of the four documented esp2Held-clear sites; previously the only one (besides the
@@ -8081,6 +8158,7 @@ void cancelRun(int mode, const char *why, bool isAuto) {
   // STOP_ALL is what actually kills the pumps: on ESP2 it clears faultHeld, the work order, the
   // step and the timed-recovery latch, so nothing can resume behind our back.
   sendEsp2("STOP_ALL");
+  esp2Serial.flush(); delay(40);                                 // see enterEmergencyStop: the power-off below may be immediate
 
   wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
   pendingRun.active = false; pendingRun.colIdx = -1;

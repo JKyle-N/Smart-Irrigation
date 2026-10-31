@@ -36,10 +36,11 @@ Three microcontrollers with strict role separation:
 - **Framed UART protocol** `<START>,COMMAND,P1,P2,...,<END>` between all controllers — corrupt/partial packets are discarded, never executed.
 - **Per-column AUTO / IRRIGATION_ONLY / OFF** modes; windowed RTC scheduling (AUTO or perpetual MANUAL).
 - **Supervisor / work-order model** — ESP32 #1 hands ESP32 #2 a complete job and then monitors; ESP32 #2 owns the *how* and the timing.
-- **Open-loop nutrient dosing** toward target N-P-K (mg/kg) + pH, with a post-fertigation flush that keeps total water roughly constant. *(The mg/kg → mL calculation is a delegated stub — see `CLAUDE.md`.)*
-- **Non-blocking everywhere** — no `delay()` in any main loop; task watchdogs on both ESP32s, internal WDT on the Nano.
+- **Open-loop, gap-based nutrient dosing** (`calcDose()`): mL = gap × batch litres ÷ stock, pulse-quantized, against a lab soil baseline, with a post-fertigation flush that keeps total water roughly constant. pH is validated, not dosed. *(With the shipped constants nothing doses yet: see "Status".)*
+- **Non-blocking everywhere** — no `delay()` in normal loop flow (one 40 ms hand-off before an emergency power cut excepted); task watchdogs on both ESP32s, internal WDT on the Nano.
 - **ESP2 powered off during idle** (power saving); ESP32 #1 powers it up on demand for each run and powers it back off.
-- **GSM (A7670C)** alerts for all fault tiers, consolidated scheduled-run notices, and on-demand reports.
+- **GSM (A7670C)** alerts for all fault tiers, scheduled-run notices and on-demand reports, with send retries, delivery reports, a modem watchdog, a weekly `SIMTEST` text and an optional second alert number.
+- **Web dashboard + cloud** — Firebase RTDB live status and remote commands, ThingSpeak graphs, daily CSV upload to Supabase, all from a core-0 task. SMS and the LCD remain the authoritative stop paths.
 - **SD logging** — RTC-timestamped CSV, one file per day (`YYYYMMDD.CSV`), buffered/batched writes.
 - **Nano recovery ladder (2 layers)** — Nano internal WDT → ESP32 #1 `RESET_REQ` (after 5 consecutive garbage packets). The old hardware-reset layer was removed when PCF8575 **P17** became the master actuator-power cutoff.
 - **P17 master cutoff + tank-aware fault hold** — on a hard ESP2 fault, ESP2 drops the P17 master power relay (bank goes dead, fail-safe), pauses, and *stays alive* holding the metered mixing-tank volume (persisted to NVS). ESP1 keeps ESP2 powered and alerts over GSM with the operation + column; recovery is user-gated: reply `STOP` / `RELEASE` / `IRRIGATE` / `NORMAL`.
@@ -75,7 +76,7 @@ cd ESP2 && pio run -e esp32dev -t upload
 ```
 
 Library dependencies are declared in each `platformio.ini` and fetched automatically
-(LiquidCrystal_I2C, RTClib, EspSoftwareSerial, INA226 for ESP1; PZEM-004T-v30 for ESP2).
+(LiquidCrystal_I2C, RTClib, EspSoftwareSerial, ArduinoJson for ESP1; PZEM-004T-v30 for ESP2).
 
 ### Arduino Nano — PlatformIO or Arduino IDE
 
@@ -100,7 +101,7 @@ flasher app or a web flasher). No compiler needed on the device.
 ## Pin / bus map (summary — see spec §17–19 for the authoritative version)
 
 **ESP32 #1:** Nano link EspSoftwareSerial GPIO16/17 · ESP2 link HW UART1 GPIO25/33 ·
-A7670C HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, INA226 0x40, DS3231 0x68) ·
+A7670C HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, secondary-battery INA226 0x40, ADS1115 0x48, DS3231 0x68) ·
 microSD SPI GPIO23/19/18/5 · buttons GPIO0/12/13/15/2 · ESP2 power relay GPIO4.
 
 **ESP32 #2:** ESP1 link HW UART2 GPIO16/17 · PZEM-004T HW UART1 GPIO13/14 ·
@@ -117,11 +118,12 @@ RS485/NPK D8/D9/D10 · soil A0–A3 + A6/A7 · BH1750 I2C A4/A5.
 | Command | Action |
 |---------|--------|
 | `SET,COL_A,N,150,P,40,K,200,pH,5.8` | Set per-column nutrient targets (mg/kg) + pH |
-| `SET,COL_A,PRESET,CARROT` | Apply a built-in crop preset |
+| `SET,COL_A,PRESET,PECHAY` | Apply a built-in crop preset (`PECHAY`, `TOMATO_S1`–`S3`) |
 | `NAME,COL_A,Lettuce` | Name a column (persisted in NVS) |
 | `MODE,COL_A,AUTO` / `MODE,COL_A,IRRIGATION_ONLY` | Per-column mode |
 | `STATUS` | Live status + daily summary report |
 | `SUMMARY` | Today's-activity digest, parsed from the SD log |
+| `SIMTEST` / `BAL` / `USSD,<code>` / `ALERTNUM,<number>` | SIM check, carrier balance, balance code, second alert phone |
 | `STOP,ALL` | Emergency stop |
 | `STOP` / `RELEASE` / `IRRIGATE` / `NORMAL` | Fault-hold recovery (only while a fault is held): acknowledge & hold / dump tank to its column / finish irrigation-only / resume the paused run |
 
@@ -135,17 +137,19 @@ and compact daily/on-demand reports (`RPT,...` / `SUM,...`).
 Hardware-dependent values are tagged in the source as `[MEASURE]`, `[TBD]`, or `[CONFIRM]`
 (soil ADC calibration, ultrasonic tank geometry, flow K-factors, NPK Modbus addresses/baud,
 EC/pH safe windows, battery thresholds, INA226 shunt, ACS712 sensitivity, the GSM recipient
-number, etc.). Set these for your rig before deployment. The nutrient mg/kg → mL dosing
-calculation is intentionally left as an editable stub (see `CLAUDE.md`).
+number, etc.). Set these for your rig before deployment: `Calibration_Worksheet.md` ranks them
+and `Commissioning_Flash_Plan.md` stages the testing.
 
 ---
 
 ## Status
 
-All three controllers compile cleanly (PlatformIO `esp32dev` / `nanoatmega328`). The
-ESP32 #2 work-order execution path is implemented to spec and can be fully end-to-end
-tested once the ESP32 #2 hardware is assembled. This is active thesis work — values marked
-for commissioning are not yet final.
+All three controllers compile cleanly (PlatformIO `esp32dev` / `nanoatmega328`) and the host
+tests pass (`pio test -e native`: 80 on ESP1, 13 on ESP2). **The current firmware has not been
+flashed to the rig**, so none of it is proven on hardware yet. **With the shipped constants
+fertigation doses nothing:** the 4 L batch is under the 5 L dosing floor, and most preset targets
+sit below the lab soil baseline. See `SESSION_HANDOFF.md` §5, item 19. This is active thesis work —
+values marked for commissioning are not yet final.
 
 ---
 

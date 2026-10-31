@@ -186,6 +186,20 @@ and `PWR2` in the log. Do this stage only once the controllers ride through the 
 > boards are ever left on the secondary after a run ends (`boardSupply` stuck at `secondary`), or a
 > third switch reset happens after `BATT_SWITCH_FAULT` latched.
 
+### Audit checks (add to stage B)
+
+Added by the 2026-11-01 audit, unproven on hardware. With water only:
+
+1. **Flow stall.** During a fill, once flow has started, close a hand valve so no more water passes the
+   transfer meter. The pump must stop about 10 s later with `FLOW_FAIL,TRANSFER|pulses=<n>`, n > 0.
+2. **Mixer.** During a mix, the mixer starts about 5 s after the inverter, and the run shows no
+   `MIXER_NOLOAD` or `MIXER_OC` under a normal load.
+3. **E-stop bookkeeping.** Press MODE+BACK during a fill and compare `tank=` on the next work order's
+   serial line against the water actually in the tank.
+
+> **Abort if** a pump keeps running after flow stops. If a false `FLOW_FAIL` appears mid-fill, raise
+> `FLOW_STALL_MS` before going further.
+
 ### M — A7670C modem (run before relying on any SMS, in any stage)
 
 Everything here has only run against a simulated modem built from the AT manual, so this stage is where
@@ -250,13 +264,12 @@ Bisecting costs about six flash cycles, which is why it is the fallback rather t
 
 ## Known-good reference
 
-`main` builds clean on all three controllers (confirmed 2026-10-26, after merging Sugian's
-2026-09 work and the hold-to-run cap / PZEM warmup / battery-gate adjustments):
+All three controllers build clean (confirmed 2026-11-01, after the A7670C swap and the firmware audit):
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 23.6 % (77,304 B) | 41.2 % (1,297,133 B) |
-| ESP2 | 7.1 % (23,228 B) | 25.8 % (337,705 B) |
+| ESP1 | 24.6 % (80,600 B) | 41.8 % (1,315,533 B) |
+| ESP2 | 7.1 % (23,252 B) | 25.9 % (339,665 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 A build that differs sharply from these has picked up something unintended.
@@ -264,16 +277,16 @@ A build that differs sharply from these has picked up something unintended.
 ## Still outstanding
 
 - The device account password (see `Firebase infos.txt`) has never been rotated.
-- The SMS Summary/Status feature was specified but never implemented.
+- `SESSION_HANDOFF.md` §5 holds the current list, including item 19: **with the shipped constants, fertigation doses nothing.** Settle it before stage G.
 
 ## Host test suite
 
-Both suites pass — 80 cases for ESP1, 7 for ESP2 — and are worth running before any flash, since
+Both suites pass — 80 cases for ESP1, 13 for ESP2 — and are worth running before any flash, since
 they take seconds and cover the maths the dosing depends on and the modem driver:
 
 ```bash
 cd ESP1 && pio test -e native     # 80 cases, including a simulated A7670C
-cd ESP2 && pio test -e native     # 7 cases
+cd ESP2 && pio test -e native     # 13 cases
 ```
 
 MinGW-w64 (g++ 14.2.0) is installed and on the persisted PATH, so this works from **a new terminal**.
