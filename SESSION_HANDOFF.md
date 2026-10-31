@@ -3,9 +3,10 @@
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 
-Last updated: **2026-10-30** — toolchain pinned after ESP1 stopped linking on the newest platform;
-LCD Thresholds/Column Mode truncation fixed; new open decisions logged in §5 (items 15–18).
-Previous: 2026-10-26, after merging Sugian's 2026-09 work (branch `merge/sugian-2026-09`).
+Last updated: **2026-11-01** — SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
+`CLAUDE.md` "LOCKED: GSM behavior". Commissioning stage M covers it.
+Previous: 2026-10-30, toolchain pinned after ESP1 stopped linking on the newest platform; LCD
+Thresholds/Column Mode truncation fixed; new open decisions logged in §5 (items 15–18).
 
 ---
 
@@ -69,7 +70,7 @@ cd ESP2 && pio run
 cd Nano && pio run
 
 # host unit tests -- ~10 seconds each, no hardware needed
-cd ESP1 && pio test -e native     # 33 cases
+cd ESP1 && pio test -e native     # 80 cases (33 pure maths + 47 simulated A7670C)
 cd ESP2 && pio test -e native     #  7 cases
 
 # website
@@ -79,19 +80,32 @@ node -e "JSON.parse(require('fs').readFileSync('Website/firebase-rules.json','ut
 firebase deploy --only database --dry-run   # validates rules WITHOUT deploying (run from Website/)
 ```
 
-Known-good build sizes after the 2026-10-26 switch-reset protection (both `SECONDARY_BATT_ENABLED 0`)
-— a sharp deviation means something unintended was picked up. With both flags at 1: ESP1 1,307,881 B
-flash, ESP2 340,393 B. Host tests: ESP1 33 cases, ESP2 7.
+Known-good build sizes after the A7670C swap (both `SECONDARY_BATT_ENABLED 0`) — a sharp deviation
+means something unintended was picked up. ESP1 before the swap: 77,400 B RAM, 1,305,857 B flash. Host
+tests: ESP1 80 cases, ESP2 7.
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 23.6 % (77,400 B) | 41.5 % (1,305,861 B) |
+| ESP1 | 24.6 % (80,600 B) | 41.8 % (1,313,949 B) |
 | ESP2 | 7.1 % (23,236 B) | 25.9 % (339,081 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
 ## 4. What the last sessions added
+
+**2026-11-01 — A7670C replaces the SIM800L on ESP1.** The user confirmed the module works with the bench
+sketch, but the integrated firmware is **unflashed**: it is host-tested against a simulated modem only.
+- **New module:** `ESP1/include/gsm_modem.h` + `ESP1/test/test_gsm_modem` (47 cases). `main.cpp` keeps
+  `handleSms` and every SMS keyword; only the modem layer moved.
+- **Add-ons the user chose:** send retries + delivery reports, modem watchdog (soft reset), weekly
+  `SIMTEST` + USSD balance, second alert number. **Reserved, not built:** network time (`AT+CTZU`), to
+  add if the RTC gives trouble.
+- **Security fixes found on the way:** a multi-line SMS could forge a `+CMT:` line with the owner's
+  number, and a sender-less SMS passed `senderIsOwner()`. Both are closed and tested.
+- **Not checked against the real module:** boot-time messages (the manual does not list them; the driver
+  watches `RDY`, `*ATREADY`, `SMS DONE` but also recovers by re-detecting), and `+CDS` / `+CSDH` formats.
+- **Rewiring needed:** ESP1 uses GPIO26/27, not the bench sketch's GPIO16/17.
 
 **2026-10-26 (later) — switch-reset protection + review fixes.** See CLAUDE.md "LOCKED: switch-reset
 protection".

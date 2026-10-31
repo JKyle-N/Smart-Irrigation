@@ -3,7 +3,7 @@
 A solar-powered automated irrigation and fertigation system for precision agriculture
 (undergraduate thesis project). It maintains soil moisture and nutrient levels per plant
 column using sensor-driven decisions, doses nutrients open-loop toward a target N-P-K, and
-supports remote monitoring/control over GSM (SIM800L).
+supports remote monitoring/control over GSM (A7670C).
 
 The full design specification is in
 [`Smart_Irrigation_System_Reference_FINAL.md`](Smart_Irrigation_System_Reference_FINAL.md)
@@ -39,7 +39,7 @@ Three microcontrollers with strict role separation:
 - **Open-loop nutrient dosing** toward target N-P-K (mg/kg) + pH, with a post-fertigation flush that keeps total water roughly constant. *(The mg/kg → mL calculation is a delegated stub — see `CLAUDE.md`.)*
 - **Non-blocking everywhere** — no `delay()` in any main loop; task watchdogs on both ESP32s, internal WDT on the Nano.
 - **ESP2 powered off during idle** (power saving); ESP32 #1 powers it up on demand for each run and powers it back off.
-- **GSM (SIM800L)** alerts for all fault tiers, consolidated scheduled-run notices, and on-demand reports.
+- **GSM (A7670C)** alerts for all fault tiers, consolidated scheduled-run notices, and on-demand reports.
 - **SD logging** — RTC-timestamped CSV, one file per day (`YYYYMMDD.CSV`), buffered/batched writes.
 - **Nano recovery ladder (2 layers)** — Nano internal WDT → ESP32 #1 `RESET_REQ` (after 5 consecutive garbage packets). The old hardware-reset layer was removed when PCF8575 **P17** became the master actuator-power cutoff.
 - **P17 master cutoff + tank-aware fault hold** — on a hard ESP2 fault, ESP2 drops the P17 master power relay (bank goes dead, fail-safe), pauses, and *stays alive* holding the metered mixing-tank volume (persisted to NVS). ESP1 keeps ESP2 powered and alerts over GSM with the operation + column; recovery is user-gated: reply `STOP` / `RELEASE` / `IRRIGATE` / `NORMAL`.
@@ -100,7 +100,7 @@ flasher app or a web flasher). No compiler needed on the device.
 ## Pin / bus map (summary — see spec §17–19 for the authoritative version)
 
 **ESP32 #1:** Nano link EspSoftwareSerial GPIO16/17 · ESP2 link HW UART1 GPIO25/33 ·
-SIM800L HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, INA226 0x40, DS3231 0x68) ·
+A7670C HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, INA226 0x40, DS3231 0x68) ·
 microSD SPI GPIO23/19/18/5 · buttons GPIO0/12/13/15/2 · ESP2 power relay GPIO4.
 
 **ESP32 #2:** ESP1 link HW UART2 GPIO16/17 · PZEM-004T HW UART1 GPIO13/14 ·

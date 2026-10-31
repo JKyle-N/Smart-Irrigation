@@ -38,6 +38,10 @@ ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS 
 | `FULL SUMMARY[,<day>]` | `FULL SUMMARY,20260625` | The day's **hour-by-hour** record + de-duplicated errors + run/dose events + peaks. Can span several texts. | `FULL,… (i/N)` |
 | `NET` | `NET` | WiFi / ThingSpeak link status. | `NET,WiFi:…` (see §4) |
 | `BATTSW` / `BATTSW,CLEAR` | `BATTSW,CLEAR` | Battery-switch status, or clear a latched `BATT_SWITCH_FAULT` (re-arms switching to the secondary battery). | `BATTSW,ON,OK,strikes=0/2,supply=MAIN` / `ACK,BATTSW,CLEARED` |
+| `SIMTEST` | `SIMTEST` | Checks the SIM and modem. Also sent by itself every Sunday with the 18:00 report: **if a Sunday passes with no `SIMTEST` text, check the SIM's load and the modem.** | `SIMTEST,sig=22,reg=Y,stat=1,sent=5,gaveup=0,dlv=5,undlv=0,resets=0` |
+| `USSD,<code>` / `USSD,CLEAR` | `USSD,*143#` | Save your carrier's balance code, or clear it. It is also checked with the Sunday `SIMTEST`. | `USSD,*143#` |
+| `BAL` | `BAL` | Ask the carrier for the SIM's balance. `BAL,FAIL,ERROR` means the module or carrier refused the request. | `BAL,<carrier's text>` |
+| `ALERTNUM,<number>` / `ALERTNUM,CLEAR` | `ALERTNUM,09171234567` | Set or clear a second phone that also gets `ALERT` texts. It only receives: commands from it are refused. | `ALERTNUM,09171234567` |
 | `SET,COL_x,N,..,P,..,K,..,pH,..` | `SET,COL_A,N,150,P,40,K,200,pH,5.8` | Set per-column nutrient targets (mg/kg) + pH. Any subset of N/P/K/pH may be given. | `ACK,SET,COL_A` |
 | `SET,COL_x,PRESET,<CROP>` | `SET,COL_B,PRESET,LETTUCE` | Apply a built-in crop preset (see §7). | `ACK,SET,COL_B,PRESET,LETTUCE` |
 | `MODE,COL_x,AUTO` | `MODE,COL_A,AUTO` | Column decides irrigate-vs-fertigate automatically (by the nutrient gap). | `ACK,MODE,COL_A,AUTO` |

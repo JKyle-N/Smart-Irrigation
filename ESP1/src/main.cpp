@@ -7,7 +7,7 @@
  *    - Decides per-column irrigation vs. fertigation (windowed schedule + soil
  *      threshold + NPK gap), and hands COMPLETE work orders to ESP32 #2
  *      (supervisor / work-order model, sec.9.8.1.1) -- then monitors.
- *    - Talks to the user over SIM800L SMS (alerts, run notices, daily report).
+ *    - Talks to the user over A7670C SMS (alerts, run notices, daily report).
  *    - Logs every event to microSD (CSV, RTC-stamped, sec.25).
  *    - Monitors battery via INA226 (display/log/telemetry only -- no battery-triggered
  *      stops/alerts); classifies OTHER faults (3 tiers, sec.23).
@@ -18,9 +18,8 @@
  *  3) is built last, so the ESP2-facing work-order path is implemented to spec
  *  here but can only be end-to-end tested once ESP32 #2 exists.
  *
- *  NON-BLOCKING: no delay() in loop(); the SIM800L AT power-up sequence uses
- *  one-time delays in setup() only (proven sequence). Task watchdog petted each
- *  loop iteration.
+ *  NON-BLOCKING: no delay() in loop(); the A7670C driver (include/gsm_modem.h) brings
+ *  the modem up from loop() and keeps retrying. Task watchdog petted each loop iteration.
  *
  *  DELEGATED (spec sec.12.4 / CLAUDE.md): the mg/kg -> mL dosing CALCULATION is
  *  out of scope and left as a clearly-marked STUB with editable tables.
@@ -44,6 +43,7 @@
 #include <WebServer.h>           // SoftAP provisioning portal (WiFi setup form)
 #include <DNSServer.h>           // captive-portal DNS for the provisioning AP
 #include "pure_math.h"           // soil/level/pulse maths -- host-testable, see ESP1/test/
+#include "gsm_modem.h"           // A7670C SMS driver -- host-tested against a simulated modem
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
 #endif
@@ -57,8 +57,8 @@
 #define NANO_TX_PIN   17        // EspSoftwareSerial TX  (-> Nano D0 RX)
 #define ESP2_RX_PIN   33        // HW UART1 RX  (<- ESP2 GPIO17 TX)
 #define ESP2_TX_PIN   25        // HW UART1 TX  (-> ESP2 GPIO16 RX)
-#define SIM_RX_PIN    26        // HW UART2 RX  (<- SIM800L TX)
-#define SIM_TX_PIN    27        // HW UART2 TX  (-> SIM800L RX)
+#define SIM_RX_PIN    26        // HW UART2 RX  (<- A7670C TX)
+#define SIM_TX_PIN    27        // HW UART2 TX  (-> A7670C RX)
 #define I2C_SDA       21
 #define I2C_SCL       22
 #define SD_SCK        18
@@ -86,7 +86,8 @@
 #define DEBUG_BAUD   115200
 #define NANO_BAUD      9600
 #define ESP2_BAUD      9600
-#define SIM_BAUD       9600
+// The A7670C's baud is auto-detected (GSM_BAUDS in gsm_modem.h, 115200 first).
+#define SIM_RX_BUFFER  2048     // ~180 ms of 115200 traffic; the default 256 B is only ~22 ms of loop stall
 
 /* ---- I2C addresses ------------------------------------------------------- */
 #define LCD_ADDR     0x27
@@ -95,6 +96,9 @@
 
 /* ---- GSM ----------------------------------------------------------------- */
 String PHONE_NUMBER = "09150424784";    // [CONFIRM] recipient for alerts/reports
+String ALERT_NUMBER2 = "";              // second recipient, ALERT texts only and no command rights (SMS ALERTNUM, NVS)
+String USSD_CODE     = "";              // carrier balance code for BAL / the weekly check (SMS USSD, NVS); carrier-specific
+const uint8_t SIM_CHECK_WEEKDAY = 0;    // weekly SIMTEST text goes with this day's report (0 = Sunday)
 
 /* ---- Columns (spec sec.14.1.4.1) ----------------------------------------- */
 #define NUM_COLUMNS 3
@@ -330,9 +334,6 @@ int  exerciseRunS    = 5;       // seconds per exercise, EX_RUN_MIN..EX_RUN_MAX 
 const int EX_RUN_MIN = 1, EX_RUN_MAX = 10;
 void saveExercise();
 const unsigned long PUMP_EXERCISE_TIMEOUT_MS  = 20000;        // ESP2 boot + 5 s run + margin
-
-/* ---- GSM live-health poll (LCD PAGE_GSM, modeled on GSM-WITH-LCD bench) ---- */
-const unsigned long GSM_HEALTH_INTERVAL_MS = 15000;  // AT+CSQ/CREG/CPIN refresh
 
 /* ---- Power logging throttle (B3, spec sec.25.2.1: not every read) --------- */
 const unsigned long PWR_LOG_INTERVAL_MS = 60000;     // log a PWR snapshot ~1/min (+ on state change)
@@ -653,35 +654,21 @@ bool summaryPending = false;    // deferred SUMMARY/FULL report (same pattern as
 // Remembered request shape for a deferred summary (fired by scheduleTick when idle).
 // (SumMode/long defined with the summary globals below; declared here for the pending slot.)
 
-/* ---- GSM live health (LCD PAGE_GSM) -------------------------------------- */
+/* ---- GSM live health, mirrored from the driver each loop (LCD PAGE_GSM, logs, dashboard) ---------- */
 int  lastRssi      = -1;        // AT+CSQ RSSI 0..31 (99/-1 = no signal)
-bool netRegistered = false;     // AT+CREG stat 1 (home) or 5 (roaming)
-int  lastCreg      = -1;        // AT+CREG raw stat (2=searching, 3=denied, etc.) -- logged, not just the bool
+bool netRegistered = false;     // registered on CREG or CEREG (LTE); see gsmRegStatOk
+int  lastCreg      = -1;        // the registered one of CEREG/CREG, else raw CREG (2=searching, 3=denied, etc.)
+int  lastCereg     = -1;        // raw AT+CEREG stat, for the logs
 bool simReady      = false;     // AT+CPIN? == READY
 unsigned long lastGsmHealthMs = 0;
-uint8_t gsmHealthStep = 0;      // round-robin: 0=CSQ 1=CREG 2=CPIN
 
-// Outbound SMS queue + non-blocking send FSM. sendSMS() only enqueues; gsmTxTick()
-// drives the AT exchange with millis() timing so fault/alert paths never stall the
-// loop (CLAUDE.md: non-blocking everywhere -- protects UART/flow/watchdog timing).
-#define SMS_QUEUE_SIZE 8
-String   smsQueue[SMS_QUEUE_SIZE];
-String   smsTo[SMS_QUEUE_SIZE];        // per-message recipient (see sendSMS)
-uint8_t  smsHead = 0, smsTail = 0, smsCount = 0;
+// The driver owns the modem, its outbound queue and every AT exchange (include/gsm_modem.h).
+// sendSMS() only enqueues, so fault/alert paths never stall the loop.
+GsmModem gsm;
 // Reply target for messages generated while handling an INBOUND command: set to the
-// sender's number in pollGSM so STATUS/ACK replies go back to whoever texted. Empty
+// sender's number in gsmOnSms so STATUS/ACK replies go back to whoever texted. Empty
 // => autonomous alerts/reports go to the configured owner PHONE_NUMBER.
 String   replyTarget = "";
-enum GsmTx { GTX_IDLE, GTX_CMGF_WAIT, GTX_PROMPT_WAIT, GTX_BODY_SETTLE };
-GsmTx    gtx = GTX_IDLE;
-unsigned long gtxMs = 0;
-String   gtxMsg;
-String   gtxTo;                        // recipient of the in-flight outbound message
-bool     gtxResultSeen = false;        // saw +CMGS/+CMS ERROR for the in-flight send (else -> TX_UNKNOWN)
-const unsigned long GSM_CMGF_SETTLE_MS    = 300;
-const unsigned long GSM_PROMPT_TIMEOUT_MS = 5000;
-const unsigned long GSM_BODY_SETTLE_MS    = 1500;
-const unsigned long GSM_SEND_RESULT_TIMEOUT_MS = 6000;  // hard cap waiting for +CMGS/+CMS ERROR after CTRL+Z
 
 /* ---- WiFi + ThingSpeak telemetry (Part A) -------------------------------- *
  * ESP32 #1 joins the nearby WiFi and uploads a numeric snapshot to ThingSpeak,
@@ -1594,10 +1581,11 @@ void i2cBusRecover();
 
 void pollGSM();
 void gsmTxTick();
-void gsmFeedInbound(char c);
-void gsmHealthTick();
+void gsmBegin();
+void simHealthCheck();
 void handleSms(const String &body);
 void sendSMS(const String &msg);
+void smsEnqueueSplit(const String &msg, const String &to, uint8_t retries);
 void sendDailyReport();
 void startSummaryJob(SumMode mode, long targetStamp);
 static long resolveSummaryDay(const String &arg);
@@ -1766,16 +1754,7 @@ void setup() {
   // ---- UART links ----
   nanoSerial.begin(NANO_BAUD);
   esp2Serial.begin(ESP2_BAUD, SERIAL_8N1, ESP2_RX_PIN, ESP2_TX_PIN);
-  simSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
-
-  // ---- SIM800L AT init (proven sequence; one-time setup delays OK) ----
-  delay(3000);                              // network/module stabilize
-  simSerial.println("AT");                  delay(300);
-  simSerial.println("AT+CMGF=1");           delay(300);   // text mode
-  simSerial.println("AT+CSCS=\"GSM\"");     delay(300);
-  simSerial.println("AT+CNMI=2,2,0,0,0");   delay(300);   // push +CMT on receive
-  simSerial.println("AT+CSMP=17,167,0,0");  delay(300);
-  while (simSerial.available()) simSerial.read();
+  gsmBegin();                               // opens UART2; the modem itself comes up from loop()
 
   // ---- sensor snapshot defaults (invalid until first packet) ----
   sensor.envValid = sensor.tankValid = sensor.lightValid = false;
@@ -1825,8 +1804,7 @@ void loop() {
   g_lastStage = 'N'; pollNano();
   g_lastStage = 'E'; pollESP2();
   g_lastStage = 'G'; pollGSM();
-  g_lastStage = 'g'; gsmTxTick();
-  g_lastStage = 'q'; gsmHealthTick();      // periodic AT+CSQ/CREG/CPIN (PAGE_GSM)
+  g_lastStage = 'g'; gsmTxTick();          // bring-up, sends, stored SMS, health queries, watchdog
 
   g_lastStage = 'M'; stateMachineTick();
   g_lastStage = 'C'; controlTick();
@@ -2035,6 +2013,8 @@ void loadConfig() {
   // WiFi + ThingSpeak (Part A/B): creds + write keys persist in NVS.
   wifiEnabled = prefs.getBool("wifien", true);   // WiFi master switch (Settings > WiFi)
   PHONE_NUMBER = prefs.getString("owner", PHONE_NUMBER);   // owner number (portal-editable; SMS gating)
+  ALERT_NUMBER2 = prefs.getString("owner2", "");           // second alert recipient (SMS ALERTNUM)
+  USSD_CODE     = prefs.getString("ussd", "");             // carrier balance code (SMS USSD)
   adminPin     = prefs.getString("apin", ADMIN_PIN_DEFAULT); // portal admin PIN
   wifiSsid = prefs.getString("wssid", "");
   wifiPass = prefs.getString("wpass", "");
@@ -3836,69 +3816,42 @@ void exerciseTick() {
 }
 
 /* =============================================================================
- *  GSM  (inbound SMS parse + outbound, proven SIM800L pattern)
+ *  GSM  (A7670C; the modem logic lives in include/gsm_modem.h, this is the wiring)
  * ========================================================================== */
+static void gsmWrite(const char *data, size_t len) { simSerial.write((const uint8_t *)data, len); }
+static void gsmSetBaud(uint32_t baud) { simSerial.updateBaudRate(baud); }
+static void gsmLog(const char *detail) { logEvent("GSM", "GSM", detail); }
+
+static void gsmOnSms(const char *sender, const char *body) {
+  logEvent("GSM", "GSM", String("RX|") + body);
+  replyTarget = sender;
+  handleSms(body);                                   // replies enqueue with replyTarget (the sender)
+  replyTarget = "";                                  // back to owner PHONE_NUMBER for autonomous msgs
+  wakeBacklight();
+}
+
+static void gsmOnUssd(bool ok, const char *text) {
+  sendSMS(String(ok ? "BAL," : "BAL,FAIL,") + text); // ERROR here usually means the carrier/IMS refused USSD
+}
+
+void gsmBegin() {
+  static const GsmModem::Callbacks cb = { gsmWrite, gsmSetBaud, gsmOnSms, gsmOnUssd, gsmLog };
+  gsm.begin(cb, millis());
+  simSerial.setRxBufferSize(SIM_RX_BUFFER);          // must precede begin()
+  simSerial.begin(gsm.baud(), SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+}
+
 void pollGSM() {
-  if (gtx != GTX_IDLE) return;          // gsmTxTick owns the SIM UART now (it routes inbound too, B5)
-  while (simSerial.available()) gsmFeedInbound((char)simSerial.read());
+  while (simSerial.available()) gsm.feed((char)simSerial.read(), millis());
 }
 
-// Shared SIM inbound line parser. Handles +CMT push (sender + body) AND the solicited
-// health replies (+CSQ/+CREG/+CPIN) for PAGE_GSM. Called from BOTH pollGSM (idle) and
-// gsmTxTick (mid-send) so an inbound command is never dropped during an outbound SMS (B5).
-void gsmFeedInbound(char c) {
-  static String line;
-  static bool expectBody = false;
-  if (c == '\n') {
-    line.trim();
-    if (line.startsWith("+CMT:")) {                 // incoming SMS header: sender in 1st quoted field
-      int q1 = line.indexOf('"');
-      int q2 = (q1 >= 0) ? line.indexOf('"', q1 + 1) : -1;
-      replyTarget = (q1 >= 0 && q2 > q1) ? line.substring(q1 + 1, q2) : "";
-      expectBody = true;                            // next non-empty line is the message body
-    } else if (line.startsWith("+CSQ:")) {          // signal quality
-      lastRssi = line.substring(5).toInt();
-    } else if (line.indexOf("+CREG:") >= 0) {       // network registration: stat after the comma
-      int cm = line.indexOf(',');
-      int stat = (cm >= 0) ? line.substring(cm + 1).toInt() : -1;
-      lastCreg = stat;                              // keep the raw stat (2=searching,3=denied) for logging
-      netRegistered = (stat == 1 || stat == 5);
-    } else if (line.indexOf("+CPIN:") >= 0) {       // SIM ready?
-      simReady = (line.indexOf("READY") >= 0);
-    } else if (line.startsWith("+CMGS:")) {          // send ACCEPTED by the network -> message reference
-      gtxResultSeen = true;
-      String ref = line.substring(6); ref.trim();    // strip the space after the colon
-      logEvent("GSM", "GSM", "TX_OK|" + ref);
-    } else if (line.startsWith("+CMS ERROR:")) {     // send REJECTED -> numeric code (no credit / no reg / bad recipient)
-      gtxResultSeen = true;
-      String code = line.substring(11); code.trim();
-      logEvent("GSM", "GSM", "TX_ERR|" + code);
-    } else if (line == "ERROR" && gtx == GTX_BODY_SETTLE) {   // bare ERROR during a send = rejection w/o a code
-      gtxResultSeen = true;
-      logEvent("GSM", "GSM", "TX_ERR|GENERIC");
-    } else if (expectBody && line.length() > 0) {
-      logEvent("GSM", "GSM", "RX|" + line);
-      handleSms(line);                              // replies enqueue with replyTarget (the sender)
-      replyTarget = "";                             // back to owner PHONE_NUMBER for autonomous msgs
-      expectBody = false;
-      wakeBacklight();
-    }
-    line = "";
-  } else if (c != '\r') {
-    line += c;
-    if (line.length() > 180) line = "";
-  }
-}
-
-// Periodic GSM health poll for PAGE_GSM (modeled on the GSM-WITH-LCD bench). Issues the
-// three queries only when no outbound send is in flight; replies parse in gsmFeedInbound.
-void gsmHealthTick() {
-  if (gtx != GTX_IDLE) return;                       // never interleave with an outbound send
-  if (millis() - lastGsmHealthMs < GSM_HEALTH_INTERVAL_MS) return;
-  lastGsmHealthMs = millis();
-  simSerial.println("AT+CSQ");                        // -> +CSQ: rssi,ber
-  simSerial.println("AT+CREG?");                      // -> +CREG: n,stat
-  simSerial.println("AT+CPIN?");                      // -> +CPIN: READY
+// Weekly (and on demand): prove the SIM can still reach the owner. The text itself is the check -- a
+// week without one means the SIM, its load or the modem needs looking at.
+void simHealthCheck() {
+  sendSMS(String("SIMTEST,sig=") + lastRssi + ",reg=" + (netRegistered ? "Y" : "N") + ",stat=" + lastCreg +
+          ",sent=" + gsm.txOk() + ",gaveup=" + gsm.txGaveUp() + ",dlv=" + gsm.delivered() +
+          ",undlv=" + gsm.undelivered() + ",resets=" + gsm.resets());
+  if (USSD_CODE.length()) gsm.requestUssd(USSD_CODE.c_str());
 }
 
 // Parse compact comma commands (spec sec.12.2). Keyword match is case-insensitive.
@@ -4132,6 +4085,38 @@ void handleSms(const String &body) {
             ",strikes=" + bswStrikes + "/" + BSW_LATCH_STRIKES + ",supply=" + (esp2OnSecondary ? "SECONDARY" : "MAIN"));
     return;
   }
+  // SIMTEST -- the weekly SIM check, on demand.  BAL -- carrier balance via USSD.
+  if (U == "SIMTEST") { simHealthCheck(); return; }
+  if (U == "BAL") {
+    if (!USSD_CODE.length()) { sendSMS("ERR,BAL,NOCODE"); return; }
+    if (!gsm.requestUssd(USSD_CODE.c_str())) sendSMS("ERR,BAL,BUSY");
+    return;                                 // the answer arrives through gsmOnUssd, to the owner
+  }
+  // USSD,<code> | USSD,CLEAR -- carrier balance code for BAL and the weekly check. USSD = show it.
+  if (U == "USSD" || U.startsWith("USSD,")) {
+    if (U != "USSD") {
+      String code = b.substring(5); code.trim();
+      if (code.equalsIgnoreCase("CLEAR")) code = "";
+      else if (!gsmUssdCodeOk(code.c_str())) { sendSMS("ERR,USSD,FORMAT"); return; }
+      USSD_CODE = code;
+      prefs.putString("ussd", USSD_CODE);
+    }
+    sendSMS("USSD," + (USSD_CODE.length() ? USSD_CODE : String("-")));
+    return;
+  }
+  // ALERTNUM,<number> | ALERTNUM,CLEAR -- second recipient for ALERT texts. It receives only: its
+  // commands are still refused, because owner-gating looks at PHONE_NUMBER alone. ALERTNUM = show it.
+  if (U == "ALERTNUM" || U.startsWith("ALERTNUM,")) {
+    if (U != "ALERTNUM") {
+      String num = b.substring(9); num.trim();
+      if (num.equalsIgnoreCase("CLEAR")) num = "";
+      else if (!gsmNumberOk(num.c_str())) { sendSMS("ERR,ALERTNUM,FORMAT"); return; }
+      ALERT_NUMBER2 = num;
+      prefs.putString("owner2", ALERT_NUMBER2);
+    }
+    sendSMS("ALERTNUM," + (ALERT_NUMBER2.length() ? ALERT_NUMBER2 : String("-")));
+    return;
+  }
   // NET -- WiFi/ThingSpeak link status (Part B)
   if (U == "NET") {
     String ss; xSemaphoreTake(netMux, portMAX_DELAY); ss = wifiSsid; xSemaphoreGive(netMux);
@@ -4339,72 +4324,41 @@ void sendSMS(const String &msg) {
   // scattered rejection sites catches every path, including ones added later. logEvent never calls
   // back into sendSMS, so this cannot recurse.
   if (msg.startsWith("ERR,")) logEvent("GSM", "SMS_ERR", msg.substring(4));
-  if (smsCount >= SMS_QUEUE_SIZE) {                     // queue full: drop oldest, keep newest alert
-    smsHead = (smsHead + 1) % SMS_QUEUE_SIZE;
-    smsCount--;
-    logEvent("GSM", "GSM", "TX|DROP_QUEUE_FULL");
-  }
-  smsQueue[smsTail] = msg;
-  // Reply to the inbound sender when one is set (STATUS/ACK); else the owner number.
-  smsTo[smsTail]    = replyTarget.length() ? replyTarget : PHONE_NUMBER;
-  smsTail = (smsTail + 1) % SMS_QUEUE_SIZE;
-  smsCount++;
+  // Reply to the inbound sender when one is set (STATUS/ACK); else the owner number. ERR,AUTH goes to
+  // strangers, so it gets no retries: a dead-end number must not hold up real alerts behind it.
+  uint8_t retries = msg.startsWith("ERR,AUTH") ? 0 : GSM_SEND_RETRIES;
+  smsEnqueueSplit(msg, replyTarget.length() ? replyTarget : PHONE_NUMBER, retries);
+  if (!replyTarget.length() && ALERT_NUMBER2.length() && msg.startsWith("ALERT,"))
+    smsEnqueueSplit(msg, ALERT_NUMBER2, retries);
 }
 
-// Non-blocking outbound SMS state machine. Owns the SIM UART only while a send is
-// in progress; pollGSM() yields during that window (see its guard).
-void gsmTxTick() {
-  switch (gtx) {
-    case GTX_IDLE:
-      if (smsCount == 0) return;
-      if (battQuietActive()) return;                     // no 2 A GSM burst during a battery switch
-      gtxMsg  = smsQueue[smsHead];
-      gtxTo   = smsTo[smsHead];
-      smsHead = (smsHead + 1) % SMS_QUEUE_SIZE;
-      smsCount--;
-      while (simSerial.available()) gsmFeedInbound((char)simSerial.read());  // parse, don't drop (B5)
-      simSerial.println("AT+CMGF=1");                    // text mode
-      gtxMs = millis();
-      gtx = GTX_CMGF_WAIT;
-      break;
-
-    case GTX_CMGF_WAIT:
-      while (simSerial.available()) gsmFeedInbound((char)simSerial.read());  // drain inbound (B5)
-      if (millis() - gtxMs < GSM_CMGF_SETTLE_MS) return;
-      simSerial.print("AT+CMGS=\""); simSerial.print(gtxTo.length() ? gtxTo : PHONE_NUMBER); simSerial.println("\"");
-      gtxMs = millis();
-      gtx = GTX_PROMPT_WAIT;
-      break;
-
-    case GTX_PROMPT_WAIT:
-      while (simSerial.available()) {
-        char c = (char)simSerial.read();
-        if (c == '>') {                                 // module ready for body
-          simSerial.print(gtxMsg);
-          simSerial.write(26);                          // CTRL+Z -> send
-          logEvent("GSM", "GSM", "TX|" + gtxMsg);
-          gtxResultSeen = false;                        // arm result capture for this send (+CMGS / +CMS ERROR)
-          gtxMs = millis();
-          gtx = GTX_BODY_SETTLE;
-          return;
-        }
-        gsmFeedInbound(c);                              // non-prompt bytes may be an inbound +CMT (B5)
-      }
-      if (millis() - gtxMs > GSM_PROMPT_TIMEOUT_MS) {    // no '>' -> abandon this message
-        logEvent("GSM", "GSM", "TX|FAIL_NO_PROMPT");
-        gtx = GTX_IDLE;
-      }
-      break;
-
-    case GTX_BODY_SETTLE:                                // wait for the network's send result, then next send
-      while (simSerial.available()) gsmFeedInbound((char)simSerial.read());  // parse +CMGS/+CMS ERROR (B5)
-      if (gtxResultSeen) { gtx = GTX_IDLE; break; }     // +CMGS / +CMS ERROR already logged the outcome
-      if (millis() - gtxMs >= GSM_SEND_RESULT_TIMEOUT_MS) {   // hard cap: silent modem can't stall the queue
-        logEvent("GSM", "GSM", "TX_UNKNOWN");
-        gtx = GTX_IDLE;
-      }
-      break;
+// One SMS holds 160 septets, and sendDailyReport() alone runs past that with three columns. A longer
+// text goes out as "(i/N)" parts, so it arrives whole instead of cut off or refused by the modem.
+void smsEnqueueSplit(const String &msg, const String &to, uint8_t retries) {
+  const char *s = msg.c_str();
+  int len = msg.length();
+  if (gsmSeptets(s) <= 160) { gsm.enqueue(s, to.c_str(), retries); return; }
+  const int SEG = 153;                                  // leaves room for a "(10/12)" prefix
+  int total = 0;
+  for (int pos = 0; pos < len; total++) pos = gsmSplitEnd(s, pos, len, SEG);
+  int pos = 0;
+  for (int i = 1; i <= total; i++) {
+    int end = gsmSplitEnd(s, pos, len, SEG);
+    String part = "(" + String(i) + "/" + String(total) + ")" + msg.substring(pos, end);
+    gsm.enqueue(part.c_str(), to.c_str(), retries);
+    pos = end;
   }
+}
+
+// Run the driver and mirror its status into the globals the LCD, logs and dashboard read.
+void gsmTxTick() {
+  gsm.tick(millis(), battQuietActive());                // quiet: no 2 A burst during a battery switch
+  lastRssi        = gsm.rssi();
+  netRegistered   = gsm.registered();
+  lastCreg        = gsm.regStat();
+  lastCereg       = gsm.ceregStat();
+  simReady        = gsm.simReady();
+  lastGsmHealthMs = gsm.lastHealthMs();
 }
 
 void sendDailyReport() {
@@ -4725,7 +4679,7 @@ void summaryTick() {
       if (sumSegIdx >= sumSegTotal) {                    // done
         sumReport = ""; summaryPending = false; summaryStage = SUM_IDLE; return;
       }
-      if (smsCount >= SMS_QUEUE_SIZE - 1) return;        // queue nearly full -> wait (paced, no drops)
+      if (gsm.queued() >= GSM_QUEUE_SIZE - 1) return;    // queue nearly full -> wait (paced, no drops)
       int len = sumReport.length();
       int from = sumSegIdx * SEG;
       String seg = sumReport.substring(from, min(len, from + SEG));
@@ -5034,8 +4988,10 @@ void healthTick() {
     // Bounded (every 5 min) GSM link telemetry: raw CSQ rssi (0-31, 99=unknown), raw CREG stat
     // (2=searching, 3=denied -- not just the reg bool), SIM state. Mirrors the WIFI|UP|rssi pattern so
     // "GSM failing" can be told apart from "no signal" / "not registered" in the logs.
-    logEvent("ESP1", "NET", "GSM|rssi=" + String(lastRssi) + "|creg=" + String(lastCreg) +
-                            "|cpin=" + String(simReady ? "READY" : "NOTREADY"));
+    logEvent("ESP1", "NET", "GSM|rssi=" + String(lastRssi) + "|creg=" + String(gsm.cregStat()) +
+                            "|cereg=" + String(lastCereg) + "|cpin=" + String(simReady ? "READY" : "NOTREADY") +
+                            "|modem=" + String(gsm.ready() ? "READY" : gsm.absent() ? "ABSENT" : "INIT") +
+                            "|baud=" + String(gsm.baud()) + "|dr=" + String(gsm.deliveryReports() ? "on" : "off"));
     String s  = "GSM:" + String(netRegistered ? "reg" : "no") + "(rssi=" + String(lastRssi) + ")";
     s += "|WIFI:" + String(!wifiEnabled ? "off" : wifiConnected ? "up" : "dn");
     s += "|RTC:" + String(rtcOk ? "ok" : "x") + "|SD:" + String(sdOk ? "ok" : "x");
@@ -5403,6 +5359,7 @@ void scheduleTick() {
 
   if (!reportSentToday && mod >= DAILY_REPORT_MIN) {
     sendDailyReport(); reportSentToday = true;
+    if (now.dayOfTheWeek() == SIM_CHECK_WEEKDAY) simHealthCheck();
   }
   if (!nanoDailyResetDone && mod >= DAILY_NANO_RESET_MIN) {     // sec.18.9.5.0.3 (exempt from HW limit)
     sendNanoCommand("RESET_REQ");
@@ -9828,12 +9785,12 @@ void lcdTick() {
       lcdRow(2, l);                                  // '*' = the boards are on that battery now
       snprintf(l, 21, "SD:%s RTC:%s%s", sdOk ? "OK" : "--", rtcOk ? "OK" : "--", bswLatched ? " SWFLT" : ""); lcdRow(3, l);
       break;
-    case PAGE_GSM:   // GSM (SIM800L) + WiFi/ThingSpeak link health
+    case PAGE_GSM:   // GSM (A7670C) + WiFi/ThingSpeak link health
       lcdRow(0, "GSM + WiFi");
       snprintf(l, 21, "GSM:%-4s Sig:%-3s Q%d",
-               netRegistered ? "REG" : "NO",
+               gsm.absent() ? "DEAD" : !gsm.ready() ? "INIT" : netRegistered ? "REG" : "NO",
                (lastRssi < 0 || lastRssi == 99) ? "--" : String(lastRssi).c_str(),
-               smsCount);
+               gsm.queued());
       lcdRow(1, l);
       if (portalActive)       snprintf(l, 21, "WiFi:PORTAL %-8s", portalApIp);
       else if (!wifiEnabled)  snprintf(l, 21, "WiFi:OFF");
@@ -10128,7 +10085,9 @@ static bool webWorthy(const char *type, const String &d) {
         d.startsWith("CANCEL|")    || d.startsWith("RESUME|")) return true;
     return false;
   }
-  if (!strcmp(type, "GSM"))  return d.startsWith("RX|") || d.startsWith("TX_ERR|");
+  if (!strcmp(type, "GSM"))  return d.startsWith("RX|") || d.startsWith("TX_ERR|") || d.startsWith("TX|GAVE_UP") ||
+                                    d.startsWith("TX_UNDELIVERED|") || d.startsWith("MODEM_SILENT") ||
+                                    d.startsWith("MODEM_ABSENT") || d.startsWith("MODEM_RESET");
   if (!strcmp(type, "RESP")) return d.startsWith("TIMEOUT|");
   return false;
 }
