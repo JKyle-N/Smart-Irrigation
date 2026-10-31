@@ -105,7 +105,7 @@ Daily fresh-start `RESET_REQ` once/day.
 - Daily summary + on-demand both via `STATUS` keyword. Compact encoded for manual expansion.
 - Inbound: `SET,COL_A,N,150,P,40,K,200,pH,5.8` (explicit, default), `SET,COL_A,PRESET,CARROT` (named), `NAME,COL_A,Lettuce` (persistent NVS), `MODE,...`, `STOP,ALL`.
 - Inbound (added): `SUMMARY[,<day>]`, `FULL SUMMARY[,<day>]`, `NET`, `WIFI,<ssid>,<pass>`, `WIFIPORTAL`, `TSKEY,<1|2|3>,<key>` — see the report/telemetry sections below.
-- **Owner-gating: ALL inbound commands require the owner number** — `handleSms` calls `senderIsOwner()` (sender's last 9 digits must match `PHONE_NUMBER`) up front and replies `ERR,AUTH` to anyone else. This covers STATUS/NET/SUMMARY, recovery (STOP/RELEASE/IRRIGATE/NORMAL), and all config. Internally-generated calls (empty `replyTarget`, e.g. the deferred-config replay) pass.
+- **Owner-gating: ALL inbound commands require the owner number** — `handleSms` calls `senderIsOwner()` (sender's last 9 digits must match `PHONE_NUMBER`) up front. Anyone else gets `ERR,AUTH`, at most once per 10 min, and short codes or promo senders get no reply at all, so a stranger cannot drain the SIM's load. This covers STATUS/NET/SUMMARY, recovery (STOP/RELEASE/IRRIGATE/NORMAL), and all config. Internally-generated calls (empty `replyTarget`, e.g. the deferred-config replay) pass.
 - **Modem driver (`ESP1/include/gsm_modem.h`, no Arduino dependency, host-tested against a simulated A7670C in `ESP1/test/test_gsm_modem`).** `main.cpp` only wires it up: bytes in through `pollGSM`, `gsmTxTick` drives it, status mirrored to `lastRssi`/`netRegistered`/`lastCreg`/`simReady`. One AT command in flight at a time, all results checked, nothing blocks.
   - **Bring-up:** auto-detects the baud (115200 first), retries setup until `OK`, re-runs setup on a modem boot message, and never replays stored messages (`AT+CMGD=1,4` at setup). `CNMI` falls back `2,2,0,1,0` → `2,2,0,0,0` → `2,1,0,0,0`; `+CMTI` is read and deleted.
   - **Registered** = CREG or CEREG stat 1/5/6/7/9/10 (LTE, and "SMS only").
@@ -113,12 +113,23 @@ Daily fresh-start `RESET_REQ` once/day.
   - **Outbound:** texts over 160 septets are split as `(i/N)` (`smsEnqueueSplit`). A failed send retries twice (30 s, 60 s backoff) ahead of later messages; messages hold while unregistered for up to 5 min. `ERR,AUTH` never retries, and alphanumeric senders get no reply. Result wait is 45 s (manual: 40 s).
   - **Delivery reports** (`AT+CSMP=49…`, `+CDS`) are logged as `TX_DELIVERED`/`TX_PENDING`/`TX_UNDELIVERED` and counted, not re-sent: the SMSC already retries temporary failures, and permanent ones would fail the same way.
   - **Watchdog:** 3 unanswered queries → `MODEM_SILENT` and re-detect (LCD `INIT`, then `DEAD` after a full sweep). 15 min unregistered or 2 consecutive abandoned messages → `AT+CFUN=1,1`, at most once an hour, never in the battery-switch quiet window. There is **no hardware reset line**, so a truly hung modem needs a power cycle.
+- **Logs never hold secrets:** `gsmSafeLogBody` hides everything after the keyword in `WIFI,`, `FBASE,AUTH`, `FBASE,APIKEY`, `SUPA,` and `TSKEY,` before the `RX|` row is written, because that row reaches the SD card, the Supabase upload and the dashboard's event list. Any new SMS command carrying a secret must be added there.
 - **Added SMS commands (owner-gated):** `SIMTEST` (also sent weekly with Sunday's report, `SIM_CHECK_WEEKDAY`: a missing weekly text means the SIM or modem needs attention), `BAL`, `USSD,<code>|CLEAR` (carrier balance code, NVS `ussd`, empty by default), `ALERTNUM,<number>|CLEAR` (NVS `owner2`: receives `ALERT,` texts only, **no command rights**).
 - **USSD is best effort:** the manual says `AT+CUSD` can return `ERROR` while IMS is on. The firmware reports `BAL,FAIL,ERROR` and must not switch IMS off, since that could affect SMS.
 - **Hardware:** bench sketch `Test Code/PlatformIO/Projects/A7670C-SMS-ESP32` uses GPIO16/17, which on ESP1 is the Nano link; ESP1 wiring is GPIO26/27. Module supply 5–12 V, 2 A, common GND. With `SECONDARY_BATT_ENABLED 1` it must share ESP1's switched rail, because the DPDT breaks both + and −.
 - Commissioning: `Commissioning_Flash_Plan.md` stage M. Network-time RTC backup (`AT+CTZU`) was offered and **reserved** by the user, not built.
 
 - **Link rules (2026-11-01 audit):** only `DONE,SEQ_…` ends a run and only `ACK,SEQ_…`/`ACK,RESUME…` advances a work order: ESP2 also sends `DONE,STOP_ALL`/`TEST`/`PRIME` and `ACK,SET_CAL`/`CAL_STOP`/`TEST`. `BUSY,ACTIVE` answering a *retried* order means the ACK was lost and the run is live. `INVALID,COL_DISABLED`/`COLUMN` ends the job with a `COL_MISMATCH` alert (no recovery ladder). `PWR_FAIL` outside a work order (exercise, AC prime) is a Major fault, not a hold. `PROG` restarts the 10-min DONE timeout, so that timeout now means "ESP2 went silent", not "the run is long".
+
+---
+
+## ADDED: Trusted clock (2026-11-01)
+Real rig logs held 17,411 rows with impossible dates (`2000-01-01` after the DS3231 lost power, `2000-00-00 45:161:0` from garbled reads).
+- **`rtcNow()` is the only way the firmware reads the clock, and core 1 is the only core that may call it.** Core 0 reads `telem.deviceTime`: Wire hands its receive buffer back unlocked, so a read from core 0 can overwrite a sensor reading in progress on core 1.
+- **A read is refused** if the date is impossible (`rtcPlausible`), or if it is over 2 min from the expected time and a second read does not agree (`rtcJumped`). A refused read answers with the last good time plus elapsed `millis()`, so one bad read cannot look like a new day.
+- **`rtcOk` now means "the chip answers and the time can be trusted".** It goes false on a lost-power flag or impossible date at boot (`rtcTimeLost`, LCD `RTC:SET`, needs setting) or after 5 refused reads in a row (recovers by itself). While false, nothing runs on the schedule and logs go to `NODATE.CSV`. `RTC_INVALID`/`RTC_MISSING` alert (Major).
+- **`rtcChipOk` gates setting the clock**, so a clock that lost its time can still be set from the LCD or the dashboard. Every `rtc.adjust()` must call `rtcClockWasSet()`.
+- A column's serviced-today stamp is checked against this trusted date.
 
 ---
 
@@ -129,6 +140,8 @@ Daily fresh-start `RESET_REQ` once/day.
 - **SEQ_MIX** waits `AC_WARMUP_MS` for the inverter before starting the mixer. The mix window and current checks count from the mixer actually running.
 - **Mixer current RMS** samples at most every 1 ms, so its 24 samples span a whole mains cycle. **EC/pH verdict** averages 16 ADC reads.
 - **Late `TEST,EXIT`** outside test mode only replies; it cannot stop a running work order.
+- **Actuation lockout covers the LCD too:** `actuationsDisabled` refuses LCD Testing (and ends a session in progress) and calibration priming. Calibration itself stays open for sensor readings.
+- **Calibration and display:** a soil calibration needs dry above wet by `CAL_MIN_SPAN_ADC` (`soilCalOk`), when saved and when loaded. Until the battery voltage is calibrated, `batteryLow`/`batteryCritical` stay false, the LCD and `STATUS` show it as uncalibrated, energy is not integrated, and PWR rows carry `VRAW=`.
 - **ESP1:** a refused force run releases `fcPhase`; a fault while in Calibration closes it and powers ESP2 off; the actuation lockout also stops a pump exercise; `lastServicedStamp` is in NVS (`c<n>ls`), so a reboot cannot re-run a column that finished today.
 
 ---

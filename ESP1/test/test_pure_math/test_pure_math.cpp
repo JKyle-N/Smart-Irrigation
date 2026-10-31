@@ -28,6 +28,46 @@ void test_imap_degenerate_span_does_not_divide_by_zero(void) {
   TEST_ASSERT_EQUAL_INT(0, imap(5, 10, 10, 0, 100));
 }
 
+/* ---- RTC sanity ---------------------------------------------------------- */
+
+// REGRESSION: these exact bad dates are in the rig's logs, and nothing stopped them reaching the scheduler.
+void test_rtc_rejects_the_bad_dates_seen_on_the_rig(void) {
+  TEST_ASSERT_FALSE(rtcPlausible(2000, 1, 1, 0, 27, 32));     // DS3231 lost power
+  TEST_ASSERT_FALSE(rtcPlausible(2000, 0, 0, 45, 161, 0));    // garbled read
+  TEST_ASSERT_FALSE(rtcPlausible(2080, 13, 10, 5, 5, 5));
+  TEST_ASSERT_FALSE(rtcPlausible(2026, 46, 65, 5, 5, 5));
+}
+
+void test_rtc_accepts_real_dates_and_checks_each_field(void) {
+  TEST_ASSERT_TRUE(rtcPlausible(2026, 11, 1, 23, 59, 59));
+  TEST_ASSERT_TRUE(rtcPlausible(2028, 2, 29, 0, 0, 0));       // leap day
+  TEST_ASSERT_FALSE(rtcPlausible(2027, 2, 29, 0, 0, 0));
+  TEST_ASSERT_FALSE(rtcPlausible(2026, 11, 31, 0, 0, 0));
+  TEST_ASSERT_FALSE(rtcPlausible(2026, 11, 1, 24, 0, 0));
+  TEST_ASSERT_FALSE(rtcPlausible(2026, 11, 1, 0, 60, 0));
+  TEST_ASSERT_FALSE(rtcPlausible(2026, 11, 1, 0, 0, 60));
+  TEST_ASSERT_FALSE(rtcPlausible(2100, 1, 1, 0, 0, 0));
+}
+
+void test_rtc_jump_works_in_both_directions(void) {
+  TEST_ASSERT_FALSE(rtcJumped(1000, 1000, 120));
+  TEST_ASSERT_FALSE(rtcJumped(1120, 1000, 120));
+  TEST_ASSERT_TRUE(rtcJumped(1121, 1000, 120));
+  TEST_ASSERT_FALSE(rtcJumped(880, 1000, 120));
+  TEST_ASSERT_TRUE(rtcJumped(879, 1000, 120));
+}
+
+/* ---- soilCalOk ------------------------------------------------------------ */
+
+// REGRESSION: two equal capture points were saved, which read as 0 % forever and watered every service.
+void test_soil_cal_needs_dry_above_wet_by_a_margin(void) {
+  TEST_ASSERT_TRUE(soilCalOk(656, 524, 20));                  // column A's measured pair
+  TEST_ASSERT_TRUE(soilCalOk(544, 524, 20));                  // exactly the margin
+  TEST_ASSERT_FALSE(soilCalOk(543, 524, 20));
+  TEST_ASSERT_FALSE(soilCalOk(524, 524, 20));                 // equal
+  TEST_ASSERT_FALSE(soilCalOk(524, 656, 20));                 // reversed
+}
+
 /* ---- soilPctCal ---------------------------------------------------------- */
 
 void test_soil_pct_endpoints(void) {
@@ -283,6 +323,10 @@ int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_imap_matches_arduino_map);
   RUN_TEST(test_imap_degenerate_span_does_not_divide_by_zero);
+  RUN_TEST(test_rtc_rejects_the_bad_dates_seen_on_the_rig);
+  RUN_TEST(test_rtc_accepts_real_dates_and_checks_each_field);
+  RUN_TEST(test_rtc_jump_works_in_both_directions);
+  RUN_TEST(test_soil_cal_needs_dry_above_wet_by_a_margin);
   RUN_TEST(test_soil_pct_endpoints);
   RUN_TEST(test_soil_pct_clamps_outside_the_span);
   RUN_TEST(test_soil_pct_survives_inverted_endpoints);

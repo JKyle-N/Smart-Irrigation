@@ -89,6 +89,7 @@
 #define ESP2_BAUD      9600
 // The A7670C's baud is auto-detected (GSM_BAUDS in gsm_modem.h, 115200 first).
 #define SIM_RX_BUFFER  2048     // ~180 ms of 115200 traffic; the default 256 B is only ~22 ms of loop stall
+#define NANO_RX_BUFFER  128     // ~130 ms at 9600; the library default of 64 B is only ~65 ms of loop stall
 
 /* ---- I2C addresses ------------------------------------------------------- */
 #define LCD_ADDR     0x27
@@ -100,6 +101,7 @@ String PHONE_NUMBER = "09150424784";    // [CONFIRM] recipient for alerts/report
 String ALERT_NUMBER2 = "";              // second recipient, ALERT texts only and no command rights (SMS ALERTNUM, NVS)
 String USSD_CODE     = "";              // carrier balance code for BAL / the weekly check (SMS USSD, NVS); carrier-specific
 const uint8_t SIM_CHECK_WEEKDAY = 0;    // weekly SIMTEST text goes with this day's report (0 = Sunday)
+const unsigned long SMS_AUTH_REPLY_GAP_MS = 600000UL;   // at most one ERR,AUTH reply per 10 min
 
 /* ---- Columns (spec sec.14.1.4.1) ----------------------------------------- */
 #define NUM_COLUMNS 3
@@ -423,7 +425,9 @@ SoftwareSerial    nanoSerial(NANO_RX_PIN, NANO_TX_PIN);   // EspSoftwareSerial
 HardwareSerial    esp2Serial(1);
 HardwareSerial    simSerial(2);
 
-bool rtcOk = false, sdOk = false;
+bool rtcOk = false, sdOk = false;   // rtcOk: the DS3231 answers AND its time can be trusted (see rtcNow)
+bool rtcChipOk = false;             // the DS3231 answered at boot, so it can at least be set
+bool rtcTimeLost = false;           // it lost power or holds an impossible date: no clock until someone sets it
 
 /* ---- WDT reboot breadcrumb (survives SW_CPU_RESET in RTC RAM) -------------- *
  * g_lastStage holds a one-char marker of the loop section in progress. After a
@@ -767,6 +771,7 @@ volatile bool fbAuthOk = false;                    // last token operation succe
 volatile int  fbAuthHttp = 0;                      // last auth HTTP status
 volatile bool fbSignInPending = false;             // portal/SMS -> netTask: force a password sign-in now
 volatile bool fbCredsPersistPending = false;       // core0 admin form -> core1: persist auth creds
+volatile bool fbTlsResetPending = false;           // SMS (core 1) -> netTask: re-apply the TLS trust policy
 // Auth backoff: a wrong password must NOT be retried every poll (that is credential
 // hammering and Google will rate-limit the account). Same ladder shape as uploadTick().
 const unsigned long FB_AUTH_BACKOFF[4] = { 30000UL, 120000UL, 480000UL, 1800000UL };
@@ -995,6 +1000,7 @@ struct TelemetrySnapshot {
   // way, so the truncation was silent -- 96 gives real headroom without meaningfully affecting RAM.
   char     lastFault[96], lastFaultAt[20];
   char     heldClearReason[16];   // why esp2Held last cleared -- see lastHeldClearReason
+  char     deviceTime[20];        // read on core 1: the RTC shares its I2C bus with core 1's sensors
   // Fault / recovery, so the dashboard can offer the same choices the LCD menu does.
   bool     held, steerRel;
   uint8_t  holdRepeats;
@@ -1536,6 +1542,9 @@ long dayStamp(const DateTime &dt);
 uint16_t minuteOfDay();
 String tsString();
 void setState(SystemState s);
+static DateTime rtcNow();
+static void rtcClockWasSet();
+void rtcHealthTick();
 void loadConfig();
 void loadCal();
 void pushAllCalToEsp2();
@@ -1728,11 +1737,16 @@ void setup() {
   loadBattCal();                                   // NVS "adccal" overrides the hardcoded defaults if present
 
   // ---- RTC init ----
-  rtcOk = rtc.begin();
-  if (rtcOk && rtc.lostPower()) {
-    // RTC lost time; logging falls back to NODATE until the clock is set.
-    Serial.println(F("WARN: RTC lost power -- backup battery may be dead. Clock cannot persist across reboots."));
-    Serial.println(F("ACTION: Replace DS3231 CR2032 backup battery, then power cycle the ESP32."));
+  rtcChipOk = rtc.begin();
+  if (rtcChipOk) {
+    DateTime n = rtc.now();
+    rtcTimeLost = rtc.lostPower() || !rtcPlausible(n.year(), n.month(), n.day(), n.hour(), n.minute(), n.second());
+    rtcOk = !rtcTimeLost;
+    if (rtcTimeLost) {
+      // No trusted clock: scheduling stops and logs go to NODATE until it is set (rtcHealthTick alerts).
+      Serial.println(F("WARN: RTC lost its time -- backup battery may be dead. Set the clock to resume scheduling."));
+      Serial.println(F("ACTION: Replace the DS3231 CR2032 if this repeats, then Settings > Set Clock or the dashboard."));
+    }
   }
 
   // ---- microSD ----
@@ -1754,7 +1768,7 @@ void setup() {
   loadCal();                          // calibration constants (separate namespace, §A.5)
 
   // ---- UART links ----
-  nanoSerial.begin(NANO_BAUD);
+  nanoSerial.begin(NANO_BAUD, SWSERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN, false, NANO_RX_BUFFER);
   esp2Serial.begin(ESP2_BAUD, SERIAL_8N1, ESP2_RX_PIN, ESP2_TX_PIN);
   gsmBegin();                               // opens UART2; the modem itself comes up from loop()
 
@@ -1807,6 +1821,8 @@ void loop() {
   g_lastStage = 'E'; pollESP2();
   g_lastStage = 'G'; pollGSM();
   g_lastStage = 'g'; gsmTxTick();          // bring-up, sends, stored SMS, health queries, watchdog
+
+  g_lastStage = 'y'; rtcHealthTick();      // clock trust: reject bad reads, alert when it needs setting
 
   g_lastStage = 'M'; stateMachineTick();
   g_lastStage = 'C'; controlTick();
@@ -1958,14 +1974,92 @@ void i2cBusRecover() {
 long dayStamp(const DateTime &dt) {
   return (long)dt.year() * 10000L + (long)dt.month() * 100L + (long)dt.day();
 }
+/* The only way the firmware reads the clock (core 1 only; I2C is not for core 0). An impossible date is
+ * refused, and one that is possible but far from where the clock should be is believed only if a second
+ * read agrees, because garbled bytes can still form a valid date. A refused read answers with the last
+ * good time plus the elapsed millis(), so one bad read cannot look like a new day to the scheduler.
+ * No logging in here: logEvent() stamps its rows through this function. rtcHealthTick() reports. */
+const uint32_t RTC_JUMP_MAX_S = 120;        // further than this from the expected time needs a second read
+const uint8_t  RTC_BAD_LIMIT  = 5;          // consecutive refused reads before the clock stops being trusted
+uint32_t      rtcRefUnix = 0;               // last good reading, and when it was taken
+unsigned long rtcRefMs = 0;
+uint8_t       rtcBadReads = 0;
+uint32_t      rtcRejected = 0;              // refused reads since boot
+bool          rtcJumpPending = false;       // a real jump was accepted; rtcHealthTick logs it
+
+static inline bool rtcDtPlausible(const DateTime &d) {
+  return rtcPlausible(d.year(), d.month(), d.day(), d.hour(), d.minute(), d.second());
+}
+static DateTime rtcNow() {
+  DateTime n = rtc.now();
+  bool good = rtcDtPlausible(n);
+  uint32_t expected = rtcRefUnix ? rtcRefUnix + (millis() - rtcRefMs) / 1000 : 0;
+  if (good && rtcRefUnix && rtcJumped(n.unixtime(), expected, RTC_JUMP_MAX_S)) {
+    DateTime again = rtc.now();
+    good = rtcDtPlausible(again) && !rtcJumped(again.unixtime(), n.unixtime(), 2);
+    if (good) { n = again; rtcJumpPending = true; }
+  }
+  if (good) {
+    rtcRefUnix = n.unixtime(); rtcRefMs = millis(); rtcBadReads = 0;
+    return n;
+  }
+  rtcRejected++;
+  if (rtcBadReads < 255) rtcBadReads++;
+  return rtcRefUnix ? DateTime(expected) : n;
+}
+// Called after every rtc.adjust(). adjust() also clears the DS3231's lost-power flag.
+static void rtcClockWasSet() {
+  rtcTimeLost = false; rtcRefUnix = 0; rtcBadReads = 0;   // a deliberate change is not a jump
+  rtcOk = rtcChipOk;
+}
+// Core 1, ~1 Hz: re-checks the clock even when nothing is logging, and does the reporting rtcNow() cannot.
+void rtcHealthTick() {
+  static unsigned long lastMs = 0, lastBadLogMs = 0, lastAlertMs = 0;
+  static uint32_t loggedRejected = 0;
+  static bool bootReported = false;
+  if (millis() - lastMs < 1000) return;
+  lastMs = millis();
+
+  if (!bootReported) {                       // setup() runs before alerts can go out
+    bootReported = true;
+    if (!rtcChipOk)        raiseFault('M', "RTC_MISSING", "DS3231|no schedule until fixed");
+    else if (rtcTimeLost)  raiseFault('M', "RTC_INVALID", "LOST_TIME|set the clock to resume the schedule");
+  }
+  if (!rtcChipOk || rtcTimeLost) return;
+
+  rtcNow();
+  bool trusted = rtcBadReads < RTC_BAD_LIMIT;
+  if (trusted != rtcOk) {                    // set first: the fault below stamps its row through tsString()
+    rtcOk = trusted;
+    if (trusted) {
+      rtcRefUnix = 0;
+      logEvent("ESP1", "STATE", "RTC|RECOVERED");
+    } else if (!lastAlertMs || millis() - lastAlertMs >= 3600000UL) {   // a flapping bus must not storm SMS
+      lastAlertMs = millis();
+      raiseFault('M', "RTC_INVALID", "BAD_READS|no schedule until it reads correctly");
+    } else {
+      logEvent("ESP1", "STATE", "RTC|UNTRUSTED");
+    }
+  }
+  if (rtcJumpPending) {
+    rtcJumpPending = false;
+    logEvent("ESP1", "STATE", "RTC|JUMP_CONFIRMED|" + tsString());
+  }
+  if (rtcRejected != loggedRejected && millis() - lastBadLogMs >= 60000UL) {
+    lastBadLogMs = millis();
+    logEvent("ESP1", "STATE", "RTC|BAD_READS|total=" + String(rtcRejected));
+    loggedRejected = rtcRejected;
+  }
+}
+
 uint16_t minuteOfDay() {
   if (!rtcOk) return 0;
-  DateTime now = rtc.now();
+  DateTime now = rtcNow();
   return now.hour() * 60 + now.minute();
 }
 String tsString() {
   if (!rtcOk) return String("0000-00-00 00:00:00");
-  DateTime n = rtc.now();
+  DateTime n = rtcNow();
   char b[20];
   snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
            n.year(), n.month(), n.day(), n.hour(), n.minute(), n.second());
@@ -2045,8 +2139,9 @@ void loadCal() {
     String k = "s" + String(c);
     // "a2"/"w2" keys (bumped from "a"/"w"): a stale pre-remap on-device soil cal no longer overrides the
     // measured compiled defaults -- the correct endpoints apply on flash until a fresh cal is saved.
-    calSoilAir[c]   = prefsCal.getInt((k + "a2").c_str(), calSoilAir[c]);
-    calSoilWater[c] = prefsCal.getInt((k + "w2").c_str(), calSoilWater[c]);
+    int savedAir   = prefsCal.getInt((k + "a2").c_str(), calSoilAir[c]);
+    int savedWater = prefsCal.getInt((k + "w2").c_str(), calSoilWater[c]);
+    if (soilCalOk(savedAir, savedWater, (int)CAL_MIN_SPAN_ADC)) { calSoilAir[c] = savedAir; calSoilWater[c] = savedWater; }
     calNpkOff[c][0] = prefsCal.getFloat((k + "N").c_str(), 0);
     calNpkOff[c][1] = prefsCal.getFloat((k + "P").c_str(), 0);
     calNpkOff[c][2] = prefsCal.getFloat((k + "K").c_str(), 0);
@@ -2120,6 +2215,8 @@ void setActuationsEnabled(bool on, const char *why) {
     // (STOP_ALL to ESP2, run UI closed, forceCmdId/forceMask cleared, dashboard command resolved).
     forceAbort("ACTUATIONS_DISABLED");
     if (wo.active || pendingRun.active) cancelRun(-1, "ACTUATIONS_DISABLED");
+    if (uiMode == UI_TEST) settingsLeaveToData(); // LCD Testing drives relays directly: end it (Calibration
+                                                  // stays open for its sensors; calHoldTick refuses the prime)
     if (pendingExercise.active) {                 // a pump exercise is an actuation too (cancelRun does not own it)
       sendEsp2("STOP_ALL");
       pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false; pendingExercise.acked = false;
@@ -3656,11 +3753,12 @@ void netHealthTick() {
  * uptime while the timestamp stays all-zero, and ONLY when truly idle with nothing pending -- never
  * mid-run, mid-fault-hold, or while the operator is in a menu / the WiFi portal.
  * The 24 h clock is uptime-based on purpose: with a dead RTC there is no calendar day to key off, and
- * millis() resets on reboot, so the next attempt is naturally ~24 h later (no boot loop).            */
+ * millis() resets on reboot, so the next attempt is naturally ~24 h later (no boot loop).
+ * Not for a clock that merely lost its time: the chip works, so only setting it helps.               */
 const unsigned long RTC_DEAD_REBOOT_MS = 86400000UL;   // 24 h of continuous all-zero timestamp
 unsigned long rtcDeadSinceMs = 0;                       // 0 = timestamp currently valid
 void rtcDeadRebootTick() {
-  if (rtcOk) { rtcDeadSinceMs = 0; return; }            // timestamp valid -> reset the clock
+  if (rtcOk || rtcTimeLost) { rtcDeadSinceMs = 0; return; }   // timestamp valid, or a reboot cannot fix it
   if (rtcDeadSinceMs == 0) { rtcDeadSinceMs = millis(); return; }   // start the 24 h clock
   if (millis() - rtcDeadSinceMs < RTC_DEAD_REBOOT_MS) return;
   // Idle-only, nothing pending, operator not busy -> otherwise wait and retry on a later tick.
@@ -3801,7 +3899,10 @@ void esp2PowerTick() {
     if (wo.active || pendingRun.active || pendingExercise.active || esp2Held) esp2OffPending = false;
     else esp2SetPower(false);
   }
-  if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held || esp2CommLost) { esp2PollActive = false; return; }
+  // uiMode + diagRemoteUntilMs: Calibration, Sensor Diag and a remote sweep all use ESP2 at IDLE_STATE. A
+  // poll finishing underneath one would power ESP2 off in the middle of it.
+  if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held || esp2CommLost ||
+      uiMode != UI_DATA || diagRemoteUntilMs) { esp2PollActive = false; return; }
   unsigned long interval = isNight() ? ESP2_IDLE_POLL_NIGHT_MS : ESP2_IDLE_POLL_DAY_MS;
   if (!esp2PollActive) {
     if (millis() - lastEsp2Ms < interval) return;          // heard from ESP2 recently -> no poll needed
@@ -3885,7 +3986,9 @@ static void gsmSetBaud(uint32_t baud) { simSerial.updateBaudRate(baud); }
 static void gsmLog(const char *detail) { logEvent("GSM", "GSM", detail); }
 
 static void gsmOnSms(const char *sender, const char *body) {
-  logEvent("GSM", "GSM", String("RX|") + body);
+  char safe[GSM_BODY_MAX];
+  gsmSafeLogBody(body, safe, sizeof(safe));          // this row reaches the SD, Supabase and the dashboard
+  logEvent("GSM", "GSM", String("RX|") + safe);
   replyTarget = sender;
   handleSms(body);                                   // replies enqueue with replyTarget (the sender)
   replyTarget = "";                                  // back to owner PHONE_NUMBER for autonomous msgs
@@ -3924,7 +4027,19 @@ void handleSms(const String &body) {
   // Owner-gate EVERY command: only the configured owner number may command the system (STATUS/NET/
   // SUMMARY included). senderIsOwner() returns true for internally-generated calls (replyTarget empty,
   // e.g. the deferred-config replay), so those still pass. Non-owner -> ERR,AUTH.
-  if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+  if (!senderIsOwner()) {
+    // Every reply costs load. Short codes and promo senders get none (a failed reply to one also counts
+    // against the modem watchdog), and anyone else at most one per SMS_AUTH_REPLY_GAP_MS, so a stranger
+    // cannot drain the SIM by texting it. A mistyped owner number still gets told.
+    static unsigned long lastAuthReplyMs = 0;
+    int digits = 0;
+    for (unsigned i = 0; i < replyTarget.length(); i++) if (isDigit(replyTarget[i])) digits++;
+    if (digits >= 9 && (!lastAuthReplyMs || millis() - lastAuthReplyMs >= SMS_AUTH_REPLY_GAP_MS)) {
+      lastAuthReplyMs = millis();
+      sendSMS("ERR,AUTH");
+    } else logEvent("GSM", "SMS_ERR", "AUTH|NO_REPLY");
+    return;
+  }
 
   // Defer a remote config-write that collides with an open LOCAL edit (companion spec §B.3.1):
   // apply it once the operator finishes the edit, so neither silently overwrites the other.
@@ -4058,7 +4173,8 @@ void handleSms(const String &body) {
       String v = rest.substring(4); v.trim();
       if (!v.equalsIgnoreCase("ON") && !v.equalsIgnoreCase("OFF")) { sendSMS("ERR,FBASE,FORMAT"); return; }
       xSemaphoreTake(netMux, portMAX_DELAY); fbPinCa = v.equalsIgnoreCase("ON"); xSemaphoreGive(netMux);
-      fbResetTls();
+      fbTlsResetPending = true;                         // netTask owns the TLS client; tearing it down from
+                                                        // here could free it in the middle of a request
       fbSignInPending = true; fbAuthFails = 0; fbAuthNextTryMs = 0;
       saveFbAuth();
       logEvent("ESP1", "CFG", String("FBASE|TLS|") + (fbPinCa ? "PIN" : "INSECURE"));
@@ -4107,7 +4223,7 @@ void handleSms(const String &body) {
     int c1 = b.indexOf(',');
     if (c1 >= 0) { String d = b.substring(c1 + 1); d.trim(); if (d.length() == 8) stamp = d.toInt(); }
     else if (rtcOk && currentDayStamp > 0) {             // no arg -> yesterday
-      DateTime y = rtc.now() - TimeSpan(1, 0, 0, 0);
+      DateTime y = rtcNow() - TimeSpan(1, 0, 0, 0);
       stamp = dayStamp(y);
     }
     xSemaphoreTake(netMux, portMAX_DELAY); bool suHave = supaUrl.length() > 0; xSemaphoreGive(netMux);
@@ -4237,8 +4353,8 @@ void handleSms(const String &body) {
   for (int i = 0; i <= b.length() && n < MAXT; i++) {
     if (i == b.length() || b[i] == ',') { tok[n++] = b.substring(start, i); start = i + 1; }
   }
-  if (n < 2) { sendSMS("ERR,PARSE"); return; }
   String k0 = tok[0]; k0.toUpperCase();
+  if (n < 2 && k0 != "WIFIPORTAL") { sendSMS("ERR,PARSE"); return; }   // the only keyword valid on its own here
 
   // resolve column index from COL_A/B/C
   auto colIdx = [&](const String &s) -> int {
@@ -4269,6 +4385,7 @@ void handleSms(const String &body) {
   if (k0 == "SET") {
     int c = colIdx(tok[1]);
     if (c < 0) { sendSMS("ERR,COL"); return; }
+    if (n < 4) { sendSMS("ERR,SET,FORMAT"); return; }    // or the reply would say ACK with nothing changed
     String t2 = tok[2]; t2.toUpperCase();
     if (t2 == "PRESET") {                   // SET,COL_A,PRESET,NAME
       String pn = tok[3]; pn.toUpperCase();
@@ -4436,7 +4553,7 @@ void sendDailyReport() {
   r += ",FLT,C" + String(faultsToday[0]) + "M" + String(faultsToday[1]) + "m" + String(faultsToday[2]);
   r += ",RST," + String(nanoResetsToday);
   r += ",ST," + String(stateLabel(sysState, actuationsDisabled));
-  r += ",BAT," + String(battV, 1) + "V";
+  r += ",BAT," + (battVCalLoaded ? String(battV, 1) + "V" : String("--"));
   r += ",BAT2," + ((secInaOk && secHaveV) ? String(secV, 1) + "V" + (secLow ? "LOW" : "") : String("--"));
   // Daily energy (sec.12.1.3): integrated discharge (CONS) + charge (CHG), Wh.
   r += ",CONS," + String((int)(energyConsumedWh + 0.5)) + "Wh";
@@ -4459,6 +4576,16 @@ static int splitPipe(const String &s, String *out, int maxn) {
 static int colFromTag(const String &t) {
   for (int j = 0; j < NUM_COLUMNS; j++) if (t == String(COL_TAG[j])) return j;
   return -1;
+}
+// Add a run's total to the columns named by "COL_A" / "COL_AB". One tank and one meter feed them all, so
+// a shared total is split evenly -- the same estimate the live daily tally makes in handleEsp2Response.
+static void sumAddToCols(float *totals, const String &tag, float value) {
+  int n = (int)tag.length() - 4;
+  if (n <= 0) return;
+  for (int i = 0; i < n; i++) {
+    int c = colFromTag(String(tag[4 + i]));
+    if (c >= 0) totals[c] += value / n;
+  }
 }
 // Record an error code once (with its first timestamp) for the FULL dedup list.
 static void sumAddError(const String &code, const String &hhmm) {
@@ -4546,19 +4673,23 @@ static void summaryParseLine(const String &ln) {
     code = "R:" + detail;
   }
   else if   (type == "DOSE")  {                      // NUT_A|target|measured|COL_A
-    sumDose++;
+    // Only ESP2's measured results count. ESP1 logs its plan under the same type (NUT_A|int=..|del=..,
+    // SUBRES, BATCH_LOW), and counting those reported doses that were skipped or never pumped.
     String f[4]; int nf = splitPipe(detail, f, 4);
-    if (nf >= 4) { int c = colFromTag(f[3].substring(f[3].length() - 1)); if (c >= 0) sumNutTot[c] += f[2].toFloat(); }
+    if (nf < 4 || !f[3].startsWith("COL_")) return;
+    sumDose++;
+    sumAddToCols(sumNutTot, f[3], f[2].toFloat());
     code = "D:" + detail;
   }
   else if   (type == "ACT") {                        // IRRIGATION|START|COL_A or ...|STOP|COL_A|W=3.2
     if      (detail.startsWith("FERTIGATION") && detail.indexOf("START") >= 0) sumFert++;
     else if (detail.startsWith("IRRIGATION")  && detail.indexOf("START") >= 0) sumIrr++;
     int wi = detail.indexOf("W=");
-    if (wi >= 0) {                                    // STOP carries delivered litres (log enhancement)
+    // STOP only: it carries the delivered litres. A force run's START row has a W= too, the volume it
+    // was asked for, and counting both reported that run's water twice.
+    if (wi >= 0 && detail.indexOf("|STOP|") >= 0) {
       String f[6]; int nf = splitPipe(detail, f, 6);
-      int c = -1; for (int i = 0; i < nf; i++) if (f[i].startsWith("COL_")) c = colFromTag(f[i].substring(f[i].length() - 1));
-      if (c >= 0) sumWaterTot[c] += detail.substring(wi + 2).toFloat();
+      for (int i = 0; i < nf; i++) if (f[i].startsWith("COL_")) sumAddToCols(sumWaterTot, f[i], detail.substring(wi + 2).toFloat());
     }
     code = "A:" + detail;
   } else if (type == "STATE" && detail.indexOf("_SET") >= 0) {
@@ -4581,7 +4712,7 @@ static long resolveSummaryDay(const String &arg) {
   if (a == "NODATE")                   return 0;
   if (a == "YESTERDAY") {
     if (!rtcOk) return 0;
-    DateTime y = rtc.now() - TimeSpan(1, 0, 0, 0);     // correct month/year rollover
+    DateTime y = rtcNow() - TimeSpan(1, 0, 0, 0);      // correct month/year rollover
     return dayStamp(y);
   }
   if (a.length() == 8) { long v = a.toInt(); if (v > 20000000L) return v; }   // explicit YYYYMMDD
@@ -4688,7 +4819,7 @@ static void buildFullReport() {
 }
 
 // Non-blocking FSM: open -> incremental read (bounded/tick) -> build -> stream SMS paced
-// to the queue so an uncapped FULL report never overflows the 8-slot queue or stalls the WDT.
+// to the queue so an uncapped FULL report never overflows the SMS queue or stalls the WDT.
 void summaryTick() {
   const int SEG = 140;                                  // each SMS under the 160-char GSM7 limit
   switch (summaryStage) {
@@ -5185,11 +5316,14 @@ void powerTick() {
   readBatteryAdc();                                    // GPIO35/34 -> polynomial -> battV/battI/battP
 
   // Energy (B2, sec.12.1.3): opto current is magnitude only, so all energy counts as consumption.
-  energyConsumedWh += (double)battP * dtH;
+  // Needs real volts: until calibrated, battV is just the raw ADC fraction (0..1).
+  if (battVCalLoaded && acsOk) energyConsumedWh += (double)battP * dtH;
 
   // Battery state flags -- DISPLAY/LOG (and, if BATTERY_SAFETY_ENABLED, the protective actions).
-  batteryCritical = (battV > 0 && battV < BATT_CRIT_V);
-  batteryLow      = (battV > 0 && battV < BATT_LOW_V);
+  // Calibrated only: the placeholder's 0..1 "volts" would otherwise read as a critically flat battery,
+  // and with the safety flag on that would be an emergency stop.
+  batteryCritical = battVCalLoaded && (battV > 0 && battV < BATT_CRIT_V);
+  batteryLow      = battVCalLoaded && (battV > 0 && battV < BATT_LOW_V);
   batterySafetyTick();                                 // ready-but-disabled protections
 
   // B3: log a PWR snapshot at most ~1/min, OR immediately on a battery-state change (sec.25.2.1).
@@ -5198,8 +5332,10 @@ void powerTick() {
   if (battStateChanged || lastPwrLogMs == 0 || millis() - lastPwrLogMs >= PWR_LOG_INTERVAL_MS) {
     lastPwrLogMs = millis();
     prevBattStateLow = batteryLow; prevBattStateCrit = batteryCritical;
-    logEvent("ESP1", "PWR", "BATT|V=" + String(battV, 2) + "|I=" + String(battI, 2) + "|P=" + String(battP, 1)
-             + "|CONS=" + String((int)(energyConsumedWh + 0.5)) + "Wh");
+    // Uncalibrated rows stay in the log for bench work, under names the SUMMARY parser does not average.
+    String vp = battVCalLoaded ? "|V=" + String(battV, 2) + "|I=" + String(battI, 2) + "|P=" + String(battP, 1)
+                               : "|VRAW=" + String(battV, 3) + "|I=" + String(battI, 2);
+    logEvent("ESP1", "PWR", "BATT" + vp + "|CONS=" + String((int)(energyConsumedWh + 0.5)) + "Wh");
   }
 }
 
@@ -5323,7 +5459,7 @@ static void bswSaveState() {
   p.putUChar("n", bswStrikes); p.putUInt("t", bswLastStrikeT); p.putBool("lat", bswLatched);
   p.end();
 }
-static uint32_t bswNow() { return rtcOk ? rtc.now().unixtime() : 0; }
+static uint32_t bswNow() { return rtcOk ? rtcNow().unixtime() : 0; }
 
 static void bswStrike(uint8_t dir, const char *by) {
   if (bswLastStrikeMs && millis() - bswLastStrikeMs < 120000UL) {
@@ -5407,7 +5543,7 @@ void bswTick() {
  * ========================================================================== */
 void scheduleTick() {
   if (!rtcOk) return;
-  DateTime now = rtc.now();
+  DateTime now = rtcNow();
   long ds = dayStamp(now);
   if (ds != currentDayStamp) {                 // midnight rollover -> reset daily counters
     currentDayStamp = ds;
@@ -5473,7 +5609,7 @@ void uploadTick() {
   if (adminUploadReq) {
     adminUploadReq = false;
     if (rtcOk && currentDayStamp > 0) {
-      long y = dayStamp(rtc.now() - TimeSpan(1, 0, 0, 0));
+      long y = dayStamp(rtcNow() - TimeSpan(1, 0, 0, 0));
       char path[16]; snprintf(path, sizeof(path), "/%08ld.CSV", y);
       bool got = sdTake(200), exists = got && SD.exists(path); if (got) sdGive();
       if (exists) { manualUploadStamp = y; attempts = 0; }
@@ -5626,7 +5762,9 @@ void deviceHealthTick() {
 void telemetryCollect() {
   if (millis() - lastTelemCollectMs < 1000) return;
   lastTelemCollectMs = millis();
+  String deviceTime = tsString();                  // before the lock: an I2C read cannot run with interrupts off
   portENTER_CRITICAL(&telemMux);
+  strlcpy(telem.deviceTime, deviceTime.c_str(), sizeof(telem.deviceTime));
   telem.temp = sensor.temp; telem.hum = sensor.hum; telem.lux = sensor.lux;
   telem.resLevel = sensor.resLevel; telem.mixLevel = sensor.mixLevel; telem.flow = sensor.flow;
   for (int c = 0; c < NUM_COLUMNS; c++) {
@@ -6113,11 +6251,11 @@ static bool firebaseUploadLive() {
   system["secondaryBattSwitching"] = (bool)SECONDARY_BATT_ENABLED;
   system["battSwitchFault"]   = t.bswLatched_;
   system["battSwitchStrikes"] = t.bswStrikes_;
-  // For the new Set Clock control: show the operator what ESP1 currently reads before they decide
-  // to change it. Reuses the exact same tsString()/rtcOk the LCD's own clock page and every log
-  // timestamp already use -- no new time source.
+  // For the new Set Clock control: show the operator what ESP1 currently reads before they decide to
+  // change it. From the snapshot, never tsString() here: that is an I2C read, and Wire hands its receive
+  // buffer back unlocked, so a read from this core can overwrite a sensor reading in progress on core 1.
   system["rtcOk"] = rtcOk;
-  system["deviceTime"] = tsString();
+  system["deviceTime"] = t.deviceTime;
 
   JsonObject sensors = doc.createNestedObject("sensors");
   if (t.tankValid)  { sensors["reservoirLevel"] = t.resLevel; sensors["mixingLevel"] = t.mixLevel; sensors["flowRate"] = t.flow; }
@@ -6229,7 +6367,7 @@ static bool firebaseUploadLive() {
   dpw["batteryLow"]      = t.battLow;
   dpw["batteryCritical"] = t.battCrit;
   dpw["batteryCurrent"]  = t.battI;
-  dpw["batteryPower"]    = t.battP;
+  if (t.battVCalValid) dpw["batteryPower"] = t.battP;   // needs real volts, same gate as the ThingSpeak field
 
   // Fault + recovery. The dashboard renders its prompt from this and offers exactly the choices the
   // LCD menu does, so the two surfaces cannot disagree about what is available.
@@ -7067,16 +7205,18 @@ void firebaseCommandTick() {
     // ---- SET_CLOCK: set the RTC, the same call the LCD's own Set Clock editor makes. No NVS --
     // the DS3231's own battery-backed register is the only store, same as the local path.
     if (!strcmp(c.type, "SET_CLOCK")) {
-      if (!rtcOk) { firebaseQueueStatus(c.id, "rejected", "RTC not present"); continue; }
+      // rtcChipOk, not rtcOk: a clock that lost its time is exactly the one that needs setting.
+      if (!rtcChipOk) { firebaseQueueStatus(c.id, "rejected", "RTC not present"); continue; }
       // Audit fix (2026-09-08): day-of-month was previously validated as a flat 1..31 regardless of
       // month/leap-year (e.g. "Feb 30" could be set), which the DS3231 has no validation of its own
       // to catch -- it would silently store the impossible date.
-      if (c.clkY < 2020 || c.clkY > 2099 || c.clkMo < 1 || c.clkMo > 12 || c.clkD < 1 ||
+      if (c.clkY < RTC_YEAR_MIN || c.clkY > RTC_YEAR_MAX || c.clkMo < 1 || c.clkMo > 12 || c.clkD < 1 ||
           c.clkD > daysInMonth(c.clkY, c.clkMo) ||
           c.clkH < 0 || c.clkH > 23 || c.clkMi < 0 || c.clkMi > 59) {
         firebaseQueueStatus(c.id, "rejected", "clock fields out of range"); continue;
       }
       rtc.adjust(DateTime((uint16_t)c.clkY, (uint8_t)c.clkMo, (uint8_t)c.clkD, (uint8_t)c.clkH, (uint8_t)c.clkMi, 0));
+      rtcClockWasSet();
       logEvent("ESP1", "STATE", "CLOCK_SET");
       firebaseQueueStatus(c.id, "completed", (String("clock set to ") + tsString()).c_str());
       continue;
@@ -7316,6 +7456,10 @@ bool supaUploadFile(const char *path, const char *objName) {
   xSemaphoreTake(netMux, portMAX_DELAY); base = supaUrl; key = supaKey; xSemaphoreGive(netMux);
   if (base.length() == 0 || key.length() == 0) { uploadHttp = 0; return false; }   // not configured
   if (!wifiConnected) { uploadHttp = 0; return false; }
+  // Close Firebase's kept-alive TLS session first, so only one is ever open (~40-50 KB each); its next
+  // request simply re-handshakes. Then the same heap floor Firebase uses: a skipped upload just retries.
+  fbResetTls();
+  if (ESP.getFreeHeap() < FIREBASE_MIN_HEAP) { uploadHttp = -3; return false; }
 
   if (!sdTake(4000)) { uploadHttp = -1; return false; }            // SD busy (portal/summary) -> retry later
   File f = SD.open(path, FILE_READ);
@@ -7634,7 +7778,9 @@ static void portalHandleOwner() {                             // POST /owner -- 
   if (!portalRequireAdmin()) return;
   String o = portalServer.arg("owner"); o.trim();
   int digits = 0; for (unsigned i = 0; i < o.length(); i++) if (isDigit(o[i])) digits++;
-  if (digits < 7 || o.length() > 15) { portalServer.send(200, "text/html", portalAdminHtml("Invalid number (7-15 digits).")); return; }
+  // 9+ digits: senderIsOwner() compares the last 9, so fewer locks the owner out. Dialable only: anything
+  // else (spaces, dashes) is refused by the modem driver, and every alert to the owner would be dropped.
+  if (digits < 9 || o.length() > 15 || !gsmNumberOk(o.c_str())) { portalServer.send(200, "text/html", portalAdminHtml("Invalid number (9-15 digits, optional leading +).")); return; }
   xSemaphoreTake(netMux, portMAX_DELAY); pendingOwner = o; xSemaphoreGive(netMux);  // barrier for core-1 read
   ownerPersistPending = true;                                 // core-1 loop applies + persists
   portalServer.send(200, "text/html", portalAdminHtml("Owner saved: " + htmlEscape(o)));
@@ -7963,6 +8109,7 @@ void netTask(void *pv) {
     }
     wifiConnected = true;
     wifiRssiVal = WiFi.RSSI();
+    if (fbTlsResetPending) { fbTlsResetPending = false; fbResetTls(); }
 
     // t.state, not raw sysState: this runs on core 0 and the telemMux-guarded snapshot is the only
     // sanctioned view of core-1 state here -- same principle firebaseUploadLive() already documents
@@ -8297,6 +8444,7 @@ static bool calCommit() {
   switch (t.kind) {
     case CK_SOIL: {
       int air = (int)calCap[0], wat = (int)calCap[1];
+      if (!soilCalOk(air, wat, (int)CAL_MIN_SPAN_ADC)) return false;      // too close, or dry/wet reversed
       String k = "s" + String(t.col);
       prefsCal.putInt((k + "a2").c_str(), air); prefsCal.putInt((k + "w2").c_str(), wat);
       snprintf(buf, sizeof(buf), "SAVE|SOIL_%c|%d/%d", COL_TAG[t.col], air, wat);
@@ -8504,7 +8652,9 @@ void calHoldTick() {
     if (millis() - lastHold >= 150) {
       lastHold = millis();
       bool acLine = !strcmp(ln, "RESMIX") || !strcmp(ln, "MIXIRR");   // transfer / booster = inverter
-      if (acLine && secBattBlocksAc()) {
+      if (actuationsDisabled) {
+        calMsg = "Actuations off";
+      } else if (acLine && secBattBlocksAc()) {
         calMsg = "BATT2 low: no prime";
       } else {
         String c = String("PRIME_START,") + ln;
@@ -9100,7 +9250,7 @@ static void seedSchedule() {
 void commitEditor() {
   switch (editItem) {
     case SET_CLOCK:
-      if (rtcOk) rtc.adjust(DateTime(editTmp[0], editTmp[1], editTmp[2], editTmp[3], editTmp[4], 0));
+      if (rtcChipOk) { rtc.adjust(DateTime(editTmp[0], editTmp[1], editTmp[2], editTmp[3], editTmp[4], 0)); rtcClockWasSet(); }
       logEvent("ESP1", "STATE", "CLOCK_SET");
       break;
     case SET_SCHEDULE:
@@ -9193,7 +9343,7 @@ void enterEditor(int item) {
   editItem = item; editField = 0; editCol = 0; editDirty = false;
   switch (item) {
     case SET_CLOCK: {
-      DateTime n = rtcOk ? rtc.now() : DateTime(2026, 1, 1, 0, 0, 0);
+      DateTime n = rtcOk ? rtcNow() : DateTime(2026, 1, 1, 0, 0, 0);
       editTmp[0] = n.year(); editTmp[1] = n.month(); editTmp[2] = n.day();
       editTmp[3] = n.hour(); editTmp[4] = n.minute();
       break;
@@ -9264,6 +9414,10 @@ void settingsButton(int i) {
         // boot), then send TEST,ENTER repeatedly until it ACKs -- the single boot READY can be
         // lost on a cold relay power-up (see testHoldTick arming retry).
         if (sysState != IDLE_STATE) return;
+        if (actuationsDisabled) {                              // the lockout means nothing energizes; the row says so
+          logEvent("ESP1", "ACT", "TEST|BLOCKED|ACTUATIONS_OFF");
+          return;
+        }
         esp2SetPower(true);                                    // power ESP2 -> boot
         testArmPending = true;
         esp2TestArmed = false; testArmTries = 0; lastTestArmMs = 0;
@@ -9354,7 +9508,7 @@ void settingsButton(int i) {
     switch (editItem) {
       case SET_CLOCK:
         if (delta) {
-          if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, 2020, 2099);
+          if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, RTC_YEAR_MIN, RTC_YEAR_MAX);
           else if (editField == 1) editTmp[1] = clampi(editTmp[1] + delta, 1, 12);
           else if (editField == 2) editTmp[2] = clampi(editTmp[2] + delta, 1, 31);
           else if (editField == 3) editTmp[3] = clampi(editTmp[3] + delta, 0, 23);
@@ -9481,7 +9635,7 @@ void settingsButton(int i) {
 
 /* ---- Dead-man relay hold: stream TEST,HOLD while ENTER is physically held ---
  * (spec sec.18.10.8.2). Runs every loop while in UI_TEST; ESP2 owns the timeout
- * and the 10 s hard cap. */
+ * and the 30 s hard cap. */
 /* =============================================================================
  *  REMOTE PUSH-TO-COLUMN PULSE  --  bounded, no dead-man needed
  * ==========================================================================
@@ -9836,7 +9990,9 @@ void lcdTick() {
     case PAGE_HOME:
       lcdRow(0, tsString().substring(0, 19).c_str());
       snprintf(l, 21, "State:%-13s", stateLabel(sysState, actuationsDisabled)); lcdRow(1, l);
-      snprintf(l, 21, "Bat:%.1fV %s", battV, batteryCritical ? "CRIT" : batteryLow ? "LOW" : "OK"); lcdRow(2, l);
+      if (battVCalLoaded) snprintf(l, 21, "Bat:%.1fV %s", battV, batteryCritical ? "CRIT" : batteryLow ? "LOW" : "OK");
+      else                snprintf(l, 21, "Bat: uncalibrated");
+      lcdRow(2, l);
       snprintf(l, 21, "Res:%d%% Mix:%d%%", (int)sensor.resLevel, (int)sensor.mixLevel); lcdRow(3, l);
       break;
     case PAGE_SENSORS:
@@ -9855,13 +10011,18 @@ void lcdTick() {
       snprintf(l, 21, "ESP2:%s", esp2Available ? "OK" : "--"); lcdRow(3, l);
       break;
     case PAGE_POWER:
-      snprintf(l, 21, "Main V:%.2f%s", battV, esp2OnSecondary ? "" : " *"); lcdRow(0, l);
-      snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP); lcdRow(1, l);
+      if (battVCalLoaded) {
+        snprintf(l, 21, "Main V:%.2f%s", battV, esp2OnSecondary ? "" : " *"); lcdRow(0, l);
+        snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP); lcdRow(1, l);
+      } else {
+        snprintf(l, 21, "Main V:uncal%s", esp2OnSecondary ? "" : " *"); lcdRow(0, l);
+        snprintf(l, 21, "I:%.2fA P:--", battI); lcdRow(1, l);
+      }
       if (secInaOk && secHaveV)
         snprintf(l, 21, "B2:%.2fV %.2fA%s", secV, secI, esp2OnSecondary ? " *" : (secLow ? " L" : ""));
       else snprintf(l, 21, "B2: no INA226");
       lcdRow(2, l);                                  // '*' = the boards are on that battery now
-      snprintf(l, 21, "SD:%s RTC:%s%s", sdOk ? "OK" : "--", rtcOk ? "OK" : "--", bswLatched ? " SWFLT" : ""); lcdRow(3, l);
+      snprintf(l, 21, "SD:%s RTC:%s%s", sdOk ? "OK" : "--", rtcOk ? "OK" : rtcTimeLost ? "SET" : "--", bswLatched ? " SWFLT" : ""); lcdRow(3, l);
       break;
     case PAGE_GSM:   // GSM (A7670C) + WiFi/ThingSpeak link health
       lcdRow(0, "GSM + WiFi");
@@ -9949,6 +10110,7 @@ static String setRowLabel(int i) {
   if (i == SET_WIFI)   return String("WiFi        ") + (wifiEnabled ? "[ON]" : "[OFF]");
   if (i == SET_SOFTAP) return String("Setup AP    ") + ((portalActive || portalRequested) ? "[ON]" : "[OFF]");
   if (i == SET_BATTSW) return bswLatched ? String("BattSw FAULT>clear") : String("Batt Switch  [OK]");
+  if (i == SET_TESTING && actuationsDisabled) return String("Testing     [OFF]");
   return SET_NAMES[i];
 }
 

@@ -12,6 +12,7 @@
 #define PURE_MATH_H
 
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 /* ---- policy constants owned by the maths below ---------------------------- */
@@ -47,6 +48,25 @@ static inline int daysInMonth(int year, int month) {
   return DAYS[month - 1];
 }
 
+/* ---- real-time clock ------------------------------------------------------ */
+
+/* Rig logs hold rows stamped 2000-01-01 (the DS3231 lost power) and 2000-00-00 45:161:0 (a garbled I2C
+ * read). Neither may reach the scheduler: a bad date looks like a new day, which resets the daily
+ * totals and the serviced-today check, and a wrong hour runs a column at the wrong time. */
+const int RTC_YEAR_MIN = 2025, RTC_YEAR_MAX = 2099;
+
+static inline bool rtcPlausible(int year, int month, int day, int hour, int minute, int second) {
+  if (year < RTC_YEAR_MIN || year > RTC_YEAR_MAX || month < 1 || month > 12) return false;
+  if (day < 1 || day > daysInMonth(year, month)) return false;
+  return hour >= 0 && hour < 24 && minute >= 0 && minute < 60 && second >= 0 && second < 60;
+}
+
+// Did the clock move further than maxS from where it should be? Garbled bytes can still form a valid date.
+static inline bool rtcJumped(uint32_t got, uint32_t expected, uint32_t maxS) {
+  uint32_t delta = (got > expected) ? got - expected : expected - got;
+  return delta > maxS;
+}
+
 /* ---- soil moisture -------------------------------------------------------- */
 
 // Map a raw soil ADC to 0..100 % using this column's endpoints (dry = high ADC, wet = low ADC).
@@ -54,6 +74,11 @@ static inline int soilPctCal(int raw, int air, int water) {
   long p = imap(raw, air, water, 0, 100);
   return (int)clampi((int)p, 0, 100);
 }
+
+/* A soil calibration must have dry above wet by a real margin. Equal endpoints map every reading to
+ * 0 %, so the column would look bone dry forever and water on every service; a reversed pair reads
+ * wet soil as dry. Applied when saving a capture and when loading saved endpoints from NVS. */
+static inline bool soilCalOk(int air, int water, int minSpan) { return air - water >= minSpan; }
 
 /* Combine a column's three moisture sensors into one 0..100 %, or -1 if none is usable.
  *

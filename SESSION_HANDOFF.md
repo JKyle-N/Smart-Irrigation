@@ -3,7 +3,7 @@
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 
-Last updated: **2026-11-01** — whole-firmware audit: bugs fixed, new decisions in §5 (items 19–25).
+Last updated: **2026-11-01** — whole-system verification and its fixes (clock trust, secrets in logs, I²C from core 0); open decisions in §5 (items 19–24, 26).
 Earlier the same day: SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
 `CLAUDE.md` "LOCKED: GSM behavior". Commissioning stage M covers it.
 Previous: 2026-10-30, toolchain pinned after ESP1 stopped linking on the newest platform; LCD
@@ -71,7 +71,7 @@ cd ESP2 && pio run
 cd Nano && pio run
 
 # host unit tests -- ~10 seconds each, no hardware needed
-cd ESP1 && pio test -e native     # 80 cases (33 pure maths + 47 simulated A7670C)
+cd ESP1 && pio test -e native     # 86 cases (37 pure maths + 49 simulated A7670C)
 cd ESP2 && pio test -e native     # 13 cases
 
 # website
@@ -84,17 +84,26 @@ firebase deploy --only database --dry-run   # validates rules WITHOUT deploying 
 Known-good build sizes after the A7670C swap (both `SECONDARY_BATT_ENABLED 0`) — a sharp deviation
 means something unintended was picked up. With all optional flags at 1 (ESP1 `SECONDARY_BATT_ENABLED`,
 `BATTERY_SAFETY_ENABLED`; ESP2 `SECONDARY_BATT_ENABLED`, `RES_VALVE_FITTED`) both still compile: ESP1
-1,317,857 B flash, ESP2 341,117 B. Host tests: ESP1 80 cases, ESP2 13.
+1,321,377 B flash, ESP2 341,117 B. Host tests: ESP1 86 cases, ESP2 13.
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 24.6 % (80,600 B) | 41.8 % (1,315,533 B) |
+| ESP1 | 24.6 % (80,672 B) | 41.9 % (1,319,045 B) |
 | ESP2 | 7.1 % (23,252 B) | 25.9 % (339,665 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
 ## 4. What the last sessions added
+
+**2026-11-01 (latest) — whole-system verification and fixes.** New this time: `CLAUDE.md` "Trusted clock",
+secrets kept out of logs, and the lockout covering LCD Testing and priming. Also fixed: `WIFIPORTAL` on its
+own, `FBASE,TLS` from the wrong core, SUMMARY totals, portal owner-number checks, the idle poll cutting ESP2
+during Calibration, one TLS session at a time during the CSV upload, and the Nano RX buffer (64 → 128 B; it
+may help the packet loss but that is unproven). CI now runs the host tests. Pure helpers are tested, but the
+`main.cpp` paths compile only. **A DS3231 with its lost-power flag set will stop the schedule until the clock
+is set**, which is intended. Not read line by line even now: `Website/script.js` (cross-checked only), portal
+form HTML, and LCD settings, calibration and diagnostics rendering.
 
 **2026-11-01 (later) — whole-firmware audit.** Read in full: Nano, ESP2, and ESP1's run, fault, link and
 modem paths. Checked by targeted search rather than read line by line: ESP1's Firebase upload, portal,
@@ -254,8 +263,10 @@ Found in the 2026-11-01 audit — **left open for the user to decide** (not chan
     once on change, so a lost one leaves the wrong cadence until the next change. Display-only impact.
 24. **`SUPA,<url>,<key>` by SMS cannot work for a real key.** A `service_role` JWT plus the URL does not
     fit one SMS, and each part of a long text arrives as a separate command. Use the portal.
-25. **Every stranger's text gets an `ERR,AUTH` reply**, which costs load (alphanumeric senders are now
-    skipped). A silent drop would be cheaper but gives a mistyped owner number no feedback.
+26. **The soil stop threshold (`soilStopPct`) does nothing.** It can be set from the LCD, SMS and the web and
+    is saved, but nothing reads it: a run delivers its fixed water budget once a day. Either stop a run
+    early when the soil reaches it, or remove the setting. That changes irrigation behaviour, so it is left
+    for the user.
 
 ---
 

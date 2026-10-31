@@ -145,7 +145,7 @@ and `Commissioning_Flash_Plan.md` stages the testing.
 ## Status
 
 All three controllers compile cleanly (PlatformIO `esp32dev` / `nanoatmega328`) and the host
-tests pass (`pio test -e native`: 80 on ESP1, 13 on ESP2). **The current firmware has not been
+tests pass (`pio test -e native`: 86 on ESP1, 13 on ESP2). **The current firmware has not been
 flashed to the rig**, so none of it is proven on hardware yet. **With the shipped constants
 fertigation doses nothing:** the 4 L batch is under the 5 L dosing floor, and most preset targets
 sit below the lab soil baseline. See `SESSION_HANDOFF.md` §5, item 19. This is active thesis work —

@@ -279,6 +279,34 @@ void test_header_body_length(void) {
   TEST_ASSERT_EQUAL_INT(-1, gsmHeaderBodyLen("+CMT: \"+639\",\"\",\"26/11/01,10:00:00+32\""));
 }
 
+static std::string safeLog(const char *body) {
+  char out[64];
+  gsmSafeLogBody(body, out, sizeof(out));
+  return out;
+}
+
+// REGRESSION (security): every inbound SMS was logged whole, so these passwords and keys reached the SD
+// card, the Supabase upload and the dashboard's event list.
+void test_secrets_never_reach_the_log(void) {
+  TEST_ASSERT_EQUAL_STRING("WIFI,***", safeLog("WIFI,HomeNet,hunter2").c_str());
+  TEST_ASSERT_EQUAL_STRING("wifi,***", safeLog("wifi,HomeNet,hunter2").c_str());
+  TEST_ASSERT_EQUAL_STRING("WIFI,***", safeLog("  WIFI,HomeNet,hunter2").c_str());
+  TEST_ASSERT_EQUAL_STRING("FBASE,AUTH,***", safeLog("FBASE,AUTH,dev@x.y,hunter2").c_str());
+  TEST_ASSERT_EQUAL_STRING("fbase,auth,***", safeLog("fbase,auth,dev@x.y,hunter2").c_str());
+  TEST_ASSERT_EQUAL_STRING("FBASE,APIKEY,***", safeLog("FBASE,APIKEY,AIzaSomething").c_str());
+  TEST_ASSERT_EQUAL_STRING("SUPA,***", safeLog("SUPA,https://x.supabase.co,eyJhbGci").c_str());
+  TEST_ASSERT_EQUAL_STRING("TSKEY,***", safeLog("TSKEY,1,ABC123").c_str());
+}
+
+void test_ordinary_commands_stay_readable_in_the_log(void) {
+  TEST_ASSERT_EQUAL_STRING("STATUS", safeLog("STATUS").c_str());
+  TEST_ASSERT_EQUAL_STRING("WIFI,ON", safeLog("WIFI,ON").c_str());
+  TEST_ASSERT_EQUAL_STRING("wifi,off", safeLog("wifi,off").c_str());
+  TEST_ASSERT_EQUAL_STRING("WIFIPORTAL", safeLog("WIFIPORTAL").c_str());
+  TEST_ASSERT_EQUAL_STRING("FBASE,STATUS", safeLog("FBASE,STATUS").c_str());
+  TEST_ASSERT_EQUAL_STRING("SET,COL_A,N,150", safeLog("SET,COL_A,N,150").c_str());
+}
+
 /* ---- Detection and setup ------------------------------------------------------------------------- */
 
 void test_finds_modem_at_115200_first(void) {
@@ -718,6 +746,8 @@ int main(int, char **) {
   RUN_TEST(test_split_without_separator_still_progresses);
   RUN_TEST(test_number_validation);
   RUN_TEST(test_header_body_length);
+  RUN_TEST(test_secrets_never_reach_the_log);
+  RUN_TEST(test_ordinary_commands_stay_readable_in_the_log);
   RUN_TEST(test_finds_modem_at_115200_first);
   RUN_TEST(test_finds_modem_at_other_baud);
   RUN_TEST(test_modem_booting_long_after_esp1_still_gets_configured);

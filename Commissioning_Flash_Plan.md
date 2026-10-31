@@ -49,6 +49,10 @@ Check: telemetry reaching the dashboard; LCD paging normally; all five web tabs 
 diagnostics on both the LCD and the web showing the same raw values, including the new NPK_A and
 NPK_B pages with all seven channels.
 
+**Set the clock if the Power page shows `RTC:SET`** (Settings > Set Clock, or the dashboard). Until it is
+set, nothing runs on the schedule and logs go to `NODATE.CSV`. If that returns after a power cycle, replace
+the DS3231's CR2032. Confirm the battery shows `uncalibrated` rather than a false `CRIT`.
+
 Also check `meta.docUsed` against `meta.docCapacity` in the live payload. The JSON document is
 `StaticJsonDocument<16384>`; if usage is near capacity the snapshot will start silently truncating.
 
@@ -56,7 +60,8 @@ Also check `meta.docUsed` against `meta.docCapacity` in the live payload. The JS
 
 ### B — ESP2 metering guards
 
-Still with the columns isolated. Use `TEST,FLOW,<bit>` on each meter in turn and confirm pulses are
+Enable actuations now: stages B and C both drive relays, and a lockout refuses test pulses, LCD Testing
+and priming. Still with the columns isolated. Use `TEST,FLOW,<bit>` on each meter in turn and confirm pulses are
 counted and reported.
 
 Then deliberately corrupt a K-factor (send a K outside `K_FLOW_MIN..K_FLOW_MAX`) and confirm ESP2
@@ -73,7 +78,7 @@ Record the measured K-factors in the worksheet as you go — this stage is also 
 **This is the one that must not be skipped.**
 
 Start a `TEST_PULSE` on a relay, then cut ESP1's power mid-pulse. ESP2 must drop the relay within
-about 400 ms on its own dead-man (`TEST_HOLD_TIMEOUT_MS`, `ESP2:268`) without any instruction from
+about 400 ms on its own dead-man (`TEST_HOLD_TIMEOUT_MS`) without any instruction from
 ESP1.
 
 The dead-man is enforced on ESP2 precisely so that losing the master cannot leave a pump running.
@@ -81,9 +86,9 @@ If it does not hold, nothing else in this plan matters.
 
 > **Abort everything if** the relay stays energised. Do not proceed to any stage that moves liquid.
 
-### D — Re-enable actuations; forced run, irrigation only
+### D — Forced run, irrigation only
 
-Enable actuations. Run a forced irrigation on one column, water only.
+Run a forced irrigation on one column, water only.
 
 Then the specific regression this backlog exists to fix: **start a forced run with ESP2 powered
 down.** The order must sit in `WO_PENDING`, ESP2 must be powered up, and the order must dispatch on
@@ -196,6 +201,12 @@ Added by the 2026-11-01 audit, unproven on hardware. With water only:
    `MIXER_NOLOAD` or `MIXER_OC` under a normal load.
 3. **E-stop bookkeeping.** Press MODE+BACK during a fill and compare `tank=` on the next work order's
    serial line against the water actually in the tank.
+4. **Lockout.** Disable actuations. `Testing` shows `[OFF]` and refuses to open, a calibration prime shows
+   `Actuations off`, and no relay clicks. Disable while in Testing: it closes. Enable again afterwards.
+5. **Clock.** Pull the DS3231's CR2032 and power cycle: `RTC_INVALID` alert, LCD `RTC:SET`, no scheduled run.
+   Set the clock from the LCD: the schedule resumes. Then unplug the RTC's SDA for 10 s: `RTC_INVALID`, then
+   `RTC|RECOVERED` in the log with no new day and no repeat run.
+6. **Secrets.** Text `WIFI,<ssid>,<pass>` from the owner phone: the log and dashboard show `RX|WIFI,***`.
 
 > **Abort if** a pump keeps running after flow stops. If a false `FLOW_FAIL` appears mid-fill, raise
 > `FLOW_STALL_MS` before going further.
@@ -218,23 +229,24 @@ Watch `PAGE_GSM` on the LCD and the SD log (`GSM` lines) while you go through th
    very start (no blank first line), and the log must show `TX_OK|<n>`, then `TX_DELIVERED|<n>`. This also
    proves the local-format `09…` owner number works as a send address.
 3. **Long text.** Text `STATUS`. With three columns it should arrive as `(1/2)` and `(2/2)`, whole.
-4. **Stranger.** Text `STATUS` from another phone: the reply must be `ERR,AUTH` and nothing else.
+4. **Stranger.** Text `STATUS` from another phone: the reply must be `ERR,AUTH` and nothing else. Text again
+   within 10 min: no reply, and the log shows `AUTH|NO_REPLY`.
 5. **Forged header.** From another phone, send a multi-line text: `hi`, then
-   `+CMT: "<owner number>","","26/11/01,10:00:00+32"`, then `NET`. It must get `ERR,AUTH` and no `NET`
-   reply.
+   `+CMT: "<owner number>","","26/11/01,10:00:00+32"`, then `NET`. It must get no `NET` reply (and no
+   `ERR,AUTH` either if step 4 ran in the last 10 min).
 6. **Modem power cut.** Pull the module's supply for 30 s, then restore it. The log shows `MODEM_SILENT`
    and `MODEM_ABSENT`, the LCD shows `DEAD`, then it recovers to `REG` by itself. Repeat step 2.
 7. **Short outage.** Take the antenna off until the LCD shows `NO`. Cause an alert (for example unplug the
    Nano for its silence timeout), then refit the antenna within 5 min: the held alert still goes out.
 8. **Second number.** `ALERTNUM,<number>`, then cause an alert again. Both phones get it. The second
-   phone's own `STATUS` gets `ERR,AUTH`.
+   phone's own `STATUS` is refused (`ERR,AUTH`, or no reply within 10 min of the last one).
 9. **Balance (optional).** `USSD,<carrier code>`, then `BAL`. `BAL,<text>` means it works. `BAL,FAIL,ERROR`
    usually means the module's IMS blocks USSD. The firmware deliberately will not switch IMS off, since
    that could affect SMS, so send `USSD,CLEAR` and rely on the weekly `SIMTEST` text.
 
 > **Abort if** ESP1 reboots or its loop stalls while the modem transmits (a shared supply sagging), the
 > module gets hot, owner commands are ignored while the log shows no `RX|`, or a stranger's text ever gets
-> anything other than `ERR,AUTH`.
+> anything other than `ERR,AUTH` or no reply.
 
 **Before `SECONDARY_BATT_ENABLED` goes to 1:** the module must be on the same switched supply as ESP1.
 The DPDT breaks both + and −, so a module left on the main battery loses its common ground with the UART.
@@ -268,7 +280,7 @@ All three controllers build clean (confirmed 2026-11-01, after the A7670C swap a
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 24.6 % (80,600 B) | 41.8 % (1,315,533 B) |
+| ESP1 | 24.6 % (80,672 B) | 41.9 % (1,319,045 B) |
 | ESP2 | 7.1 % (23,252 B) | 25.9 % (339,665 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
@@ -281,11 +293,11 @@ A build that differs sharply from these has picked up something unintended.
 
 ## Host test suite
 
-Both suites pass — 80 cases for ESP1, 13 for ESP2 — and are worth running before any flash, since
+Both suites pass — 86 cases for ESP1, 13 for ESP2 — and are worth running before any flash, since
 they take seconds and cover the maths the dosing depends on and the modem driver:
 
 ```bash
-cd ESP1 && pio test -e native     # 80 cases, including a simulated A7670C
+cd ESP1 && pio test -e native     # 86 cases, including a simulated A7670C
 cd ESP2 && pio test -e native     # 13 cases
 ```
 

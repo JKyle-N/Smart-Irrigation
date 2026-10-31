@@ -26,6 +26,8 @@ New folder/
 
 # Field logs: large rotating CSVs, and they are rig data rather than source.
 Logs/
+# Real rig logs exported from Supabase. The repo is public: never commit these.
+Reports/Supabase/
 
 # OS / editor junk
 Thumbs.db

@@ -9,6 +9,27 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Host tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: ESP1 tests
+        run: pio test -d ESP1 -e native
+
+      - name: ESP2 tests
+        run: pio test -d ESP2 -e native
+
   build:
     runs-on: ubuntu-latest
     strategy:

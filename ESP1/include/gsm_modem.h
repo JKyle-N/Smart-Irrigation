@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 static const uint32_t GSM_BAUDS[] = { 115200, 9600, 57600, 38400, 19200, 230400, 460800 };
 static const uint8_t  GSM_BAUD_COUNT = sizeof(GSM_BAUDS) / sizeof(GSM_BAUDS[0]);
@@ -101,6 +102,24 @@ static inline bool gsmUssdCodeOk(const char *s) {
   int n = 0;
   for (; *s; s++, n++) if (!((*s >= '0' && *s <= '9') || *s == '*' || *s == '#')) return false;
   return n >= 2 && n <= 20;
+}
+
+// Copy an inbound SMS for logging, hiding anything secret. The log reaches the SD card, the Supabase
+// upload and the dashboard's event list, and these commands carry passwords and API keys.
+static inline void gsmSafeLogBody(const char *body, char *out, size_t outSize) {
+  static const struct { const char *prefix; size_t keep; } SECRET[] = {
+    { "WIFI,", 4 }, { "FBASE,AUTH", 10 }, { "FBASE,APIKEY", 12 }, { "SUPA,", 4 }, { "TSKEY,", 5 },
+  };
+  while (*body == ' ') body++;
+  if (strcasecmp(body, "WIFI,ON") != 0 && strcasecmp(body, "WIFI,OFF") != 0) {
+    for (size_t i = 0; i < sizeof(SECRET) / sizeof(SECRET[0]); i++) {
+      if (strncasecmp(body, SECRET[i].prefix, strlen(SECRET[i].prefix)) == 0) {
+        snprintf(out, outSize, "%.*s,***", (int)SECRET[i].keep, body);
+        return;
+      }
+    }
+  }
+  snprintf(out, outSize, "%s", body);
 }
 
 // Copy the idx-th (0-based) double-quoted field of a line. False if the line has no such field.
