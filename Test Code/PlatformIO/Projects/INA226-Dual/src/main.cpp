@@ -11,10 +11,12 @@
     Keep load and board grounds common, and stay under the INA226's 36 V limit.
 
   SETTING THE ADDRESS (set on the module, by its A0 / A1 pins or solder pads)
-    A1 and A0 both to GND = 0x40  <- MODULE A (the default as shipped)
-    A1 to GND, A0 to VS   = 0x41  <- MODULE B: this one must be changed
+    A1 to GND, A0 to VCC  = 0x41  <- INA1
+    A1 to VCC, A0 to GND  = 0x44  <- INA2
+    The chip's address pins are named A0 and A1. If yours are marked differently and the two names
+    come out swapped (unplug INA1: INA2 goes LOST), swap the two addresses in the MODULES table.
     Two modules left on the same address both answer and corrupt each other's replies.
-    To try other addresses, change only the MODULES table below:
+    To try other addresses, change only the MODULES table below (VS = the module's VCC):
 
       A1\A0   GND    VS    SDA   SCL
       GND     0x40  0x41  0x42  0x43
@@ -45,8 +47,8 @@ struct Module {
 };
 
 Module MODULES[] = {
-  { "A", 0x40, 2048, 0.0f, 1.000f, false },
-  { "B", 0x41, 2048, 0.0f, 1.000f, false },
+  { "INA1", 0x41, 2048, 0.0f, 1.000f, false },
+  { "INA2", 0x44, 2048, 0.0f, 1.000f, false },
 };
 const uint8_t MODULE_COUNT = sizeof(MODULES) / sizeof(MODULES[0]);
 
@@ -191,8 +193,8 @@ void printStatus() {
 }
 
 void printMissingHints() {
-  Serial.println(F("  With two modules connected and one address silent, both are probably on the"));
-  Serial.println(F("  same address: set A0 to VS on module B for 0x41. Then check its SDA/SCL/VCC/GND."));
+  Serial.println(F("  Check that module's A0/A1 links (INA1 0x41: A1 GND, A0 VCC. INA2 0x44: A1 VCC, A0 GND),"));
+  Serial.println(F("  that no address pin is left floating, then its SDA/SCL/VCC/GND."));
 }
 
 void tryMissingModules() {
