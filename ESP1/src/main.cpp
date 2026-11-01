@@ -218,6 +218,26 @@ const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD
  * (PWR2) and published, but nothing is blocked or alerted.
  * Calibration follows the bench tool Test Code/Arduino R3/INA226_R010 (same CAL/offset/factor). */
 #define SECONDARY_BATT_ENABLED 0
+/* Secondary battery as a BACKUP for a critically low main battery: READY, NOT ACTIVE. At 1: when main
+ * stays below BATT_CRIT_V for BACKUP_TRIGGER_MS with nothing running, ESP1 texts a critical alert (it
+ * does NOT use raiseFault('C'): that E-stops, and the GPIO4 cut would drop the boards straight back to
+ * main), then has ESP2 hold the boards on the secondary. All inverter use is blocked from the alert
+ * until main recovers. It returns to main once main holds BACKUP_MAIN_RECOVER_V for BACKUP_RECOVER_MS,
+ * or when the pack reaches SEC_BATT_CRIT_V or stops being monitored. See backupTick. Needs
+ * SECONDARY_BATT_ENABLED and a calibrated main voltage (calBattV), since uncalibrated it never triggers.
+ * ESP2 holds the matching flag -- set both together.                                                 */
+#define SECONDARY_BACKUP_ENABLED 0
+#if SECONDARY_BACKUP_ENABLED && !SECONDARY_BATT_ENABLED
+#error "SECONDARY_BACKUP_ENABLED needs SECONDARY_BATT_ENABLED"
+#endif
+const float BACKUP_MAIN_RECOVER_V = 12.6f;              // main has recovered at or above this        [CONFIRM]
+const unsigned long BACKUP_TRIGGER_MS  = 60000;         // main critical this long before acting      [CONFIRM]
+const unsigned long BACKUP_RECOVER_MS  = 300000;        // main recovered this long before returning  [CONFIRM]
+const unsigned long BACKUP_ALERT_WAIT_MS = 60000;       // longest wait for the text before switching anyway
+const unsigned long BACKUP_SWITCH_TIMEOUT_MS = 30000;   // ESP2 boot + handshake + settle, with margin
+const unsigned long BACKUP_RESEND_MS   = 3000;          // repeat BATTBK,ON|OFF until ESP2 confirms
+const unsigned long BACKUP_RETRY_MS    = 60000;         // pause before trying again after a failed or lost switch
+const float         SEC_NO_PACK_V      = 5.0f;          // below this it is a wiring fault, not a flat pack
 const float    SEC_CURRENT_LSB      = 0.00025f;  // 0.25 mA/bit -> 8.192 A full scale
 const uint16_t SEC_INA_CAL          = 2048;      // 0.00512/(LSB*0.010 R); trim x (meter A/INA A) [MEASURE]
 const float    SEC_CURRENT_OFFSET_A = 0.014f;    // no-load reading, subtracted                 [MEASURE]
@@ -242,6 +262,10 @@ const uint8_t       BSW_LATCH_STRIKES = 2;
 const uint32_t      BSW_WINDOW_S      = 86400;      // 24 h (RTC time)
 const unsigned long BSW_QUIET_MS      = 3000;       // SD/radio/GSM quiet window around one switch
 const unsigned long BSW_PENDING_MAX_MS = 10000;     // an unconfirmed switch with no reboot = survived
+// After a boot or a counted reset the hold-up is flat, and retrying at once would be sure to fail and
+// burn the second strike. Time it needs to recharge -- measure it on the rig.             [MEASURE]
+const unsigned long BSW_RECHARGE_MS    = 60000;
+const unsigned long BSW_CUT_SURVIVE_MS = 5000;      // alive this long after a stop = the stop did not reset us
 
 /* ---- Battery CURRENT: ACS758-050B via ADS1115 (replaces the opto ADC) ------ *
  * The GPIO34 opto path logged I=0.00 on all 44,303 samples across 16 days -- battery %, the daily
@@ -989,6 +1013,7 @@ struct TelemetrySnapshot {
   bool     rtcOk_, sdOk_, acsOk_;
   bool     secOk_, secLow_, onSecondary_;           // secondary battery (INA226) + supply in use
   bool     bswLatched_; uint8_t bswStrikes_;        // battery-switch fault latch + strike count
+  uint8_t  bkState_;                                // backup state (BkState)
   float    secV_, secI_, secP_;
   bool     simOk, netReg;
   int      rssi, creg;
@@ -1121,6 +1146,12 @@ unsigned long lastInaMs = 0;                         // ADC read throttle (kept 
 bool  secInaOk = false, secHaveV = false;          // monitor answering / have a reading
 float secV = 0, secI = 0, secP = 0;                // filtered V, signed current, power
 bool  secLow = false, secCrit = false;             // low latch (hysteresis) / critical
+bool  secNoPack = false;                           // the chip answers but sees no pack: wiring or no common ground
+BkState bkState = BK_IDLE;                         // secondary-as-backup state (see backupTick)
+uint8_t tankDosedMask = 0;                         // ESP2 reports a dosed tank left for these columns (INFO,TANK,DOSED)
+bool  bswEstopRestore = false;                     // boot: an E-stop's own cut reset us, so go back into E-stop
+unsigned long bswCutMs = 0;                        // a stop was journaled (bswNoteCut); cleared once we survive it
+char  bswCmdSaved[48] = "";                        // dashboard command id on flash while the boards can be reset
 bool  esp2OnSecondary = false;                     // ESP2 reported INFO,BATT,SECONDARY (boards isolated)
 unsigned long esp2BattWaitUntil = 0;               // ESP2 power-off held for the secondary->main return
 uint8_t  bswPendingDir = 0;        // ESP2 announced a P4 switch not yet confirmed (1 to secondary, 2 to main)
@@ -1633,6 +1664,11 @@ void secBattTick();
 bool secBattBlocksAc(const char **why = nullptr);
 void bswBoot();
 void bswTick();
+void bswNoteCut(uint8_t kind, int c, int mode);
+void bswCmdJournal();
+void backupTick();
+bool backupHoldsEsp2();
+const char *bkName(BkState s);
 void bswForgetPending();
 void bswClear(const char *by);
 static void bswSavePending(uint8_t dir);
@@ -1806,6 +1842,11 @@ void setup() {
   bswBoot();                                // battery-switch latch + was THIS boot caused by a switch?
   wdtSetup();                               // arm task watchdog (core-1 loop only)
   setState(STARTUP_SYNC);
+  if (bswEstopRestore) {                    // an operator or critical stop must not end because it reset us
+    logEvent("ESP1", "PWR2", "BATTSW|ESTOP_RESTORED");
+    sendSMS("ALERT,CRIT,ESTOP_KEPT,the stop reset the controllers - confirm on the LCD to resume");
+    enterEmergencyStop(false);
+  }
   Serial.println(F("Setup complete -> STARTUP_SYNC"));
 }
 
@@ -1831,6 +1872,7 @@ void loop() {
   g_lastStage = 'P'; powerTick();          // main battery: opto ADC voltage + ACS758 current
   g_lastStage = 'b'; secBattTick();        // secondary battery: INA226 I2C read + run-block policy
   g_lastStage = 'w'; bswTick();            // battery-switch journal expiry + 24 h auto re-arm
+  g_lastStage = 'b'; backupTick();         // secondary as backup for a critical main (compiled out at 0)
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
   g_lastStage = 'p'; esp2PowerTick();      // ESP2 min-on hold + periodic idle heartbeat poll (sec.18.8)
@@ -2796,6 +2838,7 @@ void handleEsp2Response(const String &payload) {
     logEvent("ESP2", "RESP", payload);
     esp2CommRecovered();                                         // any READY = link alive -> clear COMM_LOST latch
     esp2OnSecondary = false;                                     // a fresh ESP2 boots with P4 off
+    tankDosedMask = 0;                                           // its INFO,TANK,DOSED follows if one is left
     if (bswPendingDir) {                                         // rebooted mid-switch: the switch reset it
       uint8_t dir = bswPendingDir;
       bswPendingDir = 0; bswSavePending(0); battQuietUntilMs = 0;
@@ -2844,7 +2887,37 @@ void handleEsp2Response(const String &payload) {
   }
   if (resp == "STATUS") return;                                // heartbeat
   if (resp == "INFO") {                                       // e.g. INFO,IDLE_RESET (self-heal notice)
+    // Repeated each heartbeat while it is true, so handled before the log line and logged on change only.
+    if (arg.startsWith("TANK,DOSED,")) {
+      uint8_t m = (uint8_t)(arg.substring(11).toInt() & 0x07);
+      if (m != tankDosedMask) {
+        tankDosedMask = m;
+        logEvent("ESP2", "RESP", payload + "|finishing this batch first");
+      }
+      return;
+    }
     logEvent("ESP2", "RESP", payload);
+    if (arg.startsWith("DOSE_CARRY,")) {                      // a batch dosed for one column went to another
+      raiseFault('M', "DOSE_CARRY", (String("mask=") + arg.substring(11) + "|no extra dose added").c_str());
+      return;
+    }
+    // A fault whose own P4 drop reset the boards before its reply got out. The hold is gone, so report
+    // it here and skip the column for today, as a STOP reply does: re-running into the same fault would
+    // only burn the next strike. A forced run can still retry it.
+    if (arg.startsWith("FAULT_LOST,")) {
+      sendEsp2("BATTSW,FACK");
+      static String lastLost = "";
+      static unsigned long lastLostMs = 0;
+      if (arg == lastLost && millis() - lastLostMs < 120000UL) return;   // only our FACK was lost
+      lastLost = arg; lastLostMs = millis();
+      int c1 = arg.indexOf(',', 11), c2 = (c1 > 0) ? arg.indexOf(',', c1 + 1) : -1;
+      if (c2 > 0) {
+        uint8_t m = (uint8_t)(arg.substring(c1 + 1, c2).toInt() & 0x07);
+        for (int b = 0; b < NUM_COLUMNS; b++) if (m & (1 << b)) col[b].lastServicedStamp = currentDayStamp;   // RAM only
+        raiseFault('M', arg.substring(11, c1).c_str(), (arg.substring(c2 + 1) + "|BOARD_RESET|skipped today").c_str());
+      }
+      return;
+    }
     // Secondary-battery switch notices: track which battery the boards are on. MAIN also releases a
     // power-off that was being held for exactly this return (see esp2SetPower).
     if (arg.startsWith("BATT,SWITCHING,")) {
@@ -2854,6 +2927,7 @@ void handleEsp2Response(const String &payload) {
       logFlush(true);
       if (bswPendingDir != dir) bswSavePending(dir);
       bswPendingDir = dir; bswPendingMs = millis();
+      bswCmdJournal();                                        // before GO: the switch may be the end of this boot
       battQuietUntilMs = millis() + BSW_QUIET_MS;
       sendEsp2("BATTSW,GO");
       return;
@@ -3031,6 +3105,7 @@ void handleEsp2Response(const String &payload) {
       lastPumpUseMs[0] = millis(); lastPumpUseMs[1] = millis();
       if (wo.fertigate) lastPumpUseMs[2] = millis();
       wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
+      tankDosedMask = 0;               // ESP2 cleared its dose journal when it finished this run
       if (sysState == ACTIVE_STATE) setState(IDLE_STATE);
       esp2SetPower(false);             // run complete -> ESP2 off (idle power-saving, sec.18.8)
       lastHoldCode = ""; sameHoldN = 0; steerRelease = false;   // run completed -> clear the re-hold guard
@@ -3853,6 +3928,9 @@ void esp2SetPower(bool on, bool force) {
     return;
   }
   if (!esp2Powered) { esp2OffPending = false; return; }
+  // ESP2 is holding the boards on the backup battery. Turning it off now is what would put them on the
+  // flat main battery; backupTick decides when that is allowed. force (E-stop) still cuts.
+  if (!force && backupHoldsEsp2()) { esp2OffPending = false; return; }
 #if SECONDARY_BATT_ENABLED
   // ESP2 has the boards on the secondary and returns them to main ~1 s after the inverter stops.
   // Cutting its power now would drop the DPDT at once instead, so hold a graceful off until it
@@ -3902,7 +3980,7 @@ void esp2PowerTick() {
   // uiMode + diagRemoteUntilMs: Calibration, Sensor Diag and a remote sweep all use ESP2 at IDLE_STATE. A
   // poll finishing underneath one would power ESP2 off in the middle of it.
   if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held || esp2CommLost ||
-      uiMode != UI_DATA || diagRemoteUntilMs) { esp2PollActive = false; return; }
+      uiMode != UI_DATA || diagRemoteUntilMs || backupHoldsEsp2()) { esp2PollActive = false; return; }
   unsigned long interval = isNight() ? ESP2_IDLE_POLL_NIGHT_MS : ESP2_IDLE_POLL_DAY_MS;
   if (!esp2PollActive) {
     if (millis() - lastEsp2Ms < interval) return;          // heard from ESP2 recently -> no poll needed
@@ -4555,6 +4633,9 @@ void sendDailyReport() {
   r += ",ST," + String(stateLabel(sysState, actuationsDisabled));
   r += ",BAT," + (battVCalLoaded ? String(battV, 1) + "V" : String("--"));
   r += ",BAT2," + ((secInaOk && secHaveV) ? String(secV, 1) + "V" + (secLow ? "LOW" : "") : String("--"));
+#if SECONDARY_BACKUP_ENABLED
+  if (bkState != BK_IDLE) r += ",BKUP," + String(bkName(bkState));
+#endif
   // Daily energy (sec.12.1.3): integrated discharge (CONS) + charge (CHG), Wh.
   r += ",CONS," + String((int)(energyConsumedWh + 0.5)) + "Wh";
   r += ",CHG," + String((int)(energyChargedWh + 0.5)) + "Wh";
@@ -5031,7 +5112,19 @@ void controlTick() {
 
   uint16_t mod = minuteOfDay();
 
-  for (int c = 0; c < NUM_COLUMNS; c++) {
+  // A dosed tank left behind by a reset goes first, to the column it was mixed for, whatever its window
+  // or soil reading says now: that batch has nowhere else to go (the tank has no drain) and the next
+  // column would otherwise inherit it. ESP2 doses only what is still owed. Snoozed, disabled and
+  // skipped-today columns still pass: the operator's choice wins over finishing the batch. Not at
+  // night: nobody expects pumps then, and the batch keeps until morning.
+  uint8_t dosedNow = isNight() ? 0 : tankDosedMask;
+  int order[NUM_COLUMNS], orderN = 0;
+  for (int c = 0; c < NUM_COLUMNS; c++) if (dosedNow & (1 << c)) order[orderN++] = c;
+  for (int c = 0; c < NUM_COLUMNS; c++) if (!(dosedNow & (1 << c))) order[orderN++] = c;
+
+  for (int oi = 0; oi < orderN; oi++) {
+    int c = order[oi];
+    bool finishDosed = dosedNow & (1 << c);
     if (!COLUMN_ENABLED[c]) continue;                              // config, not a fault -> no CTRL log spam
     // Operator (or the auto-cancel breaker) suppressed this column for a while. Logged like every
     // other skip reason so the CSV shows why a due column was passed over.
@@ -5043,7 +5136,7 @@ void controlTick() {
     // schedule axis: AUTO uses the default window, MANUAL uses the operator-set one (sec.18.10.7.2)
     uint16_t ws = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_START[c] : DEF_WIN_START[c];
     uint16_t we = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_END[c]   : DEF_WIN_END[c];
-    if (mod < ws || mod > we) {                                    // outside service window
+    if (!finishDosed && (mod < ws || mod > we)) {                  // outside service window
       ctrlNote(c, "OUTSIDE_WINDOW|now=" + hhmm(mod) + "|win=" + hhmm(ws) + "-" + hhmm(we));
       continue;
     }
@@ -5057,8 +5150,8 @@ void controlTick() {
       ctrlNote(c, "NANO_STALE");
       continue;
     }
-    if (sensor.soil[c] < 0) { ctrlNote(c, "SOIL_INVALID"); continue; }   // invalid soil (faulted elsewhere)
-    if (sensor.soil[c] >= soilStartPct) {                          // not dry enough
+    if (!finishDosed && sensor.soil[c] < 0) { ctrlNote(c, "SOIL_INVALID"); continue; }   // invalid soil (faulted elsewhere)
+    if (!finishDosed && sensor.soil[c] >= soilStartPct) {          // not dry enough
       ctrlNote(c, "NOT_DRY|soil=" + String(sensor.soil[c]) + ">=" + String(soilStartPct));
       continue;
     }
@@ -5069,8 +5162,8 @@ void controlTick() {
       if (!resLowLatched) { resLowLatched = true; raiseFault('M', "RES_LOW", "RESERVOIR"); }
       continue;
     }
-    bool fert = decideFertigate(c);
-    ctrlNote(c, fert ? "DUE->FERTIGATE" : "DUE->IRRIGATE");        // column is being serviced now
+    bool fert = finishDosed || decideFertigate(c);                 // a dosed batch still needs its mix and flush
+    ctrlNote(c, finishDosed ? "DUE->FINISH_DOSED" : fert ? "DUE->FERTIGATE" : "DUE->IRRIGATE");   // column is being serviced now
 #if BATTERY_SAFETY_ENABLED
     if (batteryLow) fert = false;                                  // low battery -> irrigation only (READY, not active)
 #endif
@@ -5302,8 +5395,13 @@ void readBatteryAdc() {
 void batterySafetyTick() {
 #if BATTERY_SAFETY_ENABLED
   static bool wasLow = false, wasCrit = false;
+#if !SECONDARY_BACKUP_ENABLED
+  // With the backup live, backupTick owns a critical main: this E-stop's GPIO4 cut would drop the boards
+  // onto the flat main battery at the very moment the backup is meant to take over.
   if (batteryCritical && !wasCrit) raiseFault('C', "BATTERY_CRITICAL", "BATT");   // -> enterEmergencyStop
-  else if (batteryLow && !wasLow)  raiseFault('M', "BATTERY_LOW", "BATT");
+  else
+#endif
+  if (batteryLow && !wasLow)       raiseFault('M', "BATTERY_LOW", "BATT");
   wasLow = batteryLow; wasCrit = batteryCritical;
 #endif
 }
@@ -5374,9 +5472,15 @@ static void secBattPolicy() {
     secCrit = (secV < SEC_BATT_CRIT_V);
   }
 #if SECONDARY_BATT_ENABLED
+  // raiseFault sends nothing during Testing. Setting these one-shots there would lose the alert for the
+  // whole episode, so hold them until Testing ends.
+  if (sysState == TEST_MODE) return;
   static bool missAlerted = false, lowAlerted = false, critAlerted = false;
   if (!valid) {
-    if (!missAlerted) { missAlerted = true; raiseFault('M', "SENSOR_FAIL", "INA226|SECONDARY_BATT|AC_BLOCKED"); }
+    if (!missAlerted) {
+      missAlerted = true;
+      raiseFault('M', "SENSOR_FAIL", secNoPack ? "INA226|NO_PACK_CHECK_WIRING|AC_BLOCKED" : "INA226|SECONDARY_BATT|AC_BLOCKED");
+    }
     return;
   }
   missAlerted = false;
@@ -5416,6 +5520,14 @@ void secBattTick() {
   }
   failN = 0;
   float v = rBus * 0.00125f * SEC_BUS_V_FACTOR;           // 1.25 mV/bit
+  // No 4S pack reads this low. The chip is fine, so this is a loose VBUS lead or a pack whose negative is
+  // not common with board ground -- report it as that, not as a flat battery.
+  if (v < SEC_NO_PACK_V) {
+    if (!secNoPack) logEvent("ESP1", "PWR2", "INA226|NO_PACK|V=" + String(v, 2));
+    secNoPack = true; secHaveV = false;
+    secBattPolicy(); return;
+  }
+  secNoPack = false;
   float i = (int16_t)rCur * SEC_CURRENT_LSB;
   if (SEC_INVERT_CURRENT) i = -i;
   i -= SEC_CURRENT_OFFSET_A;
@@ -5431,11 +5543,22 @@ void secBattTick() {
 
 // True when no inverter use may START: switching is live and the secondary is low or unmonitored.
 // A run already in progress is never aborted by this -- only new work is refused.
-bool secBattBlocksAc(const char **why) {
 #if SECONDARY_BATT_ENABLED
-  if (!secInaOk || !secHaveV) { if (why) *why = "the secondary battery monitor (INA226) is not responding"; return true; }
+static bool bswRecharging() {
+  return millis() < BSW_RECHARGE_MS || (bswLastStrikeMs && millis() - bswLastStrikeMs < BSW_RECHARGE_MS);
+}
+#endif
+
+bool secBattBlocksAc(const char **why) {
+#if SECONDARY_BACKUP_ENABLED
+  if (bkState != BK_IDLE)      { if (why) *why = "the main battery is critical"; return true; }
+#endif
+#if SECONDARY_BATT_ENABLED
+  if (!secInaOk || !secHaveV) { if (why) *why = secNoPack ? "the secondary battery is not seen (check its wiring and ground)"
+                                                          : "the secondary battery monitor (INA226) is not responding"; return true; }
   if (secLow)                  { if (why) *why = "the secondary battery is low"; return true; }
   if (bswLatched)              { if (why) *why = "battery-switch fault: a switch reset the controllers (clear it to retry)"; return true; }
+  if (bswRecharging())         { if (why) *why = "the controllers just restarted: waiting for the hold-up to recharge"; return true; }
 #endif
   (void)why;
   return false;
@@ -5491,6 +5614,31 @@ void bswForgetPending() {
   bswSavePending(0);
 }
 
+/* A stop while the boards are on the secondary drops P4 at once, and that transfer can reset ESP1 before
+ * the stop has finished. Unjournaled, the rig would come back as if nothing had been asked of it: an E-stop
+ * forgotten and the schedule running again, or a cancelled column re-run at once. So it is written down
+ * first. Surviving BSW_CUT_SURVIVE_MS clears it (bswTick), so a later unrelated reset can't replay it.
+ *   kind 1 = E-stop   kind 2 = cancelRun(mode) of column c                                             */
+void bswNoteCut(uint8_t kind, int c, int mode) {
+  if (!esp2OnSecondary && !bswPendingDir) return;
+  Preferences p; p.begin("battsw", false);
+  p.putUChar("cutk", kind); p.putChar("cutc", (int8_t)c); p.putChar("cutm", (int8_t)mode);
+  p.end();
+  bswCutMs = millis() ? millis() : 1;
+}
+
+/* A dashboard command in flight when the boards reset would sit on "accepted" for good, since its id is
+ * only in RAM. Keep it on flash while a reset is possible; a boot that finds one marks it failed. */
+void bswCmdJournal() {
+  const char *id = forceCmdId[0] ? forceCmdId : fbRemoteExerciseId[0] ? fbRemoteExerciseId : puCmdId;
+  if (!esp2OnSecondary && !bswPendingDir) id = "";
+  if (!strcmp(id, bswCmdSaved)) return;
+  strlcpy(bswCmdSaved, id, sizeof(bswCmdSaved));
+  Preferences p; p.begin("battsw", false);
+  if (bswCmdSaved[0]) p.putString("cmd", bswCmdSaved); else p.remove("cmd");
+  p.end();
+}
+
 void bswClear(const char *by) {
   bool was = bswLatched;
   bswLatched = false; bswStrikes = 0; bswLastStrikeT = 0;
@@ -5503,7 +5651,22 @@ void bswBoot() {
   Preferences p; p.begin("battsw", true);
   uint8_t pend = p.getUChar("pend", 0);
   bswStrikes = p.getUChar("n", 0); bswLastStrikeT = p.getUInt("t", 0); bswLatched = p.getBool("lat", false);
+  uint8_t cutKind = p.getUChar("cutk", 0);
+  int cutCol = p.getChar("cutc", -1), cutMode = p.getChar("cutm", -1);
+  String lostCmd = p.isKey("cmd") ? p.getString("cmd", "") : String("");
   p.end();
+  if (cutKind || lostCmd.length()) {            // clear first: this boot can never replay them twice
+    Preferences w; w.begin("battsw", false);
+    w.remove("cutk"); w.remove("cutc"); w.remove("cutm"); w.remove("cmd");
+    w.end();
+  }
+  if (cutKind == 1) bswEstopRestore = true;     // setup() goes back into E-stop once it has finished
+  if (cutKind == 2 && cutCol >= 0 && cutCol < NUM_COLUMNS) {
+    if (cutMode == 0) { COLUMN_ENABLED[cutCol] = false; saveColEnable(cutCol); }
+    else if (cutMode > 0) colSnoozeUntil[cutCol] = millis() + SNOOZE_LONG_MS;
+    logEvent("ESP1", "PWR2", String("BATTSW|CANCEL_RESTORED|COL_") + COL_TAG[cutCol] + "|mode=" + cutMode);
+  }
+  if (lostCmd.length()) firebaseQueueStatus(lostCmd.c_str(), "failed", "the controllers reset during a battery switch");
   if (bswLatched) logEvent("ESP1", "PWR2", "BATTSW|LATCHED_AT_BOOT|AC_BLOCKED");
   if (pend == 1 || pend == 2) {
     bswSavePending(0);                          // clear first: this boot can never count twice
@@ -5521,6 +5684,13 @@ void bswTick() {
     bswForgetPending();
   }
   if (battQuietUntilMs && !battQuietActive()) battQuietUntilMs = 0;
+  bswCmdJournal();
+  if (bswCutMs && millis() - bswCutMs >= BSW_CUT_SURVIVE_MS) {      // alive: that stop did not reset us
+    bswCutMs = 0;
+    Preferences p; p.begin("battsw", false);
+    p.remove("cutk"); p.remove("cutc"); p.remove("cutm");
+    p.end();
+  }
   // ESP2's journal report of an ESP1-boot strike arrives within seconds of STARTUP_SYNC; after 5 min
   // any report is a new event again.
   if (bswBootStruck && millis() > 300000UL) bswBootStruck = false;
@@ -5537,6 +5707,126 @@ void bswTick() {
     }
   }
 }
+
+/* =============================================================================
+ *  SECONDARY AS BACKUP  (see SECONDARY_BACKUP_ENABLED, backupNext in pure_math.h)
+ * -----------------------------------------------------------------------------
+ *  The decisions are in backupNext(), which is host-tested. This wires it up: debounce the main battery,
+ *  send the alerts, and ask ESP2 to hold or release P4. Reset-proof by construction: no state survives
+ *  a reset except "the alert already went out" (NVS battsw/bka), so a reset lands on BK_IDLE with the
+ *  boards on main, and the same steps run again -- without a second text, after the hold-up has
+ *  recharged, and at most BSW_LATCH_STRIKES times, because each switch-caused reset is a strike.
+ * ========================================================================== */
+bool backupHoldsEsp2() {
+  return bkState == BK_SWITCHING || bkState == BK_ACTIVE || bkState == BK_RETURNING;
+}
+const char *bkName(BkState s) {
+  switch (s) {
+    case BK_ALERT:     return "alert";
+    case BK_WAIT:      return "waiting";
+    case BK_SWITCHING: return "switching";
+    case BK_ACTIVE:    return "active";
+    case BK_RETURNING: return "returning";
+    default:           return "idle";
+  }
+}
+#if SECONDARY_BACKUP_ENABLED
+// Critical alert WITHOUT raiseFault('C'), which would E-stop and cut ESP2. Also not suppressed in Testing.
+static void bkCritAlert(const char *code, const String &loc) {
+  faultsToday[0]++;
+  logEvent("ESP1", "FAULT", String("CRIT|") + code + "|" + loc);
+  lastFaultMsg = String(code) + " " + loc;
+  lastFaultTime = tsString();
+  wakeBacklight();
+  sendSMS(String("ALERT,CRIT,") + code + "," + loc);
+}
+static String bkVolts() {
+  return String("MAIN=") + String(battV, 2) + "|SEC=" + ((secInaOk && secHaveV) ? String(secV, 2) : String("--"));
+}
+static void bkSaveAlerted(bool on) {
+  Preferences p; p.begin("battsw", false); p.putBool("bka", on); p.end();
+}
+
+void backupTick() {
+  static bool alerted = false, booted = false;
+  static unsigned long lowSince = 0, okSince = 0, stateMs = 0, lastSendMs = 0, retryAt = 0;
+  unsigned long now = millis();
+  if (!booted) {
+    booted = true;
+    Preferences p; p.begin("battsw", true); alerted = p.getBool("bka", false); p.end();
+    stateMs = now;
+  }
+  bool idle = sysState == IDLE_STATE && !wo.active && !pendingRun.active && !pendingExercise.active && !esp2Held &&
+              uiMode == UI_DATA && !actuationsDisabled && puPhase == PU_NONE && fcPhase == FP_NONE &&
+              !webManualHeld() && !diagRemoteUntilMs;
+  bool known = battVCalLoaded && battV > 0;
+  // A run's sag is not a flat battery: below the line only counts with nothing drawing on main.
+  if (known && battV < BATT_CRIT_V && (idle || bkState != BK_IDLE)) { if (!lowSince) lowSince = now ? now : 1; }
+  else lowSince = 0;
+  if (known && battV >= BACKUP_MAIN_RECOVER_V) { if (!okSince) okSince = now ? now : 1; }
+  else okSince = 0;
+
+  BackupIn in;
+  in.idle         = idle;
+  in.mainLowHeld  = lowSince && now - lowSince >= BACKUP_TRIGGER_MS;
+  in.mainOkHeld   = okSince && now - okSince >= BACKUP_RECOVER_MS;
+  in.secUsable    = secInaOk && secHaveV && !secLow && !bswLatched && !bswRecharging() &&
+                    (!retryAt || (long)(now - retryAt) >= 0);
+  in.secExhausted = !(secInaOk && secHaveV) || secCrit;
+  in.alertDone    = alerted || gsm.queued() == 0 || now - stateMs >= BACKUP_ALERT_WAIT_MS;
+  in.onSecondary  = esp2OnSecondary;
+  in.timedOut     = now - stateMs >= BACKUP_SWITCH_TIMEOUT_MS;
+
+  // A main that recovers ends the episode whichever state it finds, including a reboot's BK_IDLE.
+  if (in.mainOkHeld && alerted) { alerted = false; bkSaveAlerted(false); }
+
+  BkState from = bkState, to = backupNext(from, in);
+  if (to != from) {
+    bkState = to; stateMs = now; lastSendMs = 0;
+    logEvent("ESP1", "PWR2", String("BACKUP|") + bkName(from) + "->" + bkName(to) + "|" + bkVolts());
+    switch (to) {
+      case BK_ALERT:
+        // Only if this episode's text has not gone out yet: a reset must not send it again.
+        if (!alerted)
+          bkCritAlert("MAIN_BATT_CRIT", bkVolts() + (in.secUsable ? "|SWITCHING_TO_BACKUP" : "|BACKUP_NOT_AVAILABLE"));
+        break;
+      case BK_WAIT:
+        if (from == BK_ALERT) {
+          if (!alerted && gsm.queued() == 0) { alerted = true; bkSaveAlerted(true); }   // it left the modem
+        } else {
+          retryAt = now + BACKUP_RETRY_MS;                  // failed or lost: not straight back on
+          esp2SetPower(false);
+        }
+        break;
+      case BK_SWITCHING:
+        esp2SetPower(true);
+        break;
+      case BK_ACTIVE:
+        sendSMS(String("INFO,BACKUP,ON,") + bkVolts());
+        break;
+      case BK_RETURNING:
+        if (from == BK_ACTIVE && !in.mainOkHeld)
+          bkCritAlert("BACKUP_EXHAUSTED", bkVolts() + "|RETURNED_TO_MAIN");
+        else if (from == BK_SWITCHING && !in.mainOkHeld)
+          bkCritAlert("BACKUP_SWITCH_FAILED", bkVolts() + "|STAYING_ON_MAIN");
+        break;
+      case BK_IDLE:
+        retryAt = 0;
+        if (from != BK_ALERT && from != BK_WAIT) esp2SetPower(false);
+        sendSMS(String("INFO,BACKUP,OFF,") + bkVolts());
+        break;
+    }
+  }
+  // ESP2 boots first, and a frame can be lost: repeat until it confirms. Both commands are idempotent.
+  if ((bkState == BK_SWITCHING || bkState == BK_RETURNING) && esp2Available && esp2Powered &&
+      (!lastSendMs || now - lastSendMs >= BACKUP_RESEND_MS)) {
+    lastSendMs = now ? now : 1;
+    sendEsp2(bkState == BK_SWITCHING ? "BATTBK,ON" : "BATTBK,OFF");
+  }
+}
+#else
+void backupTick() {}
+#endif
 
 /* =============================================================================
  *  SCHEDULE  (daily report, daily Nano reset, day rollover)
@@ -5792,6 +6082,7 @@ void telemetryCollect() {
   telem.secOk_ = secInaOk && secHaveV; telem.secLow_ = secLow; telem.onSecondary_ = esp2OnSecondary;
   telem.secV_ = secV; telem.secI_ = secI; telem.secP_ = secP;
   telem.bswLatched_ = bswLatched; telem.bswStrikes_ = bswStrikes;
+  telem.bkState_ = (uint8_t)bkState;
   telem.simOk = simReady; telem.netReg = netRegistered;
   telem.rssi = lastRssi; telem.creg = lastCreg;
   telem.battLow = batteryLow; telem.battCrit = batteryCritical;
@@ -6251,6 +6542,8 @@ static bool firebaseUploadLive() {
   system["secondaryBattSwitching"] = (bool)SECONDARY_BATT_ENABLED;
   system["battSwitchFault"]   = t.bswLatched_;
   system["battSwitchStrikes"] = t.bswStrikes_;
+  system["backupEnabled"]     = (bool)SECONDARY_BACKUP_ENABLED;
+  system["backupState"]       = bkName((BkState)t.bkState_);
   // For the new Set Clock control: show the operator what ESP1 currently reads before they decide to
   // change it. From the snapshot, never tsString() here: that is an I2C read, and Wire hands its receive
   // buffer back unlocked, so a read from this core can overwrite a sensor reading in progress on core 1.
@@ -8222,6 +8515,7 @@ void raiseFault(char tier, const char *code, const char *loc) {
 
 void enterEmergencyStop(bool cutPower) {
   // stop all actuators (sec.22.3) then optionally cut ESP2 power (sec.23.1.1)
+  bswNoteCut(1, -1, 0);                                // before STOP_ALL: it may be the last thing we do
   if (uiMode == UI_CAL && calOpen) calCloseTarget();   // the Nano keeps its CAL stream otherwise
   esp2Serial.print(FRAME_START); esp2Serial.print(",STOP_ALL,"); esp2Serial.println(FRAME_END);
   logEvent("ESP1", "CMD", "ESP2|STOP_ALL");
@@ -8301,6 +8595,7 @@ void enterFaultHold(const char *code, const char *loc) {
  * Safe to call whether or not ESP2 is currently held. */
 void cancelRun(int mode, const char *why, bool isAuto) {
   int c = (wo.colIdx >= 0) ? wo.colIdx : pendingRun.colIdx;      // whichever run we are aborting
+  bswNoteCut(2, c, mode);                                        // before STOP_ALL: it may be the last thing we do
 
   // STOP_ALL is what actually kills the pumps: on ESP2 it clears faultHeld, the work order, the
   // step and the timed-recovery latch, so nothing can resume behind our back.
@@ -10020,6 +10315,7 @@ void lcdTick() {
       }
       if (secInaOk && secHaveV)
         snprintf(l, 21, "B2:%.2fV %.2fA%s", secV, secI, esp2OnSecondary ? " *" : (secLow ? " L" : ""));
+      else if (secNoPack) snprintf(l, 21, "B2: no pack - wiring");
       else snprintf(l, 21, "B2: no INA226");
       lcdRow(2, l);                                  // '*' = the boards are on that battery now
       snprintf(l, 21, "SD:%s RTC:%s%s", sdOk ? "OK" : "--", rtcOk ? "OK" : rtcTimeLost ? "SET" : "--", bswLatched ? " SWFLT" : ""); lcdRow(3, l);

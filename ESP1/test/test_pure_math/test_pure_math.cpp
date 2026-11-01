@@ -256,6 +256,84 @@ void test_bsw_auto_clear_only_after_a_full_known_window(void) {
   TEST_ASSERT_FALSE(bswAutoClearDue(T0, T0 - 10, DAY));                    // clock went backwards
 }
 
+/* ---- backup state machine -------------------------------------------------- */
+
+static BackupIn bkIn(void) {           // a calm rig: idle, pack fine, main neither low nor recovered
+  BackupIn in = {};
+  in.idle = true; in.secUsable = true;
+  return in;
+}
+
+void test_backup_stays_idle_until_main_is_low_for_the_whole_trigger_time(void) {
+  BackupIn in = bkIn();
+  TEST_ASSERT_EQUAL_INT(BK_IDLE, backupNext(BK_IDLE, in));
+  in.mainLowHeld = true;
+  TEST_ASSERT_EQUAL_INT(BK_ALERT, backupNext(BK_IDLE, in));
+  in.idle = false;                                                        // a run is on: its sag doesn't count
+  TEST_ASSERT_EQUAL_INT(BK_IDLE, backupNext(BK_IDLE, in));
+}
+
+void test_backup_alert_goes_out_before_the_boards_move(void) {
+  BackupIn in = bkIn(); in.mainLowHeld = true;
+  TEST_ASSERT_EQUAL_INT(BK_ALERT, backupNext(BK_ALERT, in));
+  in.alertDone = true;
+  TEST_ASSERT_EQUAL_INT(BK_WAIT, backupNext(BK_ALERT, in));
+  TEST_ASSERT_EQUAL_INT(BK_SWITCHING, backupNext(BK_WAIT, in));
+}
+
+void test_backup_never_switches_onto_an_unusable_pack_or_a_busy_rig(void) {
+  BackupIn in = bkIn(); in.mainLowHeld = true;
+  in.secUsable = false;
+  TEST_ASSERT_EQUAL_INT(BK_WAIT, backupNext(BK_WAIT, in));
+  in.secUsable = true; in.idle = false;
+  TEST_ASSERT_EQUAL_INT(BK_WAIT, backupNext(BK_WAIT, in));
+}
+
+void test_backup_failed_switch_goes_back_and_waits(void) {
+  BackupIn in = bkIn(); in.mainLowHeld = true;
+  TEST_ASSERT_EQUAL_INT(BK_SWITCHING, backupNext(BK_SWITCHING, in));
+  in.timedOut = true;
+  TEST_ASSERT_EQUAL_INT(BK_RETURNING, backupNext(BK_SWITCHING, in));
+  TEST_ASSERT_EQUAL_INT(BK_WAIT, backupNext(BK_RETURNING, in));
+}
+
+void test_backup_active_returns_when_main_recovers(void) {
+  BackupIn in = bkIn(); in.onSecondary = true;
+  TEST_ASSERT_EQUAL_INT(BK_ACTIVE, backupNext(BK_SWITCHING, in));
+  TEST_ASSERT_EQUAL_INT(BK_ACTIVE, backupNext(BK_ACTIVE, in));
+  in.mainOkHeld = true;
+  TEST_ASSERT_EQUAL_INT(BK_RETURNING, backupNext(BK_ACTIVE, in));
+  TEST_ASSERT_EQUAL_INT(BK_RETURNING, backupNext(BK_RETURNING, in));      // ESP2 hasn't confirmed yet
+  in.onSecondary = false;
+  TEST_ASSERT_EQUAL_INT(BK_IDLE, backupNext(BK_RETURNING, in));
+}
+
+void test_backup_protects_the_pack_even_if_main_is_still_critical(void) {
+  BackupIn in = bkIn(); in.onSecondary = true; in.mainLowHeld = true; in.secExhausted = true;
+  TEST_ASSERT_EQUAL_INT(BK_RETURNING, backupNext(BK_ACTIVE, in));
+  in.onSecondary = false; in.secUsable = false;
+  TEST_ASSERT_EQUAL_INT(BK_WAIT, backupNext(BK_RETURNING, in));
+  TEST_ASSERT_EQUAL_INT(BK_WAIT, backupNext(BK_WAIT, in));                // and doesn't go straight back on it
+}
+
+void test_backup_losing_the_secondary_re_requests_it(void) {
+  BackupIn in = bkIn(); in.mainLowHeld = true;                            // a fault or E-stop dropped P4
+  TEST_ASSERT_EQUAL_INT(BK_WAIT, backupNext(BK_ACTIVE, in));
+  TEST_ASSERT_EQUAL_INT(BK_SWITCHING, backupNext(BK_WAIT, in));
+}
+
+void test_backup_return_timeout_cannot_strand_the_state(void) {
+  BackupIn in = bkIn(); in.onSecondary = true; in.timedOut = true; in.mainOkHeld = true;
+  TEST_ASSERT_EQUAL_INT(BK_IDLE, backupNext(BK_RETURNING, in));
+}
+
+void test_backup_main_recovering_before_the_switch_cancels_it(void) {
+  BackupIn in = bkIn(); in.mainOkHeld = true;
+  TEST_ASSERT_EQUAL_INT(BK_IDLE, backupNext(BK_ALERT, in));
+  TEST_ASSERT_EQUAL_INT(BK_IDLE, backupNext(BK_WAIT, in));
+  TEST_ASSERT_EQUAL_INT(BK_RETURNING, backupNext(BK_SWITCHING, in));
+}
+
 /* ---- testRowUsesInverter (secondary-battery gate) ------------------------- */
 
 void test_inverter_rows_are_exactly_the_ac_rows(void) {
@@ -351,6 +429,15 @@ int main(int, char **) {
   RUN_TEST(test_bsw_strike_after_the_window_starts_over);
   RUN_TEST(test_bsw_uncheckable_time_counts_towards_the_latch);
   RUN_TEST(test_bsw_auto_clear_only_after_a_full_known_window);
+  RUN_TEST(test_backup_stays_idle_until_main_is_low_for_the_whole_trigger_time);
+  RUN_TEST(test_backup_alert_goes_out_before_the_boards_move);
+  RUN_TEST(test_backup_never_switches_onto_an_unusable_pack_or_a_busy_rig);
+  RUN_TEST(test_backup_failed_switch_goes_back_and_waits);
+  RUN_TEST(test_backup_active_returns_when_main_recovers);
+  RUN_TEST(test_backup_protects_the_pack_even_if_main_is_still_critical);
+  RUN_TEST(test_backup_losing_the_secondary_re_requests_it);
+  RUN_TEST(test_backup_return_timeout_cannot_strand_the_state);
+  RUN_TEST(test_backup_main_recovering_before_the_switch_cancels_it);
   RUN_TEST(test_inverter_rows_are_exactly_the_ac_rows);
   RUN_TEST(test_pulse_targets_that_need_the_inverter);
   RUN_TEST(test_clampi);

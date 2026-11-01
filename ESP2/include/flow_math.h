@@ -55,4 +55,19 @@ static inline bool flowStalled(bool sawFlow, bool isAC, unsigned long msSinceLas
   return sawFlow && isAC && msSinceLastPulse > limitMs;
 }
 
+/* Dose journal. A controller reset between dosing and delivery leaves a dosed tank and a column that is
+ * still due, and the re-run would dose it all over again. The journal holds what is already in the tank:
+ * a dose counts as fully delivered from the moment it starts (a reset mid-pour then under-doses, which
+ * the next cycle corrects, instead of over-dosing, which nothing can correct), and is trimmed to the
+ * measured amount when it ends. */
+static inline float doseStillOwed(float wantMl, float alreadyMl) {
+  if (!(wantMl > 0.0f)) return 0.0f;
+  if (!(alreadyMl > 0.0f)) return wantMl;
+  return wantMl > alreadyMl ? wantMl - alreadyMl : 0.0f;
+}
+static inline float doseJournalTrim(float journalMl, float targetMl, float measuredMl) {
+  float v = journalMl - targetMl + measuredMl;
+  return v > 0.0f ? v : 0.0f;
+}
+
 #endif // FLOW_MATH_H

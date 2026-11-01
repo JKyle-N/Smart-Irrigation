@@ -148,6 +148,14 @@ const uint8_t COL_VALVE_BIT[3] = { OUT_COL_A, OUT_COL_B, OUT_COL_C };
  * inverter is switched exactly as before. ESP1 holds the matching flag (it owns the INA226 and
  * the low-secondary run block) -- set both together.                                          */
 #define SECONDARY_BATT_ENABLED 0
+/* Secondary battery as a BACKUP for a critically low main battery: READY, NOT ACTIVE. ESP1 decides
+ * (backupTick) and sends BATTBK,ON|OFF; at 1 this holds P4 + P17 on with no inverter running, until
+ * BATTBK,OFF or any hard stop (a fault or STOP_ALL still returns the boards to main). Needs
+ * SECONDARY_BATT_ENABLED. Set this together with ESP1's flag of the same name.                  */
+#define SECONDARY_BACKUP_ENABLED 0
+#if SECONDARY_BACKUP_ENABLED && !SECONDARY_BATT_ENABLED
+#error "SECONDARY_BACKUP_ENABLED needs SECONDARY_BATT_ENABLED"
+#endif
 const uint8_t NUT_PUMP_BIT[3]  = { OUT_NUT_A, OUT_NUT_B, OUT_NUT_C };
 
 /* ---- Flow sensors (interrupt, stage-based; spec sec.19.4.5) --------------- *
@@ -432,6 +440,9 @@ bool pcfWrite(uint16_t s);
 extern uint8_t bswBootReport;          // battery-switch reset journal (power-path block)
 extern uint8_t bswNv;
 static void bswJournal(uint8_t v);
+void doseJLoad();
+void faultJLoad();
+void bootReports();
 void pcfOn(uint8_t bit);
 void pcfOff(uint8_t bit);
 void stopAll();
@@ -542,13 +553,15 @@ void setup() {
   bswNv = prefs.getUChar("bsw", 0);
   if (bswNv == 1 || bswNv == 2) { bswBootReport = bswNv; bswJournal(0); }
   else if (bswNv != 0) bswJournal(0);
+  doseJLoad();                              // what the tank already holds, so a re-run cannot dose it twice
+  faultJLoad();                             // a fault whose own P4 drop reset the boards before it was sent
   Serial.printf("Restored mixing-tank volume: %.2f L\n", mixTankL);
 
   // Announce READY as early as possible -- BEFORE the (non-critical) PZEM Modbus probe, which is only
   // used during a run and could otherwise slow/block the boot handshake if the meter is absent/slow.
   feedWDT();
   reply("READY,ESP2");                      // tell ESP32 #1 we are up & SAFE (sec.10.7.4)
-  if (bswBootReport) reply(String("INFO,BATT,RESET,") + (bswBootReport == 1 ? "SECONDARY" : "MAIN"));
+  bootReports();
 
   analogReadResolution(12);                 // 0..4095
   pzem.setAddress(0x01);                    // default PZEM Modbus address (begins Serial1) -- deferred, post-READY
@@ -669,8 +682,33 @@ unsigned long battPhaseMs = 0;
 bool          battGo = false;             // ESP1 answered BATTSW,GO for the announced switch
 bool          invWanted = false;          // inverter requested ON (may still be waiting on the switch)
 bool          cutoffDropPending = false;  // a normal end is waiting for the return before dropping P17
+bool          battBackupHold = false;     // ESP1 holds the boards on the secondary with no inverter (BATTBK,ON)
 uint8_t       bswBootReport = 0;          // boot found the journal set: 1/2, reported until ESP1 ACKs
 uint8_t       bswNv = 0xFF;               // last journal value written (skip redundant flash writes)
+String        faultReport = "";           // boot found a fault journal: reported until ESP1 answers BATTSW,FACK
+bool          faultJSet = false;          // a fault journal is on flash (skip redundant flash writes)
+
+/* A hard fault drops P4 at once, so with no hold-up left the boards can die before the fault's own reply
+ * is on the wire: ESP1 would then see only an unexplained reset and re-run into the same fault. Flash it
+ * first. Survival clears it (battPathTick); a boot that finds it reports it (INFO,FAULT_LOST). */
+static void faultJSave(const char *resp, uint8_t mask, const String &loc) {
+#if SECONDARY_BATT_ENABLED
+  if (battPhase == BP_MAIN || battPhase == BP_PRE_SEC || battPhase == BP_SETTLE_MAIN) return;   // P4 is off
+  prefs.putString("faultj", String(resp) + "," + mask + "," + loc);
+  faultJSet = true;
+#else
+  (void)resp; (void)mask; (void)loc;
+#endif
+}
+static void faultJForget() {
+  if (!faultJSet) return;
+  prefs.remove("faultj"); faultJSet = false;
+}
+void faultJLoad() {
+  if (!prefs.isKey("faultj")) return;
+  faultReport = prefs.getString("faultj", "");
+  prefs.remove("faultj");
+}
 
 static void bswJournal(uint8_t v) {
   if (v == bswNv) return;
@@ -694,6 +732,7 @@ static void battAbortAnnounce() { battEnter(BP_MAIN); reply("INFO,BATT,MAIN"); }
 // Called by stopAll() just before its all-OFF write drops P4 unannounced (a fault).
 static void battPathReset() {
   invWanted = false; cutoffDropPending = false;
+  battBackupHold = false;                                      // a hard stop ends a backup hold; ESP1 must re-ask
   if (battPhase == BP_PRE_SEC) { battAbortAnnounce(); return; }
   if (battPhase != BP_MAIN && battPhase != BP_SETTLE_MAIN) {   // P4 is on: this write is a switch
     bswJournal(2); tankSave();
@@ -719,10 +758,10 @@ void battPathTick() {
   unsigned long dt = millis() - battPhaseMs;
   switch (battPhase) {
     case BP_MAIN:
-      if (invWanted) battAnnounce(BP_PRE_SEC, "SECONDARY");
+      if (invWanted || battBackupHold) battAnnounce(BP_PRE_SEC, "SECONDARY");
       break;
     case BP_PRE_SEC:
-      if (!invWanted) { battAbortAnnounce(); break; }
+      if (!invWanted && !battBackupHold) { battAbortAnnounce(); break; }
       if (battGo || dt >= BATT_HANDSHAKE_MS) battToggle(true);
       break;
     case BP_SETTLE_SEC:
@@ -731,13 +770,14 @@ void battPathTick() {
         reply("INFO,BATT,SECONDARY");
         battEnter(BP_SEC);
         if (invWanted) pcfRawOn(OUT_INVERTER);
-        else           battEnter(BP_RETURN_WAIT);
+        else if (!battBackupHold) battEnter(BP_RETURN_WAIT);
       }
       break;
     case BP_SEC:
-      if (!invWanted && !pcfBitOn(OUT_INVERTER)) battEnter(BP_RETURN_WAIT);   // belt and braces
+      if (!invWanted && !battBackupHold && !pcfBitOn(OUT_INVERTER)) battEnter(BP_RETURN_WAIT);   // belt and braces
       break;
     case BP_RETURN_WAIT:
+      if (battBackupHold) { battEnter(BP_SEC); break; }         // every normal end funnels through here
       if (dt >= BATT_RETURN_DELAY_MS) battAnnounce(BP_PRE_MAIN, "MAIN");
       break;
     case BP_PRE_MAIN:
@@ -746,6 +786,7 @@ void battPathTick() {
     case BP_SETTLE_MAIN:
       if (dt >= BATT_SWITCH_SETTLE_MS) {
         bswJournal(0);
+        faultJForget();                                         // the fault's own reply got out: nothing was lost
         reply("INFO,BATT,MAIN");
         battEnter(BP_MAIN);
         if (cutoffDropPending) { cutoffDropPending = false; cutoffDeenergize(); }
@@ -871,6 +912,40 @@ void testOff() {
  * Persist mixTankL so a reboot/brown-out/power-down can never make ESP2 assume an
  * empty tank and overfill on the next fill (sec.19.4.8). Written on every change.      */
 void tankSave() { prefs.putFloat("mixL", mixTankL); }
+
+/* ---- Dose journal (see doseStillOwed) ------------------------------------- *
+ * What the tank already holds and which column it was dosed for. Survives any reset, and is cleared only
+ * when a run finishes. ESP1 hears about it on every boot (INFO,TANK,DOSED,<mask>) and sends that column
+ * first, so an interrupted batch still reaches the crop it was mixed for. `stopped` marks a batch someone
+ * or something stopped on purpose (STOP_ALL, or a fault lost in a reset): it is not offered for finishing,
+ * since nobody wants that run to restart by itself, but its doses still count when the column next runs. */
+struct DoseJournal { uint8_t mask; uint8_t stopped; float mL[3]; };
+DoseJournal doseJ = { 0, 0, { 0.0f, 0.0f, 0.0f } };
+static void doseJSave() { prefs.putBytes("dosej", &doseJ, sizeof(doseJ)); }
+void doseJLoad() {
+  if (!prefs.isKey("dosej")) return;
+  if (prefs.getBytes("dosej", &doseJ, sizeof(doseJ)) != sizeof(doseJ)) doseJ = DoseJournal{ 0, 0, { 0.0f, 0.0f, 0.0f } };
+}
+static void doseJClear() {
+  if (!doseJ.mask) return;
+  doseJ = DoseJournal{ 0, 0, { 0.0f, 0.0f, 0.0f } };
+  prefs.remove("dosej");
+}
+static void doseJMarkStopped() {
+  if (!doseJ.mask || doseJ.stopped) return;
+  doseJ.stopped = 1;
+  doseJSave();
+}
+static void doseJStart(int i, uint8_t mask, float targetMl) {
+  doseJ.mask |= mask;
+  doseJ.stopped = 0;
+  doseJ.mL[i] += targetMl;
+  doseJSave();
+}
+static void doseJEnd(int i, float targetMl, float measuredMl) {
+  doseJ.mL[i] = doseJournalTrim(doseJ.mL[i], targetMl, measuredMl);
+  doseJSave();
+}
 void tankLoad() {
   prefs.begin("esp2", false);
   mixTankL = prefs.getFloat("mixL", 0.0f);
@@ -993,6 +1068,7 @@ void dispatch(const String &payload) {
   // ---- always-honored commands ----
   if (cmd == "STOP_ALL") {
     creditRunningStage();                    // read the meter before the stop detaches it
+    doseJMarkStopped();                      // before stopAll: its P4 drop may be the last thing we do
     stopAll(); step = SEQ_NONE; wo.active = false; faultHeld = false; detachFlow();
     resumeTimed = false; lastHoldFlow = false;           // clear the timed-recovery latch
     testMode = false; testHeldBit = -1; testCapped = false;
@@ -1012,8 +1088,31 @@ void dispatch(const String &payload) {
     String sub = (n >= 2) ? tok[1] : "";
     if (sub == "GO")  { battGo = true; return; }
     if (sub == "ACK") { bswBootReport = 0; return; }
+    if (sub == "FACK") { faultReport = ""; return; }
     reply("INVALID,BATTSW"); return;
   }
+#if SECONDARY_BACKUP_ENABLED
+  // Backup hold: boards on the secondary with no inverter. ESP1 repeats ON until it hears
+  // INFO,BATT,SECONDARY, so ON must be idempotent and re-confirm a confirmation that was lost.
+  if (cmd == "BATTBK") {
+    String sub = (n >= 2) ? tok[1] : "";
+    if (sub == "ON") {
+      if (wo.active || step != SEQ_NONE || faultHeld || testMode) { reply("BUSY,BATTBK"); return; }
+      battBackupHold = true; cutoffDropPending = false;
+      cutoffEnergize();                      // P17 may gate the DPDT coil, so the bank stays powered
+      if (battPhase == BP_SEC) reply("INFO,BATT,SECONDARY");
+      return;
+    }
+    if (sub == "OFF") {
+      battBackupHold = false;
+      if (battPhase == BP_PRE_SEC) { battAbortAnnounce(); cutoffDeenergize(); }
+      else if (battPhase == BP_MAIN) { reply("INFO,BATT,MAIN"); cutoffDeenergize(); }
+      else cutoffDropPending = true;         // drop P17 once the return to main has happened
+      return;
+    }
+    reply("INVALID,BATTBK"); return;
+  }
+#endif
   if (cmd == "RESET_SELF") {                 // soft reboot on ESP1 request (spec sec.9.7.2)
     reply("ACK,RESET_SELF");
     // If genuinely still mid-sequence (reachable via a narrow ESP1-side race after a recovery-
@@ -1286,6 +1385,21 @@ void startWorkOrder() {
   doseIdx = 0;
   woWaterL = 0.0f;
   woEstimated = false;
+  // A dosed tank left by a reset or a stopped run. Same column: dose only what is still owed. Another
+  // column: that batch goes there as it is, so add nothing on top, and ESP1 raises DOSE_CARRY.
+  if (doseJ.mask) {
+    if (doseJ.mask & wo.colMask) {
+      if (wo.fertigate) {
+        for (int i = 0; i < 3; i++) wo.dose[i] = doseStillOwed(wo.dose[i], doseJ.mL[i]);
+        reply(String("INFO,DOSE_RESUME,") + String(doseJ.mL[0], 1) + "|" + String(doseJ.mL[1], 1) + "|" + String(doseJ.mL[2], 1));
+      }
+    } else if (mixTankL >= TANK_EPS_L) {
+      if (wo.fertigate) for (int i = 0; i < 3; i++) wo.dose[i] = 0.0f;
+      reply(String("INFO,DOSE_CARRY,") + doseJ.mask);
+    } else {
+      doseJClear();              // the tank is empty: that batch is long gone
+    }
+  }
   cutoffEnergize();              // power the actuator bank (sec.19.4.8); individual relays still gate each load
   Serial.printf("Work order: %s fert=%d flush=%.0f%% tank=%.2fL\n",
                 wo.cmdName.c_str(), wo.fertigate, wo.flushPct, mixTankL);
@@ -1392,6 +1506,7 @@ void finishOk() {
   // one may have left water behind, so keep what its bookkeeping says or the next fill would overfill.
   if (!woEstimated) mixTankL = 0.0f;
   tankSave();
+  doseJClear();                      // the batch reached its column
   String name = wo.cmdName;
   float water = woWaterL;
   bool est = woEstimated;
@@ -1413,6 +1528,9 @@ void holdFault(const char *resp, const char *loc) {
   unsigned long fp = 0;
   if (isFlow) { noInterrupts(); fp = flowPulses; interrupts(); }   // snapshot pulses seen this stage BEFORE detach
   stageEnd();                        // pump off + flow detached (partial liters already credited by caller)
+  String faultLoc = isFlow ? String(loc) + "|pulses=" + String(fp) : String(loc);
+  faultJSave(resp, wo.colMask, faultLoc);   // before P4 drops: this reply may never get out otherwise
+  doseJMarkStopped();                // a held fault waits for the operator, also if a reset ends the hold
   stopAll();                         // all OFF, master cutoff de-energized
   faultHeld = true;
   stepInit  = false;                 // on RESUME the paused step re-inits with the updated tank volume
@@ -1426,8 +1544,7 @@ void holdFault(const char *resp, const char *loc) {
   // For FLOW_FAIL, append the pulse count: pulses=0 means the pump/sensor produced NOTHING (dead pump,
   // dead sensor, or no water); pulses>0 means flow started then stalled (air, weak pump, sensor half in
   // path). That single number tells the field team which hardware to inspect (diagnostic C-3).
-  if (isFlow) reply(String(resp) + "," + loc + "|pulses=" + String(fp));
-  else        reply(String(resp) + "," + loc);
+  reply(String(resp) + "," + faultLoc);
 }
 
 // User-gated recovery (sec.19.4.8.2). NORMAL resumes the paused step; IRRIGATE finishes as
@@ -1523,7 +1640,13 @@ void runSequence() {
         // skip zero / disabled doses
         while (doseIdx < 3 && wo.dose[doseIdx] <= 0.0f) doseIdx++;
         if (doseIdx >= 3) { goStep(SEQ_MIX); break; }
+#if SECONDARY_BATT_ENABLED
+        // The inverter just stopped, so the boards are on their way back to main. No nutrient pump may
+        // start until that switch is over: a reset mid-pour would leave an unknown amount in the tank.
+        if (battPhase != BP_MAIN) break;
+#endif
         float targetL = wo.dose[doseIdx] / 1000.0f;     // mL -> L
+        doseJStart(doseIdx, wo.colMask, wo.dose[doseIdx]);
         stageBegin(NUT_PUMP_BIT[doseIdx], false, NUT_FLOW_PIN[doseIdx], K_NUT[doseIdx], targetL);
         // Dosed liquid physically enters the mixing tank, so it must count toward mixTankL -- otherwise
         // a dose interrupted mid-pour leaves the tank bookkeeping short and a resumed FILL overfills.
@@ -1534,6 +1657,7 @@ void runSequence() {
       int r = stagePoll();
       if (r == 1) {
         float measuredML = endMeteredStage() * 1000.0f;   // credits the tank, then ends the stage
+        doseJEnd(doseIdx, wo.dose[doseIdx], measuredML);
         Serial.printf("Dosed nutrient %d: %.1f mL\n", doseIdx, measuredML);
         // Report dose to ESP1 (target + measured) for the daily report / thesis data (sec.25.2.1).
         reply(String("DOSE,NUT_") + (char)('A' + doseIdx) + "," +
@@ -1545,6 +1669,7 @@ void runSequence() {
         // Dosing pump ran past its timed ceiling (or never flowed) -> DOSE_TIMEOUT, NOT a fallback
         // (dosing spec §2.3/§5): stuck-low flow sensor or unprimed line. Stop and HOLD for the user.
         float deliveredML = endMeteredStage() * 1000.0f;  // credit whatever partial volume did make it into the tank
+        doseJEnd(doseIdx, wo.dose[doseIdx], deliveredML);
         // Don't re-dose what already went in: a RESUME,NORMAL re-enters this step and re-reads
         // wo.dose[doseIdx] from scratch, so it must already reflect only what's still owed, not the
         // original full target (doseIdx itself isn't advanced on this path -- same step retries).
@@ -1699,6 +1824,7 @@ static void auxPowerFaultStop(bool seqActive, bool exerciseActive, bool mixActiv
     endMeteredStage();
     holdFault("PWR_FAIL", msg);
   } else if (exerciseActive) {
+    faultJSave("PWR_FAIL", 0, msg);          // this P17 drop takes P4 with it
     pcfOff(exRunBit); pcfOff(OUT_INVERTER); cutoffDeenergize();
     exRunOffAt = 0; exRunBit = -1; exRunPumpOn = false;
     reply(String("PWR_FAIL,") + msg);
@@ -1841,10 +1967,16 @@ void heartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
     lastHeartbeat = millis();
     reply("STATUS,ESP2,OK");
-    // Keep reporting a switch-caused reset until ESP1 answers BATTSW,ACK (the first report can be
-    // lost while ESP1 is itself still booting).
-    if (bswBootReport) reply(String("INFO,BATT,RESET,") + (bswBootReport == 1 ? "SECONDARY" : "MAIN"));
+    bootReports();
   }
+}
+
+// Sent with READY and repeated each heartbeat, because the first copy can be lost while ESP1 is itself
+// still booting. The first two repeat until ESP1 acknowledges; the dosed tank until a run clears it.
+void bootReports() {
+  if (bswBootReport) reply(String("INFO,BATT,RESET,") + (bswBootReport == 1 ? "SECONDARY" : "MAIN"));
+  if (faultReport.length()) reply("INFO,FAULT_LOST," + faultReport);
+  if (doseJ.mask && !doseJ.stopped && !wo.active) reply(String("INFO,TANK,DOSED,") + doseJ.mask);
 }
 
 /* =============================================================================
@@ -1854,8 +1986,9 @@ void heartbeat() {
  *  it). mixTankL is NVS-persisted, so the tank volume survives the reboot.
  * ========================================================================== */
 void idleResetTick() {
+  // A backup hold counts as activity: this reboot would drop P4 and put the boards on the flat main battery.
   bool idle = (step == SEQ_NONE && !wo.active && !faultHeld && !testMode
-               && calId == "" && primeLine == "" && exRunOffAt == 0);
+               && calId == "" && primeLine == "" && exRunOffAt == 0 && !battBackupHold);
   if (!idle)            { idleSinceMs = 0; return; }   // any activity restarts the idle clock
   if (idleSinceMs == 0) { idleSinceMs = millis(); return; }
   if (millis() - idleSinceMs >= IDLE_RESET_MS) {

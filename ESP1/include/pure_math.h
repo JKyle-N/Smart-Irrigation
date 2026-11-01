@@ -186,4 +186,43 @@ static inline bool bswAutoClearDue(uint32_t lastT, uint32_t now, uint32_t window
   return lastT != 0 && now != 0 && now >= lastT && now - lastT >= window;
 }
 
+/* ---- secondary battery as backup for a critically low main ---------------- */
+
+/* BK_IDLE       main is fine.
+ * BK_ALERT      main stayed critical: the alert is going out, and nothing moves until it has. A switch
+ *               that resets ESP1 would lose a text still queued in RAM.
+ * BK_WAIT       alert sent, not on backup: the secondary can't be used right now, or the rig is busy.
+ * BK_SWITCHING  ESP2 was asked to hold the boards on the secondary.
+ * BK_ACTIVE     on backup.
+ * BK_RETURNING  ESP2 was asked to go back to main. */
+enum BkState { BK_IDLE, BK_ALERT, BK_WAIT, BK_SWITCHING, BK_ACTIVE, BK_RETURNING };
+
+struct BackupIn {
+  bool idle;          // nothing running and no operator in a menu: the boards may be moved
+  bool mainLowHeld;   // main below the critical level for the whole trigger time
+  bool mainOkHeld;    // main at or above the recover level for the whole recover time
+  bool secUsable;     // monitor answering, not low, no switch fault, hold-up recharged
+  bool secExhausted;  // pack at its critical level, or no longer monitored
+  bool alertDone;     // the critical text left the modem, or the wait for it ran out
+  bool onSecondary;   // ESP2 confirmed the boards are on the secondary
+  bool timedOut;      // the current switch request took too long
+};
+
+/* One step of the backup logic. Every path back to main ends in BK_IDLE (main recovered) or BK_WAIT
+ * (main still critical), and a reset simply starts again from BK_IDLE, so no state can strand the boards. */
+static inline BkState backupNext(BkState s, const BackupIn &in) {
+  switch (s) {
+    case BK_IDLE:      return (in.mainLowHeld && in.idle) ? BK_ALERT : BK_IDLE;
+    case BK_ALERT:     return in.mainOkHeld ? BK_IDLE : in.alertDone ? BK_WAIT : BK_ALERT;
+    case BK_WAIT:      return in.mainOkHeld ? BK_IDLE : (in.secUsable && in.idle) ? BK_SWITCHING : BK_WAIT;
+    case BK_SWITCHING: if (in.onSecondary) return BK_ACTIVE;
+                       return (in.mainOkHeld || in.timedOut || !in.secUsable) ? BK_RETURNING : BK_SWITCHING;
+    case BK_ACTIVE:    if (!in.onSecondary) return BK_WAIT;                // lost it: a fault, E-stop or reset
+                       return (in.secExhausted || in.mainOkHeld) ? BK_RETURNING : BK_ACTIVE;
+    case BK_RETURNING: if (in.onSecondary && !in.timedOut) return BK_RETURNING;
+                       return in.mainOkHeld ? BK_IDLE : BK_WAIT;
+  }
+  return BK_IDLE;
+}
+
 #endif // PURE_MATH_H

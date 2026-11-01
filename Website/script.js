@@ -1473,7 +1473,9 @@ function updateDashboard() {
   setText("secondaryCurrent", numberText(sensors.secondaryBatteryCurrent, 2, "A"));
   setText("boardSupply", (system.boardSupply === "secondary" ? "Secondary battery (isolated)"
     : system.boardSupply === "main" ? (system.secondaryBattSwitching ? "Main battery" : "Main battery (switching off)")
-    : "Unavailable") + (system.battSwitchFault ? " — SWITCH FAULT, inverter use blocked" : ""));
+    : "Unavailable") + (system.battSwitchFault ? " — SWITCH FAULT, inverter use blocked" : "")
+    + (system.backupState === "active" ? " — ON BACKUP, main battery critical"
+      : system.backupEnabled && system.backupState && system.backupState !== "idle" ? " — MAIN BATTERY CRITICAL" : ""));
   setText("liveAge", snapshotAgeText());
 
   const fresh = deviceIsFresh();
