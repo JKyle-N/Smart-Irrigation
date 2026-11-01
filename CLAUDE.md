@@ -204,7 +204,7 @@ Supersedes the "INA226 removed" decision below for the main battery. It was remo
 - **Measure only:** neither module blocks a run or sends a text. Loss is logged (`PWRS`, `INA226|<name>|LOST`) and shown on the dashboard (`diagnostics…mainInaOk`/`solarSensorOk`). `powerInaTick` runs on core 1 only.
 - **Energy:** with the shunt bar, `CONS` counts discharge only (`battIsigned > 0`, + = discharging). The ACS758 fallback keeps counting every amp as consumption. `CHG` is solar Wh, positive current only.
 - **Published to:** LCD Power page (signed `I:`, `Sol:` row; SD and RTC moved to the Columns page), `STATUS` `SOL`, SD `PWRS` (not `PWR`, which SUMMARY averages as the main battery) and `PWR` `SRC=`/`CHG=`, Firebase `sensors.solar*` + `batteryCurrentSigned`, ThingSpeak Ch3 fields 7 (solar V) and 8 (solar W), website tiles.
-- **Bench tool:** `Test Code/PlatformIO/Projects/INA226-Dual` uses the same addresses and scaling.
+- **Bench tool:** `Test Code/PlatformIO/Projects/INA226-Dual` uses the same addresses and scaling, and calibrates each module over serial (`zero`, `amps`, `volts`, `invert`, `show`). `show` prints the values to paste into ESP1; the board stores nothing.
 
 ## CHANGED: battery read from calibrated opto ADC + ACS758; INA226 removed; safety scaffolded-off
 **The main battery's INA226 returned 2026-11-02, see above. The opto ADC + ACS758 below is now its fallback.**

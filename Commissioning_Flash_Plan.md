@@ -230,9 +230,15 @@ Wiring is in reference §21.0. Do these before any main firmware, with `Test Cod
   the isolator is the wrong way round: side 2 must face ESP1.
 - **Identify each module:** unplug solar and it must go `LOST` while the battery one keeps reading. If the
   names come out swapped, swap the addresses in the sketch and in ESP1.
-- **Check against meters:** voltage on both, then current with a clamp meter under a known load. Discharge
-  must read positive on the battery module and charging positive on the solar one, otherwise set `*_INVERT`.
-- **Calibrate** (worksheet Tier 3), and copy the values into ESP1.
+- **Direction:** discharge must read positive on the battery module and charging positive on the solar
+  one. If not, type `invert batt` or `invert solar`.
+- **Calibrate each module** with the sketch's serial commands, in this order: `zero <module>` with no current
+  through the shunt, `amps <module> <A>` at a steady current from a clamp meter, `volts <module> <V>` from a
+  multimeter across VBS and GND. It refuses a setup that can't give a good result and says why. Take
+  `amps` for solar in good sun, and at the highest steady load you can for the battery.
+- **Paste what `show` prints** into `ESP1/src/main.cpp` and the sketch's `MODULES` table. The board stores
+  nothing, so a reboot loses anything not pasted. Reboot once afterwards, and confirm the readings still
+  match the meters.
 
 Then on the main firmware:
 - LCD Power page: signed `I:` and the `Sol:` line. `STATUS` has `SOL`, the log has `PWR …|SRC=INA` and `PWRS`,

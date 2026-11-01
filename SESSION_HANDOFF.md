@@ -104,6 +104,8 @@ inverter runs without one. Addresses (solar 0x41, main 0x44) are an assumption f
 user has not said which module is which, and swapping is one line. ESP2 and the Nano need no change: only
 ESP1 has this bus. **Compiled and the scaling host-tested; `powerInaTick`, the source change and the isolator
 have never run.** With no modules fitted the rig behaves as before, via the opto ADC + ACS758.
+`INA226-Dual` also calibrates over serial. Its commands were run on a PC against a simulated INA226, using a
+throwaway harness that is not in the repo; they have never run on a real module.
 
 **2026-11-02 — secondary battery: reset-proofing + backup (ready, off).** See `CLAUDE.md` "a real blackout
 during a switch" and "secondary as backup". The user confirmed: 4S Li-ion 16.8 V, INA226 at the default
