@@ -1457,7 +1457,13 @@ function updateDashboard() {
   setText("waterEC", numberText(sensors.waterEC, 2, "mS/cm"));
   setText("batteryVoltage", numberText(sensors.batteryVoltage, 2, "V"));
   setText("batteryPercent", numberText(sensors.batteryPercent, 0, "%"));
-  setText("batteryCurrent", numberText(sensors.batteryCurrent, 2, "A"));
+  // batteryCurrentSigned exists only while the shunt bar is the source; the fallback sensor has no direction.
+  setText("batteryCurrent", numberText(sensors.batteryCurrent, 2, "A") +
+    (!hasValue(sensors.batteryCurrentSigned) ? "" : sensors.batteryCurrentSigned < 0 ? " (charging)" : " (discharging)"));
+  setText("solarVoltage", numberText(sensors.solarVoltage, 2, "V"));
+  setText("solarPower", hasValue(sensors.solarPower)
+    ? numberText(sensors.solarCurrent, 2, "A") + " / " + numberText(sensors.solarPower, 1, "W") : "Unavailable");
+  setText("solarEnergy", numberText(sensors.solarEnergyTodayWh, 0, "Wh"));
   // Watts comes from the diagnostics tree, not sensors -- ESP1 publishes battP there alongside the
   // low/critical flags. Also shown under Diagnostics > Power; this is the front-page copy.
   setText("batteryPower", numberText(diagnostics.power?.batteryPower, 1, "W"));

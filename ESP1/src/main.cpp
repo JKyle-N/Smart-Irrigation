@@ -9,9 +9,9 @@
  *      (supervisor / work-order model, sec.9.8.1.1) -- then monitors.
  *    - Talks to the user over A7670C SMS (alerts, run notices, daily report).
  *    - Logs every event to microSD (CSV, RTC-stamped, sec.25).
- *    - Monitors the main battery via opto ADC + ACS758 (display/log/telemetry only -- no
- *      battery-triggered stops/alerts) and the secondary battery via INA226; classifies OTHER
- *      faults (3 tiers, sec.23).
+ *    - Monitors solar and the main battery via two INA226 behind an ISO1540 (opto ADC + ACS758 as the
+ *      main battery's fallback; display/log/telemetry only -- no battery-triggered stops/alerts) and
+ *      the secondary battery via its own INA226; classifies OTHER faults (3 tiers, sec.23).
  *    - Drives the LCD UI; owns all recovery escalation (sec.18.9).
  *
  *  AUTHORITY BOUNDARIES: ESP32 #1 decides; ESP32 #2 executes; Nano senses.
@@ -93,7 +93,9 @@
 
 /* ---- I2C addresses ------------------------------------------------------- */
 #define LCD_ADDR     0x27
-#define INA226_ADDR  0x40
+#define INA226_ADDR  0x40       // secondary battery, on this bus directly
+#define SOLAR_INA_ADDR 0x41     // solar, behind the ISO1540 (A1 GND, A0 VCC)
+#define MAIN_INA_ADDR  0x44     // main battery, behind the ISO1540 (A1 VCC, A0 GND)
 // DS3231 0x68 and EEPROM 0x57 are auto-addressed by their libraries / unused.
 
 /* ---- GSM ----------------------------------------------------------------- */
@@ -224,8 +226,8 @@ const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD
  * main), then has ESP2 hold the boards on the secondary. All inverter use is blocked from the alert
  * until main recovers. It returns to main once main holds BACKUP_MAIN_RECOVER_V for BACKUP_RECOVER_MS,
  * or when the pack reaches SEC_BATT_CRIT_V or stops being monitored. See backupTick. Needs
- * SECONDARY_BATT_ENABLED and a calibrated main voltage (calBattV), since uncalibrated it never triggers.
- * ESP2 holds the matching flag -- set both together.                                                 */
+ * SECONDARY_BATT_ENABLED and a trustworthy main voltage (the main INA226 answering, or a calibrated
+ * calBattV), since without one it never triggers. ESP2 holds the matching flag -- set both together.  */
 #define SECONDARY_BACKUP_ENABLED 0
 #if SECONDARY_BACKUP_ENABLED && !SECONDARY_BATT_ENABLED
 #error "SECONDARY_BACKUP_ENABLED needs SECONDARY_BATT_ENABLED"
@@ -251,6 +253,27 @@ const float SEC_BATT_RECOVER_V = 14.0f;          // 3.50 V/cell: allow it again 
 const float SEC_BATT_CRIT_V    = 12.8f;          // 3.20 V/cell: critical alert                  [CONFIRM]
 const unsigned long SEC_READ_MS  = 2000;         // read cadence once found
 const unsigned long SEC_RETRY_MS = 10000;        // re-probe cadence while missing
+
+/* ---- SOLAR + MAIN BATTERY: two INA226 behind an ISO1540 I2C isolator -------------------------- *
+ * An INA226 must share a ground with what it measures, while these boards must not share one with
+ * the main battery (inverter noise, and the P4 DPDT breaks both + and -). So the two modules live on
+ * the main-battery side of an ISO1540: GND = main negative, VCC = a 3.3 V supply on that side. They stay
+ * readable through every inverter run and battery switch, and nothing but the isolator crosses over.
+ * The main INA226 is the first choice for main battery V/I/P; if it stops answering, the opto ADC and
+ * ACS758 take over by themselves. Neither module blocks a run or sends a text: they only measure.
+ * Sign: + = main battery discharging, + = solar producing (swap with *_INVERT if the leads are reversed).
+ * Main shunt: 50 A / 75 mV = 1.5 mOhm. The INA226 tops out at 81.92 mV, so it clips at 54.6 A, harmlessly. */
+const float    SOLAR_SHUNT_OHM   = 0.010f;       // R010 on the module; clips at 8.19 A           [CONFIRM]
+const float    SOLAR_CURRENT_LSB = 0.00025f;     // 0.25 mA/bit
+const float    SOLAR_OFFSET_A    = 0.0f;         // no-load reading, subtracted                   [MEASURE]
+const float    SOLAR_BUS_FACTOR  = 1.000f;       // meter V / INA V                               [MEASURE]
+const bool     SOLAR_INVERT      = false;        // true if IN+/IN- are wired reversed
+const float    MAIN_SHUNT_OHM    = 0.075f / 50.0f;  // shunt bar; the module's own R010 must be REMOVED [CONFIRM]
+const float    MAIN_CURRENT_LSB  = 0.002f;       // 2 mA/bit
+const float    MAIN_OFFSET_A     = 0.0f;         // no-load reading, subtracted                   [MEASURE]
+const float    MAIN_BUS_FACTOR   = 1.000f;       // meter V / INA V                               [MEASURE]
+const bool     MAIN_INVERT       = false;        // true if IN+/IN- are wired reversed
+const unsigned long PWR_INA_READ_MS = 2000;      // read cadence once found; re-probe uses SEC_RETRY_MS
 const unsigned long ESP2_BATT_RETURN_WAIT_MS = 4000;  // keep ESP2 powered for its secondary->main return
                                                       // (1 s delay + <=0.8 s handshake + 0.5 s settle + margin)
 /* Battery-switch reset protection. A switch whose hold-up fails resets the controllers; each such
@@ -287,9 +310,11 @@ const uint8_t ACS_PGA        = 1;       // 1 = +/-4.096 V full scale (125 uV/LSB
 // ThingSpeak Ch3 ("Chem") slot for the battery current. Ch2 "System" is full (all 8 fields).
 // Must stay ABOVE 2 x (enabled columns), since the EC/pH loop claims 2 fields per enabled column.
 const int TS3_CURRENT_FIELD  = 5;       // safe while <=2 columns are enabled  [CONFIRM if C is on]
-bool  acsOk = false;                    // last ADS1115 read succeeded -- a dead ADC must be VISIBLE,
+const int TS3_SOLAR_V_FIELD  = 7;       // free even with all 3 columns on (they take fields 1-6)
+const int TS3_SOLAR_W_FIELD  = 8;
+bool  acsOk = false;                   // last ADS1115 read succeeded -- a dead ADC must be VISIBLE,
                                         // not silently read as 0 A, which is how the opto failure hid
-float battIsigned = 0;                  // signed amps (050B is bidirectional); battI stays magnitude
+float battIsigned = 0;                  // signed amps, + = discharging; battI stays magnitude
 // Mixing-tank chemistry, captured from ESP2's TELE during a run (the tank is empty at idle, so these
 // describe the LAST batch). -1 / 0 stamp = never measured. Published as sensors.waterEC / waterPH.
 float tankEC = -1, tankPH = -1;
@@ -990,6 +1015,11 @@ struct TelemetrySnapshot {
   float npkMoist[NUM_COLUMNS], npkTemp[NUM_COLUMNS];
   bool  npkValid[NUM_COLUMNS];
   float battV, battP, battI;   // battI added for the ACS758 ThingSpeak field (core-0 uploader)
+  float battIsigned_;          // + = discharging (meaningful only with battFromIna_)
+  bool  battIOk_, battFromIna_;              // a current sensor answered / the main INA226 is the source
+  bool  solarOk_;              // solar INA226 answering (0 V at night is still a valid reading)
+  float solarV_, solarI_, solarP_;
+  double chargedWh_;
   // Which pumps are energised, derived on CORE 1 from ESP2's reported stage. Derived here rather
   // than read from run.stage in the uploader: run[] is core-1 state and a char array read from
   // core 0 can tear -- the same cross-core mistake this snapshot exists to prevent.
@@ -1140,6 +1170,27 @@ AdcCal calBattV = { 1, { 0.0, 1.0, 0.0, 0.0 } };   // voltage channel (GPIO35)
 bool   battCalLoaded = false;                       // true once NVS "adccal" overrode the defaults
 bool   battVCalLoaded = false;                       // see loadBattCal() and the battery-publish gate below
 float battV = 0, battI = 0, battP = 0;
+bool  battOptoCal = false;                          // the opto channel holds a real calibration (see loadBattCal)
+bool  battFromIna = false;                          // battV/battI came from the main INA226 this tick
+bool  battIOk = false;                              // battI is real: from the main INA226, or from the ACS758
+// The two INA226 behind the ISO1540. Core 1 only; the snapshot carries copies to core 0.
+struct InaMon {
+  const char *name; uint8_t addr; uint16_t cal; float lsb, offsetA, busFactor; bool invert;
+  float minV;                // a reading below this is a wiring fault, not a measurement
+  bool  ok, haveV, noV;      // answering / have a usable reading / below minV (logged once)
+  uint8_t failN;
+  unsigned long lastTryMs, lastReadMs;
+  float v, i, p;
+};
+enum { INA_SOLAR = 0, INA_MAIN = 1, INA_COUNT = 2 };
+InaMon powerIna[INA_COUNT] = {
+  // Solar has no minV: 0 V at night is real.
+  { "SOLAR", SOLAR_INA_ADDR, inaCalFor(SOLAR_SHUNT_OHM, SOLAR_CURRENT_LSB), SOLAR_CURRENT_LSB, SOLAR_OFFSET_A,
+    SOLAR_BUS_FACTOR, SOLAR_INVERT, 0.0f },
+  { "MAIN",  MAIN_INA_ADDR,  inaCalFor(MAIN_SHUNT_OHM,  MAIN_CURRENT_LSB),  MAIN_CURRENT_LSB,  MAIN_OFFSET_A,
+    MAIN_BUS_FACTOR,  MAIN_INVERT,  SEC_NO_PACK_V },
+};
+static inline bool inaUsable(const InaMon &m) { return m.ok && m.haveV; }
 bool  batteryLow = false, batteryCritical = false;
 unsigned long lastInaMs = 0;                         // ADC read throttle (kept name to avoid churn)
 // Secondary battery (INA226). Core 1 only; the snapshot carries copies to core 0.
@@ -1661,6 +1712,7 @@ void controlTick();
 bool decideFertigate(int c);
 void powerTick();
 void secBattTick();
+void powerInaTick();
 bool secBattBlocksAc(const char **why = nullptr);
 void bswBoot();
 void bswTick();
@@ -1869,7 +1921,8 @@ void loop() {
   g_lastStage = 'C'; controlTick();
   g_lastStage = 'X'; exerciseTick();       // preventive pump exercise (sec.14.9.1)
   g_lastStage = 'f'; forceTick();          // Settings force run: countdown -> gate re-check -> fire
-  g_lastStage = 'P'; powerTick();          // main battery: opto ADC voltage + ACS758 current
+  g_lastStage = 'i'; powerInaTick();       // solar + main battery INA226 behind the ISO1540
+  g_lastStage = 'P'; powerTick();          // main battery: main INA226, else opto ADC + ACS758
   g_lastStage = 'b'; secBattTick();        // secondary battery: INA226 I2C read + run-block policy
   g_lastStage = 'w'; bswTick();            // battery-switch journal expiry + 24 h auto re-arm
   g_lastStage = 'b'; backupTick();         // secondary as backup for a critical main (compiled out at 0)
@@ -4633,6 +4686,7 @@ void sendDailyReport() {
   r += ",ST," + String(stateLabel(sysState, actuationsDisabled));
   r += ",BAT," + (battVCalLoaded ? String(battV, 1) + "V" : String("--"));
   r += ",BAT2," + ((secInaOk && secHaveV) ? String(secV, 1) + "V" + (secLow ? "LOW" : "") : String("--"));
+  r += ",SOL," + (inaUsable(powerIna[INA_SOLAR]) ? String(powerIna[INA_SOLAR].v, 1) + "V" + String(powerIna[INA_SOLAR].i, 1) + "A" : String("--"));
 #if SECONDARY_BACKUP_ENABLED
   if (bkState != BK_IDLE) r += ",BKUP," + String(bkName(bkState));
 #endif
@@ -4719,7 +4773,7 @@ static void summaryParseLine(const String &ln) {
     }
     return;                                          // TANK/LIGHT not aggregated
   }
-  if (type == "PWR") {                               // INA226|V=..|I=..|P=..|CONS=..Wh|CHG=..Wh
+  if (type == "PWR") {                               // BATT|V=..|I=..|P=..|SRC=..|CONS=..Wh|CHG=..Wh
     String f[8]; int nf = splitPipe(detail, f, 8);
     float v = 0, p = 0; bool haveV = false, haveP = false;
     for (int i = 1; i < nf; i++) {
@@ -5327,6 +5381,7 @@ void loadBattCal() {
   bool placeholderV = (calBattV.degree == 1 && calBattV.coef[0] == 0.0 && calBattV.coef[1] == 1.0 &&
                        calBattV.coef[2] == 0.0 && calBattV.coef[3] == 0.0);
   if (!placeholderV) battVCalLoaded = true;
+  battOptoCal = battVCalLoaded;                        // battVCalLoaded also goes true for the main INA226
   Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS"
                                        : battVCalLoaded ? "using compiled coefficients"
                                                         : "using placeholder defaults (calibrate!)");
@@ -5374,18 +5429,27 @@ static bool acsReadVolts(float &v) {
 }
 
 void readBatteryAdc() {
-  battV = (float)applyPoly(calBattV, readAdcTrimmed(PIN_BATT_V));
-  // Current now comes from the ACS758 via the ADS1115, NOT the opto ADC on GPIO34 (which read 0.00 A
-  // on every sample for 16 days). On an I2C failure hold the last value and clear acsOk so the fault
-  // is visible on the Diag page -- reporting 0 A would repeat exactly the failure this replaces.
+  // The ACS758 is read either way, so a dead ADC still shows on the Diag page while the INA226 is in use.
   float vAdc;
   acsOk = acsReadVolts(vAdc);
-  if (acsOk) {
-    battIsigned = (vAdc * ACS_DIV - ACS_ZERO_V) / ACS_SENS_V_PER_A;   // signed: 050B is bidirectional
-    // Magnitude only, per CLAUDE.md: all energy counts as consumption, no charge/discharge split.
-    // The sensor CAN now tell the two apart (battIsigned) -- restoring that split is a separate
-    // decision against a documented design choice, so it is deliberately not taken here.
+  const InaMon &m = powerIna[INA_MAIN];
+  battFromIna = inaUsable(m);
+  if (battFromIna) {
+    // The shunt bar behind the ISO1540: isolated, signed, and needs no opto calibration.
+    battV = m.v; battIsigned = m.i;
     battI = fabsf(battIsigned);
+    battIOk = true; battVCalLoaded = true;
+  } else {
+    battVCalLoaded = battOptoCal;
+    battV = (float)applyPoly(calBattV, readAdcTrimmed(PIN_BATT_V));
+    // Current comes from the ACS758 via the ADS1115, NOT the opto ADC on GPIO34 (which read 0.00 A on
+    // every sample for 16 days). On an I2C failure hold the last value and clear acsOk so the fault is
+    // visible on the Diag page -- reporting 0 A would repeat exactly the failure this replaces.
+    if (acsOk) {
+      battIsigned = (vAdc * ACS_DIV - ACS_ZERO_V) / ACS_SENS_V_PER_A;   // signed: 050B is bidirectional
+      battI = fabsf(battIsigned);
+    }
+    battIOk = acsOk;
   }
   battP = battV * battI;
 }
@@ -5411,11 +5475,15 @@ void powerTick() {
   unsigned long nowMs = millis();
   float dtH = (lastInaMs == 0) ? 0.0f : (nowMs - lastInaMs) / 3600000.0f;   // hours since last read
   lastInaMs = nowMs;
-  readBatteryAdc();                                    // GPIO35/34 -> polynomial -> battV/battI/battP
+  readBatteryAdc();                                    // main INA226, else opto + ACS758 -> battV/battI/battP
 
-  // Energy (B2, sec.12.1.3): opto current is magnitude only, so all energy counts as consumption.
-  // Needs real volts: until calibrated, battV is just the raw ADC fraction (0..1).
-  if (battVCalLoaded && acsOk) energyConsumedWh += (double)battP * dtH;
+  // Energy (B2, sec.12.1.3). The shunt bar knows the direction, so only discharge counts as consumption.
+  // The ACS758 fallback keeps its documented rule: every amp counts, as it is not trusted for direction.
+  // Needs real volts: an uncalibrated opto battV is just the raw ADC fraction (0..1).
+  if (battVCalLoaded && battIOk && (!battFromIna || battIsigned > 0)) energyConsumedWh += (double)battP * dtH;
+  // Charged = what the solar module measured. A small negative reading is offset, not generation.
+  const InaMon &sol = powerIna[INA_SOLAR];
+  if (inaUsable(sol) && sol.i > 0) energyChargedWh += (double)(sol.v * sol.i) * dtH;
 
   // Battery state flags -- DISPLAY/LOG (and, if BATTERY_SAFETY_ENABLED, the protective actions).
   // Calibrated only: the placeholder's 0..1 "volts" would otherwise read as a critically flat battery,
@@ -5433,33 +5501,79 @@ void powerTick() {
     // Uncalibrated rows stay in the log for bench work, under names the SUMMARY parser does not average.
     String vp = battVCalLoaded ? "|V=" + String(battV, 2) + "|I=" + String(battI, 2) + "|P=" + String(battP, 1)
                                : "|VRAW=" + String(battV, 3) + "|I=" + String(battI, 2);
-    logEvent("ESP1", "PWR", "BATT" + vp + "|CONS=" + String((int)(energyConsumedWh + 0.5)) + "Wh");
+    logEvent("ESP1", "PWR", "BATT" + vp + "|SRC=" + (battFromIna ? "INA" : "OPTO") +
+             "|CONS=" + String((int)(energyConsumedWh + 0.5)) + "Wh|CHG=" + String((int)(energyChargedWh + 0.5)) + "Wh");
+    // PWRS, not PWR: the SUMMARY parser averages every PWR row as the main battery.
+    if (inaUsable(sol))
+      logEvent("ESP1", "PWRS", "SOLAR|V=" + String(sol.v, 2) + "|I=" + String(sol.i, 3) + "|P=" + String(sol.p, 1));
   }
 }
 
 /* =============================================================================
  *  SECONDARY BATTERY  (INA226 at INA226_ADDR, R010 shunt) -- see SECONDARY_BATT_ENABLED
  * ========================================================================== */
-static bool secInaWrite(uint8_t reg, uint16_t v) {
-  Wire.beginTransmission(INA226_ADDR); Wire.write(reg); Wire.write(v >> 8); Wire.write(v & 0xFF);
+static bool inaWrite(uint8_t addr, uint8_t reg, uint16_t v) {
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(v >> 8); Wire.write(v & 0xFF);
   return Wire.endTransmission() == 0;
 }
-static bool secInaRead(uint8_t reg, uint16_t &out) {
-  Wire.beginTransmission(INA226_ADDR); Wire.write(reg);
+static bool inaRead(uint8_t addr, uint8_t reg, uint16_t &out) {
+  Wire.beginTransmission(addr); Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((uint8_t)INA226_ADDR, (uint8_t)2) != 2) { while (Wire.available()) Wire.read(); return false; }
+  if (Wire.requestFrom(addr, (uint8_t)2) != 2) { while (Wire.available()) Wire.read(); return false; }
   out = ((uint16_t)Wire.read() << 8) | Wire.read();
   return true;
 }
 // Probe + configure. The manufacturer/die IDs prove it is really an INA226 (0x40 is a common
 // address); the calibration read-back proves the bus carries writes. No reset/delay(): writing
 // CONFIG and CAL sets every register this code reads.
-static bool secInaInit() {
+static bool inaInit(uint8_t addr, uint16_t cal) {
   uint16_t mfg, die, calBack;
-  if (!secInaRead(0xFE, mfg) || !secInaRead(0xFF, die)) return false;
+  if (!cal) return false;
+  if (!inaRead(addr, 0xFE, mfg) || !inaRead(addr, 0xFF, die)) return false;
   if (mfg != 0x5449 || die != 0x2260) return false;
-  if (!secInaWrite(0x00, SEC_INA_CONFIG) || !secInaWrite(0x05, SEC_INA_CAL)) return false;
-  return secInaRead(0x05, calBack) && calBack == SEC_INA_CAL;
+  if (!inaWrite(addr, 0x00, SEC_INA_CONFIG) || !inaWrite(addr, 0x05, cal)) return false;
+  return inaRead(addr, 0x05, calBack) && calBack == cal;
+}
+static bool secInaRead(uint8_t reg, uint16_t &out) { return inaRead(INA226_ADDR, reg, out); }
+static bool secInaInit() { return inaInit(INA226_ADDR, SEC_INA_CAL); }
+
+/* Solar + main battery modules behind the ISO1540. Their power comes from the main-battery side, so a
+ * module going quiet says the isolator or its supply needs attention; it says nothing about the boards. */
+void powerInaTick() {
+  unsigned long now = millis();
+  for (uint8_t k = 0; k < INA_COUNT; k++) {
+    InaMon &m = powerIna[k];
+    if (!m.ok) {
+      if (m.lastTryMs && now - m.lastTryMs < SEC_RETRY_MS) continue;
+      m.lastTryMs = now ? now : 1;
+      m.ok = inaInit(m.addr, m.cal);
+      if (!m.ok) continue;
+      m.failN = 0; m.lastReadMs = 0; m.noV = false;
+      logEvent("ESP1", "PWRS", String("INA226|") + m.name + "|FOUND");
+    }
+    if (m.lastReadMs && now - m.lastReadMs < PWR_INA_READ_MS) continue;
+    m.lastReadMs = now ? now : 1;
+    uint16_t rBus, rCur;
+    if (!inaRead(m.addr, 0x02, rBus) || !inaRead(m.addr, 0x04, rCur)) {
+      if (++m.failN >= 3) {                                 // debounced: one NAK is bus noise, three is gone
+        m.ok = false; m.haveV = false; m.lastTryMs = now ? now : 1;
+        logEvent("ESP1", "PWRS", String("INA226|") + m.name + "|LOST");
+      }
+      continue;
+    }
+    m.failN = 0;
+    float v = inaBusVolts(rBus, m.busFactor);
+    if (v < m.minV) {                                       // a loose VBUS lead, not a 12 V battery at 3 V
+      if (!m.noV) logEvent("ESP1", "PWRS", String("INA226|") + m.name + "|NO_BUS_VOLTAGE|V=" + String(v, 2));
+      m.noV = true; m.haveV = false;
+      continue;
+    }
+    m.noV = false;
+    m.v = m.haveV ? m.v + 0.3f * (v - m.v) : v;             // light filter, like the secondary's
+    m.haveV = true;
+    m.i = inaAmps(rCur, m.lsb, m.invert, m.offsetA);
+    m.p = m.v * m.i;
+  }
 }
 
 // Low latch with hysteresis, critical flag, and (only when switching is live) the alerts. One-shot
@@ -6065,6 +6179,10 @@ void telemetryCollect() {
     telem.npkMoist[c] = sensor.npk[c][0]; telem.npkTemp[c] = sensor.npk[c][1];
   }
   telem.battV = battV; telem.battP = battP; telem.battI = battI;
+  telem.battIsigned_ = battIsigned; telem.battIOk_ = battIOk; telem.battFromIna_ = battFromIna;
+  telem.solarOk_ = inaUsable(powerIna[INA_SOLAR]);
+  telem.solarV_ = powerIna[INA_SOLAR].v; telem.solarI_ = powerIna[INA_SOLAR].i; telem.solarP_ = powerIna[INA_SOLAR].p;
+  telem.chargedWh_ = energyChargedWh;
   telem.tankEC = tankEC; telem.tankPH = tankPH;
   // Mirror the per-group validity + coarse system state so core-0 uploaders read only from the snapshot.
   telem.envValid = sensor.envValid; telem.tankValid = sensor.tankValid; telem.lightValid = sensor.lightValid;
@@ -6207,7 +6325,7 @@ static void tsUpload() {
     if (t.lightValid) url += "&field3=" + String(t.lux, 0);
     if (t.tankValid)  { url += "&field4=" + String(t.resLevel, 1); url += "&field5=" + String(t.mixLevel, 1); url += "&field8=" + String(t.flow, 1); }
     if (t.battVCalValid) url += "&field6=" + String(t.battV, 2);
-    if (t.battVCalValid && t.acsOk_) url += "&field7=" + String(t.battP, 1);   // power needs both V and I valid
+    if (t.battVCalValid && t.battIOk_) url += "&field7=" + String(t.battP, 1);   // power needs both V and I valid
     ok = tsGet(url) || ok;
   }
   if (k3.length()) {                                  // Channel 3: chemistry (per-column EC + pH)
@@ -6220,10 +6338,14 @@ static void tsUpload() {
         url += "&field" + String(fld++) + "=" + String(t.npkPH[c], 2);
       } else fld += 2;
     }
-    // Battery current (ACS758) rides Ch3 because Ch2 "System" has all 8 fields used.
+    // Battery current rides Ch3 because Ch2 "System" has all 8 fields used.
     // CONSTRAINT: the loop above consumes 2 fields per ENABLED column -- 4 today with A and B.
     // Enabling column C would take fields 1-6 and collide with field 5. Move this constant if so.
-    if (t.acsOk_) url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
+    if (t.battIOk_) url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
+    if (t.solarOk_) {
+      url += "&field" + String(TS3_SOLAR_V_FIELD) + "=" + String(t.solarV_, 2);
+      url += "&field" + String(TS3_SOLAR_W_FIELD) + "=" + String(t.solarP_, 1);
+    }
     ok = tsGet(url) || ok;
   }
   lastTsOk = ok; lastTsUploadMs = millis();
@@ -6554,10 +6676,10 @@ static bool firebaseUploadLive() {
   if (t.tankValid)  { sensors["reservoirLevel"] = t.resLevel; sensors["mixingLevel"] = t.mixLevel; sensors["flowRate"] = t.flow; }
   if (t.envValid)   { sensors["temperature"] = t.temp; sensors["humidity"] = t.hum; }
   if (t.lightValid) sensors["lightLevel"] = t.lux;
-  // Voltage/percent only publish once a REAL calibration has been loaded for that channel -- until
-  // then there is no honest way to tell "sensor not installed" from "installed but uncalibrated,
-  // reading noise", so this correctly shows Unavailable rather than a meaningless polynomial-of-noise
-  // number. Current is gated on acsOk_, the ADS1115/ACS758's own live I2C health.
+  // Voltage/percent only publish from the main INA226 or a REAL opto calibration -- otherwise there is
+  // no honest way to tell "sensor not installed" from "installed but uncalibrated, reading noise", so
+  // this correctly shows Unavailable rather than a meaningless polynomial-of-noise number. Current is
+  // gated on battIOk_: the source in use answered on I2C just now.
   if (t.battVCalValid) {
     sensors["batteryVoltage"] = t.battV;
     // Percent from resting voltage. BATT_LOW_V/BATT_CRIT_V are alarm points, not endpoints, so the
@@ -6567,8 +6689,16 @@ static bool firebaseUploadLive() {
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     sensors["batteryPercent"] = (int)(pct + 0.5f);
   }
-  if (t.acsOk_) {
-    sensors["batteryCurrent"] = t.battI;                 // ACS758, magnitude (see readBatteryAdc)
+  if (t.battIOk_) {
+    sensors["batteryCurrent"] = t.battI;                 // magnitude (see readBatteryAdc)
+    if (t.battFromIna_) sensors["batteryCurrentSigned"] = t.battIsigned_;   // + = discharging; shunt bar only
+  }
+  // Solar INA226. Absent, not fabricated, while it is not answering. 0 V at night is a real reading.
+  if (t.solarOk_) {
+    sensors["solarVoltage"] = t.solarV_;
+    sensors["solarCurrent"] = t.solarI_;
+    sensors["solarPower"]   = t.solarP_;
+    sensors["solarEnergyTodayWh"] = (int)(t.chargedWh_ + 0.5);
   }
   // Secondary battery (INA226). Absent, not fabricated, while the monitor is not answering.
   if (t.secOk_) {
@@ -6646,7 +6776,10 @@ static bool firebaseUploadLive() {
   dna["lightValid"]       = t.lightValid;
 
   JsonObject dpe = dg.createNestedObject("peripherals");
-  dpe["rtcOk"] = t.rtcOk_; dpe["sdOk"] = t.sdOk_; dpe["batterySensorOk"] = t.acsOk_;
+  dpe["rtcOk"] = t.rtcOk_; dpe["sdOk"] = t.sdOk_; dpe["batterySensorOk"] = t.battIOk_;
+  dpe["batteryAdsOk"] = t.acsOk_;                  // the ACS758 fallback, separately: useful while INA226 is in use
+  dpe["mainInaOk"] = t.battFromIna_;
+  dpe["solarSensorOk"] = t.solarOk_;
   dpe["secondaryBatterySensorOk"] = t.secOk_;
 
   JsonObject dgs = dg.createNestedObject("gsm");
@@ -9228,9 +9361,10 @@ void lcdRenderDiag() {
     case 7:   // ESP1 local: battery raw ADC + device presence
       snprintf(l, 21, "%-8s ESP1 Loc", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "BatV raw%-5d%5.1fV", (int)readAdcTrimmed(PIN_BATT_V), battV); lcd.setCursor(0, 1); lcd.print(l);
-      // ACS758 via ADS1115 (replaces the dead GPIO34 opto read). Shows the SIGNED amps -- the 050B is
-      // bidirectional -- plus an ok/X flag, so a missing ADC reads as a fault and never as "0.0 A".
-      snprintf(l, 21, "Cur %7.2fA ADS:%s", battIsigned, acsOk ? "ok" : "X"); lcd.setCursor(0, 2); lcd.print(l);
+      // Shows the SIGNED amps from the source in use, plus the ACS758 fallback's own health (ok/X), so a
+      // missing sensor reads as a fault and never as "0.0 A". M/S = main and solar INA226 answering.
+      snprintf(l, 21, "%7.2fA M%c S%c ADS%c", battIsigned, inaUsable(powerIna[INA_MAIN]) ? '+' : 'X',
+               inaUsable(powerIna[INA_SOLAR]) ? '+' : 'X', acsOk ? '+' : 'X'); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "RTC:%s LCD:%s SD:%s", i2cPresent(0x68) ? "ok" : "X", i2cPresent(LCD_ADDR) ? "ok" : "X", sdOk ? "ok" : "X"); lcd.setCursor(0, 3); lcd.print(l);
       break;
     case 8:   // ESP2: pH / EC / ACS712 raw ADC (live CAL stream) -- ESP2's OWN probes, not the NPK's
@@ -10303,12 +10437,16 @@ void lcdTick() {
                  strlen(col[c].name) ? col[c].name : "-");
         lcdRow(c, l);
       }
-      snprintf(l, 21, "ESP2:%s", esp2Available ? "OK" : "--"); lcdRow(3, l);
+      snprintf(l, 21, "E2:%s SD:%s RTC:%s", esp2Available ? "OK" : "--", sdOk ? "OK" : "--",
+               rtcOk ? "OK" : rtcTimeLost ? "SET" : "--"); lcdRow(3, l);
       break;
     case PAGE_POWER:
       if (battVCalLoaded) {
         snprintf(l, 21, "Main V:%.2f%s", battV, esp2OnSecondary ? "" : " *"); lcdRow(0, l);
-        snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP); lcdRow(1, l);
+        // Signed from the shunt bar (- = charging); the ACS758 fallback shows a plain magnitude.
+        if (battFromIna) snprintf(l, 21, "I:%+.2fA P:%.1fW", battIsigned, battP);
+        else             snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP);
+        lcdRow(1, l);
       } else {
         snprintf(l, 21, "Main V:uncal%s", esp2OnSecondary ? "" : " *"); lcdRow(0, l);
         snprintf(l, 21, "I:%.2fA P:--", battI); lcdRow(1, l);
@@ -10318,7 +10456,11 @@ void lcdTick() {
       else if (secNoPack) snprintf(l, 21, "B2: no pack - wiring");
       else snprintf(l, 21, "B2: no INA226");
       lcdRow(2, l);                                  // '*' = the boards are on that battery now
-      snprintf(l, 21, "SD:%s RTC:%s%s", sdOk ? "OK" : "--", rtcOk ? "OK" : rtcTimeLost ? "SET" : "--", bswLatched ? " SWFLT" : ""); lcdRow(3, l);
+      if (inaUsable(powerIna[INA_SOLAR]))            // SD and RTC moved to the Columns page for this row
+        snprintf(l, 21, "Sol:%.1fV %.2fA%s", powerIna[INA_SOLAR].v, powerIna[INA_SOLAR].i, bswLatched ? " SW!" : "");
+      else
+        snprintf(l, 21, "Sol: no INA226%s", bswLatched ? " SWFLT" : "");
+      lcdRow(3, l);
       break;
     case PAGE_GSM:   // GSM (A7670C) + WiFi/ThingSpeak link health
       lcdRow(0, "GSM + WiFi");

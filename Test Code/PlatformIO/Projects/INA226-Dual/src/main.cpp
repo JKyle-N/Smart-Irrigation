@@ -1,20 +1,36 @@
 /*
-  Dual INA226 (CJMCU-226) detect + read test
+  Solar + main battery INA226 (CJMCU-226) detect + read test, for the rig's two isolated modules
   ------------------------------------------------------------------
-  Finds two INA226 modules on one I2C bus at two different addresses, proves each is really
-  an INA226 from its ID registers, and reads both side by side. Only Wire is used.
+  Finds both modules on one I2C bus at two different addresses, proves each is really an INA226
+  from its ID registers, and reads both side by side. Only Wire is used. Same addresses, scaling and
+  sign as ESP1/src/main.cpp, so a module that reads right here reads right there.
 
-  WIRING (both modules share the same bus)
-    ESP32:  SDA -> GPIO21   SCL -> GPIO22   VCC -> 3.3V   GND -> GND
-    Uno:    SDA -> A4       SCL -> A5       VCC -> 5V     GND -> GND
-    Shunt R010 on each module. IN+ / IN- in series with the load, VBS tied to IN- (high side).
-    Keep load and board grounds common, and stay under the INA226's 36 V limit.
+  SHUNTS
+    SOLAR    R010 on the module. Full scale 8.19 A. Keep panel Voc under 36 V.
+    BATTERY  50 A / 75 mV shunt bar (1.5 mOhm). Full scale 54.6 A. REMOVE the module's own R010, or it
+             sits in parallel with the bar: readings come out ~13 % low and it carries ~6.5 A at 50 A.
+
+  WIRING ON THE RIG (through the ISO1540)
+    ESP32 side:   SDA2 -> GPIO21   SCL2 -> GPIO22   VCC2 -> the voltage ESP1's bus is pulled up to
+                  GND2 -> board GND                 100 nF on VCC2
+    Module side:  SDA1 / SCL1 -> both modules' SDA / SCL   VCC1 -> 3.3 V from the main-battery side
+                  GND1 -> main battery negative     100 nF on VCC1
+    Modules:      VCC -> that same 3.3 V   GND -> main battery negative
+    Side 2 faces the ESP32 on purpose. Side 1 pulls low to only 0.57-0.8 V, and an ESP32 needs below
+    0.825 V at 3.3 V, so that way round leaves almost no margin. Side 2 reaches 0.4 V. Side 1's pull-ups
+    must sink 0.5-3.5 mA: the two modules' 10 k pull-ups in parallel (0.66 mA at 3.3 V) are enough.
+    Current sensing is high side: IN+ / IN- in series with the + line, VBS tied to IN-.
+    Stay under the INA226's 36 V limit.
+
+  ON THE BENCH (no isolator): SDA -> GPIO21 (Uno A4), SCL -> GPIO22 (Uno A5), VCC -> 3.3V (Uno 5V),
+    GND -> GND, with the load's ground common to the board's.
 
   SETTING THE ADDRESS (set on the module, by its A0 / A1 pins or solder pads)
-    A1 to GND, A0 to VCC  = 0x41  <- INA1
-    A1 to VCC, A0 to GND  = 0x44  <- INA2
+    A1 to GND, A0 to VCC  = 0x41  <- SOLAR
+    A1 to VCC, A0 to GND  = 0x44  <- BATTERY
     The chip's address pins are named A0 and A1. If yours are marked differently and the two names
-    come out swapped (unplug INA1: INA2 goes LOST), swap the two addresses in the MODULES table.
+    come out swapped (unplug SOLAR: BATTERY goes LOST), swap the two addresses in the MODULES table,
+    and in ESP1's SOLAR_INA_ADDR / MAIN_INA_ADDR.
     Two modules left on the same address both answer and corrupt each other's replies.
     To try other addresses, change only the MODULES table below (VS = the module's VCC):
 
@@ -40,19 +56,19 @@
 struct Module {
   const char *name;
   uint8_t  addr;
-  uint16_t cal;        // 2048 = R010 at 0.25 mA/bit. Trim: cal x (meter A / INA A)  [MEASURE per module]
+  uint16_t cal;        // 0.00512 / (currentLsb x shunt ohms). Trim: cal x (meter A / INA A) [MEASURE]
+  float    currentLsb; // amps per bit
   float    offsetA;    // no-load reading, subtracted                                [MEASURE per module]
   float    busFactor;  // meter V / INA V                                            [MEASURE per module]
   bool     ready;
 };
 
 Module MODULES[] = {
-  { "INA1", 0x41, 2048, 0.0f, 1.000f, false },
-  { "INA2", 0x44, 2048, 0.0f, 1.000f, false },
+  { "SOLAR", 0x41, 2048, 0.00025f, 0.0f, 1.000f, false },   // R010: 0.25 mA/bit, 8.19 A full scale
+  { "BATT",  0x44, 1707, 0.002f,   0.0f, 1.000f, false },   // 50 A / 75 mV: 2 mA/bit, 54.6 A full scale
 };
 const uint8_t MODULE_COUNT = sizeof(MODULES) / sizeof(MODULES[0]);
 
-const float    CURRENT_LSB = 0.00025f;        // 0.25 mA/bit -> 8.192 A full scale on R010
 const uint16_t CONFIG_VAL  = 0x4527;          // AVG16, 1.1 ms bus/shunt, continuous
 const uint16_t MFG_ID      = 0x5449;          // "TI"
 const uint16_t DIE_ID      = 0x2260;          // INA226
@@ -193,8 +209,9 @@ void printStatus() {
 }
 
 void printMissingHints() {
-  Serial.println(F("  Check that module's A0/A1 links (INA1 0x41: A1 GND, A0 VCC. INA2 0x44: A1 VCC, A0 GND),"));
+  Serial.println(F("  Check that module's A0/A1 links (SOLAR 0x41: A1 GND, A0 VCC. BATT 0x44: A1 VCC, A0 GND),"));
   Serial.println(F("  that no address pin is left floating, then its SDA/SCL/VCC/GND."));
+  Serial.println(F("  Through the ISO1540: both sides powered, GND1 on main negative, side 2 on the ESP32."));
 }
 
 void tryMissingModules() {
@@ -226,7 +243,7 @@ void readModule(Module &m) {
   }
   float shunt_mV  = (int16_t)rShunt * 0.0025f;              // 2.5 uV/bit, signed
   float bus_V     = rBus * 0.00125f * m.busFactor;          // 1.25 mV/bit
-  float current_A = (int16_t)rCurr * CURRENT_LSB - m.offsetA;
+  float current_A = (int16_t)rCurr * m.currentLsb - m.offsetA;
 
   Serial.print(m.name);        Serial.print('\t');
   Serial.print(bus_V, 3);      Serial.print('\t');
@@ -248,7 +265,7 @@ void setup() {
   Wire.setWireTimeout(25000, true);          // 25 ms: a stuck bus cannot freeze the sketch
 #endif
 
-  Serial.println(F("\n=== Dual INA226 test (CJMCU-226, R010) ==="));
+  Serial.println(F("\n=== Solar + battery INA226 test (CJMCU-226) ==="));
   tryMissingModules();
   lastRetryMs = lastReadMs = millis();
 }

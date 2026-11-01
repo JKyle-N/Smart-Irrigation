@@ -186,6 +186,26 @@ static inline bool bswAutoClearDue(uint32_t lastT, uint32_t now, uint32_t window
   return lastT != 0 && now != 0 && now >= lastT && now - lastT >= window;
 }
 
+/* ---- INA226 scaling ---------------------------------------------------------- */
+
+/* CAL register for a shunt and a chosen current LSB (datasheet: 0.00512 / (LSB x R)). The two modules
+ * behind the ISO1540 differ by a factor of 8 in LSB and nearly 7 in shunt, so getting this wrong is a
+ * large silent error. 0 = refused: an INA226 with CAL 0 reports no current at all. */
+static inline uint16_t inaCalFor(float shuntOhm, float lsbA) {
+  if (!(shuntOhm > 0.0f) || !(lsbA > 0.0f)) return 0;
+  float c = 0.00512f / (lsbA * shuntOhm) + 0.5f;
+  if (!(c >= 1.0f) || c > 32767.0f) return 0;
+  return (uint16_t)c;
+}
+static inline float inaBusVolts(uint16_t raw, float factor) { return raw * 0.00125f * factor; }   // 1.25 mV/bit
+/* The current register is signed. + must mean discharging (battery) or producing (solar); `invert` is
+ * for IN+/IN- wired the other way round. */
+static inline float inaAmps(uint16_t raw, float lsbA, bool invert, float offsetA) {
+  float a = (int16_t)raw * lsbA;
+  if (invert) a = -a;
+  return a - offsetA;
+}
+
 /* ---- secondary battery as backup for a critically low main ---------------- */
 
 /* BK_IDLE       main is fine.

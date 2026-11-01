@@ -256,6 +256,39 @@ void test_bsw_auto_clear_only_after_a_full_known_window(void) {
   TEST_ASSERT_FALSE(bswAutoClearDue(T0, T0 - 10, DAY));                    // clock went backwards
 }
 
+/* ---- INA226 scaling --------------------------------------------------------- */
+
+void test_ina_cal_for_the_r010_module(void) {
+  TEST_ASSERT_EQUAL_UINT16(2048, inaCalFor(0.010f, 0.00025f));
+}
+
+void test_ina_cal_for_the_50a_75mv_shunt_bar(void) {
+  TEST_ASSERT_EQUAL_UINT16(1707, inaCalFor(0.075f / 50.0f, 0.002f));   // 1706.67 rounds up
+}
+
+void test_ina_cal_refuses_values_the_register_cannot_hold(void) {
+  TEST_ASSERT_EQUAL_UINT16(0, inaCalFor(0.0f, 0.002f));
+  TEST_ASSERT_EQUAL_UINT16(0, inaCalFor(0.0015f, 0.0f));
+  TEST_ASSERT_EQUAL_UINT16(0, inaCalFor(-0.01f, 0.002f));
+  TEST_ASSERT_EQUAL_UINT16(0, inaCalFor(0.00001f, 0.00001f));          // far above 32767
+}
+
+void test_ina_amps_reads_the_register_as_signed(void) {
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 50.0f, inaAmps(25000, 0.002f, false, 0.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, -20.0f, inaAmps((uint16_t)(int16_t)-10000, 0.002f, false, 0.0f));  // charging
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 20.0f, inaAmps((uint16_t)(int16_t)-10000, 0.002f, true, 0.0f));    // leads swapped
+}
+
+void test_ina_amps_removes_the_offset_after_the_sign(void) {
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.986f, inaAmps(8000, 0.00025f, false, 0.014f));
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, -2.014f, inaAmps(8000, 0.00025f, true, 0.014f));
+}
+
+void test_ina_bus_volts(void) {
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 12.6f, inaBusVolts(10080, 1.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 12.726f, inaBusVolts(10080, 1.01f));
+}
+
 /* ---- backup state machine -------------------------------------------------- */
 
 static BackupIn bkIn(void) {           // a calm rig: idle, pack fine, main neither low nor recovered
@@ -429,6 +462,12 @@ int main(int, char **) {
   RUN_TEST(test_bsw_strike_after_the_window_starts_over);
   RUN_TEST(test_bsw_uncheckable_time_counts_towards_the_latch);
   RUN_TEST(test_bsw_auto_clear_only_after_a_full_known_window);
+  RUN_TEST(test_ina_cal_for_the_r010_module);
+  RUN_TEST(test_ina_cal_for_the_50a_75mv_shunt_bar);
+  RUN_TEST(test_ina_cal_refuses_values_the_register_cannot_hold);
+  RUN_TEST(test_ina_amps_reads_the_register_as_signed);
+  RUN_TEST(test_ina_amps_removes_the_offset_after_the_sign);
+  RUN_TEST(test_ina_bus_volts);
   RUN_TEST(test_backup_stays_idle_until_main_is_low_for_the_whole_trigger_time);
   RUN_TEST(test_backup_alert_goes_out_before_the_boards_move);
   RUN_TEST(test_backup_never_switches_onto_an_unusable_pack_or_a_busy_rig);
