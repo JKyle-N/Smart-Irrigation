@@ -150,7 +150,7 @@ static inline int pulseRowForTarget(const char *t) {
   if (!strcmp(t, "colB"))     return 18;
   if (!strcmp(t, "colC"))     return 19;
   if (!strcmp(t, "transfer")) return 16;   // Fill combo: inverter + transfer pump
-  if (!strcmp(t, "mixer"))    return 8;
+  if (!strcmp(t, "mixer"))    return 20;   // Mixer combo: an AC motor gets no power without the inverter
   if (!strcmp(t, "nutA"))     return 9;
   if (!strcmp(t, "nutB"))     return 10;
   if (!strcmp(t, "nutC"))     return 11;
@@ -161,11 +161,11 @@ static inline int pulseRowForTarget(const char *t) {
 }
 
 /* Does this ESP2 TEST row switch the inverter on? Row 5 is the bare inverter relay; 16..19 are the
- * Fill / Push>Col combos, which include it. Those are the Testing uses that move the boards to the
- * secondary battery, so they are the ones a low/unmonitored secondary must refuse. (Single pump rows
- * 6/7/8 do not raise the inverter on their own.) */
+ * Fill / Push>Col combos and 20 the dashboard's Mixer combo, which include it. Those are the Testing uses
+ * that move the boards to the secondary battery, so they are the ones a low/unmonitored secondary must
+ * refuse. (Single pump rows 6/7/8 do not raise the inverter on their own.) */
 static inline bool testRowUsesInverter(int row) {
-  return row == 5 || (row >= 16 && row <= 19);
+  return row == 5 || (row >= 16 && row <= 20);
 }
 
 /* ---- battery-switch reset strikes ------------------------------------------ */
@@ -204,6 +204,45 @@ static inline float inaAmps(uint16_t raw, float lsbA, bool invert, float offsetA
   float a = (int16_t)raw * lsbA;
   if (invert) a = -a;
   return a - offsetA;
+}
+
+/* Is a calibration value read back from NVS usable? False for NaN too, because every compare fails. */
+static inline bool calInRange(float v, float lo, float hi) { return v >= lo && v <= hi; }
+
+/* Are trims for one INA226 believable? The same limits the bench tool (Calibration/ESP1/INA226) refuses
+ * beyond, so a value it saved always passes and a corrupted one falls back to the compiled defaults:
+ *   shunt   within x0.5..x2 of nominal (the bar with the module's own R010 left on is only 13 % out, so a
+ *           real trim is far inside this; beyond it is a wrong shunt or a mistyped number)
+ *   offset  at most 2 % of full scale (more than that is real current, not an offset)
+ *   bus     within 10 % (the chip is good to about 0.1 %) */
+static inline bool inaTrimOk(float shuntOhm, float nominalOhm, float lsbA, float offsetA, float busFactor) {
+  if (!(nominalOhm > 0.0f) || !calInRange(shuntOhm, nominalOhm * 0.5f, nominalOhm * 2.0f)) return false;
+  if (inaCalFor(shuntOhm, lsbA) == 0) return false;
+  float limitA = 0.02f * (0.08192f / shuntOhm);       // 81.92 mV across the shunt is full scale
+  if (!calInRange(offsetA, -limitA, limitA)) return false;
+  return calInRange(busFactor, 1.0f / 1.10f, 1.10f);
+}
+
+/* ---- main battery low/critical flags ---------------------------------------- */
+
+/* An inverter start sags the battery for a moment. The main INA226 sees that where the old opto path never
+ * did, so without a hold the flags flicker on every pump start, and BATTERY_SAFETY_ENABLED would E-stop on
+ * it. True once the reading has stayed below the line for holdMs; a reading back above it clears at once.
+ * `*sinceMs` is the caller's: 0 means "not below". A long run can still sag past holdMs: that is a real
+ * reading of a battery under load, and BATTERY_SAFETY_ENABLED still needs a decision on it. */
+static inline bool battFlagHeld(bool below, uint32_t nowMs, uint32_t *sinceMs, uint32_t holdMs) {
+  if (!below) { *sinceMs = 0; return false; }
+  if (*sinceMs == 0) { *sinceMs = nowMs ? nowMs : 1; return false; }   // 0 is reserved for "not below"
+  return nowMs - *sinceMs >= holdMs;
+}
+
+/* ---- force run ---------------------------------------------------------------- */
+
+/* A force run that doses needs its batch (the water less the flush) at or above the dosing floor. A run
+ * with no nutrients has no floor. Checked when arming, so the operator hears it before the countdown. */
+static inline bool forceBatchOk(float liters, float flushPct, float safeMinL, float mlA, float mlB, float mlC) {
+  if (!(mlA > 0.0f) && !(mlB > 0.0f) && !(mlC > 0.0f)) return true;
+  return liters * (1.0f - flushPct / 100.0f) >= safeMinL;
 }
 
 /* ---- secondary battery as backup for a critically low main ---------------- */

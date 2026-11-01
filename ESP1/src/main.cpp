@@ -72,7 +72,7 @@
 #define BTN_BACK      15
 #define BTN_MODE       2
 #define ESP2_PWR_PIN   4        // ESP2 power relay (active HIGH)
-#define PIN_BATT_I    34        // battery CURRENT via opto -> ADC1 (nonlinear; polynomial-calibrated)
+#define PIN_BATT_I    34        // old opto current channel: read 0.00 A on every sample, no longer used
 #define PIN_BATT_V    35        // battery VOLTAGE via opto -> ADC1 (nonlinear; polynomial-calibrated)
 
 /* ---- Battery safety: READY, NOT IMPLEMENTED ----------------------------------------------------- *
@@ -206,6 +206,8 @@ const float MIX_MAX_PCT      = 95.0f;   // mixing tank overflow guard       [TBD
 /* ---- Battery (INA226) (spec sec.21.1) ------------------------------------ */
 const float BATT_LOW_V       = 11.8f;   // disable fertigation below        [TBD]
 const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD]
+const unsigned long BATT_FLAG_HOLD_MS = 60000;  // below the line this long before a flag sets, so an inverter
+                                                // start's sag cannot flicker it (battFlagHeld)  [CONFIRM]
 
 /* ---- SECONDARY battery: INA226 (R010 shunt) on this I2C bus at INA226_ADDR ------------------- *
  * A 4S Li-ion battery (16.8 V full) that powers ESP1, ESP2, the Nano, the sensors and the relay
@@ -218,7 +220,7 @@ const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD
  * (it drives the switch) -- set both together, and only once the hold-up stage that rides the
  * boards through the ~10-20 ms DPDT transfer is fitted. At 0 the INA226 is still read, logged
  * (PWR2) and published, but nothing is blocked or alerted.
- * Calibration follows the bench tool Test Code/Arduino R3/INA226_R010 (same CAL/offset/factor). */
+ * Calibrated with Calibration/ESP1/INA226, whose results load from NVS over these defaults (loadCal). */
 #define SECONDARY_BATT_ENABLED 0
 /* Secondary battery as a BACKUP for a critically low main battery: READY, NOT ACTIVE. At 1: when main
  * stays below BATT_CRIT_V for BACKUP_TRIGGER_MS with nothing running, ESP1 texts a critical alert (it
@@ -240,6 +242,7 @@ const unsigned long BACKUP_SWITCH_TIMEOUT_MS = 30000;   // ESP2 boot + handshake
 const unsigned long BACKUP_RESEND_MS   = 3000;          // repeat BATTBK,ON|OFF until ESP2 confirms
 const unsigned long BACKUP_RETRY_MS    = 60000;         // pause before trying again after a failed or lost switch
 const float         SEC_NO_PACK_V      = 5.0f;          // below this it is a wiring fault, not a flat pack
+const float    SEC_SHUNT_OHM        = 0.010f;    // R010 on the module
 const float    SEC_CURRENT_LSB      = 0.00025f;  // 0.25 mA/bit -> 8.192 A full scale
 const uint16_t SEC_INA_CAL          = 2048;      // 0.00512/(LSB*0.010 R); trim x (meter A/INA A) [MEASURE]
 const float    SEC_CURRENT_OFFSET_A = 0.014f;    // no-load reading, subtracted                 [MEASURE]
@@ -303,9 +306,10 @@ const unsigned long BSW_CUT_SURVIVE_MS = 5000;      // alive this long after a s
  * Set ACS_DIV to 1.0 only if the divider is genuinely absent.                                     */
 #define ACS_ADDR        0x48        // ADS1115 ADDR -> GND (no clash: LCD 0x27, EEPROM 0x57, RTC 0x68)
 #define ACS_CHANNEL     0           // ACS758 output on A0; A1..A3 unused
-const float ACS_DIV          = 2.0f;    // (R1+R2)/R2 in front of A0                    [MEASURE]
-const float ACS_ZERO_V       = 2.5f;    // sensor output at 0 A = VCC/2 (050B)          [MEASURE]
-const float ACS_SENS_V_PER_A = 0.040f;  // 40 mV/A = ACS758LCB-050B                     [CONFIRM]
+float ACS_DIV          = 2.0f;          // (R1+R2)/R2 in front of A0                    [MEASURE]
+float ACS_ZERO_V       = 2.5f;          // sensor output at 0 A = VCC/2 (050B)          [MEASURE]
+float ACS_SENS_V_PER_A = 0.040f;        // 40 mV/A = ACS758LCB-050B                     [CONFIRM]
+                                        // Not const: NVS "calib" overrides these three (loadCal)
 const uint8_t ACS_PGA        = 1;       // 1 = +/-4.096 V full scale (125 uV/LSB)
 // ThingSpeak Ch3 ("Chem") slot for the battery current. Ch2 "System" is full (all 8 fields).
 // Must stay ABOVE 2 x (enabled columns), since the EC/pH loop claims 2 fields per enabled column.
@@ -435,7 +439,7 @@ const int   MIN_DOSE_PULSES = 3;         // ~12 mL floor; below this -> skip + l
 // (pulses/mL "SCALE" comes live from the per-channel flow K-factor calKNut[i]/1000, not a constant.)
 // ---- Timed-ceiling backstop (§2.4) ----
 const float CEILING_MARGIN  = 2.0f;      // ceiling_s = 2x expected runtime (LOCKED)
-const float PUMP_FLOWRATE_MLPM[3] = { 50.0f, 50.0f, 50.0f };   // pre-cal default mL/min [MEASURE]
+float PUMP_FLOWRATE_MLPM[3] = { 50.0f, 50.0f, 50.0f };   // pre-cal default mL/min, NVS "calib" overrides [MEASURE]
 // ---- Mixing tank (§1.1): batch volume is VARIABLE; MAX is a ceiling, not the formula input ----
 const float MIXING_TANK_MAX_VOLUME = 50.0f;   // L (safety ceiling)
 const float MIXING_TANK_SAFE_MIN   = 5.0f;    // L (refuse dosing below)
@@ -1194,6 +1198,9 @@ static inline bool inaUsable(const InaMon &m) { return m.ok && m.haveV; }
 bool  batteryLow = false, batteryCritical = false;
 unsigned long lastInaMs = 0;                         // ADC read throttle (kept name to avoid churn)
 // Secondary battery (INA226). Core 1 only; the snapshot carries copies to core 0.
+uint16_t secInaCal = SEC_INA_CAL;                  // these four: compiled defaults, NVS "calib" overrides (loadCal)
+float    secOffsetA = SEC_CURRENT_OFFSET_A, secBusFactor = SEC_BUS_V_FACTOR;
+bool     secInvert = SEC_INVERT_CURRENT;
 bool  secInaOk = false, secHaveV = false;          // monitor answering / have a reading
 float secV = 0, secI = 0, secP = 0;                // filtered V, signed current, power
 bool  secLow = false, secCrit = false;             // low latch (hysteresis) / critical
@@ -1218,10 +1225,10 @@ static inline bool battQuietActive() {
   unsigned long u = battQuietUntilMs;
   return u != 0 && (long)(millis() - u) < 0;
 }
-// Energy integration for the daily report (sec.12.1.3). The opto current is MAGNITUDE only, so all
-// energy is counted as consumption (charge/discharge split removed with the INA226).
+// Energy integration for the daily report (sec.12.1.3). See powerTick: discharge only with the shunt bar,
+// every amp on the ACS758 fallback, which is not trusted for direction.
 double energyConsumedWh = 0.0;   // energy today (Wh)
-double energyChargedWh  = 0.0;   // kept for the report format (stays 0)
+double energyChargedWh  = 0.0;   // solar energy today (Wh), from the solar INA226
 bool   prevBattStateLow = false, prevBattStateCrit = false;  // PWR-log-on-change (B3)
 
 /* ---- Daily counters (for report) ----------------------------------------- */
@@ -1377,6 +1384,7 @@ uint8_t       fcSlot  = 0;         // which slot is counting down / running
 // fcPhase first and, if blocked, flashes this instead of arming -- see the render block near the
 // existing "FORCE RUN ARMED" screen.
 bool          forceBlockedFlash   = false;
+bool          forceBlockedLow     = false;            // the flash is for a dose on too small a batch
 unsigned long forceBlockedUntilMs = 0;
 unsigned long fcFireAtMs = 0;      // countdown deadline for FP_WAIT
 // A dashboard-initiated force run now arms this same countdown instead of dispatching immediately,
@@ -2228,6 +2236,7 @@ void loadConfig() {
 /* =============================================================================
  *  CALIBRATION NVS + DISTRIBUTION  (companion spec §A.5.1)
  * ========================================================================== */
+static void loadPowerCal();
 void loadCal() {
   prefsCal.begin("calib", false);                 // separate namespace; Restore-Defaults never touches it
   for (int c = 0; c < NUM_COLUMNS; c++) {
@@ -2260,6 +2269,46 @@ void loadCal() {
   calPhM = prefsCal.getFloat("phM", calPhM); calPhB = prefsCal.getFloat("phB", calPhB);
   calEcM = prefsCal.getFloat("ecM", calEcM); calEcB = prefsCal.getFloat("ecB", calEcB);
   calAcs712Zero = prefsCal.getFloat("acs", calAcs712Zero);
+  loadPowerCal();
+}
+
+// One INA226's trims from Calibration/ESP1/INA226. A set that is not believable is ignored whole, so a
+// corrupted value leaves the compiled defaults rather than a silently wrong current.
+static void loadInaTrim(const char *key, float nominalOhm, float lsb, uint16_t &cal, float &offsetA, float &busFactor, bool &invert) {
+  String k(key);
+  float ohm = prefsCal.getFloat((k + "O").c_str(), 0.00512f / (cal * lsb));
+  float off = prefsCal.getFloat((k + "A").c_str(), offsetA);
+  float bus = prefsCal.getFloat((k + "B").c_str(), busFactor);
+  if (!inaTrimOk(ohm, nominalOhm, lsb, off, bus)) {
+    Serial.printf("CAL: INA226 %s trims in NVS are out of range, using compiled values\n", key);
+    return;
+  }
+  cal = inaCalFor(ohm, lsb); offsetA = off; busFactor = bus;
+  invert = prefsCal.getBool((k + "I").c_str(), invert);
+}
+
+// Everything the bench tools save for the power side and the dosing pumps. Keys are listed in
+// Calibration/README.md, and CalStore can read or clear them.
+static void loadPowerCal() {
+  InaMon &sol = powerIna[INA_SOLAR], &mn = powerIna[INA_MAIN];
+  loadInaTrim("iSol",  SOLAR_SHUNT_OHM, sol.lsb, sol.cal, sol.offsetA, sol.busFactor, sol.invert);
+  loadInaTrim("iMain", MAIN_SHUNT_OHM,  mn.lsb,  mn.cal,  mn.offsetA,  mn.busFactor,  mn.invert);
+  loadInaTrim("iSec",  SEC_SHUNT_OHM, SEC_CURRENT_LSB, secInaCal, secOffsetA, secBusFactor, secInvert);
+
+  float div  = prefsCal.getFloat("acsDiv",  ACS_DIV);
+  float zero = prefsCal.getFloat("acsZero", ACS_ZERO_V);
+  float sens = prefsCal.getFloat("acsSens", ACS_SENS_V_PER_A);
+  if (calInRange(div, 0.999f, 20.0f) && calInRange(zero, 0.1f, 5.5f) && calInRange(sens, 0.002f, 0.2f)) {
+    ACS_DIV = div; ACS_ZERO_V = zero; ACS_SENS_V_PER_A = sens;
+  } else Serial.println("CAL: ACS758 values in NVS are out of range, using compiled values");
+
+  const char *PUMP_KEY[3] = { "pumpA", "pumpB", "pumpC" };
+  for (int i = 0; i < 3; i++) {
+    float r = prefsCal.getFloat(PUMP_KEY[i], PUMP_FLOWRATE_MLPM[i]);
+    // A divisor in every dose's timed ceiling, so an unusable value must never get this far.
+    if (calInRange(r, 1.0f, 5000.0f)) PUMP_FLOWRATE_MLPM[i] = r;
+    else Serial.printf("CAL: %s in NVS is out of range, using %.1f mL/min\n", PUMP_KEY[i], PUMP_FLOWRATE_MLPM[i]);
+  }
 }
 
 // Push every ESP2-owned calibration constant (baseline after any ESP2 reset, §A.5.1 #2).
@@ -3453,17 +3502,14 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
   if (primary >= NUM_COLUMNS) return;
 
   bool fert = (doseMl[0] > 0.0f || doseMl[1] > 0.0f || doseMl[2] > 0.0f);
-  if (fert) {
-    float batchV = liters * (1.0f - FLUSH_PCT / 100.0f);
-    // Same floor calcDose() enforces for the scheduled path (MIXING_TANK_SAFE_MIN) -- previously
-    // unchecked on this path, so a FORCE run (dashboard, or the LCD editor which clamps down to
-    // 0.5L) could dose nutrient into a batch both firmwares' own constants call unsafe, with no
-    // refusal anywhere in the protocol.
-    if (batchV < MIXING_TANK_SAFE_MIN) {
-      logEvent("ESP1", "ACT", "FORCE|BLOCKED|BATCH_LOW");
-      if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "batch too small to dose safely -- raise liters or remove nutrients");
-      return;
-    }
+  // Same floor calcDose() enforces for the scheduled path (MIXING_TANK_SAFE_MIN) -- previously
+  // unchecked on this path, so a FORCE run (dashboard, or the LCD editor which clamps down to
+  // 0.5L) could dose nutrient into a batch both firmwares' own constants call unsafe, with no
+  // refusal anywhere in the protocol.
+  if (!forceBatchOk(liters, FLUSH_PCT, MIXING_TANK_SAFE_MIN, doseMl[0], doseMl[1], doseMl[2])) {
+    logEvent("ESP1", "ACT", "FORCE|BLOCKED|BATCH_LOW");
+    if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "batch too small to dose safely -- raise liters or remove nutrients");
+    return;
   }
   String cols;
   for (int b = 0; b < NUM_COLUMNS; b++) if (mask & (1 << b)) cols += (char)('A' + b);
@@ -5488,8 +5534,10 @@ void powerTick() {
   // Battery state flags -- DISPLAY/LOG (and, if BATTERY_SAFETY_ENABLED, the protective actions).
   // Calibrated only: the placeholder's 0..1 "volts" would otherwise read as a critically flat battery,
   // and with the safety flag on that would be an emergency stop.
-  batteryCritical = battVCalLoaded && (battV > 0 && battV < BATT_CRIT_V);
-  batteryLow      = battVCalLoaded && (battV > 0 && battV < BATT_LOW_V);
+  // Held for BATT_FLAG_HOLD_MS, because the main INA226 reads the sag of every inverter start.
+  static uint32_t critSinceMs = 0, lowSinceMs = 0;
+  batteryCritical = battFlagHeld(battVCalLoaded && battV > 0 && battV < BATT_CRIT_V, nowMs, &critSinceMs, BATT_FLAG_HOLD_MS);
+  batteryLow      = battFlagHeld(battVCalLoaded && battV > 0 && battV < BATT_LOW_V,  nowMs, &lowSinceMs,  BATT_FLAG_HOLD_MS);
   batterySafetyTick();                                 // ready-but-disabled protections
 
   // B3: log a PWR snapshot at most ~1/min, OR immediately on a battery-state change (sec.25.2.1).
@@ -5535,10 +5583,15 @@ static bool inaInit(uint8_t addr, uint16_t cal) {
   return inaRead(addr, 0x05, calBack) && calBack == cal;
 }
 static bool secInaRead(uint8_t reg, uint16_t &out) { return inaRead(INA226_ADDR, reg, out); }
-static bool secInaInit() { return inaInit(INA226_ADDR, SEC_INA_CAL); }
+static bool secInaInit() { return inaInit(INA226_ADDR, secInaCal); }
 
 /* Solar + main battery modules behind the ISO1540. Their power comes from the main-battery side, so a
- * module going quiet says the isolator or its supply needs attention; it says nothing about the boards. */
+ * module going quiet says the isolator or its supply needs attention; it says nothing about the boards.
+ *
+ * A module that loses its supply for a moment comes back with CAL = 0 and goes on answering, with the right
+ * voltage and a current of exactly 0 A: an inverter start can do that to a regulator on the main battery,
+ * and the wrong reading would look perfectly healthy. So CAL is read back on every pass, like the first
+ * time the module was found. */
 void powerInaTick() {
   unsigned long now = millis();
   for (uint8_t k = 0; k < INA_COUNT; k++) {
@@ -5553,8 +5606,8 @@ void powerInaTick() {
     }
     if (m.lastReadMs && now - m.lastReadMs < PWR_INA_READ_MS) continue;
     m.lastReadMs = now ? now : 1;
-    uint16_t rBus, rCur;
-    if (!inaRead(m.addr, 0x02, rBus) || !inaRead(m.addr, 0x04, rCur)) {
+    uint16_t rBus, rCur, rCal;
+    if (!inaRead(m.addr, 0x02, rBus) || !inaRead(m.addr, 0x04, rCur) || !inaRead(m.addr, 0x05, rCal)) {
       if (++m.failN >= 3) {                                 // debounced: one NAK is bus noise, three is gone
         m.ok = false; m.haveV = false; m.lastTryMs = now ? now : 1;
         logEvent("ESP1", "PWRS", String("INA226|") + m.name + "|LOST");
@@ -5562,6 +5615,12 @@ void powerInaTick() {
       continue;
     }
     m.failN = 0;
+    if (rCal != m.cal) {                                    // it restarted: this current reading is not real
+      m.ok = inaInit(m.addr, m.cal);
+      logEvent("ESP1", "PWRS", String("INA226|") + m.name + (m.ok ? "|RESTARTED" : "|LOST"));
+      m.haveV = false; m.lastTryMs = now ? now : 1;
+      continue;
+    }
     float v = inaBusVolts(rBus, m.busFactor);
     if (v < m.minV) {                                       // a loose VBUS lead, not a 12 V battery at 3 V
       if (!m.noV) logEvent("ESP1", "PWRS", String("INA226|") + m.name + "|NO_BUS_VOLTAGE|V=" + String(v, 2));
@@ -5624,16 +5683,22 @@ void secBattTick() {
   }
   if (lastReadMs && now - lastReadMs < SEC_READ_MS) return;
   lastReadMs = now;
-  uint16_t rBus, rCur;
-  if (!secInaRead(0x02, rBus) || !secInaRead(0x04, rCur)) {
+  uint16_t rBus, rCur, rCal;
+  if (!secInaRead(0x02, rBus) || !secInaRead(0x04, rCur) || !secInaRead(0x05, rCal)) {
     if (++failN >= 3) {                                   // debounced: one NAK is bus noise, three is gone
-      secInaOk = false; secHaveV = false; lastTryMs = now;
+      secInaOk = false; secHaveV = false; secNoPack = false; lastTryMs = now;
       logEvent("ESP1", "PWR2", "INA226|LOST");
     }
     secBattPolicy(); return;
   }
   failN = 0;
-  float v = rBus * 0.00125f * SEC_BUS_V_FACTOR;           // 1.25 mV/bit
+  if (rCal != secInaCal) {                                // it restarted, so its current reads 0 A (see powerInaTick)
+    secInaOk = secInaInit();
+    logEvent("ESP1", "PWR2", secInaOk ? "INA226|RESTARTED" : "INA226|LOST");
+    if (!secInaOk) { secHaveV = false; secNoPack = false; lastTryMs = now; secBattPolicy(); }
+    return;                                               // the next pass reads through the restored CAL
+  }
+  float v = rBus * 0.00125f * secBusFactor;               // 1.25 mV/bit
   // No 4S pack reads this low. The chip is fine, so this is a loose VBUS lead or a pack whose negative is
   // not common with board ground -- report it as that, not as a flat battery.
   if (v < SEC_NO_PACK_V) {
@@ -5643,8 +5708,8 @@ void secBattTick() {
   }
   secNoPack = false;
   float i = (int16_t)rCur * SEC_CURRENT_LSB;
-  if (SEC_INVERT_CURRENT) i = -i;
-  i -= SEC_CURRENT_OFFSET_A;
+  if (secInvert) i = -i;
+  i -= secOffsetA;
   secV = secHaveV ? secV + 0.3f * (v - secV) : v;        // light filter so a load step can't flap the latch
   secHaveV = true; secI = i; secP = secV * i;
   secBattPolicy();
@@ -7330,8 +7395,7 @@ void firebaseCommandTick() {
         logEvent("FIREBASE", "REJECT", "FORCE|DOSE_RANGE"); continue;
       }
       // Tell the operator now, not after the countdown: sendForceWorkOrder would refuse this at fire time.
-      if ((c.doseMl[0] > 0.0f || c.doseMl[1] > 0.0f || c.doseMl[2] > 0.0f) &&
-          c.liters * (1.0f - FLUSH_PCT / 100.0f) < MIXING_TANK_SAFE_MIN) {
+      if (!forceBatchOk(c.liters, FLUSH_PCT, MIXING_TANK_SAFE_MIN, c.doseMl[0], c.doseMl[1], c.doseMl[2])) {
         firebaseQueueStatus(c.id, "rejected", "batch too small to dose safely -- raise liters or remove nutrients");
         logEvent("FIREBASE", "REJECT", "FORCE|BATCH_LOW"); continue;
       }
@@ -9663,6 +9727,7 @@ static bool testRowVisible(int r) {
 static String testRowName(int r) {
   if (r < 16) return TEST_NAMES[r];
   if (r == TEST_FILL_ROW) return "Fill Res>Mix";
+  if (r >= TEST_ROWS) return "Mixer+Inverter";       // row 20: dashboard only, not on the LCD list
   return String("Push>Col ") + COL_TAG[r - (TEST_FILL_ROW + 1)];
 }
 
@@ -9723,10 +9788,23 @@ void commitEditor() {
       // checks it, this was the missing side.
       if (fcPhase != FP_NONE) {
         logEvent("ESP1", "STATE", "FORCE_BLOCKED|ALREADY_ARMED");
+        forceBlockedLow = false;
         forceBlockedFlash = true; forceBlockedUntilMs = millis() + 3000;
         uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
         break;
       }
+      // Say so now, not when the countdown ends: sendForceWorkOrder would refuse this at fire time.
+      // The editor's 2.0 L default with any nutrient lands here.
+      { bool batchOk = true;
+        for (int s = 0; s < ((fcMode == 3) ? 2 : 1); s++)
+          if (!forceBatchOk(fcSeq[s].dL / 10.0f, FLUSH_PCT, MIXING_TANK_SAFE_MIN, fcSeq[s].ml[0], fcSeq[s].ml[1], fcSeq[s].ml[2])) batchOk = false;
+        if (!batchOk) {
+          logEvent("ESP1", "STATE", "FORCE_BLOCKED|BATCH_LOW");
+          forceBlockedLow = true;
+          forceBlockedFlash = true; forceBlockedUntilMs = millis() + 4000;
+          uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
+          break;
+        } }
       // ARM, don't run. forceTick() fires it after the countdown and re-checks safety THEN, because
       // conditions can change during a delay of up to 5 minutes. Return to UI_DATA so automation
       // (and the fire check, which requires uiMode == UI_DATA) is live while the clock runs.
@@ -10358,6 +10436,12 @@ void lcdTick() {
       if (!lcdInForce) { lcd.clear(); lcdInForce = true; }
       char fb[21];
       snprintf(fb, 21, "%-20s", "FORCE RUN BLOCKED");   lcd.setCursor(0, 0); lcd.print(fb);
+      if (forceBlockedLow) {
+        snprintf(fb, 21, "%-20s", "Too little water");  lcd.setCursor(0, 1); lcd.print(fb);
+        snprintf(fb, 21, "Dosing needs %4.2f L", MIXING_TANK_SAFE_MIN / (1.0f - FLUSH_PCT / 100.0f)); lcd.setCursor(0, 2); lcd.print(fb);
+        snprintf(fb, 21, "%-20s", "or set nutrients 0"); lcd.setCursor(0, 3); lcd.print(fb);
+        return;
+      }
       snprintf(fb, 21, "%-20s", "A run is already");    lcd.setCursor(0, 1); lcd.print(fb);
       snprintf(fb, 21, "%-20s", "armed/running.");      lcd.setCursor(0, 2); lcd.print(fb);
       snprintf(fb, 21, "%-20s", "");                    lcd.setCursor(0, 3); lcd.print(fb);

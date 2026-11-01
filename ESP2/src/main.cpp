@@ -334,6 +334,8 @@ const uint8_t COMBO_FILL[]   = { OUT_INVERTER, OUT_TRANSFER };   // transfer dra
 const uint8_t COMBO_PUSH_A[] = { OUT_INVERTER, OUT_COL_A, OUT_BOOSTER };
 const uint8_t COMBO_PUSH_B[] = { OUT_INVERTER, OUT_COL_B, OUT_BOOSTER };
 const uint8_t COMBO_PUSH_C[] = { OUT_INVERTER, OUT_COL_C, OUT_BOOSTER };
+// idx 20: the dashboard's Mixer pulse. The mixer is an AC motor, so its bare relay alone runs nothing.
+const uint8_t COMBO_MIXER[]  = { OUT_INVERTER, OUT_MIXER };
 
 /* ---- Calibration: raw stream + Prime (companion spec §A) ----------------- */
 String   calId = "";                  // active CAL sensor id ("" = none)
@@ -888,7 +890,7 @@ void cutoffDeenergizeGraceful() {
   cutoffDeenergize();
 }
 
-// Energize all PCF bits of a Testing priming combo (idx 16=Fill, 17/18/19=Push>Col A/B/C).
+// Energize all PCF bits of a Testing combo (idx 16=Fill, 17/18/19=Push>Col A/B/C, 20=Mixer).
 void testComboOn(int idx) {
   const uint8_t *bits; uint8_t cnt;
   switch (idx) {
@@ -896,6 +898,7 @@ void testComboOn(int idx) {
     case 17: bits = COMBO_PUSH_A; cnt = sizeof(COMBO_PUSH_A); break;
     case 18: bits = COMBO_PUSH_B; cnt = sizeof(COMBO_PUSH_B); break;
     case 19: bits = COMBO_PUSH_C; cnt = sizeof(COMBO_PUSH_C); break;
+    case 20: bits = COMBO_MIXER;  cnt = sizeof(COMBO_MIXER);  break;
     default: return;
   }
   for (uint8_t i = 0; i < cnt; i++) pcfOn(bits[i]);
@@ -1226,7 +1229,7 @@ void dispatch(const String &payload) {
     if (sub == "HOLD") {                                   // dead-man keep-alive for <bit/combo>
       if (!testMode || n < 3) return;
       int bit = tok[2].toInt();
-      if (bit < 0 || bit > 19) { reply("INVALID,TEST_BIT"); return; }   // 0..15 relays, 16..19 combos
+      if (bit < 0 || bit > 20) { reply("INVALID,TEST_BIT"); return; }   // 0..15 relays, 16..20 combos
       if (bit != testHeldBit) {                            // new selection -> one-at-a-time switch
         if (bit == OUT_MASTER_CUTOFF) {
           // REVERSED in test mode: the bank is kept powered by default, so holding the master

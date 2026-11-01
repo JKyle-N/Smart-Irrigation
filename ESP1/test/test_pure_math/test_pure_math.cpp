@@ -206,7 +206,7 @@ void test_pulse_row_maps_every_known_target(void) {
   TEST_ASSERT_EQUAL_INT(18, pulseRowForTarget("colB"));
   TEST_ASSERT_EQUAL_INT(19, pulseRowForTarget("colC"));
   TEST_ASSERT_EQUAL_INT(16, pulseRowForTarget("transfer"));   // fill COMBO, not the bare pump
-  TEST_ASSERT_EQUAL_INT(8,  pulseRowForTarget("mixer"));
+  TEST_ASSERT_EQUAL_INT(20, pulseRowForTarget("mixer"));      // combo: the bare relay has no AC power
   TEST_ASSERT_EQUAL_INT(9,  pulseRowForTarget("nutA"));
   TEST_ASSERT_EQUAL_INT(10, pulseRowForTarget("nutB"));
   TEST_ASSERT_EQUAL_INT(11, pulseRowForTarget("nutC"));
@@ -370,11 +370,11 @@ void test_backup_main_recovering_before_the_switch_cancels_it(void) {
 /* ---- testRowUsesInverter (secondary-battery gate) ------------------------- */
 
 void test_inverter_rows_are_exactly_the_ac_rows(void) {
-  // The bare inverter relay and every Fill/Push combo raise the inverter -> secondary battery.
+  // The bare inverter relay and every Fill/Push/Mixer combo raise the inverter -> secondary battery.
   TEST_ASSERT_TRUE(testRowUsesInverter(5));
-  for (int r = 16; r <= 19; r++) TEST_ASSERT_TRUE(testRowUsesInverter(r));
+  for (int r = 16; r <= 20; r++) TEST_ASSERT_TRUE(testRowUsesInverter(r));
   // Spare P0, the column valves, the battery select itself, pumps alone, DC pumps, P17: no inverter.
-  int none[] = { 0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, -1 };
+  int none[] = { 0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 21, -1 };
   for (unsigned k = 0; k < sizeof(none) / sizeof(none[0]); k++) TEST_ASSERT_FALSE(testRowUsesInverter(none[k]));
 }
 
@@ -384,6 +384,71 @@ void test_pulse_targets_that_need_the_inverter(void) {
   TEST_ASSERT_TRUE(testRowUsesInverter(pulseRowForTarget("colA")));
   TEST_ASSERT_FALSE(testRowUsesInverter(pulseRowForTarget("nutA")));
   TEST_ASSERT_FALSE(testRowUsesInverter(pulseRowForTarget("phUp")));
+  TEST_ASSERT_TRUE(testRowUsesInverter(pulseRowForTarget("mixer")));
+}
+
+/* ---- calibration values read back from NVS --------------------------------- */
+
+void test_cal_in_range_refuses_nan(void) {
+  TEST_ASSERT_TRUE(calInRange(50.0f, 1.0f, 5000.0f));
+  TEST_ASSERT_FALSE(calInRange(0.0f, 1.0f, 5000.0f));
+  TEST_ASSERT_FALSE(calInRange(NAN, 1.0f, 5000.0f));
+}
+
+void test_ina_trim_accepts_real_results_for_both_shunts(void) {
+  TEST_ASSERT_TRUE(inaTrimOk(0.010f, 0.010f, 0.00025f, 0.014f, 1.000f));       // R010, the secondary's real offset
+  TEST_ASSERT_TRUE(inaTrimOk(0.00152f, 0.0015f, 0.002f, -0.3f, 1.004f));       // the bar, trimmed
+  TEST_ASSERT_TRUE(inaTrimOk(0.0013f, 0.0015f, 0.002f, 0.0f, 1.0f));           // 13 % low: R010 left on, still a trim
+}
+
+void test_ina_trim_refuses_each_kind_of_bad_value(void) {
+  TEST_ASSERT_FALSE(inaTrimOk(0.0f, 0.010f, 0.00025f, 0.0f, 1.0f));            // no shunt
+  TEST_ASSERT_FALSE(inaTrimOk(0.021f, 0.010f, 0.00025f, 0.0f, 1.0f));          // over x2: the wrong module's value
+  TEST_ASSERT_FALSE(inaTrimOk(0.004f, 0.010f, 0.00025f, 0.0f, 1.0f));          // under x0.5
+  TEST_ASSERT_FALSE(inaTrimOk(0.010f, 0.010f, 0.00025f, 0.2f, 1.0f));          // over 2 % of 8.19 A: real current
+  TEST_ASSERT_FALSE(inaTrimOk(0.010f, 0.010f, 0.00025f, -0.2f, 1.0f));
+  TEST_ASSERT_FALSE(inaTrimOk(0.010f, 0.010f, 0.00025f, 0.0f, 1.2f));          // bus factor off by 20 %
+  TEST_ASSERT_FALSE(inaTrimOk(NAN, 0.010f, 0.00025f, 0.0f, 1.0f));
+  TEST_ASSERT_FALSE(inaTrimOk(0.010f, 0.010f, 0.00025f, NAN, 1.0f));
+  TEST_ASSERT_FALSE(inaTrimOk(0.010f, 0.010f, 0.00025f, 0.0f, NAN));
+}
+
+/* ---- battFlagHeld ----------------------------------------------------------- */
+
+void test_batt_flag_ignores_a_short_sag(void) {
+  uint32_t since = 0;
+  TEST_ASSERT_FALSE(battFlagHeld(true, 1000, &since, 60000));
+  TEST_ASSERT_FALSE(battFlagHeld(true, 60999, &since, 60000));    // one ms short
+  TEST_ASSERT_FALSE(battFlagHeld(false, 61000, &since, 60000));   // recovered: the clock restarts
+  TEST_ASSERT_EQUAL_UINT32(0, since);
+  TEST_ASSERT_FALSE(battFlagHeld(true, 62000, &since, 60000));
+  TEST_ASSERT_FALSE(battFlagHeld(true, 121999, &since, 60000));
+}
+
+void test_batt_flag_sets_after_the_hold_and_clears_at_once(void) {
+  uint32_t since = 0;
+  TEST_ASSERT_FALSE(battFlagHeld(true, 5000, &since, 60000));
+  TEST_ASSERT_TRUE(battFlagHeld(true, 65000, &since, 60000));
+  TEST_ASSERT_TRUE(battFlagHeld(true, 70000, &since, 60000));
+  TEST_ASSERT_FALSE(battFlagHeld(false, 70001, &since, 60000));
+}
+
+void test_batt_flag_survives_millis_zero_and_rollover(void) {
+  uint32_t since = 0;
+  TEST_ASSERT_FALSE(battFlagHeld(true, 0, &since, 60000));        // starting at 0 must still start the clock
+  TEST_ASSERT_EQUAL_UINT32(1, since);
+  since = 0xFFFFFFF0UL;                                           // started just before millis() wrapped
+  TEST_ASSERT_FALSE(battFlagHeld(true, 100, &since, 60000));
+  TEST_ASSERT_TRUE(battFlagHeld(true, 60000, &since, 60000));
+}
+
+/* ---- forceBatchOk ----------------------------------------------------------- */
+
+void test_force_batch_needs_the_floor_only_when_dosing(void) {
+  TEST_ASSERT_TRUE(forceBatchOk(2.0f, 20.0f, 5.0f, 0, 0, 0));     // water only: no floor
+  TEST_ASSERT_FALSE(forceBatchOk(2.0f, 20.0f, 5.0f, 25, 0, 0));   // the LCD editor's default volume, with a dose
+  TEST_ASSERT_FALSE(forceBatchOk(6.0f, 20.0f, 5.0f, 0, 25, 0));   // 4.8 L batch
+  TEST_ASSERT_TRUE(forceBatchOk(6.25f, 20.0f, 5.0f, 0, 0, 25));   // exactly the 5 L floor
 }
 
 /* ---- clampi -------------------------------------------------------------- */
@@ -479,6 +544,13 @@ int main(int, char **) {
   RUN_TEST(test_backup_main_recovering_before_the_switch_cancels_it);
   RUN_TEST(test_inverter_rows_are_exactly_the_ac_rows);
   RUN_TEST(test_pulse_targets_that_need_the_inverter);
+  RUN_TEST(test_cal_in_range_refuses_nan);
+  RUN_TEST(test_ina_trim_accepts_real_results_for_both_shunts);
+  RUN_TEST(test_ina_trim_refuses_each_kind_of_bad_value);
+  RUN_TEST(test_batt_flag_ignores_a_short_sag);
+  RUN_TEST(test_batt_flag_sets_after_the_hold_and_clears_at_once);
+  RUN_TEST(test_batt_flag_survives_millis_zero_and_rollover);
+  RUN_TEST(test_force_batch_needs_the_floor_only_when_dosing);
   RUN_TEST(test_clampi);
   RUN_TEST(test_days_in_month_ordinary_year);
   RUN_TEST(test_days_in_month_leap_year_rules);

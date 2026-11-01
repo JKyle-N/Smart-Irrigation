@@ -29,6 +29,10 @@ Logs/
 # Real rig logs exported from Supabase. The repo is public: never commit these.
 Reports/Supabase/
 
+# OneDrive conflict copies moved out of the source folders: PlatformIO compiles every file in src/ and
+# test/, so a stray main-<PC>.cpp stops the firmware linking. Their content is already in git history.
+_OneDrive_conflicts/
+
 # OS / editor junk
 Thumbs.db
 desktop.ini
