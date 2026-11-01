@@ -172,7 +172,8 @@ FLT,C0M1m0,RST,1,ST,IDLE_STATE,BAT,12.6V,CONS,180Wh,CHG,240Wh
 | `ST,IDLE_STATE` | Current system state. |
 | `BAT,12.6V` | Battery voltage. |
 | `BAT2,15.9V` | Secondary battery voltage (`LOW` appended when below its low threshold; `--` if its monitor isn't answering). |
-| `CONS,180Wh` / `CHG,240Wh` | Energy consumed / charged today. |
+| `SOL,14.2V3.1A` | Solar voltage and current (`--` if its monitor isn't answering; `0.0V` at night is normal). |
+| `CONS,180Wh` / `CHG,240Wh` | Energy drawn from the main battery / measured from solar today. |
 
 ### 4.6 Summary — `SUM,<day> …` (averages)
 Example: `SUM,2026-06-25 A:N148P39K198M42 B:N-P-K-M51 BAT12.5V 3.2W CONS180 CHG240Wh H2O17.5L NUT30mL FLT C0M1m0 RST1 IRR2 FERT1 DOSE3`
@@ -233,7 +234,7 @@ full emergency stop is done at the LCD fault screen.
 **Buttons:** UP, DOWN, ENTER, BACK, MODE.
 
 - **MODE** toggles between the live data pages and the **Settings** menu (and exits Testing/Calibration).
-- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (main battery V/I, plus a `B2:` line for the secondary battery; `*` marks the one the controllers are running from),
+- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (main battery V/I, where a minus current means it is charging; a `B2:` line for the secondary battery, with `*` marking the battery the controllers are running from; and a `Sol:` line for solar. SD card and clock status are on the Columns page's last line),
   **GSM + WiFi** health, **Fault** (last fault / recovery prompts).
 
 ### 6.1 Settings menu

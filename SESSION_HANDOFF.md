@@ -3,7 +3,7 @@
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 
-Last updated: **2026-11-02** — secondary battery checked end to end, reset-proofing for a real blackout during a switch, and the backup feature (ready, compiled off); see §4.
+Last updated: **2026-11-02** — solar + main battery INA226 behind an ISO1540; secondary battery checked end to end, reset-proofing for a real blackout during a switch, and the backup feature (ready, compiled off); see §4.
 2026-11-01: whole-system verification and its fixes (clock trust, secrets in logs, I²C from core 0); open decisions in §5 (items 19–24, 26).
 Earlier that day: SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
 `CLAUDE.md` "LOCKED: GSM behavior". Commissioning stage M covers it.
@@ -72,7 +72,7 @@ cd ESP2 && pio run
 cd Nano && pio run
 
 # host unit tests -- ~10 seconds each, no hardware needed
-cd ESP1 && pio test -e native     # 95 cases (46 pure maths + 49 simulated A7670C)
+cd ESP1 && pio test -e native     # 101 cases (52 pure maths + 49 simulated A7670C)
 cd ESP2 && pio test -e native     # 17 cases
 
 # website
@@ -86,17 +86,24 @@ Known-good build sizes as of 2026-11-02 (`SECONDARY_BATT_ENABLED 0`, `SECONDARY_
 sharp deviation means something unintended was picked up. With all optional flags at 1 (ESP1
 `SECONDARY_BATT_ENABLED`, `SECONDARY_BACKUP_ENABLED`, `BATTERY_SAFETY_ENABLED`; ESP2
 `SECONDARY_BATT_ENABLED`, `SECONDARY_BACKUP_ENABLED`, `RES_VALVE_FITTED`) both still compile: ESP1
-1,329,085 B flash, ESP2 345,729 B. Host tests: ESP1 95 cases, ESP2 17.
+1,333,017 B flash, ESP2 345,729 B. Host tests: ESP1 101 cases, ESP2 17.
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 24.6 % (80,768 B) | 42.1 % (1,323,233 B) |
+| ESP1 | 24.7 % (80,920 B) | 42.2 % (1,327,285 B) |
 | ESP2 | 7.1 % (23,292 B) | 26.2 % (343,021 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
 ## 4. What the last sessions added
+
+**2026-11-02 (latest) — solar + main battery INA226 behind an ISO1540.** See `CLAUDE.md` "CHANGED (2026-11-02)"
+and reference §21.0. The user chose the isolator after being told an INA226 on main could not read during
+inverter runs without one. Addresses (solar 0x41, main 0x44) are an assumption from the bench sketch; the
+user has not said which module is which, and swapping is one line. ESP2 and the Nano need no change: only
+ESP1 has this bus. **Compiled and the scaling host-tested; `powerInaTick`, the source change and the isolator
+have never run.** With no modules fitted the rig behaves as before, via the opto ADC + ACS758.
 
 **2026-11-02 — secondary battery: reset-proofing + backup (ready, off).** See `CLAUDE.md` "a real blackout
 during a switch" and "secondary as backup". The user confirmed: 4S Li-ion 16.8 V, INA226 at the default
@@ -222,7 +229,8 @@ Roughly in priority order.
     while on main (the DPDT breaks both + and −, so the pack's negative must still be common with board
     ground for the INA226 to read it), bench-test with the Testing `Batt->2nd` row, calibrate the INA226
     (worksheet Tier 3), and set `SECONDARY_BATT_ENABLED 1` in **both** ESP1 and ESP2. The backup
-    (`SECONDARY_BACKUP_ENABLED`) comes after that, and also needs `calBattV` calibrated.
+    (`SECONDARY_BACKUP_ENABLED`) comes after that, and also needs the main INA226 reading (or `calBattV`
+    calibrated).
 11. **The dashboard's `mixer` Timed Pulse / hold drives TEST row 8 alone, without the inverter.** The
     mixer is an AC load, so it probably gets no power that way. This was found while mapping inverter
     rows for this change and left unchanged; confirm on the rig.
@@ -279,6 +287,10 @@ Found in the 2026-11-01 audit — **left open for the user to decide** (not chan
     once on change, so a lost one leaves the wrong cadence until the next change. Display-only impact.
 24. **`SUPA,<url>,<key>` by SMS cannot work for a real key.** A `service_role` JWT plus the URL does not
     fit one SMS, and each part of a long text arrives as a separate command. Use the portal.
+28. **`BATTERY_SAFETY_ENABLED` would now E-stop on inverter sag.** The main INA226 reads the battery under
+    load, where the opto never gave a real value, and `batteryCritical` has no debounce. It is 0 today and
+    the flags are display-only. Add a debounce or an idle-only check before turning it on. Separately, the
+    dashboard's and LCD's `CRIT`/`LOW` may flicker during runs; that is the real sag, not a fault.
 27. **Two switch resets in 24 h stop all irrigation until cleared.** `BATT_SWITCH_FAULT` refuses every
     inverter use, by design, so a failing hold-up can't reset the rig in a loop. The crops go unwatered
     meanwhile (the user gets the alert). Running the inverter on main without isolation would keep them

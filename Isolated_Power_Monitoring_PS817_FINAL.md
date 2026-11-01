@@ -1,4 +1,7 @@
 # Isolated Power Monitoring Guide (Current + Voltage + Charging)
+
+> **Superseded 2026-11-02.** Solar and the main battery are now measured by two INA226 behind an ISO1540 isolator; see `Smart_Irrigation_System_Reference_FINAL.md` §21.0. The isolation problem described here is what that solves. This guide is kept for the opto voltage fallback and as history.
+
 ## Smart Irrigation System — ESP32 #1 Battery Energy Monitoring
 
 **Date:** 2026-07-11  

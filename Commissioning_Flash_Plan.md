@@ -201,8 +201,8 @@ and `PWR2` in the log. Do this stage only once the controllers ride through the 
     `BSW_RECHARGE_MS` from what it really needs.
 - Unplug the pack's negative or VBUS lead: expect `B2: no pack - wiring`, and a forced run refused with that reason.
 
-**Backup for a critical main (optional, only after everything above passes).** `calBattV` must be calibrated.
-Set `SECONDARY_BACKUP_ENABLED 1` in **both** firmwares and reflash both. Use a bench supply as the main battery:
+**Backup for a critical main (optional, only after everything above passes).** The main INA226 must be
+reading (stage I), or `calBattV` must be calibrated. Set `SECONDARY_BACKUP_ENABLED 1` in **both** firmwares and reflash both. Use a bench supply as the main battery:
 - Lower it below `BATT_CRIT_V`. After 60 s expect `ALERT,CRIT,MAIN_BATT_CRIT,…SWITCHING_TO_BACKUP`, the
   text arriving **before** the boards move, then `INFO,BACKUP,ON`. A forced run must be refused.
 - Leave it 40 min: ESP2 must not self-reboot or be powered off, and `boardSupply` stays `secondary`.
@@ -216,6 +216,36 @@ Set `SECONDARY_BACKUP_ENABLED 1` in **both** firmwares and reflash both. Use a b
 > **Abort if** any controller reboots on a switch *with the hold-up fitted*, the DPDT chatters, the
 > boards are ever left on the secondary after a run ends (`boardSupply` stuck at `secondary`), or a
 > third switch reset happens after `BATT_SWITCH_FAULT` latched.
+
+### I — Solar + main battery INA226 behind the ISO1540  *(no flag; the firmware finds them by itself)*
+
+Wiring is in reference §21.0. Do these before any main firmware, with `Test Code/PlatformIO/Projects/INA226-Dual`:
+
+- **Before powering:** on the main battery module, confirm its onboard R010 is gone (no continuity across
+  it, IN+ to IN-, with the shunt bar disconnected). Confirm the panel's Voc is under 36 V and Isc under 8.19 A.
+- **Isolation, with everything off:** no continuity between board GND and main negative through the new
+  wiring. If there is, the isolator has been bypassed.
+- **Bus level:** measure SDA on ESP1's bus at idle and feed the ISO1540's VCC2 from that same voltage.
+- **Scope a low on ESP1's SDA during a read:** it must be near 0.4 V or below. A low near 0.6–0.8 V means
+  the isolator is the wrong way round: side 2 must face ESP1.
+- **Identify each module:** unplug solar and it must go `LOST` while the battery one keeps reading. If the
+  names come out swapped, swap the addresses in the sketch and in ESP1.
+- **Check against meters:** voltage on both, then current with a clamp meter under a known load. Discharge
+  must read positive on the battery module and charging positive on the solar one, otherwise set `*_INVERT`.
+- **Calibrate** (worksheet Tier 3), and copy the values into ESP1.
+
+Then on the main firmware:
+- LCD Power page: signed `I:` and the `Sol:` line. `STATUS` has `SOL`, the log has `PWR …|SRC=INA` and `PWRS`,
+  and the dashboard's solar tiles fill in.
+- Force a run on a bench supply or the real battery: readings keep updating through the whole run, with
+  no I²C errors and no LCD or RTC faults. This is the test of the noise problem the isolator is there to solve.
+- Remove the isolator's VCC1: within about 6 s `INA226|MAIN|LOST` is logged, and the rig keeps working on the
+  opto ADC + ACS758, or shows the main battery as uncalibrated if the opto isn't calibrated. Restore it:
+  `FOUND` within about 10 s.
+- Compare `CONS` and `CHG` on a sunny day against a rough estimate.
+
+> **Abort if** I²C errors or LCD/RTC faults appear only while the inverter runs, or board GND and main
+> negative have continuity.
 
 ### Audit checks (add to stage B)
 

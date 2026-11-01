@@ -2908,7 +2908,10 @@ UART0 (GPIO1/GPIO3) is intentionally left for the USB serial monitor; no device 
 I2C Devices with adress:
 
 * LCD (0x27)
-* INA226 (0x40)
+* INA226, secondary battery (0x40)
+* INA226, solar (0x41), behind the ISO1540 (§21.0)
+* INA226, main battery (0x44), behind the ISO1540 (§21.0)
+* ADS1115 (0x48)
 * DS3231 RTC (0x68)
 * EEPROM (0x57)
 
@@ -3597,7 +3600,36 @@ Upon reset or power-up:
 
 # 21. 🔌 Power Monitoring System
 
-## 21.1. Battery Monitoring (calibrated opto ADC — replaces INA226)
+## 21.0. Solar + Main Battery Monitoring (two INA226 behind an ISO1540)
+
+An INA226 must share a ground with what it measures, while the boards must not share one with the main battery. Two modules therefore sit on the main-battery side of an **ISO1540** I²C isolator and stay readable through every inverter run and battery switch. Nothing but the isolator crosses over.
+
+| Module | Address | Address pins | Shunt | CAL | Current LSB | Clips at |
+|---|---|---|---|---|---|---|
+| Solar | 0x41 | A1 GND, A0 VCC | R010 on the module | 2048 | 0.25 mA | 8.19 A |
+| Main battery | 0x44 | A1 VCC, A0 GND | 50 A / 75 mV bar (1.5 mΩ) | 1707 | 2 mA | 54.6 A |
+
+**Wiring**
+
+| ISO1540 side | Pins | Connects to |
+|---|---|---|
+| Side 2 (boards) | SDA2, SCL2 | ESP1 GPIO21, GPIO22 |
+| | VCC2 | The voltage ESP1's bus is pulled up to (3–5.5 V). Measure SDA at idle: an LCD backpack may pull it to 5 V |
+| | GND2 | Board GND |
+| Side 1 (main battery) | SDA1, SCL1 | Both modules' SDA, SCL |
+| | VCC1 + module VCC | 3.3 V from a regulator fed by the main battery |
+| | GND1 + module GND | Main battery negative |
+
+- Fit 100 nF on each VCC, close to the pins.
+- **Why side 2 faces ESP1:** side 1 pulls low to only 0.57–0.8 V, against an ESP32 input limit of 0.825 V at 3.3 V. Side 2 reaches 0.4 V. An INA226 reads side 1's low comfortably (its limit is 0.3 × VCC, about 1 V).
+- **Side 1 pull-ups** must sink 0.5–3.5 mA. The two modules' 10 kΩ resistors in parallel give 0.66 mA at 3.3 V, which is enough. If they are removed, fit 1–6.6 kΩ.
+- **Main-side 3.3 V, not an isolated converter from the boards:** a converter's interwinding capacitance is the path the inverter's noise already takes, and this way the hold-up carries no extra load.
+- **Current sensing is high side:** IN+/IN- in series with the + line, VBS tied to IN-. The module's own R010 must be **removed** on the main battery module. Left in, it parallels the bar: readings come out about 13 % low and it carries about 6.5 A at 50 A.
+- **Solar limits:** the INA226 is rated to 36 V and the R010 clips at 8.19 A. Measure on the charge controller's battery side, whose negative is common with the main battery; panel negative may not be.
+
+**Behaviour.** The main INA226 is the first choice for main battery V/I/P, and the opto ADC + ACS758 (§21.1) takes over automatically if it stops answering. A main reading below 5 V is treated as a wiring fault and not used; solar has no such floor, because 0 V at night is real. Neither module blocks a run or sends a text. With the shunt bar, current is signed (+ = discharging), so `CONS` counts discharge only; `CHG` is solar energy.
+
+## 21.1. Battery Monitoring Fallback (calibrated opto ADC)
 
 - Battery **voltage (GPIO35)** and **current (GPIO34)** are sensed through an optocoupler into the ESP32
   ADC (ADC1, 12-bit, `ADC_11db`). The optocoupler makes the raw counts NONLINEAR, so each channel is
@@ -3606,8 +3638,8 @@ Upon reset or power-up:
 - **Calibration:** use the bench tool `Test Code/ESP1_ADC_OPTO_CAL` (apply known inputs, capture points,
   compute) and paste the printed coefficients into the firmware defaults (`calBattV`/`calBattI`), or store
   them in NVS namespace `adccal` which `loadBattCal()` reads at boot.
-- The INA226 is no longer used for battery. Current is **magnitude only**, so energy is counted purely as
-  consumption (no charge/discharge split).
+- On this fallback, current is **magnitude only**, so energy is counted purely as consumption (no
+  charge/discharge split).
 
 ### 21.1.1. Control Usage: READY, NOT IMPLEMENTED
 Battery voltage drives no control action by default. The protections below are **scaffolded** behind the
@@ -3921,7 +3953,9 @@ The detail column content is defined per event_type below. Secondary delimiter i
 | DOSE       | ESP2           | NUTRIENT|target_mL|measured_mL|COL                         | NUT_A|50.0|49.2|COL_A                    |
 | ACT        | ESP1/ESP2      | DEVICE|STATE|COL  (STATE = START/STOP)                     | IRRIGATION|START|COL_A                   |
 | GSM        | GSM            | DIR|payload  (DIR = TX/RX)                                 | TX|ALERT|MAJ|NPK_FAULT|COL_B             |
-| PWR        | ESP1           | SRC|fields  (SRC = INA226/PZEM)                            | INA226|V=12.6|I=1.2|P=15.1|CHG=150Wh    |
+| PWR        | ESP1           | SRC|fields  (main battery; SRC=INA or OPTO)                | BATT|V=12.6|I=1.2|P=15.1|SRC=INA|CONS=90Wh|CHG=150Wh |
+| PWR2       | ESP1           | secondary battery and switch events                        | BATT2|V=15.9|I=0.800|P=12.7|LOW=0|SRC=MAIN |
+| PWRS       | ESP1           | solar, and both isolated modules' FOUND/LOST               | SOLAR|V=14.20|I=3.100|P=44.0            |
 
 Notes:
 * GARBAGE RAW is truncated to a safe length (e.g. 64 chars) to bound row size; the consecutive-garbage counter value is recorded as COUNT=n.
