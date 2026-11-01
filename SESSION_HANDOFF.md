@@ -3,8 +3,9 @@
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 
-Last updated: **2026-11-01** — whole-firmware audit: bugs fixed, new decisions in §5 (items 19–25).
-Earlier the same day: SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
+Last updated: **2026-11-02** — calibration tools rebuilt, results now go to ESP1's NVS, INA226 restart bug fixed; see §4 "calibration rebuilt". Earlier the same day: solar + main battery INA226 behind an ISO1540; secondary battery checked end to end, reset-proofing for a real blackout during a switch, and the backup feature (ready, compiled off).
+2026-11-01: whole-system verification and its fixes (clock trust, secrets in logs, I²C from core 0); open decisions in §5 (items 19–24, 26).
+Earlier that day: SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
 `CLAUDE.md` "LOCKED: GSM behavior". Commissioning stage M covers it.
 Previous: 2026-10-30, toolchain pinned after ESP1 stopped linking on the newest platform; LCD
 Thresholds/Column Mode truncation fixed; new open decisions logged in §5 (items 15–18).
@@ -54,7 +55,9 @@ power mid-hold) and Stage F (Manual/Test, including the web hold-to-run cap) mus
 | **PlatformIO** | Not on PATH. It is at `C:\Users\johnb\.platformio\penv\Scripts\pio.exe` — prepend that dir to `$env:PATH` |
 | **Platform versions** | **Pinned** since 2026-10-30: ESP1/ESP2 `espressif32@6.9.0` (Arduino core 2.0.17), Nano `atmelavr@5.3.0`. Unpinned, PlatformIO pulled espressif32 8.0.0 / core 3.3.12 and ESP1 failed to link (EspSoftwareSerial: `dangerous relocation: l32r`). Do not unpin |
 | **Git** | Not on this machine's PATH by default; it is at `E:\Program Files\Git\cmd\git.exe` |
-| **Host compiler** | MinGW-w64 g++ 14.2.0 was installed on the *old* machine (`C:\` paths). On the current machine (project on `E:\`, 2026-10-30) **no gcc is installed**, so `pio test -e native` fails with "gcc is not recognized" — install MinGW (see the `platformio.ini` comment) to run the host tests |
+| **Host compiler** | MinGW-w64 g++ 14.2.0 was installed on the *old* machine (`C:\` paths). On the current machine (project on `E:\`, 2026-10-30) **no gcc is installed**, so `pio test -e native` fails with "gcc is not recognized". No system install is needed: `pio pkg install --global --tool platformio/toolchain-gccmingw32` with `PLATFORMIO_CORE_DIR` set to a temp folder, then put its `packages\toolchain-gccmingw32\bin` on PATH for that shell. It is g++ 5.1 and runs both test suites |
+| **Keep builds out of OneDrive** | Set `PLATFORMIO_BUILD_DIR` and `PLATFORMIO_LIBDEPS_DIR` to a temp folder. `Calibration/cal.ps1` does this |
+| **OneDrive conflict copies** | A `*-JohnbPC.*` file in a `src/`, `test/` or `Nano/` folder stops that firmware building (`multiple definition`). Check it against git (`git log --all --find-object=<hash>`), then move it to `_OneDrive_conflicts/` |
 | **`platformio.ini` (ESP1, ESP2)** | Both have the **skip-worktree** bit set. Git silently ignores your edits to them. Check with `git ls-files -v -- '*platformio.ini'` (an `S` means skip-worktree) |
 | **Why that bit exists** | To keep the local `upload_port = COM5` from overwriting the committed `COM8`. Preserve both: clear the bit, commit with `COM8`, restore `COM5` locally, re-set the bit |
 | **`Firebase infos.txt`** | Gitignored. Holds the RTDB URL, device UID, and the device password. Never commit or transmit it |
@@ -71,8 +74,8 @@ cd ESP2 && pio run
 cd Nano && pio run
 
 # host unit tests -- ~10 seconds each, no hardware needed
-cd ESP1 && pio test -e native     # 80 cases (33 pure maths + 47 simulated A7670C)
-cd ESP2 && pio test -e native     # 13 cases
+cd ESP1 && pio test -e native     # 108 cases (59 pure maths + 49 simulated A7670C)
+cd ESP2 && pio test -e native     # 17 cases
 
 # website
 node --check Website/script.js
@@ -81,20 +84,55 @@ node -e "JSON.parse(require('fs').readFileSync('Website/firebase-rules.json','ut
 firebase deploy --only database --dry-run   # validates rules WITHOUT deploying (run from Website/)
 ```
 
-Known-good build sizes after the A7670C swap (both `SECONDARY_BATT_ENABLED 0`) — a sharp deviation
-means something unintended was picked up. With all optional flags at 1 (ESP1 `SECONDARY_BATT_ENABLED`,
-`BATTERY_SAFETY_ENABLED`; ESP2 `SECONDARY_BATT_ENABLED`, `RES_VALVE_FITTED`) both still compile: ESP1
-1,317,857 B flash, ESP2 341,117 B. Host tests: ESP1 80 cases, ESP2 13.
+Known-good build sizes as of 2026-11-02 (`SECONDARY_BATT_ENABLED 0`, `SECONDARY_BACKUP_ENABLED 0`) — a
+sharp deviation means something unintended was picked up. With all optional flags at 1 (ESP1
+`SECONDARY_BATT_ENABLED`, `SECONDARY_BACKUP_ENABLED`, `BATTERY_SAFETY_ENABLED`; ESP2
+`SECONDARY_BATT_ENABLED`, `SECONDARY_BACKUP_ENABLED`, `RES_VALVE_FITTED`) both still compile. Host tests:
+ESP1 108 cases, ESP2 17.
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 24.6 % (80,600 B) | 41.8 % (1,315,533 B) |
-| ESP2 | 7.1 % (23,252 B) | 25.9 % (339,665 B) |
+| ESP1 | 24.7 % (80,960 B) | 42.3 % (1,330,565 B) |
+| ESP2 | 7.1 % (23,292 B) | 26.2 % (343,369 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
 ## 4. What the last sessions added
+
+**2026-11-02 (latest) — calibration rebuilt.** See `CLAUDE.md` "calibration results live in ESP1's NVS" and `Calibration/README.md`. **Nothing here has run on hardware.** The tools compile; INA226, Flow, CalStore, pH and opto also ran against simulated parts, in a throwaway harness that is not in the repo.
+- **Found:** the three firmwares no longer linked here, because of OneDrive conflict copies in their source folders. Old tools pasted results into ESP2 constants that ESP1 overwrites, so those calibrations did nothing. `ESP2/Flow` and `FlowPinFinder` drove P4 (now the battery DPDT) as a valve. `ESP2/ACS712` averaged an AC signal, so its `sens` could not work. `Nano/NPK` trimmed every column from column A.
+- **New:** `ESP1/INA226` (all three modules, `save`, `bustest`), `ESP1/CalStore`, `ESP1/BatteryOpto`, pump rates in `ESP2/Flow` (closes §5 item 1's "no tool"), tank-full in `Nano/Ultrasonic`, `cal.ps1`, `common.ini`, `Test Code/README.md`.
+- **Firmware:** a restarted INA226 no longer reads 0 A, INA/ACS758/pump values load from NVS, the battery flags have a 60 s hold, the LCD force run refuses early (item 22 closed), the dashboard mixer pulse brings the inverter (item 11 closed).
+
+**2026-11-02 — solar + main battery INA226 behind an ISO1540.** See `CLAUDE.md` "CHANGED (2026-11-02)"
+and reference §21.0. The user chose the isolator after being told an INA226 on main could not read during
+inverter runs without one. Addresses (solar 0x41, main 0x44) are an assumption from the bench sketch; the
+user has not said which module is which, and swapping is one line. ESP2 and the Nano need no change: only
+ESP1 has this bus. **Compiled and the scaling host-tested; `powerInaTick`, the source change and the isolator
+have never run.** With no modules fitted the rig behaves as before, via the opto ADC + ACS758.
+`INA226-Dual` also calibrates over serial, now superseded by `Calibration/ESP1/INA226`. Its commands were run on a PC against a simulated INA226, using a
+throwaway harness that is not in the repo; they have never run on a real module.
+
+**2026-11-02 — secondary battery: reset-proofing + backup (ready, off).** See `CLAUDE.md` "a real blackout
+during a switch" and "secondary as backup". The user confirmed: 4S Li-ion 16.8 V, INA226 at the default
+0x40 (`INA226-Dual`'s 0x41/0x44 were bench settings only), hold-up fitted (not proven on the rig).
+- **Found by tracing a real 1 s blackout:** a re-run dosed nutrients a second time; an E-stop or cancel on
+  the secondary was forgotten and the schedule resumed; a fault's own P4 drop could lose the fault; the
+  retry hit a still-flat hold-up. All fixed.
+- **Live at every flag setting:** the dose journal and finishing a dosed batch cover **any** ESP2 reset, so
+  they change the default build too. The rest only acts with the boards on the secondary.
+- **Both flags stay 0.** `SECONDARY_BATT_ENABLED` needs stage H first. **All of this compiles and only the
+  pure logic is host-tested; the `main.cpp` paths have never run.**
+
+**2026-11-01 (latest) — whole-system verification and fixes.** New this time: `CLAUDE.md` "Trusted clock",
+secrets kept out of logs, and the lockout covering LCD Testing and priming. Also fixed: `WIFIPORTAL` on its
+own, `FBASE,TLS` from the wrong core, SUMMARY totals, portal owner-number checks, the idle poll cutting ESP2
+during Calibration, one TLS session at a time during the CSV upload, and the Nano RX buffer (64 → 128 B; it
+may help the packet loss but that is unproven). CI now runs the host tests. Pure helpers are tested, but the
+`main.cpp` paths compile only. **A DS3231 with its lost-power flag set will stop the schedule until the clock
+is set**, which is intended. Not read line by line even now: `Website/script.js` (cross-checked only), portal
+form HTML, and LCD settings, calibration and diagnostics rendering.
 
 **2026-11-01 (later) — whole-firmware audit.** Read in full: Nano, ESP2, and ESP1's run, fault, link and
 modem paths. Checked by targeted search rather than read line by line: ESP1's Firebase upload, portal,
@@ -175,8 +213,8 @@ sketches under `Test Code/`.
 Roughly in priority order.
 
 1. **`PUMP_FLOWRATE_MLPM` is still a guess** (`ESP1/src/main.cpp`, `50` mL/min). It sets both a
-   dose's run time and its timeout ceiling, and unlike the flow K-factors it has **no calibration
-   tool** — it needs a jug and a stopwatch. Wrong here means silently wrong doses with no alarm.
+   dose's run time and its timeout ceiling. `Calibration/ESP2/Flow` now measures it. Wrong here means
+   silently wrong doses with no alarm.
 2. **61 calibration constants** still carry `[MEASURE]` / `[TBD]` / `[CONFIRM]`. See
    `Calibration_Worksheet.md`, which ranks them by damage and marks which are genuine measurements
    versus agronomic decisions or datasheet lookups. `INVERTER_WARMUP_MS` (now 5 s) belongs on that list.
@@ -194,14 +232,15 @@ Roughly in priority order.
 8. **Website operators** — decide whether the user's own account should be an operator; that is a
    rules + `delete-user-api` edit and a redeploy, and needs explicit approval.
 9. **Nothing has been flashed or hardware-validated** (§1).
-10. **Secondary-battery switching needs hardware before it can be enabled.** Without a hold-up after the
-    DPDT, every switch resets all three controllers, and the P4/DPDT coils drop the boards straight
-    back to main. Fit a hold-up stage that also keeps the coils powered. Then bench-test with the
-    Testing `Batt->2nd` row, calibrate the INA226 (worksheet Tier 3), and set
-    `SECONDARY_BATT_ENABLED 1` in **both** ESP1 and ESP2.
-11. **The dashboard's `mixer` Timed Pulse / hold drives TEST row 8 alone, without the inverter.** The
-    mixer is an AC load, so it probably gets no power that way. This was found while mapping inverter
-    rows for this change and left unchanged; confirm on the rig.
+10. **Secondary-battery switching is waiting on stage H.** The hold-up is reported fitted (2026-11-02) but
+    is unproven. Without one that carries the boards and the coils, every switch resets all three
+    controllers and the DPDT drops straight back to main. Check the `B2:` reading against a multimeter
+    while on main (the DPDT breaks both + and −, so the pack's negative must still be common with board
+    ground for the INA226 to read it), bench-test with the Testing `Batt->2nd` row, calibrate the INA226
+    (worksheet Tier 3), and set `SECONDARY_BATT_ENABLED 1` in **both** ESP1 and ESP2. The backup
+    (`SECONDARY_BACKUP_ENABLED`) comes after that, and also needs the main INA226 reading (or `calBattV`
+    calibrated).
+11. ~~The dashboard's `mixer` pulse drives TEST row 8 alone~~ — fixed 2026-11-02: row 20, inverter + mixer. Confirm on the rig.
 12. **Deploy the RTDB rules** (`firebase deploy --only database`, after a `--dry-run`) so the
     `CLEAR_BATT_SWITCH` dashboard command is accepted. The LCD and SMS clears work without it.
 13. **An ESP1 reboot (manual, remote, or self-reset) during a run or held fault also cuts ESP2**
@@ -209,7 +248,8 @@ Roughly in priority order.
     in ESP2's NVS. This is documented, not changed. A fix would mean keeping GPIO4 high across a
     software reset, or refusing reboots while busy — a design decision.
 14. **A dashboard command in flight when ESP1 itself resets** stays `accepted` forever: ESP1 keeps
-    the command id in RAM only. Also documented, not changed.
+    the command id in RAM only. Narrowed 2026-11-02: while the boards are on the secondary or mid-switch
+    the id is on NVS and a boot marks it failed. Any other ESP1 reset is unchanged.
 
 Found in the 2026-10-30 review — **left open for the user to decide** (not changed):
 
@@ -246,16 +286,25 @@ Found in the 2026-11-01 audit — **left open for the user to decide** (not chan
 21. **AC Prime and Testing combos start the inverter and the pump together**, with no warmup. Automated
     stages, exercise and now mix all wait. Left because these are attended and dead-man held; adding the
     wait means holding the button ~5 s before anything runs.
-22. **An LCD force run with nutrients needs at least 6.25 L**, or the 5 L floor refuses it when the
-    countdown ends (with an alert). The editor's default is 2.0 L. The web path now refuses up front; the
-    LCD editor could too.
+22. ~~An LCD force run with nutrients is refused only when the countdown ends~~ — fixed 2026-11-02: it is refused when armed, and the screen says it needs 6.25 L.
 23. **Nano link.** SoftwareSerial on the Nano's NPK bus masks interrupts while its bytes pass, so an
     inbound command or flow pulses can be lost during the NPK reply. `nanoPaceTick` sends ACTIVE/DAY/NIGHT
     once on change, so a lost one leaves the wrong cadence until the next change. Display-only impact.
 24. **`SUPA,<url>,<key>` by SMS cannot work for a real key.** A `service_role` JWT plus the URL does not
     fit one SMS, and each part of a long text arrives as a separate command. Use the portal.
-25. **Every stranger's text gets an `ERR,AUTH` reply**, which costs load (alphanumeric senders are now
-    skipped). A silent drop would be cheaper but gives a mistyped owner number no feedback.
+28. **`BATTERY_SAFETY_ENABLED` could still E-stop on a long run's sag.** The main INA226 reads the battery under
+    load, where the opto never gave a real value. The flags now need 60 s below the line (`BATT_FLAG_HOLD_MS`),
+    so a start's dip no longer sets them, but a run longer than that can. It is 0 today and the flags are
+    display-only. Whether to judge the battery only at idle is a policy decision for the user; measure the
+    sag first.
+27. **Two switch resets in 24 h stop all irrigation until cleared.** `BATT_SWITCH_FAULT` refuses every
+    inverter use, by design, so a failing hold-up can't reset the rig in a loop. The crops go unwatered
+    meanwhile (the user gets the alert). Running the inverter on main without isolation would keep them
+    watered with noisier sensor readings. That is a policy decision for the user; not built.
+26. **The soil stop threshold (`soilStopPct`) does nothing.** It can be set from the LCD, SMS and the web and
+    is saved, but nothing reads it: a run delivers its fixed water budget once a day. Either stop a run
+    early when the soil reaches it, or remove the setting. That changes irrigation behaviour, so it is left
+    for the user.
 
 ---
 
@@ -302,7 +351,8 @@ Found in the 2026-11-01 audit — **left open for the user to decide** (not chan
 | `Calibration_Worksheet.md` | Every untuned constant, ranked by damage |
 | `Operator_Manual.md` | How the rig is operated day to day, including the website (§8) |
 | `Website/README.md` | RTDB node layout, access tiers and the rules workflow |
-| `Calibration/README.md` | Per-sensor bench calibration tools |
+| `Calibration/README.md` | Per-component calibration tools, and where each result goes |
+| `Test Code/README.md` | Which older sketches are still useful, replaced, or must not be flashed |
 | `Settings_Calibration_and_Safe_Edit_Spec.md` | §A — the calibration methods |
 | `Nutrient_Dosing_Firmware_Spec.md` | The dosing maths |
 | `ESP2_Recovery_Resume_Plan.md` | Fault hold and resume behaviour |

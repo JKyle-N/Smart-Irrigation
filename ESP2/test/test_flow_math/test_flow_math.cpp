@@ -33,6 +33,33 @@ void test_ksane_rejects_non_finite(void) {
   TEST_ASSERT_FALSE(kSane(-INFINITY));
 }
 
+/* ---- dose journal: a re-run after a reset must not dose the tank twice ---- */
+
+void test_dose_owed_subtracts_what_is_already_in_the_tank(void) {
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 30.0f, doseStillOwed(50.0f, 20.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 50.0f, doseStillOwed(50.0f, 0.0f));       // nothing dosed yet
+}
+
+void test_dose_owed_never_goes_negative(void) {
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, doseStillOwed(50.0f, 50.0f));       // the common case: all done
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, doseStillOwed(40.0f, 50.0f));       // the re-run asks for less
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, doseStillOwed(0.0f, 50.0f));        // skipped dose stays skipped
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, doseStillOwed(NAN, 50.0f));
+}
+
+void test_dose_journal_counts_a_started_dose_as_delivered(void) {
+  // Reset mid-pour: the journal already holds the whole target, so the re-run errs towards under-dosing.
+  float j = 0.0f + 50.0f;
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, doseStillOwed(50.0f, j));
+}
+
+void test_dose_journal_trims_to_the_measured_amount(void) {
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 48.0f, doseJournalTrim(50.0f, 50.0f, 48.0f));   // normal end
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 12.0f, doseJournalTrim(50.0f, 50.0f, 12.0f));   // timed out part way
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 42.0f, doseJournalTrim(50.0f, 30.0f, 22.0f));   // resumed second part
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, doseJournalTrim(10.0f, 50.0f, 0.0f));     // never below zero
+}
+
 /* ---- pulsesToLiters ------------------------------------------------------ */
 
 void test_liters_normal_conversion(void) {
@@ -109,6 +136,10 @@ void test_stall_needs_flow_first_and_an_ac_pump(void) {
 
 int main(int, char **) {
   UNITY_BEGIN();
+  RUN_TEST(test_dose_owed_subtracts_what_is_already_in_the_tank);
+  RUN_TEST(test_dose_owed_never_goes_negative);
+  RUN_TEST(test_dose_journal_counts_a_started_dose_as_delivered);
+  RUN_TEST(test_dose_journal_trims_to_the_measured_amount);
   RUN_TEST(test_ksane_accepts_the_working_band);
   RUN_TEST(test_ksane_rejects_out_of_band);
   RUN_TEST(test_ksane_rejects_non_finite);

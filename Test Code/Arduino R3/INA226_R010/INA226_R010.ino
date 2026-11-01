@@ -1,4 +1,7 @@
 /*
+  SUPERSEDED by Calibration/ESP1/INA226 (the "sec" module), which calibrates over serial instead of by
+  editing constants. Note this one takes the FIRST INA226 it finds, so it can read the wrong module.
+
   INA226 current / voltage / power monitor - with detection diagnostics
   Shunt: R010 (0.010 ohm), VBS tied to IN- (high-side sensing)
   No external library needed - uses Wire only.

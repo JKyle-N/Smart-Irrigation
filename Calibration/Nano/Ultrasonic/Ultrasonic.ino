@@ -1,154 +1,156 @@
 /* =============================================================================
- *  SMART IRRIGATION  --  CALIBRATION BENCH TOOL  --  ULTRASONIC (Arduino Nano)
+ *  SMART IRRIGATION -- CALIBRATION TOOL -- ULTRASONIC TANK LEVEL (Arduino Nano)
  * -----------------------------------------------------------------------------
- *  Standalone. No ESP1, no UART. Measures the empty-tank REFERENCE DISTANCE
- *  (mounting / zero offset) for the two HC-SR04 tank sensors. One-point cal per
- *  spec sec.A.4: with the tank empty, the sensor->surface distance is the zero
- *  reference the firmware subtracts to derive fill level.
+ *  ESP1 works out a tank's % from two distances, sensor to water surface: one when EMPTY and one when FULL.
+ *  The LCD's Calibration menu only captures empty. This captures both.
  *
- *  PINS (match Nano/Nano.ino:80-83):
- *    Reservoir : TRIG D4, ECHO D5      Mixing : TRIG D6, ECHO D7
- *  Distance formula matches the firmware exactly (Nano.ino:131-132,462-469):
- *    distance_cm = echo_us * (0.0343 / 2),  pulseIn timeout 25000 us (~4.3 m).
+ *  HOW TO USE (<t> = res or mix; the tool tells you the next step)
+ *    1. Tank empty.                  empty res
+ *    2. Tank at your full level.     full res
+ *       (No need to fill it: `full res 11` takes a distance you measured with a tape.)
+ *    3. result                       prints the lines for CalStore
+ *    Also: r, live, h.
  *
- *  SERIAL 115200 -- commands (type + Enter):
- *    h                 help
- *    r                 print both distances once (median of a few pings)
- *    live              toggle ~2 Hz live readout
- *    zero res          capture reservoir empty-tank reference distance
- *    zero mix          capture mixing-tank empty-tank reference distance
- *    show              print both captured references
- *
- *  Measure the EMPTY tank (or hold a tape to the known surface) and `zero` it.
- *  Paste the reference distances into ESP32 #1's ultrasonic geometry.
- *
- *  Build: Arduino IDE (Arduino Nano, ATmega328P) or `pio run` in this folder.
+ *  PINS and distance formula as in Nano/Nano.ino: reservoir TRIG D4, ECHO D5; mixing TRIG D6, ECHO D7.
+ *  Disconnect D0/D1 (the link to ESP1) while flashing and while using this tool.
  * ========================================================================== */
 #include <Arduino.h>
 
-const uint8_t PIN_TRIG_RES = 4, PIN_ECHO_RES = 5;
-const uint8_t PIN_TRIG_MIX = 6, PIN_ECHO_MIX = 7;
+const uint8_t PIN_TRIG[2] = { 4, 6 }, PIN_ECHO[2] = { 5, 7 };
+const char *const TANK_NAME[2] = { "res", "mix" };
 
-const float         SOUND_CM_PER_US       = 0.0343f / 2.0f;   // round-trip -> one way
-const unsigned long ULTRASONIC_TIMEOUT_US = 25000UL;         // ~4.3 m cap, bounds pulseIn
-const unsigned long LIVE_MS = 500;
+const float         SOUND_CM_PER_US = 0.0343f / 2.0f;
+const unsigned long TIMEOUT_US = 25000UL;
+const unsigned long LIVE_MS = 1000;
+const float MIN_RANGE_CM = 2.0f;        // an HC-SR04 cannot range closer
+const float MIN_SPAN_CM  = 3.0f;        // empty and full closer than this make a useless scale
 
-float zeroRes = -1.0f, zeroMix = -1.0f;   // captured empty-tank references (cm)
+float emptyCm[2] = { -1.0f, -1.0f }, fullCm[2] = { -1.0f, -1.0f };
 bool  liveOn = false;
 unsigned long lastLiveMs = 0;
 
-#define LINE_BUF 48
+#define LINE_BUF 32
 char    line[LINE_BUF];
 uint8_t lineLen = 0;
 
-void printHelp();
-float readDistanceCm(uint8_t trig, uint8_t echo);
-float readMedianCm(uint8_t trig, uint8_t echo);
-void  printRaw();
-void  handleLine(char *s);
+float readDistanceCm(uint8_t t) {
+  digitalWrite(PIN_TRIG[t], LOW);  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG[t], HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG[t], LOW);
+  unsigned long dur = pulseIn(PIN_ECHO[t], HIGH, TIMEOUT_US);
+  if (dur == 0) return -1.0f;
+  return (float)dur * SOUND_CM_PER_US;
+}
+
+// Median of up to 9 pings. -1 unless at least 5 came back, so a flaky echo cannot become a calibration.
+float readMedianCm(uint8_t t) {
+  float v[9];
+  uint8_t got = 0;
+  for (uint8_t i = 0; i < 9; i++) {
+    float d = readDistanceCm(t);
+    if (d >= 0.0f) v[got++] = d;
+    delay(60);
+  }
+  if (got < 5) return -1.0f;
+  for (uint8_t i = 1; i < got; i++) { float key = v[i]; int8_t j = i - 1; while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; } v[j + 1] = key; }
+  return v[got / 2];
+}
+
+void printHelp() {
+  Serial.println(F("Commands (<t> = res or mix):"));
+  Serial.println(F("  empty <t>        tank empty: capture the distance"));
+  Serial.println(F("  full <t> [cm]    tank full: capture it, or give a distance you measured"));
+  Serial.println(F("  result           lines to paste into CalStore"));
+  Serial.println(F("  r / live         distances now, and live on/off"));
+}
+
+void printRaw() {
+  for (uint8_t t = 0; t < 2; t++) {
+    float d = readMedianCm(t);
+    Serial.print(TANK_NAME[t]); Serial.print(F(" = "));
+    if (d < 0) Serial.print(F("no echo")); else { Serial.print(d, 1); Serial.print(F(" cm")); }
+    Serial.print(F("   "));
+  }
+  Serial.println();
+}
+
+int tankFrom(const char *s) {
+  if (!s) return -1;
+  if (!strcasecmp(s, "res")) return 0;
+  if (!strcasecmp(s, "mix")) return 1;
+  return -1;
+}
+
+void captured(uint8_t t, bool isEmpty, float d) {
+  if (isEmpty) emptyCm[t] = d; else fullCm[t] = d;
+  Serial.print(TANK_NAME[t]); Serial.print(isEmpty ? F(" empty = ") : F(" full = ")); Serial.print(d, 1); Serial.println(F(" cm"));
+  if (emptyCm[t] >= 0 && fullCm[t] >= 0) {
+    if (emptyCm[t] - fullCm[t] < MIN_SPAN_CM) {
+      Serial.println(F("REFUSED: empty must be further from the sensor than full by at least 3 cm. Capture both again."));
+      emptyCm[t] = fullCm[t] = -1.0f;
+      return;
+    }
+    Serial.println(F("NEXT: the other tank, or type result"));
+  } else {
+    Serial.print(isEmpty ? F("NEXT: at the full level type: full ") : F("NEXT: with the tank empty type: empty "));
+    Serial.println(TANK_NAME[t]);
+  }
+}
+
+void printResult() {
+  const char *const EK[2] = { "reCm", "meCm" }, *const FK[2] = { "rfCm", "mfCm" };
+  bool any = false;
+  for (uint8_t t = 0; t < 2; t++) if (emptyCm[t] >= 0 || fullCm[t] >= 0) any = true;
+  if (!any) { Serial.println(F("Nothing captured yet. Start with: empty res")); return; }
+  Serial.println(F("======== RESULT ========"));
+  Serial.println(F("CalStore on ESP1 (flash Calibration/ESP1/CalStore, paste, flash the firmware back):"));
+  for (uint8_t t = 0; t < 2; t++) {
+    if (emptyCm[t] >= 0) { Serial.print(F("  set ")); Serial.print(EK[t]); Serial.print(' '); Serial.println(emptyCm[t], 1); }
+    if (fullCm[t]  >= 0) { Serial.print(F("  set ")); Serial.print(FK[t]); Serial.print(' '); Serial.println(fullCm[t], 1); }
+  }
+  Serial.println(F("========================"));
+}
+
+void handleLine(char *s) {
+  char *t1 = strtok(s, " ");
+  if (!t1) return;
+  if (!strcasecmp(t1, "h") || !strcasecmp(t1, "help")) { printHelp(); return; }
+  if (!strcasecmp(t1, "r"))      { printRaw(); return; }
+  if (!strcasecmp(t1, "result") || !strcasecmp(t1, "show")) { printResult(); return; }
+  if (!strcasecmp(t1, "live"))   { liveOn = !liveOn; Serial.println(liveOn ? F("live ON") : F("live OFF")); return; }
+  bool isEmpty = !strcasecmp(t1, "empty") || !strcasecmp(t1, "zero");
+  bool isFull  = !strcasecmp(t1, "full");
+  if (!isEmpty && !isFull) { Serial.println(F("Unknown command: type h")); return; }
+  int t = tankFrom(strtok(NULL, " "));
+  if (t < 0) { Serial.println(F("Name a tank: empty res  or  empty mix")); return; }
+  char *given = strtok(NULL, " ");
+  float d;
+  if (given) {
+    d = atof(given);
+    if (d < MIN_RANGE_CM || d > 400.0f) { Serial.println(F("usage: full <res|mix> <cm from the sensor to the water, 2 to 400>")); return; }
+  } else {
+    d = readMedianCm(t);
+    if (d < 0) { Serial.println(F("REFUSED: not enough echoes came back. Check the wiring and that the sensor faces the water squarely.")); return; }
+    if (d < MIN_RANGE_CM) { Serial.println(F("REFUSED: closer than the sensor can range.")); return; }
+  }
+  captured(t, isEmpty, d);
+}
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_TRIG_RES, OUTPUT); digitalWrite(PIN_TRIG_RES, LOW); pinMode(PIN_ECHO_RES, INPUT);
-  pinMode(PIN_TRIG_MIX, OUTPUT); digitalWrite(PIN_TRIG_MIX, LOW); pinMode(PIN_ECHO_MIX, INPUT);
+  for (uint8_t t = 0; t < 2; t++) { pinMode(PIN_TRIG[t], OUTPUT); digitalWrite(PIN_TRIG[t], LOW); pinMode(PIN_ECHO[t], INPUT); }
   Serial.println();
-  Serial.println(F("=== ULTRASONIC CALIBRATION (Nano) ==="));
+  Serial.println(F("=== ULTRASONIC TANK LEVEL CALIBRATION (Nano) ==="));
   printHelp();
+  Serial.println(F("START: reservoir empty. Type: empty res"));
 }
 
 void loop() {
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
-      if (lineLen > 0) { line[lineLen] = '\0'; handleLine(line); lineLen = 0; }
-    } else if (lineLen < LINE_BUF - 1) {
-      line[lineLen++] = c;
-    } else {
-      lineLen = 0;
-    }
+      if (lineLen > 0) { line[lineLen] = '\0'; lineLen = 0; handleLine(line); }
+    } else if (lineLen < LINE_BUF - 1) line[lineLen++] = c;
   }
-  if (liveOn && (unsigned long)(millis() - lastLiveMs) >= LIVE_MS) {
-    lastLiveMs = millis();
-    printRaw();
-  }
-}
-
-void printHelp() {
-  Serial.println(F("Commands:"));
-  Serial.println(F("  h            this help"));
-  Serial.println(F("  r            distances once"));
-  Serial.println(F("  live         toggle ~2 Hz live readout"));
-  Serial.println(F("  zero res     capture reservoir empty reference"));
-  Serial.println(F("  zero mix     capture mixing empty reference"));
-  Serial.println(F("  show         print captured references"));
-}
-
-// Raw one-way distance (cm) or -1 on timeout -- identical to the firmware.
-float readDistanceCm(uint8_t trig, uint8_t echo) {
-  digitalWrite(trig, LOW);  delayMicroseconds(2);
-  digitalWrite(trig, HIGH); delayMicroseconds(10);
-  digitalWrite(trig, LOW);
-  unsigned long dur = pulseIn(echo, HIGH, ULTRASONIC_TIMEOUT_US);
-  if (dur == 0) return -1.0f;
-  return (float)dur * SOUND_CM_PER_US;
-}
-
-// Median of 5 pings (drops the odd dropout/echo) for a steadier capture.
-float readMedianCm(uint8_t trig, uint8_t echo) {
-  float v[5];
-  uint8_t got = 0;
-  for (uint8_t i = 0; i < 5; i++) {
-    float d = readDistanceCm(trig, echo);
-    if (d >= 0.0f) v[got++] = d;
-    delay(60);                  // ~60 ms between pings (bounded, one-shot capture; not in the hot loop)
-  }
-  if (got == 0) return -1.0f;
-  // simple insertion sort of the valid samples
-  for (uint8_t i = 1; i < got; i++) {
-    float key = v[i]; int8_t j = i - 1;
-    while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
-    v[j + 1] = key;
-  }
-  return v[got / 2];
-}
-
-void printRaw() {
-  float res = readMedianCm(PIN_TRIG_RES, PIN_ECHO_RES);
-  float mix = readMedianCm(PIN_TRIG_MIX, PIN_ECHO_MIX);
-  Serial.print(F("RES = "));
-  if (res < 0) Serial.print(F("timeout")); else { Serial.print(res, 1); Serial.print(F(" cm")); }
-  Serial.print(F("   MIX = "));
-  if (mix < 0) Serial.print(F("timeout")); else { Serial.print(mix, 1); Serial.print(F(" cm")); }
-  Serial.println();
-}
-
-void handleLine(char *s) {
-  char *t1 = strtok(s, " ");
-  if (!t1) return;
-
-  if (!strcasecmp(t1, "h"))    { printHelp(); return; }
-  if (!strcasecmp(t1, "r"))    { printRaw();  return; }
-  if (!strcasecmp(t1, "live")) { liveOn = !liveOn; Serial.print(F("live=")); Serial.println(liveOn ? F("ON") : F("OFF")); return; }
-  if (!strcasecmp(t1, "show")) {
-    Serial.print(F("zero_res = ")); if (zeroRes < 0) Serial.println(F("(uncaptured)")); else { Serial.print(zeroRes, 1); Serial.println(F(" cm")); }
-    Serial.print(F("zero_mix = ")); if (zeroMix < 0) Serial.println(F("(uncaptured)")); else { Serial.print(zeroMix, 1); Serial.println(F(" cm")); }
-    return;
-  }
-  if (!strcasecmp(t1, "zero")) {
-    char *t2 = strtok(NULL, " ");
-    if (!t2) { Serial.println(F("usage: zero <res|mix>")); return; }
-    if (!strcasecmp(t2, "res")) {
-      zeroRes = readMedianCm(PIN_TRIG_RES, PIN_ECHO_RES);
-      Serial.print(F("reservoir empty reference = ")); Serial.print(zeroRes, 1); Serial.println(F(" cm"));
-      return;
-    }
-    if (!strcasecmp(t2, "mix")) {
-      zeroMix = readMedianCm(PIN_TRIG_MIX, PIN_ECHO_MIX);
-      Serial.print(F("mixing empty reference = ")); Serial.print(zeroMix, 1); Serial.println(F(" cm"));
-      return;
-    }
-    Serial.println(F("usage: zero <res|mix>"));
-    return;
-  }
-  Serial.println(F("? unknown command -- type h"));
+  if (liveOn && (unsigned long)(millis() - lastLiveMs) >= LIVE_MS) { lastLiveMs = millis(); printRaw(); }
 }

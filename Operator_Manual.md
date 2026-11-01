@@ -135,10 +135,18 @@ A hard actuator fault adds the current operation + column and a recovery menu, e
 | ~~`BATTERY_LOW`~~ | — | **Removed** — battery low no longer disables fertigation or alerts. Monitoring only. | Watch the battery voltage yourself. |
 | `BATT2_LOW` | MAJ | Secondary battery below 13.6 V. While secondary-battery switching is enabled, no run, exercise, AC prime or inverter Testing row may **start** until it is back above 14.0 V (a run already going finishes). | It recharges from the main battery while idle; check the charger if it stays low. |
 | `BATT2_CRIT` | MAJ | Secondary battery below 12.8 V (3.2 V/cell). | Charge or replace it before the next run. |
-| `BATT_SWITCH_RESET` | MAJ | Moving the controllers to/from the secondary battery reset them: the hold-up didn't carry them through the switch. The text says which direction and the count (`n=1/2`). The interrupted run re-runs on its own when still due (the tank volume is kept). | Check the hold-up stage / DPDT coil supply. |
+| `BATT_SWITCH_RESET` | MAJ | Moving the controllers to/from the secondary battery reset them: the hold-up didn't carry them through the switch. The text says which direction and the count (`n=1/2`). After about a minute (the hold-up recharges), the interrupted run re-runs on its own when still due. The tank volume is kept, and nutrients already in the tank are not dosed again. | Check the hold-up stage / DPDT coil supply. |
 | `BATT_SWITCH_FAULT` | MAJ | A **second** switch reset within 24 h. Switching is latched off and **every run that needs the inverter is refused** (runs, exercise, AC prime, inverter Testing rows). This stops a weak hold-up from resetting the rig over and over. | Fix the hold-up, then clear it: LCD **Settings → Batt Switch**, SMS `BATTSW,CLEAR`, or the dashboard System tab. It also clears itself 24 h after the last reset (if the clock is good). |
+| `ESTOP_KEPT` | CRIT | An emergency stop reset the controllers as it cut the power. The rig came back still stopped, so the stop was not lost. | Confirm on the LCD fault screen when it is safe to resume. |
+| `<fault>…\|BOARD_RESET` | MAJ | A fault (for example `FLOW_FAIL`) reset the controllers as it stopped the pumps, so the usual hold and reply menu are gone. The column is **skipped for today**. | Fix the cause. A forced run can retry it today; otherwise it runs tomorrow. |
+| `DOSE_CARRY` | MAJ | The tank still held a batch dosed for another column, and this column received it. No extra nutrients were added. | Note it for the crop records. It usually follows a stopped or skipped run. |
+| `MAIN_BATT_CRIT` | CRIT | *Only if the backup feature is enabled.* The main battery stayed critically low. The text says `SWITCHING_TO_BACKUP` or `BACKUP_NOT_AVAILABLE`. No run or other inverter use can start until it recovers. | Check the solar charging and the main battery. |
+| `BACKUP_EXHAUSTED` | CRIT | *Only if the backup feature is enabled.* The secondary battery ran down, or stopped being monitored, while running the controllers. They were returned to the main battery and **may shut down** if it is too weak. | Charge the batteries now. |
+| `BACKUP_SWITCH_FAILED` | CRIT | *Only if the backup feature is enabled.* The controllers could not be moved to the secondary battery. They stay on main and retry every minute. | Check ESP2, its link and the P4 relay. |
 | `ESP2_RESTARTED` | MAJ | The actuator controller rebooted in the middle of a run, test or held fault (a battery switch, a power glitch, or its watchdog). The job is released at once; the tank volume is kept and a still-due column re-runs on its own. | Look for the cause in the log just before it (`BATTSW`, `PWR_FAIL`, …). |
-| `SENSOR_FAIL,INA226…` | MAJ | The secondary battery's INA226 monitor isn't answering; inverter use is blocked (switching enabled) because the battery can't be checked. | Check the INA226 wiring on ESP1's I²C (address 0x40). |
+| `RTC_INVALID` | MAJ | The clock cannot be trusted: its backup battery let it lose the time, or it keeps returning impossible dates. **Nothing runs on the schedule** and logs go to `NODATE.CSV`. | Set the clock (Settings → Set Clock, or the dashboard). If it happens again after a power cycle, replace the DS3231's CR2032. If it is `BAD_READS`, check the I²C wiring; it clears itself once reads are good. |
+| `RTC_MISSING` | MAJ | The clock chip did not answer at boot. Nothing runs on the schedule. | Check the DS3231 and its I²C wiring, then reboot. |
+| `SENSOR_FAIL,INA226…` | MAJ | The secondary battery's INA226 monitor isn't answering; inverter use is blocked (switching enabled) because the battery can't be checked. | Check the INA226 wiring on ESP1's I²C (address 0x40). If the text says `NO_PACK_CHECK_WIRING` (LCD `B2: no pack - wiring`), the chip is fine but sees no battery: check its VBUS lead and that the pack's negative is common with board ground. |
 | `NANO_GARBAGE` | MAJ | Sensor hub kept sending garbage after a software reset; running on last-valid data. | Check the Nano / sensor wiring. |
 | `NANO_RESET` | WARN | The sensor hub was told to self-reset (after 5 bad packets, or the daily fresh-start). | Informational. |
 | `NANO_SILENCE` | MIN | The sensor hub went quiet (its own watchdog restarts it). | Informational; check if it persists. |
@@ -164,7 +172,8 @@ FLT,C0M1m0,RST,1,ST,IDLE_STATE,BAT,12.6V,CONS,180Wh,CHG,240Wh
 | `ST,IDLE_STATE` | Current system state. |
 | `BAT,12.6V` | Battery voltage. |
 | `BAT2,15.9V` | Secondary battery voltage (`LOW` appended when below its low threshold; `--` if its monitor isn't answering). |
-| `CONS,180Wh` / `CHG,240Wh` | Energy consumed / charged today. |
+| `SOL,14.2V3.1A` | Solar voltage and current (`--` if its monitor isn't answering; `0.0V` at night is normal). |
+| `CONS,180Wh` / `CHG,240Wh` | Energy drawn from the main battery / measured from solar today. |
 
 ### 4.6 Summary — `SUM,<day> …` (averages)
 Example: `SUM,2026-06-25 A:N148P39K198M42 B:N-P-K-M51 BAT12.5V 3.2W CONS180 CHG240Wh H2O17.5L NUT30mL FLT C0M1m0 RST1 IRR2 FERT1 DOSE3`
@@ -225,7 +234,7 @@ full emergency stop is done at the LCD fault screen.
 **Buttons:** UP, DOWN, ENTER, BACK, MODE.
 
 - **MODE** toggles between the live data pages and the **Settings** menu (and exits Testing/Calibration).
-- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (main battery V/I, plus a `B2:` line for the secondary battery; `*` marks the one the controllers are running from),
+- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (main battery V/I, where a minus current means it is charging; a `B2:` line for the secondary battery, with `*` marking the battery the controllers are running from; and a `Sol:` line for solar. SD card and clock status are on the Columns page's last line),
   **GSM + WiFi** health, **Fault** (last fault / recovery prompts).
 
 ### 6.1 Settings menu
@@ -439,7 +448,7 @@ obvious at a glance.
 |---|---|---|
 | **Live dashboard** | Everyone signed in | Read-only telemetry: reservoir/mixing levels, flow, battery, per-zone NPK/pH/EC/moisture, run progress, command history. |
 | **Zone profiles** | Everyone signed in | Crop/growth-stage reference notes per physical zone (A/B/C). Editable only once approved; read-only text otherwise. Purely a dashboard planning note — the rig only actually changes when you press "Send to ESP1" on the firmware-settings form underneath. |
-| **Controls** | Approved and above | Disable/re-enable actuations, reboot Nano/ESP2/ESP1, Emergency Stop, Force Run (a real one-off irrigation/fertigation outside the schedule). |
+| **Controls** | Approved and above | Disable/re-enable actuations (while disabled, LCD Testing and calibration priming are refused too), reboot Nano/ESP2/ESP1, Emergency Stop, Force Run (a real one-off irrigation/fertigation outside the schedule). |
 | **Manual/Test** | Sub-operator / temp-access / operator only | **Direct hardware control** — every button here energises a real relay immediately, with none of the checks a scheduled run goes through. Opening it takes the rig out of automatic until you leave. Covers preventive pump exercise, Timed Pulses (run a pump/valve combo for a set number of seconds), and Hold-to-run (press-and-hold buttons that mirror the LCD Testing screen's own dead-man button — energised only while held. Because the press travels through Firebase, release is not instant: the relay drops about 1 s after you let go, within about 4 s if the tab or connection is lost, and after 15 s of continuous holding at the latest. After that cap, let go and press again to restart). The pH pumps dispense a corrosive adjuster and ask you to confirm first. |
 | **Diagnostics** | Everyone signed in | The same raw/pre-conversion sensor values the LCD's Sensor Diag pages show, plus recent ESP1 events. |
 | **System** | Sub-operator / temp-access / operator only | Remote equivalents of LCD Settings-menu items not covered elsewhere: Set Clock, Thresholds, Restore Defaults, LCD Lock status (read-only). |

@@ -101,7 +101,7 @@ flasher app or a web flasher). No compiler needed on the device.
 ## Pin / bus map (summary — see spec §17–19 for the authoritative version)
 
 **ESP32 #1:** Nano link EspSoftwareSerial GPIO16/17 · ESP2 link HW UART1 GPIO25/33 ·
-A7670C HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, secondary-battery INA226 0x40, ADS1115 0x48, DS3231 0x68) ·
+A7670C HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, secondary-battery INA226 0x40, ADS1115 0x48, DS3231 0x68; behind an ISO1540: solar INA226 0x41, main-battery INA226 0x44) ·
 microSD SPI GPIO23/19/18/5 · buttons GPIO0/12/13/15/2 · ESP2 power relay GPIO4.
 
 **ESP32 #2:** ESP1 link HW UART2 GPIO16/17 · PZEM-004T HW UART1 GPIO13/14 ·
@@ -145,7 +145,7 @@ and `Commissioning_Flash_Plan.md` stages the testing.
 ## Status
 
 All three controllers compile cleanly (PlatformIO `esp32dev` / `nanoatmega328`) and the host
-tests pass (`pio test -e native`: 80 on ESP1, 13 on ESP2). **The current firmware has not been
+tests pass (`pio test -e native`: 86 on ESP1, 13 on ESP2). **The current firmware has not been
 flashed to the rig**, so none of it is proven on hardware yet. **With the shipped constants
 fertigation doses nothing:** the 4 L batch is under the 5 L dosing floor, and most preset targets
 sit below the lab soil baseline. See `SESSION_HANDOFF.md` §5, item 19. This is active thesis work —

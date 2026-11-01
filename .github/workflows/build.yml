@@ -9,6 +9,58 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Host tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: ESP1 tests
+        run: pio test -d ESP1 -e native
+
+      - name: ESP2 tests
+        run: pio test -d ESP2 -e native
+
+  # Every calibration tool, so one cannot quietly stop building. Compile only: nothing to publish.
+  calibration:
+    runs-on: ubuntu-latest
+    name: Build calibration tools
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('Calibration/common.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build every tool
+        run: |
+          for d in Calibration/ESP1/* Calibration/ESP2/* Calibration/Nano/*; do
+            echo "::group::$d"
+            pio run -d "$d" || exit 1
+            echo "::endgroup::"
+          done
+
   build:
     runs-on: ubuntu-latest
     strategy:

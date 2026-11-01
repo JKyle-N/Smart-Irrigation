@@ -1,6 +1,9 @@
 /* =============================================================================
  *  ESP1 NONLINEAR ADC CALIBRATION  --  opto-isolated current + voltage
  * -----------------------------------------------------------------------------
+ *  SUPERSEDED by Calibration/ESP1/BatteryOpto. The firmware no longer reads the
+ *  GPIO34 current channel below, so calibrating it has no effect.
+ * -----------------------------------------------------------------------------
  *  Standalone bench tool (no main firmware / no UART / no other controllers).
  *  An optocoupler in front of the ESP32 ADC makes raw counts -> real-world units
  *  NONLINEAR (ESP32 ADC curve + opto CTR/saturation). This tool captures known

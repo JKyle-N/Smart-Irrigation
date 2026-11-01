@@ -2908,7 +2908,10 @@ UART0 (GPIO1/GPIO3) is intentionally left for the USB serial monitor; no device 
 I2C Devices with adress:
 
 * LCD (0x27)
-* INA226 (0x40)
+* INA226, secondary battery (0x40)
+* INA226, solar (0x41), behind the ISO1540 (§21.0)
+* INA226, main battery (0x44), behind the ISO1540 (§21.0)
+* ADS1115 (0x48)
 * DS3231 RTC (0x68)
 * EEPROM (0x57)
 
@@ -3419,7 +3422,7 @@ Note: P17 is no longer the Nano hardware-reset line. It is now a master cutoff t
 - **Secondary battery:** 4S Li-ion, 16.8 V full (14.8 V nominal). It is charged from the main battery while the DPDT is in the main position (idle).
 - **What moves to it:** ESP1, ESP2, the Nano, the sensors and the relay coils.
 - **Switch:** P4, the relay of the condemned mixing-tank valve, drives the DPDT. De-energized = main battery, which is the fail-safe position. A fault, an E-stop, an ESP2 reboot, or ESP1 cutting ESP2's power (GPIO4) all return the boards to main.
-- **Monitor:** an **INA226 with an R010 shunt** on **ESP1's I²C at 0x40** measures the secondary's voltage and current. The bench tool is `Test Code/Arduino R3/INA226_R010/`.
+- **Monitor:** an **INA226 with an R010 shunt** on **ESP1's I²C at 0x40** measures the secondary's voltage and current. It is calibrated with `Calibration/ESP1/INA226` (module `sec`).
 - **Plumbing:** the mixing tank feeds the booster directly and the column valves select the column. The reservoir valve is no longer fitted, so P0 is a spare.
 
 **Sequencing (ESP2).** The rule is that inverter ON implies the secondary battery, for every inverter use (run stages, mixing, exercise, AC prime, and Testing / Timed Pulse / hold-to-run):
@@ -3428,7 +3431,7 @@ Note: P17 is no longer the Nano hardware-reset line. It is now a master cutoff t
 3. The existing `INVERTER_WARMUP_MS` follows, extended by the settle time (`AC_WARMUP_MS`).
 4. When the inverter stops, P4 returns the boards to main after `BATT_RETURN_DELAY_MS` (1000 ms). On a normal end, P17 stays up until that return; faults cut everything at once.
 
-ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 logs them, publishes them, and holds off cutting ESP2's power until the return (`ESP2_BATT_RETURN_WAIT_MS`, 2.5 s bound).
+ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 logs them, publishes them, and holds off cutting ESP2's power until the return (`ESP2_BATT_RETURN_WAIT_MS`, 4 s bound).
 
 **Policy (ESP1).** Thresholds are [CONFIRM]:
 - **Block:** with switching enabled, no inverter use may *start* when either of these holds. A run already in progress is never aborted.
@@ -3451,6 +3454,14 @@ ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 log
 - **Clearing the latch:** LCD Settings → Batt Switch, SMS `BATTSW,CLEAR`, or the dashboard System tab (`CLEAR_BATT_SWITCH`). It also clears itself 24 h after the last strike when the RTC is good.
 
 Independently of the battery switch, any `READY` from ESP2 during a live run, held fault or exercise is now handled as "ESP2 restarted". The job is released at once (`ESP2_RESTARTED`, then `STARTUP_SYNC`). Before this, it waited for the 10-minute completion timeout and ended in an emergency stop.
+
+**A real blackout during a switch.** If the boards actually lose power for a moment, the DPDT coil drops with them and all three controllers restart on main. Nothing decided before the reset is lost or repeated:
+- **Recharge wait:** no inverter use for `BSW_RECHARGE_MS` (60 s, [MEASURE]) after a boot or strike, because the hold-up is flat.
+- **No double dose:** ESP2 keeps what the tank already holds in NVS, and a re-run doses only what is still owed. A dose started but not finished counts as delivered, so the error is always towards under-dosing. No dose starts until a switch back to main has finished.
+- **The batch reaches its column:** the column the tank was dosed for runs first, regardless of its window or soil reading, except at night or if the operator snoozed, disabled or skipped it. A batch stopped on purpose is not restarted automatically, but its doses still count when the column next runs. An order for a different column adds no dose and raises `DOSE_CARRY`.
+- **Faults, stops and commands:** a fault is written to NVS before its own P4 drop and reported after the reset, and its column is skipped for the day. An E-stop or cancel is written down before its cut and restored after the reset. A dashboard command in flight is marked failed.
+
+**Backup for a critical main battery — ready, not active** (`SECONDARY_BACKUP_ENABLED 0`, ESP1 and ESP2). When main stays below `BATT_CRIT_V` for 60 s with nothing running, ESP1 texts `ALERT,CRIT,MAIN_BATT_CRIT`, waits for the text to leave the modem, and has ESP2 hold the boards on the secondary (`BATTBK,ON`). ESP2 stays powered and holds P4 and P17; all inverter use is blocked from the alert onward, because the inverter would load the flat main battery. The boards return when main holds `BACKUP_MAIN_RECOVER_V` (12.6 V, [CONFIRM]) for 5 minutes, or when the pack reaches `SEC_BATT_CRIT_V` or stops being monitored (`ALERT,CRIT,BACKUP_EXHAUSTED`). Needs `SECONDARY_BATT_ENABLED` and a calibrated main voltage. **Limits:** the pack does not charge while it powers the boards; if the boards return to a main too weak to run them, the rig stays dark until main recovers; and the charger needs its own low-voltage cutoff so it does not drain a critical main.
 
 ### 19.4.8. 🔹 P17 Master Actuator-Power Cutoff & Fault Hold
 
@@ -3589,17 +3600,50 @@ Upon reset or power-up:
 
 # 21. 🔌 Power Monitoring System
 
-## 21.1. Battery Monitoring (calibrated opto ADC — replaces INA226)
+## 21.0. Solar + Main Battery Monitoring (two INA226 behind an ISO1540)
 
-- Battery **voltage (GPIO35)** and **current (GPIO34)** are sensed through an optocoupler into the ESP32
-  ADC (ADC1, 12-bit, `ADC_11db`). The optocoupler makes the raw counts NONLINEAR, so each channel is
-  fitted with a **least-squares polynomial** `value = a0 + a1·u + a2·u² + a3·u³`, `u = raw/4095`, capturing
-  the ADC + opto curve end-to-end.
-- **Calibration:** use the bench tool `Test Code/ESP1_ADC_OPTO_CAL` (apply known inputs, capture points,
-  compute) and paste the printed coefficients into the firmware defaults (`calBattV`/`calBattI`), or store
-  them in NVS namespace `adccal` which `loadBattCal()` reads at boot.
-- The INA226 is no longer used for battery. Current is **magnitude only**, so energy is counted purely as
-  consumption (no charge/discharge split).
+An INA226 must share a ground with what it measures, while the boards must not share one with the main battery. Two modules therefore sit on the main-battery side of an **ISO1540** I²C isolator and stay readable through every inverter run and battery switch. Nothing but the isolator crosses over. (The part number matters: an ISO1450 is an RS-485 transceiver and passes no I²C.)
+
+| Module | Address | Address pins | Shunt | CAL | Current LSB | Clips at |
+|---|---|---|---|---|---|---|
+| Solar | 0x41 | A1 GND, A0 VCC | R010 on the module | 2048 | 0.25 mA | 8.19 A |
+| Main battery | 0x44 | A1 VCC, A0 GND | 50 A / 75 mV bar (1.5 mΩ) | 1707 | 2 mA | 54.6 A |
+
+**Wiring**
+
+| ISO1540 side | Pins | Connects to |
+|---|---|---|
+| Side 2 (boards) | SDA2, SCL2 | ESP1 GPIO21, GPIO22 |
+| | VCC2 | The voltage ESP1's bus is pulled up to (3–5.5 V). Measure SDA at idle: an LCD backpack may pull it to 5 V |
+| | GND2 | Board GND |
+| Side 1 (main battery) | SDA1, SCL1 | Both modules' SDA, SCL |
+| | VCC1 + module VCC | 3.3 V from a regulator fed by the main battery |
+| | GND1 + module GND | Main battery negative |
+
+- Fit 100 nF on each VCC, close to the pins.
+- **Why side 2 faces ESP1:** side 1 pulls low to only 0.57–0.8 V, against an ESP32 input limit of 0.825 V at 3.3 V. Side 2 reaches 0.4 V. An INA226 reads side 1's low comfortably (its limit is 0.3 × VCC, about 1 V).
+- **Side 1 pull-ups** must sink 0.5–3.5 mA. The two modules' 10 kΩ resistors in parallel give 0.66 mA at 3.3 V, which is enough. If they are removed, fit 1–6.6 kΩ.
+- **Main-side 3.3 V, not an isolated converter from the boards:** a converter's interwinding capacitance is the path the inverter's noise already takes, and this way the hold-up carries no extra load.
+- **Current sensing is high side:** IN+/IN- in series with the + line, VBS tied to IN-. The module's own R010 must be **removed** on the main battery module. Left in, it parallels the bar: readings come out about 13 % low and it carries about 6.5 A at 50 A.
+- **Solar limits:** the INA226 is rated to 36 V and the R010 clips at 8.19 A. Measure on the charge controller's battery side, whose negative is common with the main battery; panel negative may not be.
+
+**Behaviour.** The main INA226 is the first choice for main battery V/I/P, and the opto ADC + ACS758 (§21.1) takes over automatically if it stops answering. A main reading below 5 V is treated as a wiring fault and not used; solar has no such floor, because 0 V at night is real. Neither module blocks a run or sends a text. With the shunt bar, current is signed (+ = discharging), so `CONS` counts discharge only; `CHG` is solar energy.
+
+A module that loses its supply for a moment answers again with its calibration register at 0, which reads a healthy voltage and exactly 0 A. ESP1 reads that register back on every pass and restores it (`INA226|<name>|RESTARTED`). The secondary's monitor does the same.
+
+**Calibration.** `Calibration/ESP1/INA226`, flashed to ESP1, calibrates all three modules and saves to NVS `calib`, which `loadCal()` applies over the compiled constants. A value outside what the tool itself would accept is ignored and the compiled value used.
+
+## 21.1. Battery Monitoring Fallback (calibrated opto ADC)
+
+- Battery **voltage (GPIO35)** is sensed through an optocoupler into the ESP32 ADC (ADC1, 12-bit, `ADC_11db`).
+  The optocoupler makes the raw counts NONLINEAR, so it is fitted with a **least-squares polynomial**
+  `value = a0 + a1·u + a2·u² + a3·u³`, `u = raw/4095`, capturing the ADC + opto curve end-to-end. Current comes
+  from the ACS758 through the ADS1115; the old GPIO34 opto current channel is no longer read.
+- **Calibration:** `Calibration/ESP1/BatteryOpto` (apply known voltages, capture points, compute) saves to NVS
+  namespace `adccal`, which `loadBattCal()` reads at boot, and prints the coefficients for `calBattV`.
+  `Calibration/ESP1/ACS758` covers the current sensor.
+- On this fallback, current is **magnitude only**, so energy is counted purely as consumption (no
+  charge/discharge split).
 
 ### 21.1.1. Control Usage: READY, NOT IMPLEMENTED
 Battery voltage drives no control action by default. The protections below are **scaffolded** behind the
@@ -3913,7 +3957,9 @@ The detail column content is defined per event_type below. Secondary delimiter i
 | DOSE       | ESP2           | NUTRIENT|target_mL|measured_mL|COL                         | NUT_A|50.0|49.2|COL_A                    |
 | ACT        | ESP1/ESP2      | DEVICE|STATE|COL  (STATE = START/STOP)                     | IRRIGATION|START|COL_A                   |
 | GSM        | GSM            | DIR|payload  (DIR = TX/RX)                                 | TX|ALERT|MAJ|NPK_FAULT|COL_B             |
-| PWR        | ESP1           | SRC|fields  (SRC = INA226/PZEM)                            | INA226|V=12.6|I=1.2|P=15.1|CHG=150Wh    |
+| PWR        | ESP1           | SRC|fields  (main battery; SRC=INA or OPTO)                | BATT|V=12.6|I=1.2|P=15.1|SRC=INA|CONS=90Wh|CHG=150Wh |
+| PWR2       | ESP1           | secondary battery and switch events                        | BATT2|V=15.9|I=0.800|P=12.7|LOW=0|SRC=MAIN |
+| PWRS       | ESP1           | solar, and both isolated modules' FOUND/LOST               | SOLAR|V=14.20|I=3.100|P=44.0            |
 
 Notes:
 * GARBAGE RAW is truncated to a safe length (e.g. 64 chars) to bound row size; the consecutive-garbage counter value is recorded as COUNT=n.

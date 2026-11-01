@@ -9,9 +9,9 @@
  *      (supervisor / work-order model, sec.9.8.1.1) -- then monitors.
  *    - Talks to the user over A7670C SMS (alerts, run notices, daily report).
  *    - Logs every event to microSD (CSV, RTC-stamped, sec.25).
- *    - Monitors the main battery via opto ADC + ACS758 (display/log/telemetry only -- no
- *      battery-triggered stops/alerts) and the secondary battery via INA226; classifies OTHER
- *      faults (3 tiers, sec.23).
+ *    - Monitors solar and the main battery via two INA226 behind an ISO1540 (opto ADC + ACS758 as the
+ *      main battery's fallback; display/log/telemetry only -- no battery-triggered stops/alerts) and
+ *      the secondary battery via its own INA226; classifies OTHER faults (3 tiers, sec.23).
  *    - Drives the LCD UI; owns all recovery escalation (sec.18.9).
  *
  *  AUTHORITY BOUNDARIES: ESP32 #1 decides; ESP32 #2 executes; Nano senses.
@@ -72,7 +72,7 @@
 #define BTN_BACK      15
 #define BTN_MODE       2
 #define ESP2_PWR_PIN   4        // ESP2 power relay (active HIGH)
-#define PIN_BATT_I    34        // battery CURRENT via opto -> ADC1 (nonlinear; polynomial-calibrated)
+#define PIN_BATT_I    34        // old opto current channel: read 0.00 A on every sample, no longer used
 #define PIN_BATT_V    35        // battery VOLTAGE via opto -> ADC1 (nonlinear; polynomial-calibrated)
 
 /* ---- Battery safety: READY, NOT IMPLEMENTED ----------------------------------------------------- *
@@ -89,10 +89,13 @@
 #define ESP2_BAUD      9600
 // The A7670C's baud is auto-detected (GSM_BAUDS in gsm_modem.h, 115200 first).
 #define SIM_RX_BUFFER  2048     // ~180 ms of 115200 traffic; the default 256 B is only ~22 ms of loop stall
+#define NANO_RX_BUFFER  128     // ~130 ms at 9600; the library default of 64 B is only ~65 ms of loop stall
 
 /* ---- I2C addresses ------------------------------------------------------- */
 #define LCD_ADDR     0x27
-#define INA226_ADDR  0x40
+#define INA226_ADDR  0x40       // secondary battery, on this bus directly
+#define SOLAR_INA_ADDR 0x41     // solar, behind the ISO1540 (A1 GND, A0 VCC)
+#define MAIN_INA_ADDR  0x44     // main battery, behind the ISO1540 (A1 VCC, A0 GND)
 // DS3231 0x68 and EEPROM 0x57 are auto-addressed by their libraries / unused.
 
 /* ---- GSM ----------------------------------------------------------------- */
@@ -100,6 +103,7 @@ String PHONE_NUMBER = "09150424784";    // [CONFIRM] recipient for alerts/report
 String ALERT_NUMBER2 = "";              // second recipient, ALERT texts only and no command rights (SMS ALERTNUM, NVS)
 String USSD_CODE     = "";              // carrier balance code for BAL / the weekly check (SMS USSD, NVS); carrier-specific
 const uint8_t SIM_CHECK_WEEKDAY = 0;    // weekly SIMTEST text goes with this day's report (0 = Sunday)
+const unsigned long SMS_AUTH_REPLY_GAP_MS = 600000UL;   // at most one ERR,AUTH reply per 10 min
 
 /* ---- Columns (spec sec.14.1.4.1) ----------------------------------------- */
 #define NUM_COLUMNS 3
@@ -202,6 +206,8 @@ const float MIX_MAX_PCT      = 95.0f;   // mixing tank overflow guard       [TBD
 /* ---- Battery (INA226) (spec sec.21.1) ------------------------------------ */
 const float BATT_LOW_V       = 11.8f;   // disable fertigation below        [TBD]
 const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD]
+const unsigned long BATT_FLAG_HOLD_MS = 60000;  // below the line this long before a flag sets, so an inverter
+                                                // start's sag cannot flicker it (battFlagHeld)  [CONFIRM]
 
 /* ---- SECONDARY battery: INA226 (R010 shunt) on this I2C bus at INA226_ADDR ------------------- *
  * A 4S Li-ion battery (16.8 V full) that powers ESP1, ESP2, the Nano, the sensors and the relay
@@ -214,8 +220,29 @@ const float BATT_CRIT_V      = 11.2f;   // stop all below                   [TBD
  * (it drives the switch) -- set both together, and only once the hold-up stage that rides the
  * boards through the ~10-20 ms DPDT transfer is fitted. At 0 the INA226 is still read, logged
  * (PWR2) and published, but nothing is blocked or alerted.
- * Calibration follows the bench tool Test Code/Arduino R3/INA226_R010 (same CAL/offset/factor). */
+ * Calibrated with Calibration/ESP1/INA226, whose results load from NVS over these defaults (loadCal). */
 #define SECONDARY_BATT_ENABLED 0
+/* Secondary battery as a BACKUP for a critically low main battery: READY, NOT ACTIVE. At 1: when main
+ * stays below BATT_CRIT_V for BACKUP_TRIGGER_MS with nothing running, ESP1 texts a critical alert (it
+ * does NOT use raiseFault('C'): that E-stops, and the GPIO4 cut would drop the boards straight back to
+ * main), then has ESP2 hold the boards on the secondary. All inverter use is blocked from the alert
+ * until main recovers. It returns to main once main holds BACKUP_MAIN_RECOVER_V for BACKUP_RECOVER_MS,
+ * or when the pack reaches SEC_BATT_CRIT_V or stops being monitored. See backupTick. Needs
+ * SECONDARY_BATT_ENABLED and a trustworthy main voltage (the main INA226 answering, or a calibrated
+ * calBattV), since without one it never triggers. ESP2 holds the matching flag -- set both together.  */
+#define SECONDARY_BACKUP_ENABLED 0
+#if SECONDARY_BACKUP_ENABLED && !SECONDARY_BATT_ENABLED
+#error "SECONDARY_BACKUP_ENABLED needs SECONDARY_BATT_ENABLED"
+#endif
+const float BACKUP_MAIN_RECOVER_V = 12.6f;              // main has recovered at or above this        [CONFIRM]
+const unsigned long BACKUP_TRIGGER_MS  = 60000;         // main critical this long before acting      [CONFIRM]
+const unsigned long BACKUP_RECOVER_MS  = 300000;        // main recovered this long before returning  [CONFIRM]
+const unsigned long BACKUP_ALERT_WAIT_MS = 60000;       // longest wait for the text before switching anyway
+const unsigned long BACKUP_SWITCH_TIMEOUT_MS = 30000;   // ESP2 boot + handshake + settle, with margin
+const unsigned long BACKUP_RESEND_MS   = 3000;          // repeat BATTBK,ON|OFF until ESP2 confirms
+const unsigned long BACKUP_RETRY_MS    = 60000;         // pause before trying again after a failed or lost switch
+const float         SEC_NO_PACK_V      = 5.0f;          // below this it is a wiring fault, not a flat pack
+const float    SEC_SHUNT_OHM        = 0.010f;    // R010 on the module
 const float    SEC_CURRENT_LSB      = 0.00025f;  // 0.25 mA/bit -> 8.192 A full scale
 const uint16_t SEC_INA_CAL          = 2048;      // 0.00512/(LSB*0.010 R); trim x (meter A/INA A) [MEASURE]
 const float    SEC_CURRENT_OFFSET_A = 0.014f;    // no-load reading, subtracted                 [MEASURE]
@@ -229,6 +256,27 @@ const float SEC_BATT_RECOVER_V = 14.0f;          // 3.50 V/cell: allow it again 
 const float SEC_BATT_CRIT_V    = 12.8f;          // 3.20 V/cell: critical alert                  [CONFIRM]
 const unsigned long SEC_READ_MS  = 2000;         // read cadence once found
 const unsigned long SEC_RETRY_MS = 10000;        // re-probe cadence while missing
+
+/* ---- SOLAR + MAIN BATTERY: two INA226 behind an ISO1540 I2C isolator -------------------------- *
+ * An INA226 must share a ground with what it measures, while these boards must not share one with
+ * the main battery (inverter noise, and the P4 DPDT breaks both + and -). So the two modules live on
+ * the main-battery side of an ISO1540: GND = main negative, VCC = a 3.3 V supply on that side. They stay
+ * readable through every inverter run and battery switch, and nothing but the isolator crosses over.
+ * The main INA226 is the first choice for main battery V/I/P; if it stops answering, the opto ADC and
+ * ACS758 take over by themselves. Neither module blocks a run or sends a text: they only measure.
+ * Sign: + = main battery discharging, + = solar producing (swap with *_INVERT if the leads are reversed).
+ * Main shunt: 50 A / 75 mV = 1.5 mOhm. The INA226 tops out at 81.92 mV, so it clips at 54.6 A, harmlessly. */
+const float    SOLAR_SHUNT_OHM   = 0.010f;       // R010 on the module; clips at 8.19 A           [CONFIRM]
+const float    SOLAR_CURRENT_LSB = 0.00025f;     // 0.25 mA/bit
+const float    SOLAR_OFFSET_A    = 0.0f;         // no-load reading, subtracted                   [MEASURE]
+const float    SOLAR_BUS_FACTOR  = 1.000f;       // meter V / INA V                               [MEASURE]
+const bool     SOLAR_INVERT      = false;        // true if IN+/IN- are wired reversed
+const float    MAIN_SHUNT_OHM    = 0.075f / 50.0f;  // shunt bar; the module's own R010 must be REMOVED [CONFIRM]
+const float    MAIN_CURRENT_LSB  = 0.002f;       // 2 mA/bit
+const float    MAIN_OFFSET_A     = 0.0f;         // no-load reading, subtracted                   [MEASURE]
+const float    MAIN_BUS_FACTOR   = 1.000f;       // meter V / INA V                               [MEASURE]
+const bool     MAIN_INVERT       = false;        // true if IN+/IN- are wired reversed
+const unsigned long PWR_INA_READ_MS = 2000;      // read cadence once found; re-probe uses SEC_RETRY_MS
 const unsigned long ESP2_BATT_RETURN_WAIT_MS = 4000;  // keep ESP2 powered for its secondary->main return
                                                       // (1 s delay + <=0.8 s handshake + 0.5 s settle + margin)
 /* Battery-switch reset protection. A switch whose hold-up fails resets the controllers; each such
@@ -240,6 +288,10 @@ const uint8_t       BSW_LATCH_STRIKES = 2;
 const uint32_t      BSW_WINDOW_S      = 86400;      // 24 h (RTC time)
 const unsigned long BSW_QUIET_MS      = 3000;       // SD/radio/GSM quiet window around one switch
 const unsigned long BSW_PENDING_MAX_MS = 10000;     // an unconfirmed switch with no reboot = survived
+// After a boot or a counted reset the hold-up is flat, and retrying at once would be sure to fail and
+// burn the second strike. Time it needs to recharge -- measure it on the rig.             [MEASURE]
+const unsigned long BSW_RECHARGE_MS    = 60000;
+const unsigned long BSW_CUT_SURVIVE_MS = 5000;      // alive this long after a stop = the stop did not reset us
 
 /* ---- Battery CURRENT: ACS758-050B via ADS1115 (replaces the opto ADC) ------ *
  * The GPIO34 opto path logged I=0.00 on all 44,303 samples across 16 days -- battery %, the daily
@@ -254,16 +306,19 @@ const unsigned long BSW_PENDING_MAX_MS = 10000;     // an unconfirmed switch wit
  * Set ACS_DIV to 1.0 only if the divider is genuinely absent.                                     */
 #define ACS_ADDR        0x48        // ADS1115 ADDR -> GND (no clash: LCD 0x27, EEPROM 0x57, RTC 0x68)
 #define ACS_CHANNEL     0           // ACS758 output on A0; A1..A3 unused
-const float ACS_DIV          = 2.0f;    // (R1+R2)/R2 in front of A0                    [MEASURE]
-const float ACS_ZERO_V       = 2.5f;    // sensor output at 0 A = VCC/2 (050B)          [MEASURE]
-const float ACS_SENS_V_PER_A = 0.040f;  // 40 mV/A = ACS758LCB-050B                     [CONFIRM]
+float ACS_DIV          = 2.0f;          // (R1+R2)/R2 in front of A0                    [MEASURE]
+float ACS_ZERO_V       = 2.5f;          // sensor output at 0 A = VCC/2 (050B)          [MEASURE]
+float ACS_SENS_V_PER_A = 0.040f;        // 40 mV/A = ACS758LCB-050B                     [CONFIRM]
+                                        // Not const: NVS "calib" overrides these three (loadCal)
 const uint8_t ACS_PGA        = 1;       // 1 = +/-4.096 V full scale (125 uV/LSB)
 // ThingSpeak Ch3 ("Chem") slot for the battery current. Ch2 "System" is full (all 8 fields).
 // Must stay ABOVE 2 x (enabled columns), since the EC/pH loop claims 2 fields per enabled column.
 const int TS3_CURRENT_FIELD  = 5;       // safe while <=2 columns are enabled  [CONFIRM if C is on]
-bool  acsOk = false;                    // last ADS1115 read succeeded -- a dead ADC must be VISIBLE,
+const int TS3_SOLAR_V_FIELD  = 7;       // free even with all 3 columns on (they take fields 1-6)
+const int TS3_SOLAR_W_FIELD  = 8;
+bool  acsOk = false;                   // last ADS1115 read succeeded -- a dead ADC must be VISIBLE,
                                         // not silently read as 0 A, which is how the opto failure hid
-float battIsigned = 0;                  // signed amps (050B is bidirectional); battI stays magnitude
+float battIsigned = 0;                  // signed amps, + = discharging; battI stays magnitude
 // Mixing-tank chemistry, captured from ESP2's TELE during a run (the tank is empty at idle, so these
 // describe the LAST batch). -1 / 0 stamp = never measured. Published as sensors.waterEC / waterPH.
 float tankEC = -1, tankPH = -1;
@@ -384,7 +439,7 @@ const int   MIN_DOSE_PULSES = 3;         // ~12 mL floor; below this -> skip + l
 // (pulses/mL "SCALE" comes live from the per-channel flow K-factor calKNut[i]/1000, not a constant.)
 // ---- Timed-ceiling backstop (§2.4) ----
 const float CEILING_MARGIN  = 2.0f;      // ceiling_s = 2x expected runtime (LOCKED)
-const float PUMP_FLOWRATE_MLPM[3] = { 50.0f, 50.0f, 50.0f };   // pre-cal default mL/min [MEASURE]
+float PUMP_FLOWRATE_MLPM[3] = { 50.0f, 50.0f, 50.0f };   // pre-cal default mL/min, NVS "calib" overrides [MEASURE]
 // ---- Mixing tank (§1.1): batch volume is VARIABLE; MAX is a ceiling, not the formula input ----
 const float MIXING_TANK_MAX_VOLUME = 50.0f;   // L (safety ceiling)
 const float MIXING_TANK_SAFE_MIN   = 5.0f;    // L (refuse dosing below)
@@ -423,7 +478,9 @@ SoftwareSerial    nanoSerial(NANO_RX_PIN, NANO_TX_PIN);   // EspSoftwareSerial
 HardwareSerial    esp2Serial(1);
 HardwareSerial    simSerial(2);
 
-bool rtcOk = false, sdOk = false;
+bool rtcOk = false, sdOk = false;   // rtcOk: the DS3231 answers AND its time can be trusted (see rtcNow)
+bool rtcChipOk = false;             // the DS3231 answered at boot, so it can at least be set
+bool rtcTimeLost = false;           // it lost power or holds an impossible date: no clock until someone sets it
 
 /* ---- WDT reboot breadcrumb (survives SW_CPU_RESET in RTC RAM) -------------- *
  * g_lastStage holds a one-char marker of the loop section in progress. After a
@@ -767,6 +824,7 @@ volatile bool fbAuthOk = false;                    // last token operation succe
 volatile int  fbAuthHttp = 0;                      // last auth HTTP status
 volatile bool fbSignInPending = false;             // portal/SMS -> netTask: force a password sign-in now
 volatile bool fbCredsPersistPending = false;       // core0 admin form -> core1: persist auth creds
+volatile bool fbTlsResetPending = false;           // SMS (core 1) -> netTask: re-apply the TLS trust policy
 // Auth backoff: a wrong password must NOT be retried every poll (that is credential
 // hammering and Google will rate-limit the account). Same ladder shape as uploadTick().
 const unsigned long FB_AUTH_BACKOFF[4] = { 30000UL, 120000UL, 480000UL, 1800000UL };
@@ -961,6 +1019,11 @@ struct TelemetrySnapshot {
   float npkMoist[NUM_COLUMNS], npkTemp[NUM_COLUMNS];
   bool  npkValid[NUM_COLUMNS];
   float battV, battP, battI;   // battI added for the ACS758 ThingSpeak field (core-0 uploader)
+  float battIsigned_;          // + = discharging (meaningful only with battFromIna_)
+  bool  battIOk_, battFromIna_;              // a current sensor answered / the main INA226 is the source
+  bool  solarOk_;              // solar INA226 answering (0 V at night is still a valid reading)
+  float solarV_, solarI_, solarP_;
+  double chargedWh_;
   // Which pumps are energised, derived on CORE 1 from ESP2's reported stage. Derived here rather
   // than read from run.stage in the uploader: run[] is core-1 state and a char array read from
   // core 0 can tear -- the same cross-core mistake this snapshot exists to prevent.
@@ -984,6 +1047,7 @@ struct TelemetrySnapshot {
   bool     rtcOk_, sdOk_, acsOk_;
   bool     secOk_, secLow_, onSecondary_;           // secondary battery (INA226) + supply in use
   bool     bswLatched_; uint8_t bswStrikes_;        // battery-switch fault latch + strike count
+  uint8_t  bkState_;                                // backup state (BkState)
   float    secV_, secI_, secP_;
   bool     simOk, netReg;
   int      rssi, creg;
@@ -995,6 +1059,7 @@ struct TelemetrySnapshot {
   // way, so the truncation was silent -- 96 gives real headroom without meaningfully affecting RAM.
   char     lastFault[96], lastFaultAt[20];
   char     heldClearReason[16];   // why esp2Held last cleared -- see lastHeldClearReason
+  char     deviceTime[20];        // read on core 1: the RTC shares its I2C bus with core 1's sensors
   // Fault / recovery, so the dashboard can offer the same choices the LCD menu does.
   bool     held, steerRel;
   uint8_t  holdRepeats;
@@ -1109,12 +1174,42 @@ AdcCal calBattV = { 1, { 0.0, 1.0, 0.0, 0.0 } };   // voltage channel (GPIO35)
 bool   battCalLoaded = false;                       // true once NVS "adccal" overrode the defaults
 bool   battVCalLoaded = false;                       // see loadBattCal() and the battery-publish gate below
 float battV = 0, battI = 0, battP = 0;
+bool  battOptoCal = false;                          // the opto channel holds a real calibration (see loadBattCal)
+bool  battFromIna = false;                          // battV/battI came from the main INA226 this tick
+bool  battIOk = false;                              // battI is real: from the main INA226, or from the ACS758
+// The two INA226 behind the ISO1540. Core 1 only; the snapshot carries copies to core 0.
+struct InaMon {
+  const char *name; uint8_t addr; uint16_t cal; float lsb, offsetA, busFactor; bool invert;
+  float minV;                // a reading below this is a wiring fault, not a measurement
+  bool  ok, haveV, noV;      // answering / have a usable reading / below minV (logged once)
+  uint8_t failN;
+  unsigned long lastTryMs, lastReadMs;
+  float v, i, p;
+};
+enum { INA_SOLAR = 0, INA_MAIN = 1, INA_COUNT = 2 };
+InaMon powerIna[INA_COUNT] = {
+  // Solar has no minV: 0 V at night is real.
+  { "SOLAR", SOLAR_INA_ADDR, inaCalFor(SOLAR_SHUNT_OHM, SOLAR_CURRENT_LSB), SOLAR_CURRENT_LSB, SOLAR_OFFSET_A,
+    SOLAR_BUS_FACTOR, SOLAR_INVERT, 0.0f },
+  { "MAIN",  MAIN_INA_ADDR,  inaCalFor(MAIN_SHUNT_OHM,  MAIN_CURRENT_LSB),  MAIN_CURRENT_LSB,  MAIN_OFFSET_A,
+    MAIN_BUS_FACTOR,  MAIN_INVERT,  SEC_NO_PACK_V },
+};
+static inline bool inaUsable(const InaMon &m) { return m.ok && m.haveV; }
 bool  batteryLow = false, batteryCritical = false;
 unsigned long lastInaMs = 0;                         // ADC read throttle (kept name to avoid churn)
 // Secondary battery (INA226). Core 1 only; the snapshot carries copies to core 0.
+uint16_t secInaCal = SEC_INA_CAL;                  // these four: compiled defaults, NVS "calib" overrides (loadCal)
+float    secOffsetA = SEC_CURRENT_OFFSET_A, secBusFactor = SEC_BUS_V_FACTOR;
+bool     secInvert = SEC_INVERT_CURRENT;
 bool  secInaOk = false, secHaveV = false;          // monitor answering / have a reading
 float secV = 0, secI = 0, secP = 0;                // filtered V, signed current, power
 bool  secLow = false, secCrit = false;             // low latch (hysteresis) / critical
+bool  secNoPack = false;                           // the chip answers but sees no pack: wiring or no common ground
+BkState bkState = BK_IDLE;                         // secondary-as-backup state (see backupTick)
+uint8_t tankDosedMask = 0;                         // ESP2 reports a dosed tank left for these columns (INFO,TANK,DOSED)
+bool  bswEstopRestore = false;                     // boot: an E-stop's own cut reset us, so go back into E-stop
+unsigned long bswCutMs = 0;                        // a stop was journaled (bswNoteCut); cleared once we survive it
+char  bswCmdSaved[48] = "";                        // dashboard command id on flash while the boards can be reset
 bool  esp2OnSecondary = false;                     // ESP2 reported INFO,BATT,SECONDARY (boards isolated)
 unsigned long esp2BattWaitUntil = 0;               // ESP2 power-off held for the secondary->main return
 uint8_t  bswPendingDir = 0;        // ESP2 announced a P4 switch not yet confirmed (1 to secondary, 2 to main)
@@ -1130,10 +1225,10 @@ static inline bool battQuietActive() {
   unsigned long u = battQuietUntilMs;
   return u != 0 && (long)(millis() - u) < 0;
 }
-// Energy integration for the daily report (sec.12.1.3). The opto current is MAGNITUDE only, so all
-// energy is counted as consumption (charge/discharge split removed with the INA226).
+// Energy integration for the daily report (sec.12.1.3). See powerTick: discharge only with the shunt bar,
+// every amp on the ACS758 fallback, which is not trusted for direction.
 double energyConsumedWh = 0.0;   // energy today (Wh)
-double energyChargedWh  = 0.0;   // kept for the report format (stays 0)
+double energyChargedWh  = 0.0;   // solar energy today (Wh), from the solar INA226
 bool   prevBattStateLow = false, prevBattStateCrit = false;  // PWR-log-on-change (B3)
 
 /* ---- Daily counters (for report) ----------------------------------------- */
@@ -1289,6 +1384,7 @@ uint8_t       fcSlot  = 0;         // which slot is counting down / running
 // fcPhase first and, if blocked, flashes this instead of arming -- see the render block near the
 // existing "FORCE RUN ARMED" screen.
 bool          forceBlockedFlash   = false;
+bool          forceBlockedLow     = false;            // the flash is for a dose on too small a batch
 unsigned long forceBlockedUntilMs = 0;
 unsigned long fcFireAtMs = 0;      // countdown deadline for FP_WAIT
 // A dashboard-initiated force run now arms this same countdown instead of dispatching immediately,
@@ -1536,6 +1632,9 @@ long dayStamp(const DateTime &dt);
 uint16_t minuteOfDay();
 String tsString();
 void setState(SystemState s);
+static DateTime rtcNow();
+static void rtcClockWasSet();
+void rtcHealthTick();
 void loadConfig();
 void loadCal();
 void pushAllCalToEsp2();
@@ -1621,9 +1720,15 @@ void controlTick();
 bool decideFertigate(int c);
 void powerTick();
 void secBattTick();
+void powerInaTick();
 bool secBattBlocksAc(const char **why = nullptr);
 void bswBoot();
 void bswTick();
+void bswNoteCut(uint8_t kind, int c, int mode);
+void bswCmdJournal();
+void backupTick();
+bool backupHoldsEsp2();
+const char *bkName(BkState s);
 void bswForgetPending();
 void bswClear(const char *by);
 static void bswSavePending(uint8_t dir);
@@ -1728,11 +1833,16 @@ void setup() {
   loadBattCal();                                   // NVS "adccal" overrides the hardcoded defaults if present
 
   // ---- RTC init ----
-  rtcOk = rtc.begin();
-  if (rtcOk && rtc.lostPower()) {
-    // RTC lost time; logging falls back to NODATE until the clock is set.
-    Serial.println(F("WARN: RTC lost power -- backup battery may be dead. Clock cannot persist across reboots."));
-    Serial.println(F("ACTION: Replace DS3231 CR2032 backup battery, then power cycle the ESP32."));
+  rtcChipOk = rtc.begin();
+  if (rtcChipOk) {
+    DateTime n = rtc.now();
+    rtcTimeLost = rtc.lostPower() || !rtcPlausible(n.year(), n.month(), n.day(), n.hour(), n.minute(), n.second());
+    rtcOk = !rtcTimeLost;
+    if (rtcTimeLost) {
+      // No trusted clock: scheduling stops and logs go to NODATE until it is set (rtcHealthTick alerts).
+      Serial.println(F("WARN: RTC lost its time -- backup battery may be dead. Set the clock to resume scheduling."));
+      Serial.println(F("ACTION: Replace the DS3231 CR2032 if this repeats, then Settings > Set Clock or the dashboard."));
+    }
   }
 
   // ---- microSD ----
@@ -1754,7 +1864,7 @@ void setup() {
   loadCal();                          // calibration constants (separate namespace, §A.5)
 
   // ---- UART links ----
-  nanoSerial.begin(NANO_BAUD);
+  nanoSerial.begin(NANO_BAUD, SWSERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN, false, NANO_RX_BUFFER);
   esp2Serial.begin(ESP2_BAUD, SERIAL_8N1, ESP2_RX_PIN, ESP2_TX_PIN);
   gsmBegin();                               // opens UART2; the modem itself comes up from loop()
 
@@ -1792,6 +1902,11 @@ void setup() {
   bswBoot();                                // battery-switch latch + was THIS boot caused by a switch?
   wdtSetup();                               // arm task watchdog (core-1 loop only)
   setState(STARTUP_SYNC);
+  if (bswEstopRestore) {                    // an operator or critical stop must not end because it reset us
+    logEvent("ESP1", "PWR2", "BATTSW|ESTOP_RESTORED");
+    sendSMS("ALERT,CRIT,ESTOP_KEPT,the stop reset the controllers - confirm on the LCD to resume");
+    enterEmergencyStop(false);
+  }
   Serial.println(F("Setup complete -> STARTUP_SYNC"));
 }
 
@@ -1808,13 +1923,17 @@ void loop() {
   g_lastStage = 'G'; pollGSM();
   g_lastStage = 'g'; gsmTxTick();          // bring-up, sends, stored SMS, health queries, watchdog
 
+  g_lastStage = 'y'; rtcHealthTick();      // clock trust: reject bad reads, alert when it needs setting
+
   g_lastStage = 'M'; stateMachineTick();
   g_lastStage = 'C'; controlTick();
   g_lastStage = 'X'; exerciseTick();       // preventive pump exercise (sec.14.9.1)
   g_lastStage = 'f'; forceTick();          // Settings force run: countdown -> gate re-check -> fire
-  g_lastStage = 'P'; powerTick();          // main battery: opto ADC voltage + ACS758 current
+  g_lastStage = 'i'; powerInaTick();       // solar + main battery INA226 behind the ISO1540
+  g_lastStage = 'P'; powerTick();          // main battery: main INA226, else opto ADC + ACS758
   g_lastStage = 'b'; secBattTick();        // secondary battery: INA226 I2C read + run-block policy
   g_lastStage = 'w'; bswTick();            // battery-switch journal expiry + 24 h auto re-arm
+  g_lastStage = 'b'; backupTick();         // secondary as backup for a critical main (compiled out at 0)
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
   g_lastStage = 'p'; esp2PowerTick();      // ESP2 min-on hold + periodic idle heartbeat poll (sec.18.8)
@@ -1958,14 +2077,92 @@ void i2cBusRecover() {
 long dayStamp(const DateTime &dt) {
   return (long)dt.year() * 10000L + (long)dt.month() * 100L + (long)dt.day();
 }
+/* The only way the firmware reads the clock (core 1 only; I2C is not for core 0). An impossible date is
+ * refused, and one that is possible but far from where the clock should be is believed only if a second
+ * read agrees, because garbled bytes can still form a valid date. A refused read answers with the last
+ * good time plus the elapsed millis(), so one bad read cannot look like a new day to the scheduler.
+ * No logging in here: logEvent() stamps its rows through this function. rtcHealthTick() reports. */
+const uint32_t RTC_JUMP_MAX_S = 120;        // further than this from the expected time needs a second read
+const uint8_t  RTC_BAD_LIMIT  = 5;          // consecutive refused reads before the clock stops being trusted
+uint32_t      rtcRefUnix = 0;               // last good reading, and when it was taken
+unsigned long rtcRefMs = 0;
+uint8_t       rtcBadReads = 0;
+uint32_t      rtcRejected = 0;              // refused reads since boot
+bool          rtcJumpPending = false;       // a real jump was accepted; rtcHealthTick logs it
+
+static inline bool rtcDtPlausible(const DateTime &d) {
+  return rtcPlausible(d.year(), d.month(), d.day(), d.hour(), d.minute(), d.second());
+}
+static DateTime rtcNow() {
+  DateTime n = rtc.now();
+  bool good = rtcDtPlausible(n);
+  uint32_t expected = rtcRefUnix ? rtcRefUnix + (millis() - rtcRefMs) / 1000 : 0;
+  if (good && rtcRefUnix && rtcJumped(n.unixtime(), expected, RTC_JUMP_MAX_S)) {
+    DateTime again = rtc.now();
+    good = rtcDtPlausible(again) && !rtcJumped(again.unixtime(), n.unixtime(), 2);
+    if (good) { n = again; rtcJumpPending = true; }
+  }
+  if (good) {
+    rtcRefUnix = n.unixtime(); rtcRefMs = millis(); rtcBadReads = 0;
+    return n;
+  }
+  rtcRejected++;
+  if (rtcBadReads < 255) rtcBadReads++;
+  return rtcRefUnix ? DateTime(expected) : n;
+}
+// Called after every rtc.adjust(). adjust() also clears the DS3231's lost-power flag.
+static void rtcClockWasSet() {
+  rtcTimeLost = false; rtcRefUnix = 0; rtcBadReads = 0;   // a deliberate change is not a jump
+  rtcOk = rtcChipOk;
+}
+// Core 1, ~1 Hz: re-checks the clock even when nothing is logging, and does the reporting rtcNow() cannot.
+void rtcHealthTick() {
+  static unsigned long lastMs = 0, lastBadLogMs = 0, lastAlertMs = 0;
+  static uint32_t loggedRejected = 0;
+  static bool bootReported = false;
+  if (millis() - lastMs < 1000) return;
+  lastMs = millis();
+
+  if (!bootReported) {                       // setup() runs before alerts can go out
+    bootReported = true;
+    if (!rtcChipOk)        raiseFault('M', "RTC_MISSING", "DS3231|no schedule until fixed");
+    else if (rtcTimeLost)  raiseFault('M', "RTC_INVALID", "LOST_TIME|set the clock to resume the schedule");
+  }
+  if (!rtcChipOk || rtcTimeLost) return;
+
+  rtcNow();
+  bool trusted = rtcBadReads < RTC_BAD_LIMIT;
+  if (trusted != rtcOk) {                    // set first: the fault below stamps its row through tsString()
+    rtcOk = trusted;
+    if (trusted) {
+      rtcRefUnix = 0;
+      logEvent("ESP1", "STATE", "RTC|RECOVERED");
+    } else if (!lastAlertMs || millis() - lastAlertMs >= 3600000UL) {   // a flapping bus must not storm SMS
+      lastAlertMs = millis();
+      raiseFault('M', "RTC_INVALID", "BAD_READS|no schedule until it reads correctly");
+    } else {
+      logEvent("ESP1", "STATE", "RTC|UNTRUSTED");
+    }
+  }
+  if (rtcJumpPending) {
+    rtcJumpPending = false;
+    logEvent("ESP1", "STATE", "RTC|JUMP_CONFIRMED|" + tsString());
+  }
+  if (rtcRejected != loggedRejected && millis() - lastBadLogMs >= 60000UL) {
+    lastBadLogMs = millis();
+    logEvent("ESP1", "STATE", "RTC|BAD_READS|total=" + String(rtcRejected));
+    loggedRejected = rtcRejected;
+  }
+}
+
 uint16_t minuteOfDay() {
   if (!rtcOk) return 0;
-  DateTime now = rtc.now();
+  DateTime now = rtcNow();
   return now.hour() * 60 + now.minute();
 }
 String tsString() {
   if (!rtcOk) return String("0000-00-00 00:00:00");
-  DateTime n = rtc.now();
+  DateTime n = rtcNow();
   char b[20];
   snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
            n.year(), n.month(), n.day(), n.hour(), n.minute(), n.second());
@@ -2039,14 +2236,16 @@ void loadConfig() {
 /* =============================================================================
  *  CALIBRATION NVS + DISTRIBUTION  (companion spec §A.5.1)
  * ========================================================================== */
+static void loadPowerCal();
 void loadCal() {
   prefsCal.begin("calib", false);                 // separate namespace; Restore-Defaults never touches it
   for (int c = 0; c < NUM_COLUMNS; c++) {
     String k = "s" + String(c);
     // "a2"/"w2" keys (bumped from "a"/"w"): a stale pre-remap on-device soil cal no longer overrides the
     // measured compiled defaults -- the correct endpoints apply on flash until a fresh cal is saved.
-    calSoilAir[c]   = prefsCal.getInt((k + "a2").c_str(), calSoilAir[c]);
-    calSoilWater[c] = prefsCal.getInt((k + "w2").c_str(), calSoilWater[c]);
+    int savedAir   = prefsCal.getInt((k + "a2").c_str(), calSoilAir[c]);
+    int savedWater = prefsCal.getInt((k + "w2").c_str(), calSoilWater[c]);
+    if (soilCalOk(savedAir, savedWater, (int)CAL_MIN_SPAN_ADC)) { calSoilAir[c] = savedAir; calSoilWater[c] = savedWater; }
     calNpkOff[c][0] = prefsCal.getFloat((k + "N").c_str(), 0);
     calNpkOff[c][1] = prefsCal.getFloat((k + "P").c_str(), 0);
     calNpkOff[c][2] = prefsCal.getFloat((k + "K").c_str(), 0);
@@ -2070,6 +2269,46 @@ void loadCal() {
   calPhM = prefsCal.getFloat("phM", calPhM); calPhB = prefsCal.getFloat("phB", calPhB);
   calEcM = prefsCal.getFloat("ecM", calEcM); calEcB = prefsCal.getFloat("ecB", calEcB);
   calAcs712Zero = prefsCal.getFloat("acs", calAcs712Zero);
+  loadPowerCal();
+}
+
+// One INA226's trims from Calibration/ESP1/INA226. A set that is not believable is ignored whole, so a
+// corrupted value leaves the compiled defaults rather than a silently wrong current.
+static void loadInaTrim(const char *key, float nominalOhm, float lsb, uint16_t &cal, float &offsetA, float &busFactor, bool &invert) {
+  String k(key);
+  float ohm = prefsCal.getFloat((k + "O").c_str(), 0.00512f / (cal * lsb));
+  float off = prefsCal.getFloat((k + "A").c_str(), offsetA);
+  float bus = prefsCal.getFloat((k + "B").c_str(), busFactor);
+  if (!inaTrimOk(ohm, nominalOhm, lsb, off, bus)) {
+    Serial.printf("CAL: INA226 %s trims in NVS are out of range, using compiled values\n", key);
+    return;
+  }
+  cal = inaCalFor(ohm, lsb); offsetA = off; busFactor = bus;
+  invert = prefsCal.getBool((k + "I").c_str(), invert);
+}
+
+// Everything the bench tools save for the power side and the dosing pumps. Keys are listed in
+// Calibration/README.md, and CalStore can read or clear them.
+static void loadPowerCal() {
+  InaMon &sol = powerIna[INA_SOLAR], &mn = powerIna[INA_MAIN];
+  loadInaTrim("iSol",  SOLAR_SHUNT_OHM, sol.lsb, sol.cal, sol.offsetA, sol.busFactor, sol.invert);
+  loadInaTrim("iMain", MAIN_SHUNT_OHM,  mn.lsb,  mn.cal,  mn.offsetA,  mn.busFactor,  mn.invert);
+  loadInaTrim("iSec",  SEC_SHUNT_OHM, SEC_CURRENT_LSB, secInaCal, secOffsetA, secBusFactor, secInvert);
+
+  float div  = prefsCal.getFloat("acsDiv",  ACS_DIV);
+  float zero = prefsCal.getFloat("acsZero", ACS_ZERO_V);
+  float sens = prefsCal.getFloat("acsSens", ACS_SENS_V_PER_A);
+  if (calInRange(div, 0.999f, 20.0f) && calInRange(zero, 0.1f, 5.5f) && calInRange(sens, 0.002f, 0.2f)) {
+    ACS_DIV = div; ACS_ZERO_V = zero; ACS_SENS_V_PER_A = sens;
+  } else Serial.println("CAL: ACS758 values in NVS are out of range, using compiled values");
+
+  const char *PUMP_KEY[3] = { "pumpA", "pumpB", "pumpC" };
+  for (int i = 0; i < 3; i++) {
+    float r = prefsCal.getFloat(PUMP_KEY[i], PUMP_FLOWRATE_MLPM[i]);
+    // A divisor in every dose's timed ceiling, so an unusable value must never get this far.
+    if (calInRange(r, 1.0f, 5000.0f)) PUMP_FLOWRATE_MLPM[i] = r;
+    else Serial.printf("CAL: %s in NVS is out of range, using %.1f mL/min\n", PUMP_KEY[i], PUMP_FLOWRATE_MLPM[i]);
+  }
 }
 
 // Push every ESP2-owned calibration constant (baseline after any ESP2 reset, §A.5.1 #2).
@@ -2120,6 +2359,8 @@ void setActuationsEnabled(bool on, const char *why) {
     // (STOP_ALL to ESP2, run UI closed, forceCmdId/forceMask cleared, dashboard command resolved).
     forceAbort("ACTUATIONS_DISABLED");
     if (wo.active || pendingRun.active) cancelRun(-1, "ACTUATIONS_DISABLED");
+    if (uiMode == UI_TEST) settingsLeaveToData(); // LCD Testing drives relays directly: end it (Calibration
+                                                  // stays open for its sensors; calHoldTick refuses the prime)
     if (pendingExercise.active) {                 // a pump exercise is an actuation too (cancelRun does not own it)
       sendEsp2("STOP_ALL");
       pendingExercise.active = false; pendingExercise.idx = -1; pendingExercise.sent = false; pendingExercise.acked = false;
@@ -2699,6 +2940,7 @@ void handleEsp2Response(const String &payload) {
     logEvent("ESP2", "RESP", payload);
     esp2CommRecovered();                                         // any READY = link alive -> clear COMM_LOST latch
     esp2OnSecondary = false;                                     // a fresh ESP2 boots with P4 off
+    tankDosedMask = 0;                                           // its INFO,TANK,DOSED follows if one is left
     if (bswPendingDir) {                                         // rebooted mid-switch: the switch reset it
       uint8_t dir = bswPendingDir;
       bswPendingDir = 0; bswSavePending(0); battQuietUntilMs = 0;
@@ -2747,7 +2989,37 @@ void handleEsp2Response(const String &payload) {
   }
   if (resp == "STATUS") return;                                // heartbeat
   if (resp == "INFO") {                                       // e.g. INFO,IDLE_RESET (self-heal notice)
+    // Repeated each heartbeat while it is true, so handled before the log line and logged on change only.
+    if (arg.startsWith("TANK,DOSED,")) {
+      uint8_t m = (uint8_t)(arg.substring(11).toInt() & 0x07);
+      if (m != tankDosedMask) {
+        tankDosedMask = m;
+        logEvent("ESP2", "RESP", payload + "|finishing this batch first");
+      }
+      return;
+    }
     logEvent("ESP2", "RESP", payload);
+    if (arg.startsWith("DOSE_CARRY,")) {                      // a batch dosed for one column went to another
+      raiseFault('M', "DOSE_CARRY", (String("mask=") + arg.substring(11) + "|no extra dose added").c_str());
+      return;
+    }
+    // A fault whose own P4 drop reset the boards before its reply got out. The hold is gone, so report
+    // it here and skip the column for today, as a STOP reply does: re-running into the same fault would
+    // only burn the next strike. A forced run can still retry it.
+    if (arg.startsWith("FAULT_LOST,")) {
+      sendEsp2("BATTSW,FACK");
+      static String lastLost = "";
+      static unsigned long lastLostMs = 0;
+      if (arg == lastLost && millis() - lastLostMs < 120000UL) return;   // only our FACK was lost
+      lastLost = arg; lastLostMs = millis();
+      int c1 = arg.indexOf(',', 11), c2 = (c1 > 0) ? arg.indexOf(',', c1 + 1) : -1;
+      if (c2 > 0) {
+        uint8_t m = (uint8_t)(arg.substring(c1 + 1, c2).toInt() & 0x07);
+        for (int b = 0; b < NUM_COLUMNS; b++) if (m & (1 << b)) col[b].lastServicedStamp = currentDayStamp;   // RAM only
+        raiseFault('M', arg.substring(11, c1).c_str(), (arg.substring(c2 + 1) + "|BOARD_RESET|skipped today").c_str());
+      }
+      return;
+    }
     // Secondary-battery switch notices: track which battery the boards are on. MAIN also releases a
     // power-off that was being held for exactly this return (see esp2SetPower).
     if (arg.startsWith("BATT,SWITCHING,")) {
@@ -2757,6 +3029,7 @@ void handleEsp2Response(const String &payload) {
       logFlush(true);
       if (bswPendingDir != dir) bswSavePending(dir);
       bswPendingDir = dir; bswPendingMs = millis();
+      bswCmdJournal();                                        // before GO: the switch may be the end of this boot
       battQuietUntilMs = millis() + BSW_QUIET_MS;
       sendEsp2("BATTSW,GO");
       return;
@@ -2934,6 +3207,7 @@ void handleEsp2Response(const String &payload) {
       lastPumpUseMs[0] = millis(); lastPumpUseMs[1] = millis();
       if (wo.fertigate) lastPumpUseMs[2] = millis();
       wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
+      tankDosedMask = 0;               // ESP2 cleared its dose journal when it finished this run
       if (sysState == ACTIVE_STATE) setState(IDLE_STATE);
       esp2SetPower(false);             // run complete -> ESP2 off (idle power-saving, sec.18.8)
       lastHoldCode = ""; sameHoldN = 0; steerRelease = false;   // run completed -> clear the re-hold guard
@@ -3228,17 +3502,14 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
   if (primary >= NUM_COLUMNS) return;
 
   bool fert = (doseMl[0] > 0.0f || doseMl[1] > 0.0f || doseMl[2] > 0.0f);
-  if (fert) {
-    float batchV = liters * (1.0f - FLUSH_PCT / 100.0f);
-    // Same floor calcDose() enforces for the scheduled path (MIXING_TANK_SAFE_MIN) -- previously
-    // unchecked on this path, so a FORCE run (dashboard, or the LCD editor which clamps down to
-    // 0.5L) could dose nutrient into a batch both firmwares' own constants call unsafe, with no
-    // refusal anywhere in the protocol.
-    if (batchV < MIXING_TANK_SAFE_MIN) {
-      logEvent("ESP1", "ACT", "FORCE|BLOCKED|BATCH_LOW");
-      if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "batch too small to dose safely -- raise liters or remove nutrients");
-      return;
-    }
+  // Same floor calcDose() enforces for the scheduled path (MIXING_TANK_SAFE_MIN) -- previously
+  // unchecked on this path, so a FORCE run (dashboard, or the LCD editor which clamps down to
+  // 0.5L) could dose nutrient into a batch both firmwares' own constants call unsafe, with no
+  // refusal anywhere in the protocol.
+  if (!forceBatchOk(liters, FLUSH_PCT, MIXING_TANK_SAFE_MIN, doseMl[0], doseMl[1], doseMl[2])) {
+    logEvent("ESP1", "ACT", "FORCE|BLOCKED|BATCH_LOW");
+    if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "batch too small to dose safely -- raise liters or remove nutrients");
+    return;
   }
   String cols;
   for (int b = 0; b < NUM_COLUMNS; b++) if (mask & (1 << b)) cols += (char)('A' + b);
@@ -3656,11 +3927,12 @@ void netHealthTick() {
  * uptime while the timestamp stays all-zero, and ONLY when truly idle with nothing pending -- never
  * mid-run, mid-fault-hold, or while the operator is in a menu / the WiFi portal.
  * The 24 h clock is uptime-based on purpose: with a dead RTC there is no calendar day to key off, and
- * millis() resets on reboot, so the next attempt is naturally ~24 h later (no boot loop).            */
+ * millis() resets on reboot, so the next attempt is naturally ~24 h later (no boot loop).
+ * Not for a clock that merely lost its time: the chip works, so only setting it helps.               */
 const unsigned long RTC_DEAD_REBOOT_MS = 86400000UL;   // 24 h of continuous all-zero timestamp
 unsigned long rtcDeadSinceMs = 0;                       // 0 = timestamp currently valid
 void rtcDeadRebootTick() {
-  if (rtcOk) { rtcDeadSinceMs = 0; return; }            // timestamp valid -> reset the clock
+  if (rtcOk || rtcTimeLost) { rtcDeadSinceMs = 0; return; }   // timestamp valid, or a reboot cannot fix it
   if (rtcDeadSinceMs == 0) { rtcDeadSinceMs = millis(); return; }   // start the 24 h clock
   if (millis() - rtcDeadSinceMs < RTC_DEAD_REBOOT_MS) return;
   // Idle-only, nothing pending, operator not busy -> otherwise wait and retry on a later tick.
@@ -3755,6 +4027,9 @@ void esp2SetPower(bool on, bool force) {
     return;
   }
   if (!esp2Powered) { esp2OffPending = false; return; }
+  // ESP2 is holding the boards on the backup battery. Turning it off now is what would put them on the
+  // flat main battery; backupTick decides when that is allowed. force (E-stop) still cuts.
+  if (!force && backupHoldsEsp2()) { esp2OffPending = false; return; }
 #if SECONDARY_BATT_ENABLED
   // ESP2 has the boards on the secondary and returns them to main ~1 s after the inverter stops.
   // Cutting its power now would drop the DPDT at once instead, so hold a graceful off until it
@@ -3801,7 +4076,10 @@ void esp2PowerTick() {
     if (wo.active || pendingRun.active || pendingExercise.active || esp2Held) esp2OffPending = false;
     else esp2SetPower(false);
   }
-  if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held || esp2CommLost) { esp2PollActive = false; return; }
+  // uiMode + diagRemoteUntilMs: Calibration, Sensor Diag and a remote sweep all use ESP2 at IDLE_STATE. A
+  // poll finishing underneath one would power ESP2 off in the middle of it.
+  if (sysState != IDLE_STATE || pendingRun.active || pendingExercise.active || esp2Held || esp2CommLost ||
+      uiMode != UI_DATA || diagRemoteUntilMs || backupHoldsEsp2()) { esp2PollActive = false; return; }
   unsigned long interval = isNight() ? ESP2_IDLE_POLL_NIGHT_MS : ESP2_IDLE_POLL_DAY_MS;
   if (!esp2PollActive) {
     if (millis() - lastEsp2Ms < interval) return;          // heard from ESP2 recently -> no poll needed
@@ -3885,7 +4163,9 @@ static void gsmSetBaud(uint32_t baud) { simSerial.updateBaudRate(baud); }
 static void gsmLog(const char *detail) { logEvent("GSM", "GSM", detail); }
 
 static void gsmOnSms(const char *sender, const char *body) {
-  logEvent("GSM", "GSM", String("RX|") + body);
+  char safe[GSM_BODY_MAX];
+  gsmSafeLogBody(body, safe, sizeof(safe));          // this row reaches the SD, Supabase and the dashboard
+  logEvent("GSM", "GSM", String("RX|") + safe);
   replyTarget = sender;
   handleSms(body);                                   // replies enqueue with replyTarget (the sender)
   replyTarget = "";                                  // back to owner PHONE_NUMBER for autonomous msgs
@@ -3924,7 +4204,19 @@ void handleSms(const String &body) {
   // Owner-gate EVERY command: only the configured owner number may command the system (STATUS/NET/
   // SUMMARY included). senderIsOwner() returns true for internally-generated calls (replyTarget empty,
   // e.g. the deferred-config replay), so those still pass. Non-owner -> ERR,AUTH.
-  if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+  if (!senderIsOwner()) {
+    // Every reply costs load. Short codes and promo senders get none (a failed reply to one also counts
+    // against the modem watchdog), and anyone else at most one per SMS_AUTH_REPLY_GAP_MS, so a stranger
+    // cannot drain the SIM by texting it. A mistyped owner number still gets told.
+    static unsigned long lastAuthReplyMs = 0;
+    int digits = 0;
+    for (unsigned i = 0; i < replyTarget.length(); i++) if (isDigit(replyTarget[i])) digits++;
+    if (digits >= 9 && (!lastAuthReplyMs || millis() - lastAuthReplyMs >= SMS_AUTH_REPLY_GAP_MS)) {
+      lastAuthReplyMs = millis();
+      sendSMS("ERR,AUTH");
+    } else logEvent("GSM", "SMS_ERR", "AUTH|NO_REPLY");
+    return;
+  }
 
   // Defer a remote config-write that collides with an open LOCAL edit (companion spec §B.3.1):
   // apply it once the operator finishes the edit, so neither silently overwrites the other.
@@ -4058,7 +4350,8 @@ void handleSms(const String &body) {
       String v = rest.substring(4); v.trim();
       if (!v.equalsIgnoreCase("ON") && !v.equalsIgnoreCase("OFF")) { sendSMS("ERR,FBASE,FORMAT"); return; }
       xSemaphoreTake(netMux, portMAX_DELAY); fbPinCa = v.equalsIgnoreCase("ON"); xSemaphoreGive(netMux);
-      fbResetTls();
+      fbTlsResetPending = true;                         // netTask owns the TLS client; tearing it down from
+                                                        // here could free it in the middle of a request
       fbSignInPending = true; fbAuthFails = 0; fbAuthNextTryMs = 0;
       saveFbAuth();
       logEvent("ESP1", "CFG", String("FBASE|TLS|") + (fbPinCa ? "PIN" : "INSECURE"));
@@ -4107,7 +4400,7 @@ void handleSms(const String &body) {
     int c1 = b.indexOf(',');
     if (c1 >= 0) { String d = b.substring(c1 + 1); d.trim(); if (d.length() == 8) stamp = d.toInt(); }
     else if (rtcOk && currentDayStamp > 0) {             // no arg -> yesterday
-      DateTime y = rtc.now() - TimeSpan(1, 0, 0, 0);
+      DateTime y = rtcNow() - TimeSpan(1, 0, 0, 0);
       stamp = dayStamp(y);
     }
     xSemaphoreTake(netMux, portMAX_DELAY); bool suHave = supaUrl.length() > 0; xSemaphoreGive(netMux);
@@ -4237,8 +4530,8 @@ void handleSms(const String &body) {
   for (int i = 0; i <= b.length() && n < MAXT; i++) {
     if (i == b.length() || b[i] == ',') { tok[n++] = b.substring(start, i); start = i + 1; }
   }
-  if (n < 2) { sendSMS("ERR,PARSE"); return; }
   String k0 = tok[0]; k0.toUpperCase();
+  if (n < 2 && k0 != "WIFIPORTAL") { sendSMS("ERR,PARSE"); return; }   // the only keyword valid on its own here
 
   // resolve column index from COL_A/B/C
   auto colIdx = [&](const String &s) -> int {
@@ -4269,6 +4562,7 @@ void handleSms(const String &body) {
   if (k0 == "SET") {
     int c = colIdx(tok[1]);
     if (c < 0) { sendSMS("ERR,COL"); return; }
+    if (n < 4) { sendSMS("ERR,SET,FORMAT"); return; }    // or the reply would say ACK with nothing changed
     String t2 = tok[2]; t2.toUpperCase();
     if (t2 == "PRESET") {                   // SET,COL_A,PRESET,NAME
       String pn = tok[3]; pn.toUpperCase();
@@ -4436,8 +4730,12 @@ void sendDailyReport() {
   r += ",FLT,C" + String(faultsToday[0]) + "M" + String(faultsToday[1]) + "m" + String(faultsToday[2]);
   r += ",RST," + String(nanoResetsToday);
   r += ",ST," + String(stateLabel(sysState, actuationsDisabled));
-  r += ",BAT," + String(battV, 1) + "V";
+  r += ",BAT," + (battVCalLoaded ? String(battV, 1) + "V" : String("--"));
   r += ",BAT2," + ((secInaOk && secHaveV) ? String(secV, 1) + "V" + (secLow ? "LOW" : "") : String("--"));
+  r += ",SOL," + (inaUsable(powerIna[INA_SOLAR]) ? String(powerIna[INA_SOLAR].v, 1) + "V" + String(powerIna[INA_SOLAR].i, 1) + "A" : String("--"));
+#if SECONDARY_BACKUP_ENABLED
+  if (bkState != BK_IDLE) r += ",BKUP," + String(bkName(bkState));
+#endif
   // Daily energy (sec.12.1.3): integrated discharge (CONS) + charge (CHG), Wh.
   r += ",CONS," + String((int)(energyConsumedWh + 0.5)) + "Wh";
   r += ",CHG," + String((int)(energyChargedWh + 0.5)) + "Wh";
@@ -4459,6 +4757,16 @@ static int splitPipe(const String &s, String *out, int maxn) {
 static int colFromTag(const String &t) {
   for (int j = 0; j < NUM_COLUMNS; j++) if (t == String(COL_TAG[j])) return j;
   return -1;
+}
+// Add a run's total to the columns named by "COL_A" / "COL_AB". One tank and one meter feed them all, so
+// a shared total is split evenly -- the same estimate the live daily tally makes in handleEsp2Response.
+static void sumAddToCols(float *totals, const String &tag, float value) {
+  int n = (int)tag.length() - 4;
+  if (n <= 0) return;
+  for (int i = 0; i < n; i++) {
+    int c = colFromTag(String(tag[4 + i]));
+    if (c >= 0) totals[c] += value / n;
+  }
 }
 // Record an error code once (with its first timestamp) for the FULL dedup list.
 static void sumAddError(const String &code, const String &hhmm) {
@@ -4511,7 +4819,7 @@ static void summaryParseLine(const String &ln) {
     }
     return;                                          // TANK/LIGHT not aggregated
   }
-  if (type == "PWR") {                               // INA226|V=..|I=..|P=..|CONS=..Wh|CHG=..Wh
+  if (type == "PWR") {                               // BATT|V=..|I=..|P=..|SRC=..|CONS=..Wh|CHG=..Wh
     String f[8]; int nf = splitPipe(detail, f, 8);
     float v = 0, p = 0; bool haveV = false, haveP = false;
     for (int i = 1; i < nf; i++) {
@@ -4546,19 +4854,23 @@ static void summaryParseLine(const String &ln) {
     code = "R:" + detail;
   }
   else if   (type == "DOSE")  {                      // NUT_A|target|measured|COL_A
-    sumDose++;
+    // Only ESP2's measured results count. ESP1 logs its plan under the same type (NUT_A|int=..|del=..,
+    // SUBRES, BATCH_LOW), and counting those reported doses that were skipped or never pumped.
     String f[4]; int nf = splitPipe(detail, f, 4);
-    if (nf >= 4) { int c = colFromTag(f[3].substring(f[3].length() - 1)); if (c >= 0) sumNutTot[c] += f[2].toFloat(); }
+    if (nf < 4 || !f[3].startsWith("COL_")) return;
+    sumDose++;
+    sumAddToCols(sumNutTot, f[3], f[2].toFloat());
     code = "D:" + detail;
   }
   else if   (type == "ACT") {                        // IRRIGATION|START|COL_A or ...|STOP|COL_A|W=3.2
     if      (detail.startsWith("FERTIGATION") && detail.indexOf("START") >= 0) sumFert++;
     else if (detail.startsWith("IRRIGATION")  && detail.indexOf("START") >= 0) sumIrr++;
     int wi = detail.indexOf("W=");
-    if (wi >= 0) {                                    // STOP carries delivered litres (log enhancement)
+    // STOP only: it carries the delivered litres. A force run's START row has a W= too, the volume it
+    // was asked for, and counting both reported that run's water twice.
+    if (wi >= 0 && detail.indexOf("|STOP|") >= 0) {
       String f[6]; int nf = splitPipe(detail, f, 6);
-      int c = -1; for (int i = 0; i < nf; i++) if (f[i].startsWith("COL_")) c = colFromTag(f[i].substring(f[i].length() - 1));
-      if (c >= 0) sumWaterTot[c] += detail.substring(wi + 2).toFloat();
+      for (int i = 0; i < nf; i++) if (f[i].startsWith("COL_")) sumAddToCols(sumWaterTot, f[i], detail.substring(wi + 2).toFloat());
     }
     code = "A:" + detail;
   } else if (type == "STATE" && detail.indexOf("_SET") >= 0) {
@@ -4581,7 +4893,7 @@ static long resolveSummaryDay(const String &arg) {
   if (a == "NODATE")                   return 0;
   if (a == "YESTERDAY") {
     if (!rtcOk) return 0;
-    DateTime y = rtc.now() - TimeSpan(1, 0, 0, 0);     // correct month/year rollover
+    DateTime y = rtcNow() - TimeSpan(1, 0, 0, 0);      // correct month/year rollover
     return dayStamp(y);
   }
   if (a.length() == 8) { long v = a.toInt(); if (v > 20000000L) return v; }   // explicit YYYYMMDD
@@ -4688,7 +5000,7 @@ static void buildFullReport() {
 }
 
 // Non-blocking FSM: open -> incremental read (bounded/tick) -> build -> stream SMS paced
-// to the queue so an uncapped FULL report never overflows the 8-slot queue or stalls the WDT.
+// to the queue so an uncapped FULL report never overflows the SMS queue or stalls the WDT.
 void summaryTick() {
   const int SEG = 140;                                  // each SMS under the 160-char GSM7 limit
   switch (summaryStage) {
@@ -4900,7 +5212,19 @@ void controlTick() {
 
   uint16_t mod = minuteOfDay();
 
-  for (int c = 0; c < NUM_COLUMNS; c++) {
+  // A dosed tank left behind by a reset goes first, to the column it was mixed for, whatever its window
+  // or soil reading says now: that batch has nowhere else to go (the tank has no drain) and the next
+  // column would otherwise inherit it. ESP2 doses only what is still owed. Snoozed, disabled and
+  // skipped-today columns still pass: the operator's choice wins over finishing the batch. Not at
+  // night: nobody expects pumps then, and the batch keeps until morning.
+  uint8_t dosedNow = isNight() ? 0 : tankDosedMask;
+  int order[NUM_COLUMNS], orderN = 0;
+  for (int c = 0; c < NUM_COLUMNS; c++) if (dosedNow & (1 << c)) order[orderN++] = c;
+  for (int c = 0; c < NUM_COLUMNS; c++) if (!(dosedNow & (1 << c))) order[orderN++] = c;
+
+  for (int oi = 0; oi < orderN; oi++) {
+    int c = order[oi];
+    bool finishDosed = dosedNow & (1 << c);
     if (!COLUMN_ENABLED[c]) continue;                              // config, not a fault -> no CTRL log spam
     // Operator (or the auto-cancel breaker) suppressed this column for a while. Logged like every
     // other skip reason so the CSV shows why a due column was passed over.
@@ -4912,7 +5236,7 @@ void controlTick() {
     // schedule axis: AUTO uses the default window, MANUAL uses the operator-set one (sec.18.10.7.2)
     uint16_t ws = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_START[c] : DEF_WIN_START[c];
     uint16_t we = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_END[c]   : DEF_WIN_END[c];
-    if (mod < ws || mod > we) {                                    // outside service window
+    if (!finishDosed && (mod < ws || mod > we)) {                  // outside service window
       ctrlNote(c, "OUTSIDE_WINDOW|now=" + hhmm(mod) + "|win=" + hhmm(ws) + "-" + hhmm(we));
       continue;
     }
@@ -4926,8 +5250,8 @@ void controlTick() {
       ctrlNote(c, "NANO_STALE");
       continue;
     }
-    if (sensor.soil[c] < 0) { ctrlNote(c, "SOIL_INVALID"); continue; }   // invalid soil (faulted elsewhere)
-    if (sensor.soil[c] >= soilStartPct) {                          // not dry enough
+    if (!finishDosed && sensor.soil[c] < 0) { ctrlNote(c, "SOIL_INVALID"); continue; }   // invalid soil (faulted elsewhere)
+    if (!finishDosed && sensor.soil[c] >= soilStartPct) {          // not dry enough
       ctrlNote(c, "NOT_DRY|soil=" + String(sensor.soil[c]) + ">=" + String(soilStartPct));
       continue;
     }
@@ -4938,8 +5262,8 @@ void controlTick() {
       if (!resLowLatched) { resLowLatched = true; raiseFault('M', "RES_LOW", "RESERVOIR"); }
       continue;
     }
-    bool fert = decideFertigate(c);
-    ctrlNote(c, fert ? "DUE->FERTIGATE" : "DUE->IRRIGATE");        // column is being serviced now
+    bool fert = finishDosed || decideFertigate(c);                 // a dosed batch still needs its mix and flush
+    ctrlNote(c, finishDosed ? "DUE->FINISH_DOSED" : fert ? "DUE->FERTIGATE" : "DUE->IRRIGATE");   // column is being serviced now
 #if BATTERY_SAFETY_ENABLED
     if (batteryLow) fert = false;                                  // low battery -> irrigation only (READY, not active)
 #endif
@@ -5103,6 +5427,7 @@ void loadBattCal() {
   bool placeholderV = (calBattV.degree == 1 && calBattV.coef[0] == 0.0 && calBattV.coef[1] == 1.0 &&
                        calBattV.coef[2] == 0.0 && calBattV.coef[3] == 0.0);
   if (!placeholderV) battVCalLoaded = true;
+  battOptoCal = battVCalLoaded;                        // battVCalLoaded also goes true for the main INA226
   Serial.printf("Battery ADC cal: %s\n", battCalLoaded ? "loaded from NVS"
                                        : battVCalLoaded ? "using compiled coefficients"
                                                         : "using placeholder defaults (calibrate!)");
@@ -5150,18 +5475,27 @@ static bool acsReadVolts(float &v) {
 }
 
 void readBatteryAdc() {
-  battV = (float)applyPoly(calBattV, readAdcTrimmed(PIN_BATT_V));
-  // Current now comes from the ACS758 via the ADS1115, NOT the opto ADC on GPIO34 (which read 0.00 A
-  // on every sample for 16 days). On an I2C failure hold the last value and clear acsOk so the fault
-  // is visible on the Diag page -- reporting 0 A would repeat exactly the failure this replaces.
+  // The ACS758 is read either way, so a dead ADC still shows on the Diag page while the INA226 is in use.
   float vAdc;
   acsOk = acsReadVolts(vAdc);
-  if (acsOk) {
-    battIsigned = (vAdc * ACS_DIV - ACS_ZERO_V) / ACS_SENS_V_PER_A;   // signed: 050B is bidirectional
-    // Magnitude only, per CLAUDE.md: all energy counts as consumption, no charge/discharge split.
-    // The sensor CAN now tell the two apart (battIsigned) -- restoring that split is a separate
-    // decision against a documented design choice, so it is deliberately not taken here.
+  const InaMon &m = powerIna[INA_MAIN];
+  battFromIna = inaUsable(m);
+  if (battFromIna) {
+    // The shunt bar behind the ISO1540: isolated, signed, and needs no opto calibration.
+    battV = m.v; battIsigned = m.i;
     battI = fabsf(battIsigned);
+    battIOk = true; battVCalLoaded = true;
+  } else {
+    battVCalLoaded = battOptoCal;
+    battV = (float)applyPoly(calBattV, readAdcTrimmed(PIN_BATT_V));
+    // Current comes from the ACS758 via the ADS1115, NOT the opto ADC on GPIO34 (which read 0.00 A on
+    // every sample for 16 days). On an I2C failure hold the last value and clear acsOk so the fault is
+    // visible on the Diag page -- reporting 0 A would repeat exactly the failure this replaces.
+    if (acsOk) {
+      battIsigned = (vAdc * ACS_DIV - ACS_ZERO_V) / ACS_SENS_V_PER_A;   // signed: 050B is bidirectional
+      battI = fabsf(battIsigned);
+    }
+    battIOk = acsOk;
   }
   battP = battV * battI;
 }
@@ -5171,8 +5505,13 @@ void readBatteryAdc() {
 void batterySafetyTick() {
 #if BATTERY_SAFETY_ENABLED
   static bool wasLow = false, wasCrit = false;
+#if !SECONDARY_BACKUP_ENABLED
+  // With the backup live, backupTick owns a critical main: this E-stop's GPIO4 cut would drop the boards
+  // onto the flat main battery at the very moment the backup is meant to take over.
   if (batteryCritical && !wasCrit) raiseFault('C', "BATTERY_CRITICAL", "BATT");   // -> enterEmergencyStop
-  else if (batteryLow && !wasLow)  raiseFault('M', "BATTERY_LOW", "BATT");
+  else
+#endif
+  if (batteryLow && !wasLow)       raiseFault('M', "BATTERY_LOW", "BATT");
   wasLow = batteryLow; wasCrit = batteryCritical;
 #endif
 }
@@ -5182,14 +5521,23 @@ void powerTick() {
   unsigned long nowMs = millis();
   float dtH = (lastInaMs == 0) ? 0.0f : (nowMs - lastInaMs) / 3600000.0f;   // hours since last read
   lastInaMs = nowMs;
-  readBatteryAdc();                                    // GPIO35/34 -> polynomial -> battV/battI/battP
+  readBatteryAdc();                                    // main INA226, else opto + ACS758 -> battV/battI/battP
 
-  // Energy (B2, sec.12.1.3): opto current is magnitude only, so all energy counts as consumption.
-  energyConsumedWh += (double)battP * dtH;
+  // Energy (B2, sec.12.1.3). The shunt bar knows the direction, so only discharge counts as consumption.
+  // The ACS758 fallback keeps its documented rule: every amp counts, as it is not trusted for direction.
+  // Needs real volts: an uncalibrated opto battV is just the raw ADC fraction (0..1).
+  if (battVCalLoaded && battIOk && (!battFromIna || battIsigned > 0)) energyConsumedWh += (double)battP * dtH;
+  // Charged = what the solar module measured. A small negative reading is offset, not generation.
+  const InaMon &sol = powerIna[INA_SOLAR];
+  if (inaUsable(sol) && sol.i > 0) energyChargedWh += (double)(sol.v * sol.i) * dtH;
 
   // Battery state flags -- DISPLAY/LOG (and, if BATTERY_SAFETY_ENABLED, the protective actions).
-  batteryCritical = (battV > 0 && battV < BATT_CRIT_V);
-  batteryLow      = (battV > 0 && battV < BATT_LOW_V);
+  // Calibrated only: the placeholder's 0..1 "volts" would otherwise read as a critically flat battery,
+  // and with the safety flag on that would be an emergency stop.
+  // Held for BATT_FLAG_HOLD_MS, because the main INA226 reads the sag of every inverter start.
+  static uint32_t critSinceMs = 0, lowSinceMs = 0;
+  batteryCritical = battFlagHeld(battVCalLoaded && battV > 0 && battV < BATT_CRIT_V, nowMs, &critSinceMs, BATT_FLAG_HOLD_MS);
+  batteryLow      = battFlagHeld(battVCalLoaded && battV > 0 && battV < BATT_LOW_V,  nowMs, &lowSinceMs,  BATT_FLAG_HOLD_MS);
   batterySafetyTick();                                 // ready-but-disabled protections
 
   // B3: log a PWR snapshot at most ~1/min, OR immediately on a battery-state change (sec.25.2.1).
@@ -5198,34 +5546,93 @@ void powerTick() {
   if (battStateChanged || lastPwrLogMs == 0 || millis() - lastPwrLogMs >= PWR_LOG_INTERVAL_MS) {
     lastPwrLogMs = millis();
     prevBattStateLow = batteryLow; prevBattStateCrit = batteryCritical;
-    logEvent("ESP1", "PWR", "BATT|V=" + String(battV, 2) + "|I=" + String(battI, 2) + "|P=" + String(battP, 1)
-             + "|CONS=" + String((int)(energyConsumedWh + 0.5)) + "Wh");
+    // Uncalibrated rows stay in the log for bench work, under names the SUMMARY parser does not average.
+    String vp = battVCalLoaded ? "|V=" + String(battV, 2) + "|I=" + String(battI, 2) + "|P=" + String(battP, 1)
+                               : "|VRAW=" + String(battV, 3) + "|I=" + String(battI, 2);
+    logEvent("ESP1", "PWR", "BATT" + vp + "|SRC=" + (battFromIna ? "INA" : "OPTO") +
+             "|CONS=" + String((int)(energyConsumedWh + 0.5)) + "Wh|CHG=" + String((int)(energyChargedWh + 0.5)) + "Wh");
+    // PWRS, not PWR: the SUMMARY parser averages every PWR row as the main battery.
+    if (inaUsable(sol))
+      logEvent("ESP1", "PWRS", "SOLAR|V=" + String(sol.v, 2) + "|I=" + String(sol.i, 3) + "|P=" + String(sol.p, 1));
   }
 }
 
 /* =============================================================================
  *  SECONDARY BATTERY  (INA226 at INA226_ADDR, R010 shunt) -- see SECONDARY_BATT_ENABLED
  * ========================================================================== */
-static bool secInaWrite(uint8_t reg, uint16_t v) {
-  Wire.beginTransmission(INA226_ADDR); Wire.write(reg); Wire.write(v >> 8); Wire.write(v & 0xFF);
+static bool inaWrite(uint8_t addr, uint8_t reg, uint16_t v) {
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(v >> 8); Wire.write(v & 0xFF);
   return Wire.endTransmission() == 0;
 }
-static bool secInaRead(uint8_t reg, uint16_t &out) {
-  Wire.beginTransmission(INA226_ADDR); Wire.write(reg);
+static bool inaRead(uint8_t addr, uint8_t reg, uint16_t &out) {
+  Wire.beginTransmission(addr); Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((uint8_t)INA226_ADDR, (uint8_t)2) != 2) { while (Wire.available()) Wire.read(); return false; }
+  if (Wire.requestFrom(addr, (uint8_t)2) != 2) { while (Wire.available()) Wire.read(); return false; }
   out = ((uint16_t)Wire.read() << 8) | Wire.read();
   return true;
 }
 // Probe + configure. The manufacturer/die IDs prove it is really an INA226 (0x40 is a common
 // address); the calibration read-back proves the bus carries writes. No reset/delay(): writing
 // CONFIG and CAL sets every register this code reads.
-static bool secInaInit() {
+static bool inaInit(uint8_t addr, uint16_t cal) {
   uint16_t mfg, die, calBack;
-  if (!secInaRead(0xFE, mfg) || !secInaRead(0xFF, die)) return false;
+  if (!cal) return false;
+  if (!inaRead(addr, 0xFE, mfg) || !inaRead(addr, 0xFF, die)) return false;
   if (mfg != 0x5449 || die != 0x2260) return false;
-  if (!secInaWrite(0x00, SEC_INA_CONFIG) || !secInaWrite(0x05, SEC_INA_CAL)) return false;
-  return secInaRead(0x05, calBack) && calBack == SEC_INA_CAL;
+  if (!inaWrite(addr, 0x00, SEC_INA_CONFIG) || !inaWrite(addr, 0x05, cal)) return false;
+  return inaRead(addr, 0x05, calBack) && calBack == cal;
+}
+static bool secInaRead(uint8_t reg, uint16_t &out) { return inaRead(INA226_ADDR, reg, out); }
+static bool secInaInit() { return inaInit(INA226_ADDR, secInaCal); }
+
+/* Solar + main battery modules behind the ISO1540. Their power comes from the main-battery side, so a
+ * module going quiet says the isolator or its supply needs attention; it says nothing about the boards.
+ *
+ * A module that loses its supply for a moment comes back with CAL = 0 and goes on answering, with the right
+ * voltage and a current of exactly 0 A: an inverter start can do that to a regulator on the main battery,
+ * and the wrong reading would look perfectly healthy. So CAL is read back on every pass, like the first
+ * time the module was found. */
+void powerInaTick() {
+  unsigned long now = millis();
+  for (uint8_t k = 0; k < INA_COUNT; k++) {
+    InaMon &m = powerIna[k];
+    if (!m.ok) {
+      if (m.lastTryMs && now - m.lastTryMs < SEC_RETRY_MS) continue;
+      m.lastTryMs = now ? now : 1;
+      m.ok = inaInit(m.addr, m.cal);
+      if (!m.ok) continue;
+      m.failN = 0; m.lastReadMs = 0; m.noV = false;
+      logEvent("ESP1", "PWRS", String("INA226|") + m.name + "|FOUND");
+    }
+    if (m.lastReadMs && now - m.lastReadMs < PWR_INA_READ_MS) continue;
+    m.lastReadMs = now ? now : 1;
+    uint16_t rBus, rCur, rCal;
+    if (!inaRead(m.addr, 0x02, rBus) || !inaRead(m.addr, 0x04, rCur) || !inaRead(m.addr, 0x05, rCal)) {
+      if (++m.failN >= 3) {                                 // debounced: one NAK is bus noise, three is gone
+        m.ok = false; m.haveV = false; m.lastTryMs = now ? now : 1;
+        logEvent("ESP1", "PWRS", String("INA226|") + m.name + "|LOST");
+      }
+      continue;
+    }
+    m.failN = 0;
+    if (rCal != m.cal) {                                    // it restarted: this current reading is not real
+      m.ok = inaInit(m.addr, m.cal);
+      logEvent("ESP1", "PWRS", String("INA226|") + m.name + (m.ok ? "|RESTARTED" : "|LOST"));
+      m.haveV = false; m.lastTryMs = now ? now : 1;
+      continue;
+    }
+    float v = inaBusVolts(rBus, m.busFactor);
+    if (v < m.minV) {                                       // a loose VBUS lead, not a 12 V battery at 3 V
+      if (!m.noV) logEvent("ESP1", "PWRS", String("INA226|") + m.name + "|NO_BUS_VOLTAGE|V=" + String(v, 2));
+      m.noV = true; m.haveV = false;
+      continue;
+    }
+    m.noV = false;
+    m.v = m.haveV ? m.v + 0.3f * (v - m.v) : v;             // light filter, like the secondary's
+    m.haveV = true;
+    m.i = inaAmps(rCur, m.lsb, m.invert, m.offsetA);
+    m.p = m.v * m.i;
+  }
 }
 
 // Low latch with hysteresis, critical flag, and (only when switching is live) the alerts. One-shot
@@ -5238,9 +5645,15 @@ static void secBattPolicy() {
     secCrit = (secV < SEC_BATT_CRIT_V);
   }
 #if SECONDARY_BATT_ENABLED
+  // raiseFault sends nothing during Testing. Setting these one-shots there would lose the alert for the
+  // whole episode, so hold them until Testing ends.
+  if (sysState == TEST_MODE) return;
   static bool missAlerted = false, lowAlerted = false, critAlerted = false;
   if (!valid) {
-    if (!missAlerted) { missAlerted = true; raiseFault('M', "SENSOR_FAIL", "INA226|SECONDARY_BATT|AC_BLOCKED"); }
+    if (!missAlerted) {
+      missAlerted = true;
+      raiseFault('M', "SENSOR_FAIL", secNoPack ? "INA226|NO_PACK_CHECK_WIRING|AC_BLOCKED" : "INA226|SECONDARY_BATT|AC_BLOCKED");
+    }
     return;
   }
   missAlerted = false;
@@ -5270,19 +5683,33 @@ void secBattTick() {
   }
   if (lastReadMs && now - lastReadMs < SEC_READ_MS) return;
   lastReadMs = now;
-  uint16_t rBus, rCur;
-  if (!secInaRead(0x02, rBus) || !secInaRead(0x04, rCur)) {
+  uint16_t rBus, rCur, rCal;
+  if (!secInaRead(0x02, rBus) || !secInaRead(0x04, rCur) || !secInaRead(0x05, rCal)) {
     if (++failN >= 3) {                                   // debounced: one NAK is bus noise, three is gone
-      secInaOk = false; secHaveV = false; lastTryMs = now;
+      secInaOk = false; secHaveV = false; secNoPack = false; lastTryMs = now;
       logEvent("ESP1", "PWR2", "INA226|LOST");
     }
     secBattPolicy(); return;
   }
   failN = 0;
-  float v = rBus * 0.00125f * SEC_BUS_V_FACTOR;           // 1.25 mV/bit
+  if (rCal != secInaCal) {                                // it restarted, so its current reads 0 A (see powerInaTick)
+    secInaOk = secInaInit();
+    logEvent("ESP1", "PWR2", secInaOk ? "INA226|RESTARTED" : "INA226|LOST");
+    if (!secInaOk) { secHaveV = false; secNoPack = false; lastTryMs = now; secBattPolicy(); }
+    return;                                               // the next pass reads through the restored CAL
+  }
+  float v = rBus * 0.00125f * secBusFactor;               // 1.25 mV/bit
+  // No 4S pack reads this low. The chip is fine, so this is a loose VBUS lead or a pack whose negative is
+  // not common with board ground -- report it as that, not as a flat battery.
+  if (v < SEC_NO_PACK_V) {
+    if (!secNoPack) logEvent("ESP1", "PWR2", "INA226|NO_PACK|V=" + String(v, 2));
+    secNoPack = true; secHaveV = false;
+    secBattPolicy(); return;
+  }
+  secNoPack = false;
   float i = (int16_t)rCur * SEC_CURRENT_LSB;
-  if (SEC_INVERT_CURRENT) i = -i;
-  i -= SEC_CURRENT_OFFSET_A;
+  if (secInvert) i = -i;
+  i -= secOffsetA;
   secV = secHaveV ? secV + 0.3f * (v - secV) : v;        // light filter so a load step can't flap the latch
   secHaveV = true; secI = i; secP = secV * i;
   secBattPolicy();
@@ -5295,11 +5722,22 @@ void secBattTick() {
 
 // True when no inverter use may START: switching is live and the secondary is low or unmonitored.
 // A run already in progress is never aborted by this -- only new work is refused.
-bool secBattBlocksAc(const char **why) {
 #if SECONDARY_BATT_ENABLED
-  if (!secInaOk || !secHaveV) { if (why) *why = "the secondary battery monitor (INA226) is not responding"; return true; }
+static bool bswRecharging() {
+  return millis() < BSW_RECHARGE_MS || (bswLastStrikeMs && millis() - bswLastStrikeMs < BSW_RECHARGE_MS);
+}
+#endif
+
+bool secBattBlocksAc(const char **why) {
+#if SECONDARY_BACKUP_ENABLED
+  if (bkState != BK_IDLE)      { if (why) *why = "the main battery is critical"; return true; }
+#endif
+#if SECONDARY_BATT_ENABLED
+  if (!secInaOk || !secHaveV) { if (why) *why = secNoPack ? "the secondary battery is not seen (check its wiring and ground)"
+                                                          : "the secondary battery monitor (INA226) is not responding"; return true; }
   if (secLow)                  { if (why) *why = "the secondary battery is low"; return true; }
   if (bswLatched)              { if (why) *why = "battery-switch fault: a switch reset the controllers (clear it to retry)"; return true; }
+  if (bswRecharging())         { if (why) *why = "the controllers just restarted: waiting for the hold-up to recharge"; return true; }
 #endif
   (void)why;
   return false;
@@ -5323,7 +5761,7 @@ static void bswSaveState() {
   p.putUChar("n", bswStrikes); p.putUInt("t", bswLastStrikeT); p.putBool("lat", bswLatched);
   p.end();
 }
-static uint32_t bswNow() { return rtcOk ? rtc.now().unixtime() : 0; }
+static uint32_t bswNow() { return rtcOk ? rtcNow().unixtime() : 0; }
 
 static void bswStrike(uint8_t dir, const char *by) {
   if (bswLastStrikeMs && millis() - bswLastStrikeMs < 120000UL) {
@@ -5355,6 +5793,31 @@ void bswForgetPending() {
   bswSavePending(0);
 }
 
+/* A stop while the boards are on the secondary drops P4 at once, and that transfer can reset ESP1 before
+ * the stop has finished. Unjournaled, the rig would come back as if nothing had been asked of it: an E-stop
+ * forgotten and the schedule running again, or a cancelled column re-run at once. So it is written down
+ * first. Surviving BSW_CUT_SURVIVE_MS clears it (bswTick), so a later unrelated reset can't replay it.
+ *   kind 1 = E-stop   kind 2 = cancelRun(mode) of column c                                             */
+void bswNoteCut(uint8_t kind, int c, int mode) {
+  if (!esp2OnSecondary && !bswPendingDir) return;
+  Preferences p; p.begin("battsw", false);
+  p.putUChar("cutk", kind); p.putChar("cutc", (int8_t)c); p.putChar("cutm", (int8_t)mode);
+  p.end();
+  bswCutMs = millis() ? millis() : 1;
+}
+
+/* A dashboard command in flight when the boards reset would sit on "accepted" for good, since its id is
+ * only in RAM. Keep it on flash while a reset is possible; a boot that finds one marks it failed. */
+void bswCmdJournal() {
+  const char *id = forceCmdId[0] ? forceCmdId : fbRemoteExerciseId[0] ? fbRemoteExerciseId : puCmdId;
+  if (!esp2OnSecondary && !bswPendingDir) id = "";
+  if (!strcmp(id, bswCmdSaved)) return;
+  strlcpy(bswCmdSaved, id, sizeof(bswCmdSaved));
+  Preferences p; p.begin("battsw", false);
+  if (bswCmdSaved[0]) p.putString("cmd", bswCmdSaved); else p.remove("cmd");
+  p.end();
+}
+
 void bswClear(const char *by) {
   bool was = bswLatched;
   bswLatched = false; bswStrikes = 0; bswLastStrikeT = 0;
@@ -5367,7 +5830,22 @@ void bswBoot() {
   Preferences p; p.begin("battsw", true);
   uint8_t pend = p.getUChar("pend", 0);
   bswStrikes = p.getUChar("n", 0); bswLastStrikeT = p.getUInt("t", 0); bswLatched = p.getBool("lat", false);
+  uint8_t cutKind = p.getUChar("cutk", 0);
+  int cutCol = p.getChar("cutc", -1), cutMode = p.getChar("cutm", -1);
+  String lostCmd = p.isKey("cmd") ? p.getString("cmd", "") : String("");
   p.end();
+  if (cutKind || lostCmd.length()) {            // clear first: this boot can never replay them twice
+    Preferences w; w.begin("battsw", false);
+    w.remove("cutk"); w.remove("cutc"); w.remove("cutm"); w.remove("cmd");
+    w.end();
+  }
+  if (cutKind == 1) bswEstopRestore = true;     // setup() goes back into E-stop once it has finished
+  if (cutKind == 2 && cutCol >= 0 && cutCol < NUM_COLUMNS) {
+    if (cutMode == 0) { COLUMN_ENABLED[cutCol] = false; saveColEnable(cutCol); }
+    else if (cutMode > 0) colSnoozeUntil[cutCol] = millis() + SNOOZE_LONG_MS;
+    logEvent("ESP1", "PWR2", String("BATTSW|CANCEL_RESTORED|COL_") + COL_TAG[cutCol] + "|mode=" + cutMode);
+  }
+  if (lostCmd.length()) firebaseQueueStatus(lostCmd.c_str(), "failed", "the controllers reset during a battery switch");
   if (bswLatched) logEvent("ESP1", "PWR2", "BATTSW|LATCHED_AT_BOOT|AC_BLOCKED");
   if (pend == 1 || pend == 2) {
     bswSavePending(0);                          // clear first: this boot can never count twice
@@ -5385,6 +5863,13 @@ void bswTick() {
     bswForgetPending();
   }
   if (battQuietUntilMs && !battQuietActive()) battQuietUntilMs = 0;
+  bswCmdJournal();
+  if (bswCutMs && millis() - bswCutMs >= BSW_CUT_SURVIVE_MS) {      // alive: that stop did not reset us
+    bswCutMs = 0;
+    Preferences p; p.begin("battsw", false);
+    p.remove("cutk"); p.remove("cutc"); p.remove("cutm");
+    p.end();
+  }
   // ESP2's journal report of an ESP1-boot strike arrives within seconds of STARTUP_SYNC; after 5 min
   // any report is a new event again.
   if (bswBootStruck && millis() > 300000UL) bswBootStruck = false;
@@ -5403,11 +5888,131 @@ void bswTick() {
 }
 
 /* =============================================================================
+ *  SECONDARY AS BACKUP  (see SECONDARY_BACKUP_ENABLED, backupNext in pure_math.h)
+ * -----------------------------------------------------------------------------
+ *  The decisions are in backupNext(), which is host-tested. This wires it up: debounce the main battery,
+ *  send the alerts, and ask ESP2 to hold or release P4. Reset-proof by construction: no state survives
+ *  a reset except "the alert already went out" (NVS battsw/bka), so a reset lands on BK_IDLE with the
+ *  boards on main, and the same steps run again -- without a second text, after the hold-up has
+ *  recharged, and at most BSW_LATCH_STRIKES times, because each switch-caused reset is a strike.
+ * ========================================================================== */
+bool backupHoldsEsp2() {
+  return bkState == BK_SWITCHING || bkState == BK_ACTIVE || bkState == BK_RETURNING;
+}
+const char *bkName(BkState s) {
+  switch (s) {
+    case BK_ALERT:     return "alert";
+    case BK_WAIT:      return "waiting";
+    case BK_SWITCHING: return "switching";
+    case BK_ACTIVE:    return "active";
+    case BK_RETURNING: return "returning";
+    default:           return "idle";
+  }
+}
+#if SECONDARY_BACKUP_ENABLED
+// Critical alert WITHOUT raiseFault('C'), which would E-stop and cut ESP2. Also not suppressed in Testing.
+static void bkCritAlert(const char *code, const String &loc) {
+  faultsToday[0]++;
+  logEvent("ESP1", "FAULT", String("CRIT|") + code + "|" + loc);
+  lastFaultMsg = String(code) + " " + loc;
+  lastFaultTime = tsString();
+  wakeBacklight();
+  sendSMS(String("ALERT,CRIT,") + code + "," + loc);
+}
+static String bkVolts() {
+  return String("MAIN=") + String(battV, 2) + "|SEC=" + ((secInaOk && secHaveV) ? String(secV, 2) : String("--"));
+}
+static void bkSaveAlerted(bool on) {
+  Preferences p; p.begin("battsw", false); p.putBool("bka", on); p.end();
+}
+
+void backupTick() {
+  static bool alerted = false, booted = false;
+  static unsigned long lowSince = 0, okSince = 0, stateMs = 0, lastSendMs = 0, retryAt = 0;
+  unsigned long now = millis();
+  if (!booted) {
+    booted = true;
+    Preferences p; p.begin("battsw", true); alerted = p.getBool("bka", false); p.end();
+    stateMs = now;
+  }
+  bool idle = sysState == IDLE_STATE && !wo.active && !pendingRun.active && !pendingExercise.active && !esp2Held &&
+              uiMode == UI_DATA && !actuationsDisabled && puPhase == PU_NONE && fcPhase == FP_NONE &&
+              !webManualHeld() && !diagRemoteUntilMs;
+  bool known = battVCalLoaded && battV > 0;
+  // A run's sag is not a flat battery: below the line only counts with nothing drawing on main.
+  if (known && battV < BATT_CRIT_V && (idle || bkState != BK_IDLE)) { if (!lowSince) lowSince = now ? now : 1; }
+  else lowSince = 0;
+  if (known && battV >= BACKUP_MAIN_RECOVER_V) { if (!okSince) okSince = now ? now : 1; }
+  else okSince = 0;
+
+  BackupIn in;
+  in.idle         = idle;
+  in.mainLowHeld  = lowSince && now - lowSince >= BACKUP_TRIGGER_MS;
+  in.mainOkHeld   = okSince && now - okSince >= BACKUP_RECOVER_MS;
+  in.secUsable    = secInaOk && secHaveV && !secLow && !bswLatched && !bswRecharging() &&
+                    (!retryAt || (long)(now - retryAt) >= 0);
+  in.secExhausted = !(secInaOk && secHaveV) || secCrit;
+  in.alertDone    = alerted || gsm.queued() == 0 || now - stateMs >= BACKUP_ALERT_WAIT_MS;
+  in.onSecondary  = esp2OnSecondary;
+  in.timedOut     = now - stateMs >= BACKUP_SWITCH_TIMEOUT_MS;
+
+  // A main that recovers ends the episode whichever state it finds, including a reboot's BK_IDLE.
+  if (in.mainOkHeld && alerted) { alerted = false; bkSaveAlerted(false); }
+
+  BkState from = bkState, to = backupNext(from, in);
+  if (to != from) {
+    bkState = to; stateMs = now; lastSendMs = 0;
+    logEvent("ESP1", "PWR2", String("BACKUP|") + bkName(from) + "->" + bkName(to) + "|" + bkVolts());
+    switch (to) {
+      case BK_ALERT:
+        // Only if this episode's text has not gone out yet: a reset must not send it again.
+        if (!alerted)
+          bkCritAlert("MAIN_BATT_CRIT", bkVolts() + (in.secUsable ? "|SWITCHING_TO_BACKUP" : "|BACKUP_NOT_AVAILABLE"));
+        break;
+      case BK_WAIT:
+        if (from == BK_ALERT) {
+          if (!alerted && gsm.queued() == 0) { alerted = true; bkSaveAlerted(true); }   // it left the modem
+        } else {
+          retryAt = now + BACKUP_RETRY_MS;                  // failed or lost: not straight back on
+          esp2SetPower(false);
+        }
+        break;
+      case BK_SWITCHING:
+        esp2SetPower(true);
+        break;
+      case BK_ACTIVE:
+        sendSMS(String("INFO,BACKUP,ON,") + bkVolts());
+        break;
+      case BK_RETURNING:
+        if (from == BK_ACTIVE && !in.mainOkHeld)
+          bkCritAlert("BACKUP_EXHAUSTED", bkVolts() + "|RETURNED_TO_MAIN");
+        else if (from == BK_SWITCHING && !in.mainOkHeld)
+          bkCritAlert("BACKUP_SWITCH_FAILED", bkVolts() + "|STAYING_ON_MAIN");
+        break;
+      case BK_IDLE:
+        retryAt = 0;
+        if (from != BK_ALERT && from != BK_WAIT) esp2SetPower(false);
+        sendSMS(String("INFO,BACKUP,OFF,") + bkVolts());
+        break;
+    }
+  }
+  // ESP2 boots first, and a frame can be lost: repeat until it confirms. Both commands are idempotent.
+  if ((bkState == BK_SWITCHING || bkState == BK_RETURNING) && esp2Available && esp2Powered &&
+      (!lastSendMs || now - lastSendMs >= BACKUP_RESEND_MS)) {
+    lastSendMs = now ? now : 1;
+    sendEsp2(bkState == BK_SWITCHING ? "BATTBK,ON" : "BATTBK,OFF");
+  }
+}
+#else
+void backupTick() {}
+#endif
+
+/* =============================================================================
  *  SCHEDULE  (daily report, daily Nano reset, day rollover)
  * ========================================================================== */
 void scheduleTick() {
   if (!rtcOk) return;
-  DateTime now = rtc.now();
+  DateTime now = rtcNow();
   long ds = dayStamp(now);
   if (ds != currentDayStamp) {                 // midnight rollover -> reset daily counters
     currentDayStamp = ds;
@@ -5473,7 +6078,7 @@ void uploadTick() {
   if (adminUploadReq) {
     adminUploadReq = false;
     if (rtcOk && currentDayStamp > 0) {
-      long y = dayStamp(rtc.now() - TimeSpan(1, 0, 0, 0));
+      long y = dayStamp(rtcNow() - TimeSpan(1, 0, 0, 0));
       char path[16]; snprintf(path, sizeof(path), "/%08ld.CSV", y);
       bool got = sdTake(200), exists = got && SD.exists(path); if (got) sdGive();
       if (exists) { manualUploadStamp = y; attempts = 0; }
@@ -5626,7 +6231,9 @@ void deviceHealthTick() {
 void telemetryCollect() {
   if (millis() - lastTelemCollectMs < 1000) return;
   lastTelemCollectMs = millis();
+  String deviceTime = tsString();                  // before the lock: an I2C read cannot run with interrupts off
   portENTER_CRITICAL(&telemMux);
+  strlcpy(telem.deviceTime, deviceTime.c_str(), sizeof(telem.deviceTime));
   telem.temp = sensor.temp; telem.hum = sensor.hum; telem.lux = sensor.lux;
   telem.resLevel = sensor.resLevel; telem.mixLevel = sensor.mixLevel; telem.flow = sensor.flow;
   for (int c = 0; c < NUM_COLUMNS; c++) {
@@ -5637,6 +6244,10 @@ void telemetryCollect() {
     telem.npkMoist[c] = sensor.npk[c][0]; telem.npkTemp[c] = sensor.npk[c][1];
   }
   telem.battV = battV; telem.battP = battP; telem.battI = battI;
+  telem.battIsigned_ = battIsigned; telem.battIOk_ = battIOk; telem.battFromIna_ = battFromIna;
+  telem.solarOk_ = inaUsable(powerIna[INA_SOLAR]);
+  telem.solarV_ = powerIna[INA_SOLAR].v; telem.solarI_ = powerIna[INA_SOLAR].i; telem.solarP_ = powerIna[INA_SOLAR].p;
+  telem.chargedWh_ = energyChargedWh;
   telem.tankEC = tankEC; telem.tankPH = tankPH;
   // Mirror the per-group validity + coarse system state so core-0 uploaders read only from the snapshot.
   telem.envValid = sensor.envValid; telem.tankValid = sensor.tankValid; telem.lightValid = sensor.lightValid;
@@ -5654,6 +6265,7 @@ void telemetryCollect() {
   telem.secOk_ = secInaOk && secHaveV; telem.secLow_ = secLow; telem.onSecondary_ = esp2OnSecondary;
   telem.secV_ = secV; telem.secI_ = secI; telem.secP_ = secP;
   telem.bswLatched_ = bswLatched; telem.bswStrikes_ = bswStrikes;
+  telem.bkState_ = (uint8_t)bkState;
   telem.simOk = simReady; telem.netReg = netRegistered;
   telem.rssi = lastRssi; telem.creg = lastCreg;
   telem.battLow = batteryLow; telem.battCrit = batteryCritical;
@@ -5778,7 +6390,7 @@ static void tsUpload() {
     if (t.lightValid) url += "&field3=" + String(t.lux, 0);
     if (t.tankValid)  { url += "&field4=" + String(t.resLevel, 1); url += "&field5=" + String(t.mixLevel, 1); url += "&field8=" + String(t.flow, 1); }
     if (t.battVCalValid) url += "&field6=" + String(t.battV, 2);
-    if (t.battVCalValid && t.acsOk_) url += "&field7=" + String(t.battP, 1);   // power needs both V and I valid
+    if (t.battVCalValid && t.battIOk_) url += "&field7=" + String(t.battP, 1);   // power needs both V and I valid
     ok = tsGet(url) || ok;
   }
   if (k3.length()) {                                  // Channel 3: chemistry (per-column EC + pH)
@@ -5791,10 +6403,14 @@ static void tsUpload() {
         url += "&field" + String(fld++) + "=" + String(t.npkPH[c], 2);
       } else fld += 2;
     }
-    // Battery current (ACS758) rides Ch3 because Ch2 "System" has all 8 fields used.
+    // Battery current rides Ch3 because Ch2 "System" has all 8 fields used.
     // CONSTRAINT: the loop above consumes 2 fields per ENABLED column -- 4 today with A and B.
     // Enabling column C would take fields 1-6 and collide with field 5. Move this constant if so.
-    if (t.acsOk_) url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
+    if (t.battIOk_) url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
+    if (t.solarOk_) {
+      url += "&field" + String(TS3_SOLAR_V_FIELD) + "=" + String(t.solarV_, 2);
+      url += "&field" + String(TS3_SOLAR_W_FIELD) + "=" + String(t.solarP_, 1);
+    }
     ok = tsGet(url) || ok;
   }
   lastTsOk = ok; lastTsUploadMs = millis();
@@ -6113,20 +6729,22 @@ static bool firebaseUploadLive() {
   system["secondaryBattSwitching"] = (bool)SECONDARY_BATT_ENABLED;
   system["battSwitchFault"]   = t.bswLatched_;
   system["battSwitchStrikes"] = t.bswStrikes_;
-  // For the new Set Clock control: show the operator what ESP1 currently reads before they decide
-  // to change it. Reuses the exact same tsString()/rtcOk the LCD's own clock page and every log
-  // timestamp already use -- no new time source.
+  system["backupEnabled"]     = (bool)SECONDARY_BACKUP_ENABLED;
+  system["backupState"]       = bkName((BkState)t.bkState_);
+  // For the new Set Clock control: show the operator what ESP1 currently reads before they decide to
+  // change it. From the snapshot, never tsString() here: that is an I2C read, and Wire hands its receive
+  // buffer back unlocked, so a read from this core can overwrite a sensor reading in progress on core 1.
   system["rtcOk"] = rtcOk;
-  system["deviceTime"] = tsString();
+  system["deviceTime"] = t.deviceTime;
 
   JsonObject sensors = doc.createNestedObject("sensors");
   if (t.tankValid)  { sensors["reservoirLevel"] = t.resLevel; sensors["mixingLevel"] = t.mixLevel; sensors["flowRate"] = t.flow; }
   if (t.envValid)   { sensors["temperature"] = t.temp; sensors["humidity"] = t.hum; }
   if (t.lightValid) sensors["lightLevel"] = t.lux;
-  // Voltage/percent only publish once a REAL calibration has been loaded for that channel -- until
-  // then there is no honest way to tell "sensor not installed" from "installed but uncalibrated,
-  // reading noise", so this correctly shows Unavailable rather than a meaningless polynomial-of-noise
-  // number. Current is gated on acsOk_, the ADS1115/ACS758's own live I2C health.
+  // Voltage/percent only publish from the main INA226 or a REAL opto calibration -- otherwise there is
+  // no honest way to tell "sensor not installed" from "installed but uncalibrated, reading noise", so
+  // this correctly shows Unavailable rather than a meaningless polynomial-of-noise number. Current is
+  // gated on battIOk_: the source in use answered on I2C just now.
   if (t.battVCalValid) {
     sensors["batteryVoltage"] = t.battV;
     // Percent from resting voltage. BATT_LOW_V/BATT_CRIT_V are alarm points, not endpoints, so the
@@ -6136,8 +6754,16 @@ static bool firebaseUploadLive() {
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     sensors["batteryPercent"] = (int)(pct + 0.5f);
   }
-  if (t.acsOk_) {
-    sensors["batteryCurrent"] = t.battI;                 // ACS758, magnitude (see readBatteryAdc)
+  if (t.battIOk_) {
+    sensors["batteryCurrent"] = t.battI;                 // magnitude (see readBatteryAdc)
+    if (t.battFromIna_) sensors["batteryCurrentSigned"] = t.battIsigned_;   // + = discharging; shunt bar only
+  }
+  // Solar INA226. Absent, not fabricated, while it is not answering. 0 V at night is a real reading.
+  if (t.solarOk_) {
+    sensors["solarVoltage"] = t.solarV_;
+    sensors["solarCurrent"] = t.solarI_;
+    sensors["solarPower"]   = t.solarP_;
+    sensors["solarEnergyTodayWh"] = (int)(t.chargedWh_ + 0.5);
   }
   // Secondary battery (INA226). Absent, not fabricated, while the monitor is not answering.
   if (t.secOk_) {
@@ -6215,7 +6841,10 @@ static bool firebaseUploadLive() {
   dna["lightValid"]       = t.lightValid;
 
   JsonObject dpe = dg.createNestedObject("peripherals");
-  dpe["rtcOk"] = t.rtcOk_; dpe["sdOk"] = t.sdOk_; dpe["batterySensorOk"] = t.acsOk_;
+  dpe["rtcOk"] = t.rtcOk_; dpe["sdOk"] = t.sdOk_; dpe["batterySensorOk"] = t.battIOk_;
+  dpe["batteryAdsOk"] = t.acsOk_;                  // the ACS758 fallback, separately: useful while INA226 is in use
+  dpe["mainInaOk"] = t.battFromIna_;
+  dpe["solarSensorOk"] = t.solarOk_;
   dpe["secondaryBatterySensorOk"] = t.secOk_;
 
   JsonObject dgs = dg.createNestedObject("gsm");
@@ -6229,7 +6858,7 @@ static bool firebaseUploadLive() {
   dpw["batteryLow"]      = t.battLow;
   dpw["batteryCritical"] = t.battCrit;
   dpw["batteryCurrent"]  = t.battI;
-  dpw["batteryPower"]    = t.battP;
+  if (t.battVCalValid) dpw["batteryPower"] = t.battP;   // needs real volts, same gate as the ThingSpeak field
 
   // Fault + recovery. The dashboard renders its prompt from this and offers exactly the choices the
   // LCD menu does, so the two surfaces cannot disagree about what is available.
@@ -6766,8 +7395,7 @@ void firebaseCommandTick() {
         logEvent("FIREBASE", "REJECT", "FORCE|DOSE_RANGE"); continue;
       }
       // Tell the operator now, not after the countdown: sendForceWorkOrder would refuse this at fire time.
-      if ((c.doseMl[0] > 0.0f || c.doseMl[1] > 0.0f || c.doseMl[2] > 0.0f) &&
-          c.liters * (1.0f - FLUSH_PCT / 100.0f) < MIXING_TANK_SAFE_MIN) {
+      if (!forceBatchOk(c.liters, FLUSH_PCT, MIXING_TANK_SAFE_MIN, c.doseMl[0], c.doseMl[1], c.doseMl[2])) {
         firebaseQueueStatus(c.id, "rejected", "batch too small to dose safely -- raise liters or remove nutrients");
         logEvent("FIREBASE", "REJECT", "FORCE|BATCH_LOW"); continue;
       }
@@ -7067,16 +7695,18 @@ void firebaseCommandTick() {
     // ---- SET_CLOCK: set the RTC, the same call the LCD's own Set Clock editor makes. No NVS --
     // the DS3231's own battery-backed register is the only store, same as the local path.
     if (!strcmp(c.type, "SET_CLOCK")) {
-      if (!rtcOk) { firebaseQueueStatus(c.id, "rejected", "RTC not present"); continue; }
+      // rtcChipOk, not rtcOk: a clock that lost its time is exactly the one that needs setting.
+      if (!rtcChipOk) { firebaseQueueStatus(c.id, "rejected", "RTC not present"); continue; }
       // Audit fix (2026-09-08): day-of-month was previously validated as a flat 1..31 regardless of
       // month/leap-year (e.g. "Feb 30" could be set), which the DS3231 has no validation of its own
       // to catch -- it would silently store the impossible date.
-      if (c.clkY < 2020 || c.clkY > 2099 || c.clkMo < 1 || c.clkMo > 12 || c.clkD < 1 ||
+      if (c.clkY < RTC_YEAR_MIN || c.clkY > RTC_YEAR_MAX || c.clkMo < 1 || c.clkMo > 12 || c.clkD < 1 ||
           c.clkD > daysInMonth(c.clkY, c.clkMo) ||
           c.clkH < 0 || c.clkH > 23 || c.clkMi < 0 || c.clkMi > 59) {
         firebaseQueueStatus(c.id, "rejected", "clock fields out of range"); continue;
       }
       rtc.adjust(DateTime((uint16_t)c.clkY, (uint8_t)c.clkMo, (uint8_t)c.clkD, (uint8_t)c.clkH, (uint8_t)c.clkMi, 0));
+      rtcClockWasSet();
       logEvent("ESP1", "STATE", "CLOCK_SET");
       firebaseQueueStatus(c.id, "completed", (String("clock set to ") + tsString()).c_str());
       continue;
@@ -7316,6 +7946,10 @@ bool supaUploadFile(const char *path, const char *objName) {
   xSemaphoreTake(netMux, portMAX_DELAY); base = supaUrl; key = supaKey; xSemaphoreGive(netMux);
   if (base.length() == 0 || key.length() == 0) { uploadHttp = 0; return false; }   // not configured
   if (!wifiConnected) { uploadHttp = 0; return false; }
+  // Close Firebase's kept-alive TLS session first, so only one is ever open (~40-50 KB each); its next
+  // request simply re-handshakes. Then the same heap floor Firebase uses: a skipped upload just retries.
+  fbResetTls();
+  if (ESP.getFreeHeap() < FIREBASE_MIN_HEAP) { uploadHttp = -3; return false; }
 
   if (!sdTake(4000)) { uploadHttp = -1; return false; }            // SD busy (portal/summary) -> retry later
   File f = SD.open(path, FILE_READ);
@@ -7634,7 +8268,9 @@ static void portalHandleOwner() {                             // POST /owner -- 
   if (!portalRequireAdmin()) return;
   String o = portalServer.arg("owner"); o.trim();
   int digits = 0; for (unsigned i = 0; i < o.length(); i++) if (isDigit(o[i])) digits++;
-  if (digits < 7 || o.length() > 15) { portalServer.send(200, "text/html", portalAdminHtml("Invalid number (7-15 digits).")); return; }
+  // 9+ digits: senderIsOwner() compares the last 9, so fewer locks the owner out. Dialable only: anything
+  // else (spaces, dashes) is refused by the modem driver, and every alert to the owner would be dropped.
+  if (digits < 9 || o.length() > 15 || !gsmNumberOk(o.c_str())) { portalServer.send(200, "text/html", portalAdminHtml("Invalid number (9-15 digits, optional leading +).")); return; }
   xSemaphoreTake(netMux, portMAX_DELAY); pendingOwner = o; xSemaphoreGive(netMux);  // barrier for core-1 read
   ownerPersistPending = true;                                 // core-1 loop applies + persists
   portalServer.send(200, "text/html", portalAdminHtml("Owner saved: " + htmlEscape(o)));
@@ -7963,6 +8599,7 @@ void netTask(void *pv) {
     }
     wifiConnected = true;
     wifiRssiVal = WiFi.RSSI();
+    if (fbTlsResetPending) { fbTlsResetPending = false; fbResetTls(); }
 
     // t.state, not raw sysState: this runs on core 0 and the telemMux-guarded snapshot is the only
     // sanctioned view of core-1 state here -- same principle firebaseUploadLive() already documents
@@ -8075,6 +8712,7 @@ void raiseFault(char tier, const char *code, const char *loc) {
 
 void enterEmergencyStop(bool cutPower) {
   // stop all actuators (sec.22.3) then optionally cut ESP2 power (sec.23.1.1)
+  bswNoteCut(1, -1, 0);                                // before STOP_ALL: it may be the last thing we do
   if (uiMode == UI_CAL && calOpen) calCloseTarget();   // the Nano keeps its CAL stream otherwise
   esp2Serial.print(FRAME_START); esp2Serial.print(",STOP_ALL,"); esp2Serial.println(FRAME_END);
   logEvent("ESP1", "CMD", "ESP2|STOP_ALL");
@@ -8154,6 +8792,7 @@ void enterFaultHold(const char *code, const char *loc) {
  * Safe to call whether or not ESP2 is currently held. */
 void cancelRun(int mode, const char *why, bool isAuto) {
   int c = (wo.colIdx >= 0) ? wo.colIdx : pendingRun.colIdx;      // whichever run we are aborting
+  bswNoteCut(2, c, mode);                                        // before STOP_ALL: it may be the last thing we do
 
   // STOP_ALL is what actually kills the pumps: on ESP2 it clears faultHeld, the work order, the
   // step and the timed-recovery latch, so nothing can resume behind our back.
@@ -8297,6 +8936,7 @@ static bool calCommit() {
   switch (t.kind) {
     case CK_SOIL: {
       int air = (int)calCap[0], wat = (int)calCap[1];
+      if (!soilCalOk(air, wat, (int)CAL_MIN_SPAN_ADC)) return false;      // too close, or dry/wet reversed
       String k = "s" + String(t.col);
       prefsCal.putInt((k + "a2").c_str(), air); prefsCal.putInt((k + "w2").c_str(), wat);
       snprintf(buf, sizeof(buf), "SAVE|SOIL_%c|%d/%d", COL_TAG[t.col], air, wat);
@@ -8504,7 +9144,9 @@ void calHoldTick() {
     if (millis() - lastHold >= 150) {
       lastHold = millis();
       bool acLine = !strcmp(ln, "RESMIX") || !strcmp(ln, "MIXIRR");   // transfer / booster = inverter
-      if (acLine && secBattBlocksAc()) {
+      if (actuationsDisabled) {
+        calMsg = "Actuations off";
+      } else if (acLine && secBattBlocksAc()) {
         calMsg = "BATT2 low: no prime";
       } else {
         String c = String("PRIME_START,") + ln;
@@ -8783,9 +9425,10 @@ void lcdRenderDiag() {
     case 7:   // ESP1 local: battery raw ADC + device presence
       snprintf(l, 21, "%-8s ESP1 Loc", hdr);                              lcd.setCursor(0, 0); lcd.print(l);
       snprintf(l, 21, "BatV raw%-5d%5.1fV", (int)readAdcTrimmed(PIN_BATT_V), battV); lcd.setCursor(0, 1); lcd.print(l);
-      // ACS758 via ADS1115 (replaces the dead GPIO34 opto read). Shows the SIGNED amps -- the 050B is
-      // bidirectional -- plus an ok/X flag, so a missing ADC reads as a fault and never as "0.0 A".
-      snprintf(l, 21, "Cur %7.2fA ADS:%s", battIsigned, acsOk ? "ok" : "X"); lcd.setCursor(0, 2); lcd.print(l);
+      // Shows the SIGNED amps from the source in use, plus the ACS758 fallback's own health (ok/X), so a
+      // missing sensor reads as a fault and never as "0.0 A". M/S = main and solar INA226 answering.
+      snprintf(l, 21, "%7.2fA M%c S%c ADS%c", battIsigned, inaUsable(powerIna[INA_MAIN]) ? '+' : 'X',
+               inaUsable(powerIna[INA_SOLAR]) ? '+' : 'X', acsOk ? '+' : 'X'); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "RTC:%s LCD:%s SD:%s", i2cPresent(0x68) ? "ok" : "X", i2cPresent(LCD_ADDR) ? "ok" : "X", sdOk ? "ok" : "X"); lcd.setCursor(0, 3); lcd.print(l);
       break;
     case 8:   // ESP2: pH / EC / ACS712 raw ADC (live CAL stream) -- ESP2's OWN probes, not the NPK's
@@ -9084,6 +9727,7 @@ static bool testRowVisible(int r) {
 static String testRowName(int r) {
   if (r < 16) return TEST_NAMES[r];
   if (r == TEST_FILL_ROW) return "Fill Res>Mix";
+  if (r >= TEST_ROWS) return "Mixer+Inverter";       // row 20: dashboard only, not on the LCD list
   return String("Push>Col ") + COL_TAG[r - (TEST_FILL_ROW + 1)];
 }
 
@@ -9100,7 +9744,7 @@ static void seedSchedule() {
 void commitEditor() {
   switch (editItem) {
     case SET_CLOCK:
-      if (rtcOk) rtc.adjust(DateTime(editTmp[0], editTmp[1], editTmp[2], editTmp[3], editTmp[4], 0));
+      if (rtcChipOk) { rtc.adjust(DateTime(editTmp[0], editTmp[1], editTmp[2], editTmp[3], editTmp[4], 0)); rtcClockWasSet(); }
       logEvent("ESP1", "STATE", "CLOCK_SET");
       break;
     case SET_SCHEDULE:
@@ -9144,10 +9788,23 @@ void commitEditor() {
       // checks it, this was the missing side.
       if (fcPhase != FP_NONE) {
         logEvent("ESP1", "STATE", "FORCE_BLOCKED|ALREADY_ARMED");
+        forceBlockedLow = false;
         forceBlockedFlash = true; forceBlockedUntilMs = millis() + 3000;
         uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
         break;
       }
+      // Say so now, not when the countdown ends: sendForceWorkOrder would refuse this at fire time.
+      // The editor's 2.0 L default with any nutrient lands here.
+      { bool batchOk = true;
+        for (int s = 0; s < ((fcMode == 3) ? 2 : 1); s++)
+          if (!forceBatchOk(fcSeq[s].dL / 10.0f, FLUSH_PCT, MIXING_TANK_SAFE_MIN, fcSeq[s].ml[0], fcSeq[s].ml[1], fcSeq[s].ml[2])) batchOk = false;
+        if (!batchOk) {
+          logEvent("ESP1", "STATE", "FORCE_BLOCKED|BATCH_LOW");
+          forceBlockedLow = true;
+          forceBlockedFlash = true; forceBlockedUntilMs = millis() + 4000;
+          uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
+          break;
+        } }
       // ARM, don't run. forceTick() fires it after the countdown and re-checks safety THEN, because
       // conditions can change during a delay of up to 5 minutes. Return to UI_DATA so automation
       // (and the fire check, which requires uiMode == UI_DATA) is live while the clock runs.
@@ -9193,7 +9850,7 @@ void enterEditor(int item) {
   editItem = item; editField = 0; editCol = 0; editDirty = false;
   switch (item) {
     case SET_CLOCK: {
-      DateTime n = rtcOk ? rtc.now() : DateTime(2026, 1, 1, 0, 0, 0);
+      DateTime n = rtcOk ? rtcNow() : DateTime(2026, 1, 1, 0, 0, 0);
       editTmp[0] = n.year(); editTmp[1] = n.month(); editTmp[2] = n.day();
       editTmp[3] = n.hour(); editTmp[4] = n.minute();
       break;
@@ -9264,6 +9921,10 @@ void settingsButton(int i) {
         // boot), then send TEST,ENTER repeatedly until it ACKs -- the single boot READY can be
         // lost on a cold relay power-up (see testHoldTick arming retry).
         if (sysState != IDLE_STATE) return;
+        if (actuationsDisabled) {                              // the lockout means nothing energizes; the row says so
+          logEvent("ESP1", "ACT", "TEST|BLOCKED|ACTUATIONS_OFF");
+          return;
+        }
         esp2SetPower(true);                                    // power ESP2 -> boot
         testArmPending = true;
         esp2TestArmed = false; testArmTries = 0; lastTestArmMs = 0;
@@ -9354,7 +10015,7 @@ void settingsButton(int i) {
     switch (editItem) {
       case SET_CLOCK:
         if (delta) {
-          if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, 2020, 2099);
+          if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, RTC_YEAR_MIN, RTC_YEAR_MAX);
           else if (editField == 1) editTmp[1] = clampi(editTmp[1] + delta, 1, 12);
           else if (editField == 2) editTmp[2] = clampi(editTmp[2] + delta, 1, 31);
           else if (editField == 3) editTmp[3] = clampi(editTmp[3] + delta, 0, 23);
@@ -9481,7 +10142,7 @@ void settingsButton(int i) {
 
 /* ---- Dead-man relay hold: stream TEST,HOLD while ENTER is physically held ---
  * (spec sec.18.10.8.2). Runs every loop while in UI_TEST; ESP2 owns the timeout
- * and the 10 s hard cap. */
+ * and the 30 s hard cap. */
 /* =============================================================================
  *  REMOTE PUSH-TO-COLUMN PULSE  --  bounded, no dead-man needed
  * ==========================================================================
@@ -9775,6 +10436,12 @@ void lcdTick() {
       if (!lcdInForce) { lcd.clear(); lcdInForce = true; }
       char fb[21];
       snprintf(fb, 21, "%-20s", "FORCE RUN BLOCKED");   lcd.setCursor(0, 0); lcd.print(fb);
+      if (forceBlockedLow) {
+        snprintf(fb, 21, "%-20s", "Too little water");  lcd.setCursor(0, 1); lcd.print(fb);
+        snprintf(fb, 21, "Dosing needs %4.2f L", MIXING_TANK_SAFE_MIN / (1.0f - FLUSH_PCT / 100.0f)); lcd.setCursor(0, 2); lcd.print(fb);
+        snprintf(fb, 21, "%-20s", "or set nutrients 0"); lcd.setCursor(0, 3); lcd.print(fb);
+        return;
+      }
       snprintf(fb, 21, "%-20s", "A run is already");    lcd.setCursor(0, 1); lcd.print(fb);
       snprintf(fb, 21, "%-20s", "armed/running.");      lcd.setCursor(0, 2); lcd.print(fb);
       snprintf(fb, 21, "%-20s", "");                    lcd.setCursor(0, 3); lcd.print(fb);
@@ -9836,7 +10503,9 @@ void lcdTick() {
     case PAGE_HOME:
       lcdRow(0, tsString().substring(0, 19).c_str());
       snprintf(l, 21, "State:%-13s", stateLabel(sysState, actuationsDisabled)); lcdRow(1, l);
-      snprintf(l, 21, "Bat:%.1fV %s", battV, batteryCritical ? "CRIT" : batteryLow ? "LOW" : "OK"); lcdRow(2, l);
+      if (battVCalLoaded) snprintf(l, 21, "Bat:%.1fV %s", battV, batteryCritical ? "CRIT" : batteryLow ? "LOW" : "OK");
+      else                snprintf(l, 21, "Bat: uncalibrated");
+      lcdRow(2, l);
       snprintf(l, 21, "Res:%d%% Mix:%d%%", (int)sensor.resLevel, (int)sensor.mixLevel); lcdRow(3, l);
       break;
     case PAGE_SENSORS:
@@ -9852,16 +10521,30 @@ void lcdTick() {
                  strlen(col[c].name) ? col[c].name : "-");
         lcdRow(c, l);
       }
-      snprintf(l, 21, "ESP2:%s", esp2Available ? "OK" : "--"); lcdRow(3, l);
+      snprintf(l, 21, "E2:%s SD:%s RTC:%s", esp2Available ? "OK" : "--", sdOk ? "OK" : "--",
+               rtcOk ? "OK" : rtcTimeLost ? "SET" : "--"); lcdRow(3, l);
       break;
     case PAGE_POWER:
-      snprintf(l, 21, "Main V:%.2f%s", battV, esp2OnSecondary ? "" : " *"); lcdRow(0, l);
-      snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP); lcdRow(1, l);
+      if (battVCalLoaded) {
+        snprintf(l, 21, "Main V:%.2f%s", battV, esp2OnSecondary ? "" : " *"); lcdRow(0, l);
+        // Signed from the shunt bar (- = charging); the ACS758 fallback shows a plain magnitude.
+        if (battFromIna) snprintf(l, 21, "I:%+.2fA P:%.1fW", battIsigned, battP);
+        else             snprintf(l, 21, "I:%.2fA P:%.1fW", battI, battP);
+        lcdRow(1, l);
+      } else {
+        snprintf(l, 21, "Main V:uncal%s", esp2OnSecondary ? "" : " *"); lcdRow(0, l);
+        snprintf(l, 21, "I:%.2fA P:--", battI); lcdRow(1, l);
+      }
       if (secInaOk && secHaveV)
         snprintf(l, 21, "B2:%.2fV %.2fA%s", secV, secI, esp2OnSecondary ? " *" : (secLow ? " L" : ""));
+      else if (secNoPack) snprintf(l, 21, "B2: no pack - wiring");
       else snprintf(l, 21, "B2: no INA226");
       lcdRow(2, l);                                  // '*' = the boards are on that battery now
-      snprintf(l, 21, "SD:%s RTC:%s%s", sdOk ? "OK" : "--", rtcOk ? "OK" : "--", bswLatched ? " SWFLT" : ""); lcdRow(3, l);
+      if (inaUsable(powerIna[INA_SOLAR]))            // SD and RTC moved to the Columns page for this row
+        snprintf(l, 21, "Sol:%.1fV %.2fA%s", powerIna[INA_SOLAR].v, powerIna[INA_SOLAR].i, bswLatched ? " SW!" : "");
+      else
+        snprintf(l, 21, "Sol: no INA226%s", bswLatched ? " SWFLT" : "");
+      lcdRow(3, l);
       break;
     case PAGE_GSM:   // GSM (A7670C) + WiFi/ThingSpeak link health
       lcdRow(0, "GSM + WiFi");
@@ -9949,6 +10632,7 @@ static String setRowLabel(int i) {
   if (i == SET_WIFI)   return String("WiFi        ") + (wifiEnabled ? "[ON]" : "[OFF]");
   if (i == SET_SOFTAP) return String("Setup AP    ") + ((portalActive || portalRequested) ? "[ON]" : "[OFF]");
   if (i == SET_BATTSW) return bswLatched ? String("BattSw FAULT>clear") : String("Batt Switch  [OK]");
+  if (i == SET_TESTING && actuationsDisabled) return String("Testing     [OFF]");
   return SET_NAMES[i];
 }
 

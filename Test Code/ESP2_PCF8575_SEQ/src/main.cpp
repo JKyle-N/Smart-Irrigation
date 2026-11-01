@@ -12,10 +12,12 @@
  *    Outputs are ACTIVE-LOW: writing 0xFFFF = all relays OFF; clearing a bit
  *    drives that output LOW = that relay ON.
  *
- *  >>> SAFETY: this drives EVERY output in turn, including the inverter (P5),
- *      the AC pumps (P6/P7/P10), and the Nano-RESET line (P17/bit15). For a dry
- *      wiring check, power the relay board but keep AC pumps/loads DISCONNECTED,
- *      or set FIRST_BIT / LAST_BIT below to skip those channels.
+ *  >>> SAFETY: this drives every output in turn, including the inverter (P5), the
+ *      AC pumps (P6/P7/P10) and the master cutoff (P17/bit15). For a dry wiring
+ *      check, power the relay board but keep AC pumps/loads DISCONNECTED, or set
+ *      FIRST_BIT / LAST_BIT below to skip those channels.
+ *      P4 is skipped: it is the battery-select DPDT now, not a valve, and it would
+ *      move the boards to the secondary. Set SKIP_P4 false only with the hold-up proven.
  *
  *  BUILD: PlatformIO -> env:esp32dev (only uses <Wire.h>, no extra libs).
  *         `pio run -t upload` then `pio device monitor` @ 115200.
@@ -33,14 +35,15 @@
 const uint8_t  FIRST_BIT = 0;      // first PCF output to test (0..15)
 const uint8_t  LAST_BIT  = 15;     // last  PCF output to test (0..15)
 const uint16_t STEP_MS   = 1000;   // 1 second between each relay (gap requested)
+const bool     SKIP_P4   = true;   // P4 = the battery DPDT (see SAFETY above)
 
 /* ---- Channel names (mirror ESP2 OUT_* numbering) ------------------------- */
 const char *CH_NAME[16] = {
-  "ResValve",  // P0
+  "Spare P0",  // P0
   "Col A Vlv", // P1
   "Col B Vlv", // P2
   "Col C Vlv", // P3
-  "Mix Valve", // P4
+  "Batt->2nd", // P4
   "Inverter",  // P5  (AC source)
   "Transfer",  // P6  (AC pump)
   "Booster",   // P7  (AC pump)
@@ -51,7 +54,7 @@ const char *CH_NAME[16] = {
   "Nut D",     // P12 (P14, unused in main fw)
   "pH Up",     // P13 (P15)
   "pH Down",   // P14 (P16)
-  "Nano RST"   // P15 (P17)
+  "Cutoff"     // P15 (P17, master actuator-power cutoff)
 };
 
 /* ---- PCF8575 raw I2C (active-LOW; identical pattern to ESP2 firmware) ----- */
@@ -95,6 +98,7 @@ void setup() {
 
 void loop() {
   for (uint8_t b = FIRST_BIT; b <= LAST_BIT && b < 16; b++) {
+    if (SKIP_P4 && b == 4) continue;
     relayOn(b);                              // exactly this relay ON (all others OFF)
     Serial.printf("P%-2u -> %-9s ON\n", b, CH_NAME[b]);
     delay(STEP_MS);                          // 1 s gap, then move up to the next
