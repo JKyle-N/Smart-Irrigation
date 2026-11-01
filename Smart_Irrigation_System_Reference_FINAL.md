@@ -3422,7 +3422,7 @@ Note: P17 is no longer the Nano hardware-reset line. It is now a master cutoff t
 - **Secondary battery:** 4S Li-ion, 16.8 V full (14.8 V nominal). It is charged from the main battery while the DPDT is in the main position (idle).
 - **What moves to it:** ESP1, ESP2, the Nano, the sensors and the relay coils.
 - **Switch:** P4, the relay of the condemned mixing-tank valve, drives the DPDT. De-energized = main battery, which is the fail-safe position. A fault, an E-stop, an ESP2 reboot, or ESP1 cutting ESP2's power (GPIO4) all return the boards to main.
-- **Monitor:** an **INA226 with an R010 shunt** on **ESP1's I²C at 0x40** measures the secondary's voltage and current. The bench tool is `Test Code/Arduino R3/INA226_R010/`.
+- **Monitor:** an **INA226 with an R010 shunt** on **ESP1's I²C at 0x40** measures the secondary's voltage and current. It is calibrated with `Calibration/ESP1/INA226` (module `sec`).
 - **Plumbing:** the mixing tank feeds the booster directly and the column valves select the column. The reservoir valve is no longer fitted, so P0 is a spare.
 
 **Sequencing (ESP2).** The rule is that inverter ON implies the secondary battery, for every inverter use (run stages, mixing, exercise, AC prime, and Testing / Timed Pulse / hold-to-run):
@@ -3602,7 +3602,7 @@ Upon reset or power-up:
 
 ## 21.0. Solar + Main Battery Monitoring (two INA226 behind an ISO1540)
 
-An INA226 must share a ground with what it measures, while the boards must not share one with the main battery. Two modules therefore sit on the main-battery side of an **ISO1540** I²C isolator and stay readable through every inverter run and battery switch. Nothing but the isolator crosses over.
+An INA226 must share a ground with what it measures, while the boards must not share one with the main battery. Two modules therefore sit on the main-battery side of an **ISO1540** I²C isolator and stay readable through every inverter run and battery switch. Nothing but the isolator crosses over. (The part number matters: an ISO1450 is an RS-485 transceiver and passes no I²C.)
 
 | Module | Address | Address pins | Shunt | CAL | Current LSB | Clips at |
 |---|---|---|---|---|---|---|
@@ -3629,15 +3629,19 @@ An INA226 must share a ground with what it measures, while the boards must not s
 
 **Behaviour.** The main INA226 is the first choice for main battery V/I/P, and the opto ADC + ACS758 (§21.1) takes over automatically if it stops answering. A main reading below 5 V is treated as a wiring fault and not used; solar has no such floor, because 0 V at night is real. Neither module blocks a run or sends a text. With the shunt bar, current is signed (+ = discharging), so `CONS` counts discharge only; `CHG` is solar energy.
 
+A module that loses its supply for a moment answers again with its calibration register at 0, which reads a healthy voltage and exactly 0 A. ESP1 reads that register back on every pass and restores it (`INA226|<name>|RESTARTED`). The secondary's monitor does the same.
+
+**Calibration.** `Calibration/ESP1/INA226`, flashed to ESP1, calibrates all three modules and saves to NVS `calib`, which `loadCal()` applies over the compiled constants. A value outside what the tool itself would accept is ignored and the compiled value used.
+
 ## 21.1. Battery Monitoring Fallback (calibrated opto ADC)
 
-- Battery **voltage (GPIO35)** and **current (GPIO34)** are sensed through an optocoupler into the ESP32
-  ADC (ADC1, 12-bit, `ADC_11db`). The optocoupler makes the raw counts NONLINEAR, so each channel is
-  fitted with a **least-squares polynomial** `value = a0 + a1·u + a2·u² + a3·u³`, `u = raw/4095`, capturing
-  the ADC + opto curve end-to-end.
-- **Calibration:** use the bench tool `Test Code/ESP1_ADC_OPTO_CAL` (apply known inputs, capture points,
-  compute) and paste the printed coefficients into the firmware defaults (`calBattV`/`calBattI`), or store
-  them in NVS namespace `adccal` which `loadBattCal()` reads at boot.
+- Battery **voltage (GPIO35)** is sensed through an optocoupler into the ESP32 ADC (ADC1, 12-bit, `ADC_11db`).
+  The optocoupler makes the raw counts NONLINEAR, so it is fitted with a **least-squares polynomial**
+  `value = a0 + a1·u + a2·u² + a3·u³`, `u = raw/4095`, capturing the ADC + opto curve end-to-end. Current comes
+  from the ACS758 through the ADS1115; the old GPIO34 opto current channel is no longer read.
+- **Calibration:** `Calibration/ESP1/BatteryOpto` (apply known voltages, capture points, compute) saves to NVS
+  namespace `adccal`, which `loadBattCal()` reads at boot, and prints the coefficients for `calBattV`.
+  `Calibration/ESP1/ACS758` covers the current sensor.
 - On this fallback, current is **magnitude only**, so energy is counted purely as consumption (no
   charge/discharge split).
 

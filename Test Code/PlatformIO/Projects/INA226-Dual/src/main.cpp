@@ -1,4 +1,7 @@
 /*
+  SUPERSEDED by Calibration/ESP1/INA226, which does this and adds the secondary battery and saving to
+  ESP1. Kept because it runs on an Uno bench with nothing else connected and no ESP32 at all.
+
   Solar + main battery INA226 (CJMCU-226) detect, read + calibrate, for the rig's two isolated modules
   ------------------------------------------------------------------
   Finds both modules on one I2C bus at two different addresses, proves each is really an INA226

@@ -1,6 +1,8 @@
 /* =============================================================================
  *  SMART IRRIGATION  --  BENCH TOOL  --  ADS1115 DETECT + ACS758 CURRENT (ESP32 #1)
  * -----------------------------------------------------------------------------
+ *  To calibrate, use Calibration/ESP1/ACS758: same maths, and it prints lines for CalStore.
+ * -----------------------------------------------------------------------------
  *  Standalone. No main firmware, no UART to the Nano/ESP2. Two jobs:
  *    1. DETECT  -- scan the I2C bus, confirm the ADS1115 answers at 0x48, and identify
  *                  every other device so a wiring mistake is obvious immediately.

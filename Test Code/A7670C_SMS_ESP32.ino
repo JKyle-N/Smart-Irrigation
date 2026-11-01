@@ -46,9 +46,9 @@ const uint16_t MODEM_BUF_SIZE = 256;
 const uint16_t SMS_MAX_LEN    = 160;
 
 // waitFor() results
-const uint8_t R_TIMEOUT = 0;
-const uint8_t R_OK      = 1;
-const uint8_t R_ERR     = 2;
+const uint8_t RES_TIMEOUT = 0;
+const uint8_t RES_OK      = 1;
+const uint8_t RES_ERR     = 2;
 
 HardwareSerial &modem = Serial2;
 
@@ -98,17 +98,17 @@ uint8_t waitFor(const char* okStr, const char* errStr, uint32_t idleTimeoutMs) {
       Serial.write(c);
       memmove(tail, tail + 1, sizeof(tail) - 2);
       tail[sizeof(tail) - 2] = c;
-      if (strstr(tail, okStr))  return R_OK;
-      if (strstr(tail, errStr)) return R_ERR;
+      if (strstr(tail, okStr))  return RES_OK;
+      if (strstr(tail, errStr)) return RES_ERR;
     }
     delay(1);
   }
-  return R_TIMEOUT;
+  return RES_TIMEOUT;
 }
 
 uint8_t finishCmd(uint32_t timeoutMs) {
   uint8_t r = waitFor("OK\r\n", "ERROR", timeoutMs);
-  if (r == R_TIMEOUT) Serial.println("[!] Timeout - no reply from module");
+  if (r == RES_TIMEOUT) Serial.println("[!] Timeout - no reply from module");
   return r;
 }
 
@@ -224,7 +224,7 @@ bool sendSms(const char* number, const char* text) {
   modem.print("\"\r");
 
   uint8_t r = waitFor("> ", "ERROR", 10000);
-  if (r != R_OK) {
+  if (r != RES_OK) {
     Serial.println("\n[!] No '>' prompt from module - cancelled");
     modem.write((uint8_t)0x1B);               // ESC = cancel
     return false;
@@ -235,11 +235,11 @@ bool sendSms(const char* number, const char* text) {
 
   Serial.println("\n[..] Waiting for network (up to 60 s)...");
   r = waitFor("OK\r\n", "ERROR", 60000);
-  if (r == R_OK) {
+  if (r == RES_OK) {
     Serial.println("[OK] SMS sent");
     return true;
   }
-  if (r == R_ERR) {
+  if (r == RES_ERR) {
     Serial.println("\n[FAIL] Module reported an error (see +CMS ERROR code above)");
   } else {
     Serial.println("\n[FAIL] Timeout waiting for send confirmation");
@@ -358,7 +358,7 @@ bool initModem() {
   runAT("AT+CSCS=\"GSM\"", 2000);   // plain GSM character set
 
   // Deliver incoming SMS straight to the serial port (+CMT)
-  if (runAT("AT+CNMI=2,2,0,0,0", 2000) != R_OK) {
+  if (runAT("AT+CNMI=2,2,0,0,0", 2000) != RES_OK) {
     Serial.println("[i] Falling back to CNMI=2,1 (store + notify)");
     runAT("AT+CNMI=2,1,0,0,0", 2000);
   }

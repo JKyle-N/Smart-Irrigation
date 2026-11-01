@@ -219,7 +219,10 @@ reading (stage I), or `calBattV` must be calibrated. Set `SECONDARY_BACKUP_ENABL
 
 ### I — Solar + main battery INA226 behind the ISO1540  *(no flag; the firmware finds them by itself)*
 
-Wiring is in reference §21.0. Do these before any main firmware, with `Test Code/PlatformIO/Projects/INA226-Dual`:
+Wiring is in reference §21.0. Do these before any main firmware, with `Calibration/ESP1/INA226` flashed to ESP1 (`.\cal.ps1 ina226` in `Calibration/`):
+
+- **Read the chip's marking: it must say ISO1540.** An ISO1450 is an RS-485 transceiver and passes no I²C.
+- **`bustest`, with the inverter off and then running:** 0 failed and 0 wrong on each module.
 
 - **Before powering:** on the main battery module, confirm its onboard R010 is gone (no continuity across
   it, IN+ to IN-, with the shunt bar disconnected). Confirm the panel's Voc is under 36 V and Isc under 8.19 A.
@@ -232,15 +235,16 @@ Wiring is in reference §21.0. Do these before any main firmware, with `Test Cod
   names come out swapped, swap the addresses in the sketch and in ESP1.
 - **Direction:** discharge must read positive on the battery module and charging positive on the solar
   one. If not, type `invert batt` or `invert solar`.
-- **Calibrate each module** with the sketch's serial commands, in this order: `zero <module>` with no current
+- **Calibrate each module** with the tool's serial commands, in this order: `zero <module>` with no current
   through the shunt, `amps <module> <A>` at a steady current from a clamp meter, `volts <module> <V>` from a
   multimeter across VBS and GND. It refuses a setup that can't give a good result and says why. Take
   `amps` for solar in good sun, and at the highest steady load you can for the battery.
-- **Paste what `show` prints** into `ESP1/src/main.cpp` and the sketch's `MODULES` table. The board stores
-  nothing, so a reboot loses anything not pasted. Reboot once afterwards, and confirm the readings still
-  match the meters.
+- **`save <module>`** stores the trims in ESP1's NVS, which the firmware loads at boot. Reboot once afterwards:
+  the tool must report them loaded, and the readings must still match the meters.
 
 Then on the main firmware:
+- **A restart must not read 0 A.** Under a steady load, pull the modules' 3.3 V for a moment and restore it:
+  expect `INA226|<name>|RESTARTED` in the log and the current back at its true value within about 4 s.
 - LCD Power page: signed `I:` and the `Sol:` line. `STATUS` has `SOL`, the log has `PWR …|SRC=INA` and `PWRS`,
   and the dashboard's solar tiles fill in.
 - Force a run on a bench supply or the real battery: readings keep updating through the whole run, with
