@@ -1,12 +1,12 @@
 /* =============================================================================
- *  SMART IRRIGATION  --  CALIBRATION BENCH TOOL  --  ACS758 CURRENT via ADS1115 (ESP32 #1)
+ *  SMART IRRIGATION  --  CALIBRATION TOOL  --  ACS758 CURRENT via ADS1115 (ESP32 #1)
  * -----------------------------------------------------------------------------
- *  Standalone. No ESP2, no Nano, no UART. Reads an ACS758 hall-effect current
- *  sensor through an ADS1115 16-bit I2C ADC and captures the two constants the
- *  real firmware needs:
- *      amps = (v_sensor - ACS758_ZERO_V) / ACS758_SENS_V_PER_A
- *  Same shape as the existing ESP2 ACS712 tool (Calibration/ESP2/ACS712), so the
- *  method and the paste-ready output transfer 1:1.
+ *  The main battery's FALLBACK current sensor: ESP1 uses it only while the main INA226
+ *  is not answering. Reads an ACS758 through an ADS1115 and captures what the firmware needs:
+ *      amps = (v_at_A0 * ACS_DIV - ACS_ZERO_V) / ACS_SENS_V_PER_A
+ *
+ *  HOW TO USE: variant 50B, vcc <measured>, div <measured>, load OFF: zero, then at a known
+ *  current: sens <A>, then show for the lines to paste into CalStore.
  *
  *  WHY AN EXTERNAL ADC: the ESP32's own ADC is nonlinear and noisy at the few-mV
  *  level an ACS758 resolves (10-40 mV/A). The ADS1115 gives 125 uV/LSB on the
@@ -39,7 +39,7 @@
  *
  *  PINS (match ESP1/src/main.cpp:62-63): I2C SDA=21, SCL=22.
  *  ADS1115 ADDR pin -> GND = 0x48 (default here). VDD=0x49, SDA=0x4A, SCL=0x4B.
- *  0x48 does not collide with the rig's LCD 0x27 / INA226 0x40 / EEPROM 0x57 / RTC 0x68.
+ *  0x48 does not collide with the rig's LCD 0x27 / INA226 0x40, 0x41, 0x44 / EEPROM 0x57 / RTC 0x68.
  *
  *  RATIOMETRIC SENSOR: the ACS758's zero point and sensitivity both scale with its
  *  supply. Zero = VCC/2 (bidirectional "B" parts) or 0.12 x VCC (unidirectional "U").
@@ -53,8 +53,8 @@
  *    r                 read once: raw code, volts, amps
  *    live              toggle ~2 Hz live readout
  *    stats [n]         n samples (default 200): mean/min/max/ripple + amps
- *    zero              load OFF: capture the quiescent output -> ACS758_ZERO_V
- *    sens <amps>       load at a KNOWN current: derive V/A -> ACS758_SENS_V_PER_A
+ *    zero              load OFF: capture the quiescent output -> ACS_ZERO_V
+ *    sens <amps>       load at a KNOWN current: derive V/A -> ACS_SENS_V_PER_A
  *    variant <name>    datasheet defaults, e.g. `variant 50B` / `100U` (see `variant ?`)
  *    vcc <volts>       measured ACS758 supply rail (ratiometric correction)
  *    div <ratio>       divider ratio (R1+R2)/R2 in front of the ADC; 1.0 = direct
@@ -92,9 +92,11 @@ const float PGA_FS[6] = { 6.144f, 4.096f, 2.048f, 1.024f, 0.512f, 0.256f };
 double divRatio = 2.0;                  // (R1+R2)/R2 -- 10k/10k. 1.0 if wired direct.
 double acsVcc   = 5.0;                  // MEASURE this rail; the sensor is ratiometric
 bool   biDir    = true;                 // "B" part (zero at VCC/2) vs "U" (zero at 0.12*VCC)
-double zeroV    = 2.5;                  // ACS758_ZERO_V  (recomputed by `variant` / `vcc`)
-double sensVperA = 0.040;               // ACS758_SENS_V_PER_A (50 A bidirectional default)
+double zeroV    = 2.5;                  // ACS_ZERO_V  (recomputed by `variant` / `vcc` until measured)
+double sensVperA = 0.040;               // ACS_SENS_V_PER_A (50 A bidirectional default)
 double sens5V   = 0.040;                // datasheet sensitivity AT 5.0 V, before ratiometric scaling
+bool   zeroMeasured = false;            // `zero` ran: a later `vcc` or `variant` must not overwrite it
+bool   sensMeasured = false;            // `sens` ran: likewise
 
 bool liveOn = false;
 unsigned long lastLiveMs = 0;
@@ -125,6 +127,7 @@ void setup() {
   i2cBusRecover();                      // same trick as ESP1/src/main.cpp:1366 -- free a stuck slave
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(100000);                // 100 kHz: this is a precision read, not a race
+  Wire.setTimeOut(50);                  // bound a stuck bus
 
   Serial.println();
   Serial.println("=== ACS758 CURRENT CALIBRATION via ADS1115 (ESP32 #1) ===");
@@ -225,9 +228,10 @@ double ampsFrom(double vSensor) {
 // Re-derive the zero point and sensitivity for the ACS758's ACTUAL supply voltage.
 // Both are ratiometric: a 3% low rail is a 3% error in both, and the zero-point shift
 // alone is worth amps of phantom reading.
+// A value already MEASURED stays: that is the point of measuring it, and it already includes the real rail.
 void applyRatiometric() {
-  zeroV     = biDir ? (acsVcc * 0.5) : (acsVcc * 0.12);
-  sensVperA = sens5V * (acsVcc / 5.0);
+  if (!zeroMeasured) zeroV     = biDir ? (acsVcc * 0.5) : (acsVcc * 0.12);
+  if (!sensMeasured) sensVperA = sens5V * (acsVcc / 5.0);
 }
 
 /* Bit-bang up to 9 SCL pulses to free a slave stuck holding SDA low, then STOP.
@@ -261,7 +265,7 @@ void printHelp() {
   Serial.println("  r                 read once: raw code, volts, amps");
   Serial.println("  live              toggle ~2 Hz live readout");
   Serial.println("  stats [n]         n samples (default 200): mean/min/max/ripple");
-  Serial.println("  zero              load OFF: capture quiescent -> ACS758_ZERO_V");
+  Serial.println("  zero              load OFF: capture quiescent -> ACS_ZERO_V");
   Serial.println("  sens <amps>       load at a KNOWN current: derive V/A");
   Serial.println("  variant <name>    datasheet defaults (`variant ?` to list)");
   Serial.println("  vcc <volts>       measured ACS758 supply (ratiometric!)");
@@ -297,10 +301,15 @@ void printShow() {
   Serial.print("  variant = "); Serial.print(biDir ? "bidirectional (B)" : "unidirectional (U)");
   Serial.print("   VCC = "); Serial.print(acsVcc, 3); Serial.println(" V (measured)");
   Serial.print("  datasheet sens @5V = "); Serial.print(sens5V * 1000.0, 2); Serial.println(" mV/A");
-  Serial.println("--- constants (paste into the ESP1 firmware) ---");
-  Serial.print("const float ACS758_ZERO_V        = "); Serial.print(zeroV, 5); Serial.println("f;");
-  Serial.print("const float ACS758_SENS_V_PER_A  = "); Serial.print(sensVperA, 5); Serial.println("f;");
-  Serial.print("const float ACS758_DIV_RATIO     = "); Serial.print(divRatio, 5); Serial.println("f;");
+  // The firmware is fixed on 0x48, AIN0 and +/-4.096 V, so a result taken elsewhere does not transfer.
+  if (adsAddr != 0x48 || adsChan != 0 || adsGain != 1)
+    Serial.println("  WARNING: ESP1 uses addr 0x48, AIN0, gain 1. It will not read this sensor as set up here.");
+  Serial.println("======== RESULT ========");
+  Serial.println("CalStore on ESP1 (flash Calibration/ESP1/CalStore, paste, flash the firmware back):");
+  Serial.print("  set acsDiv ");  Serial.println(divRatio, 5);
+  Serial.print("  set acsZero "); Serial.println(zeroV, 5);
+  Serial.print("  set acsSens "); Serial.println(sensVperA, 5);
+  Serial.println("========================");
 }
 
 void printRead() {
@@ -326,7 +335,9 @@ void doScan() {
       Serial.print("  found 0x"); Serial.print(a, HEX);
       if (a >= 0x48 && a <= 0x4B) Serial.print("   <-- ADS1115");
       else if (a == 0x27) Serial.print("   (LCD)");
-      else if (a == 0x40) Serial.print("   (INA226)");
+      else if (a == 0x40) Serial.print("   (INA226, secondary)");
+      else if (a == 0x41) Serial.print("   (INA226, solar, behind the ISO1540)");
+      else if (a == 0x44) Serial.print("   (INA226, main battery, behind the ISO1540)");
       else if (a == 0x57) Serial.print("   (EEPROM)");
       else if (a == 0x68) Serial.print("   (DS3231 RTC)");
       Serial.println();
@@ -373,8 +384,8 @@ void handleLine(const String &in) {
   if (cmd == "zero") {
     double v, lo, hi;
     if (!voltsMean(256, v, &lo, &hi)) { Serial.println("READ FAILED -- check wiring"); return; }
-    zeroV = v;
-    Serial.print("zero captured over 256 samples: ACS758_ZERO_V = "); Serial.println(zeroV, 5);
+    zeroV = v; zeroMeasured = true;
+    Serial.print("zero captured over 256 samples: ACS_ZERO_V = "); Serial.println(zeroV, 5);
     Serial.print("  ripple was "); Serial.print((hi - lo) * 1000.0, 2); Serial.println(" mVpp");
     double expect = biDir ? acsVcc * 0.5 : acsVcc * 0.12;
     double dev = fabs(zeroV - expect);
@@ -386,8 +397,7 @@ void handleLine(const String &in) {
       Serial.print(" V; you are "); Serial.print(dev * 1000.0, 0); Serial.println(" mV off.");
       Serial.println("  Check `div` (measure R1/R2), `vcc` (measure the rail), and that the load is truly OFF.");
     }
-    Serial.println("// paste:");
-    Serial.print("const float ACS758_ZERO_V = "); Serial.print(zeroV, 5); Serial.println("f;");
+    Serial.println("NEXT: run a known current, read it on a clamp meter, then type: sens <amps>");
     return;
   }
 
@@ -402,14 +412,13 @@ void handleLine(const String &in) {
       Serial.println("output barely moved from zero (<2 mV) -- is the load actually drawing current?");
       return;
     }
-    sensVperA = fabs(delta) / fabs(amps);
+    sensVperA = fabs(delta) / fabs(amps); sensMeasured = true;
     sens5V    = sensVperA / (acsVcc / 5.0);               // back out the ratiometric scaling
     Serial.print("delta = "); Serial.print(delta * 1000.0, 2); Serial.print(" mV at ");
     Serial.print(amps, 3); Serial.println(" A");
-    Serial.print("ACS758_SENS_V_PER_A = "); Serial.println(sensVperA, 5);
+    Serial.print("ACS_SENS_V_PER_A = "); Serial.println(sensVperA, 5);
     Serial.print("  (= "); Serial.print(sens5V * 1000.0, 2); Serial.println(" mV/A normalised to 5.0 V)");
-    Serial.println("// paste:");
-    Serial.print("const float ACS758_SENS_V_PER_A = "); Serial.print(sensVperA, 5); Serial.println("f;");
+    Serial.println("NEXT: type show for the result.");
     return;
   }
 
@@ -427,6 +436,7 @@ void handleLine(const String &in) {
     else if (v == "200U") { sens5V = 0.0200; biDir = false; }
     else ok = false;
     if (!ok) { Serial.println("unknown variant -- `variant ?` to list"); return; }
+    zeroMeasured = sensMeasured = false;                  // a different part: start from its datasheet values
     applyRatiometric();
     Serial.print("variant "); Serial.print(v); Serial.println(" loaded (datasheet defaults):");
     Serial.print("  zero = "); Serial.print(zeroV, 4); Serial.print(" V   sens = ");

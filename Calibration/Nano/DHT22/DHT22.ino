@@ -1,25 +1,17 @@
 /* =============================================================================
- *  SMART IRRIGATION  --  CALIBRATION BENCH TOOL  --  DHT22 (Arduino Nano)
+ *  SMART IRRIGATION -- CALIBRATION TOOL -- DHT22 (Arduino Nano)
  * -----------------------------------------------------------------------------
- *  Standalone. No ESP1, no UART. Measures the temperature & humidity OFFSET trims
- *  (spec sec.A.4: offset vs. a reference thermo-hygrometer; default 0). ESP32 #1
- *  applies these offsets when it interprets the Nano's ENV packet.
+ *  Temperature and humidity offsets against a reference instrument. They stay 0 unless a reference says
+ *  otherwise. ESP1 adds them to what the Nano reports.
  *
- *  PIN (match Nano/Nano.ino:87,165): DHT22 data D11.
+ *  HOW TO USE
+ *    Put the sensor beside your reference and give them 10 minutes.
+ *    1. ref t 28.4      your thermometer's reading
+ *    2. ref h 62        your hygrometer's reading
+ *    3. result          prints the lines for CalStore
+ *    Also: r, live, h.
  *
- *  SERIAL 115200 -- commands (type + Enter):
- *    h                 help
- *    r                 print temp/hum once
- *    live              toggle ~2 Hz live readout
- *    ref t <value>     enter your reference thermometer reading -> temp offset
- *    ref h <value>     enter your reference hygrometer reading   -> humidity offset
- *    show              print current offsets
- *
- *  offset = reference - sensor. Add it to the sensor reading to correct.
- *  Paste temp/hum offsets into ESP32 #1's ENV offset trims (default 0).
- *
- *  Libraries (Arduino IDE: install "DHT sensor library" + "Adafruit Unified Sensor").
- *  Build: Arduino IDE (Arduino Nano, ATmega328P) or `pio run` in this folder.
+ *  PIN as in Nano/Nano.ino: DHT22 data on D11. Disconnect D0/D1 while flashing and while using this tool.
  * ========================================================================== */
 #include <Arduino.h>
 #include <DHT.h>
@@ -27,18 +19,84 @@
 const uint8_t PIN_DHT = 11;
 DHT dht(PIN_DHT, DHT22);
 
-const unsigned long LIVE_MS = 2000;   // DHT22 updates ~0.5 Hz; don't poll faster
+const unsigned long LIVE_MS = 2500;   // a DHT22 gives a new reading every 2 s at best
+const uint8_t AVG_READS = 4;
+const float MAX_T_OFF = 10.0f, MAX_H_OFF = 25.0f;   // further out, suspect the setup rather than the sensor
+
 float tempOffset = 0.0f, humOffset = 0.0f;
+bool  tempDone = false, humDone = false;
 bool  liveOn = false;
 unsigned long lastLiveMs = 0;
 
-#define LINE_BUF 48
+#define LINE_BUF 32
 char    line[LINE_BUF];
 uint8_t lineLen = 0;
 
-void printHelp();
-void printRaw();
-void handleLine(char *s);
+void printHelp() {
+  Serial.println(F("Commands:"));
+  Serial.println(F("  ref t <value>   your thermometer: works out the temperature offset"));
+  Serial.println(F("  ref h <value>   your hygrometer: works out the humidity offset"));
+  Serial.println(F("  result          lines to paste into CalStore"));
+  Serial.println(F("  r / live        reading now, and live on/off"));
+}
+
+void printRaw() {
+  float t = dht.readTemperature(), h = dht.readHumidity();
+  if (isnan(t) || isnan(h)) { Serial.println(F("DHT read FAILED: check D11 and its power.")); return; }
+  Serial.print(F("T=")); Serial.print(t + tempOffset, 1); Serial.print(F(" C   H=")); Serial.print(h + humOffset, 1); Serial.println(F(" %  (offsets applied)"));
+}
+
+// Mean of a few fresh readings, about 8 s. NAN if any of them failed.
+float averaged(bool temp) {
+  float sum = 0;
+  Serial.println(F("Reading, about 8 s..."));
+  for (uint8_t i = 0; i < AVG_READS; i++) {
+    delay(2100);
+    float v = temp ? dht.readTemperature() : dht.readHumidity();
+    if (isnan(v)) return NAN;
+    sum += v;
+  }
+  return sum / AVG_READS;
+}
+
+void printResult() {
+  if (!tempDone && !humDone) { Serial.println(F("Nothing measured yet. Start with: ref t <value>")); return; }
+  Serial.println(F("======== RESULT ========"));
+  Serial.println(F("CalStore on ESP1 (flash Calibration/ESP1/CalStore, paste, flash the firmware back):"));
+  if (tempDone) { Serial.print(F("  set tOff ")); Serial.println(tempOffset, 2); }
+  if (humDone)  { Serial.print(F("  set hOff ")); Serial.println(humOffset, 2); }
+  Serial.println(F("========================"));
+}
+
+void handleLine(char *s) {
+  char *t1 = strtok(s, " ");
+  if (!t1) return;
+  if (!strcasecmp(t1, "h") || !strcasecmp(t1, "help")) { printHelp(); return; }
+  if (!strcasecmp(t1, "r"))      { printRaw(); return; }
+  if (!strcasecmp(t1, "result") || !strcasecmp(t1, "show")) { printResult(); return; }
+  if (!strcasecmp(t1, "live"))   { liveOn = !liveOn; Serial.println(liveOn ? F("live ON") : F("live OFF")); return; }
+  if (!strcasecmp(t1, "ref")) {
+    char *t2 = strtok(NULL, " "), *t3 = strtok(NULL, " ");
+    bool isT = t2 && !strcasecmp(t2, "t"), isH = t2 && !strcasecmp(t2, "h");
+    char *end = NULL;
+    float ref = t3 ? (float)strtod(t3, &end) : 0.0f;
+    if ((!isT && !isH) || !t3 || *end != '\0') { Serial.println(F("usage: ref t <value>  or  ref h <value>")); return; }
+    float v = averaged(isT);
+    if (isnan(v)) { Serial.println(F("DHT read FAILED: check D11 and its power.")); return; }
+    float off = ref - v;
+    if (fabs(off) > (isT ? MAX_T_OFF : MAX_H_OFF)) {
+      Serial.print(F("REFUSED: the sensor reads ")); Serial.print(v, 1); Serial.print(F(" against your ")); Serial.print(ref, 1);
+      Serial.println(F(". Too far apart to be a trim: check the number and let them settle together."));
+      return;
+    }
+    if (isT) { tempOffset = off; tempDone = true; } else { humOffset = off; humDone = true; }
+    Serial.print(isT ? F("Temperature offset = ") : F("Humidity offset = ")); Serial.println(off, 2);
+    if (tempDone && humDone) Serial.println(F("NEXT: type result"));
+    else Serial.println(isT ? F("NEXT: ref h <your hygrometer's reading>") : F("NEXT: ref t <your thermometer's reading>"));
+    return;
+  }
+  Serial.println(F("Unknown command: type h"));
+}
 
 void setup() {
   Serial.begin(115200);
@@ -46,80 +104,15 @@ void setup() {
   Serial.println();
   Serial.println(F("=== DHT22 CALIBRATION (Nano) ==="));
   printHelp();
+  Serial.println(F("START: sensor beside your reference for 10 minutes, then: ref t <value>"));
 }
 
 void loop() {
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
-      if (lineLen > 0) { line[lineLen] = '\0'; handleLine(line); lineLen = 0; }
-    } else if (lineLen < LINE_BUF - 1) {
-      line[lineLen++] = c;
-    } else {
-      lineLen = 0;
-    }
+      if (lineLen > 0) { line[lineLen] = '\0'; lineLen = 0; handleLine(line); }
+    } else if (lineLen < LINE_BUF - 1) line[lineLen++] = c;
   }
-  if (liveOn && (unsigned long)(millis() - lastLiveMs) >= LIVE_MS) {
-    lastLiveMs = millis();
-    printRaw();
-  }
-}
-
-void printHelp() {
-  Serial.println(F("Commands:"));
-  Serial.println(F("  h               this help"));
-  Serial.println(F("  r               temp/hum once"));
-  Serial.println(F("  live            toggle ~0.5 Hz live readout"));
-  Serial.println(F("  ref t <value>   reference thermometer -> temp offset"));
-  Serial.println(F("  ref h <value>   reference hygrometer   -> humidity offset"));
-  Serial.println(F("  show            print current offsets"));
-}
-
-void printRaw() {
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
-  if (isnan(t) || isnan(h)) { Serial.println(F("DHT read FAILED (check wiring/power)")); return; }
-  Serial.print(F("T = ")); Serial.print(t, 1); Serial.print(F(" C"));
-  Serial.print(F("  (corr ")); Serial.print(t + tempOffset, 1); Serial.print(F(" C)"));
-  Serial.print(F("   H = ")); Serial.print(h, 1); Serial.print(F(" %"));
-  Serial.print(F("  (corr ")); Serial.print(h + humOffset, 1); Serial.println(F(" %)"));
-}
-
-void handleLine(char *s) {
-  char *t1 = strtok(s, " ");
-  if (!t1) return;
-
-  if (!strcasecmp(t1, "h"))    { printHelp(); return; }
-  if (!strcasecmp(t1, "r"))    { printRaw();  return; }
-  if (!strcasecmp(t1, "live")) { liveOn = !liveOn; Serial.print(F("live=")); Serial.println(liveOn ? F("ON") : F("OFF")); return; }
-  if (!strcasecmp(t1, "show")) {
-    Serial.print(F("temp offset = ")); Serial.println(tempOffset, 2);
-    Serial.print(F("hum  offset = ")); Serial.println(humOffset, 2);
-    return;
-  }
-  if (!strcasecmp(t1, "ref")) {
-    char *t2 = strtok(NULL, " ");
-    char *t3 = strtok(NULL, " ");
-    if (!t2 || !t3) { Serial.println(F("usage: ref <t|h> <value>")); return; }
-    float ref = atof(t3);
-    if (!strcasecmp(t2, "t")) {
-      float t = dht.readTemperature();
-      if (isnan(t)) { Serial.println(F("DHT read FAILED")); return; }
-      tempOffset = ref - t;
-      Serial.print(F("temp offset = ")); Serial.print(tempOffset, 2);
-      Serial.print(F("  (ref ")); Serial.print(ref, 1); Serial.print(F(" - sensor ")); Serial.print(t, 1); Serial.println(F(")"));
-      return;
-    }
-    if (!strcasecmp(t2, "h")) {
-      float h = dht.readHumidity();
-      if (isnan(h)) { Serial.println(F("DHT read FAILED")); return; }
-      humOffset = ref - h;
-      Serial.print(F("hum offset = ")); Serial.print(humOffset, 2);
-      Serial.print(F("  (ref ")); Serial.print(ref, 1); Serial.print(F(" - sensor ")); Serial.print(h, 1); Serial.println(F(")"));
-      return;
-    }
-    Serial.println(F("usage: ref <t|h> <value>"));
-    return;
-  }
-  Serial.println(F("? unknown command -- type h"));
+  if (liveOn && (unsigned long)(millis() - lastLiveMs) >= LIVE_MS) { lastLiveMs = millis(); printRaw(); }
 }

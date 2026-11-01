@@ -1,288 +1,253 @@
 /* =============================================================================
- *  SMART IRRIGATION  --  CALIBRATION BENCH TOOL  --  8x FLOW SENSORS (ESP32 #2)
+ *  SMART IRRIGATION -- CALIBRATION TOOL -- FLOW K-FACTORS + PUMP RATES (ESP32 #2)
  * -----------------------------------------------------------------------------
- *  Standalone. No ESP1, no work orders. Measures the flow-sensor K-factors
- *  (pulses per LITER) that the REAL firmware doses/meters with (K_RES_MIX /
- *  K_MIX_IRR / K_NUT[]). Flow is single-factor, zero-offset: K = pulses / liters,
- *  measured 3x + median outlier check (spec sec.A.4.1).
+ *  Runs a line's pump while you HOLD the on-board BOOT button, into a measuring vessel. From the pulses,
+ *  the volume you caught and the time the pump ran it works out two things:
+ *    K     pulses per litre, for that line's flow sensor
+ *    rate  how fast the pump really moves water: the only tool for PUMP_FLOWRATE_MLPM, TRANSFER_LPM, BOOSTER_LPM
  *
- *  DRIVES THE PUMP UNDER A HARDWARE DEAD-MAN: to move water the tool opens the line's
- *  valve(s) + runs its paired pump via the PCF8575 -- but ONLY while you physically
- *  HOLD the ESP32's on-board BOOT button (GPIO0). Release BOOT -> pump stops instantly.
- *  A hard per-class time cap still applies (sec.A.4.1.3): if you hold past the cap the
- *  pump auto-stops and you must RELEASE and re-press to continue. `off` = panic-SAFE.
+ *  HOW TO USE (the tool tells you the next step each time)
+ *    1. ch NUTA              Pick a line. MIXIRR also needs a column: ch MIXIRR A
+ *    2. Hold BOOT            Fill the vessel. An AC line waits 5 s for the inverter first. Release to stop.
+ *    3. ml 120  or  vol 3.0  What you caught. Repeat 2-3 at least 3 times.
+ *    4. calc                 Checks the runs agree within 8 %, and prints the lines for CalStore.
+ *    Also: r, live, runs, drop <n>, clear, off (stop everything now), h.
  *
- *  PINS / BITS (match ESP2/src/main.cpp): flow pins RES_MIX 26, MIX_IRR 5, NUT_A 23,
- *  NUT_B 19, NUT_C 18, NUT_D 27, PH_UP 4, PH_DN 25 (ISR FALLING, INPUT_PULLUP,
- *  main.cpp:120-126,601-606). PCF8575 I2C SDA21/SCL22 addr 0x20, ACTIVE-LOW
- *  (0xFFFF = all OFF); output bits from main.cpp:99-115. Master cutoff bit 15 (P17)
- *  gates power to the whole bank and is energized whenever a pump runs.
- *  Dead-man button: on-board BOOT = GPIO0 (active-LOW, pressed = LOW).
- *  Line->(valve,pump) pairing follows the Prime table (spec sec.A.4.2.1).
+ *  For a pump rate, hold BOOT in ONE go for about a minute: a stop and restart spoils the timing, not the K.
  *
- *  !!! SAFETY: this drives real pumps/valves. Only run with the rig plumbed and a
- *      vessel in place. Releasing BOOT or the hard cap stops it. `off` = panic-SAFE. !!!
+ *  SAFETY
+ *    - WATER ONLY, with the rig plumbed and a vessel in place.
+ *    - Releasing BOOT, the hard cap, `off`, or (on an AC line) 10 s with no flow stops everything.
+ *    - P4 is never driven. It is the battery-select DPDT now, not a valve: energizing it moves the boards
+ *      to the secondary, which is why this tool's old MIXIRR run could reset the controllers.
+ *    - ESP2's PCF8575 is on the rail ESP1 switches with GPIO4. If it is not found, that rail is off.
  *
- *  SERIAL 115200 -- commands (type + Enter):
- *    h                    help
- *    ch <ID> [A|B|C]      select+arm a channel (col required for MIXIRR); zeros its ISR.
- *                         Then HOLD the on-board BOOT button to flow, release to stop.
- *    r / live             pulse count (live toggles ~2 Hz)
- *    vol <liters>         enter caught volume -> stores this run's K, re-zeros for next run
- *    runs                 list captured runs
- *    calc                 median/outlier check -> final K to paste
- *    x / clear            drop last run / all runs
- *    off                  force ALL outputs SAFE (panic)
- *    IDs: RESMIX MIXIRR NUTA NUTB NUTC NUTD PHUP PHDN
- *
- *  Build: PlatformIO `pio run -e esp32dev` in this folder.
+ *  PINS, BITS, SIGN: same as ESP2/src/main.cpp. Flow is INPUT_PULLUP, FALLING. PCF8575 at 0x20, active LOW.
  * ========================================================================== */
 #include <Arduino.h>
 #include <Wire.h>
 
-/* ---- PCF8575 (match ESP2/src/main.cpp:94-115) ---------------------------- */
-const int      I2C_SDA = 21, I2C_SCL = 22;
-const uint8_t  PCF_ADDR = 0x20;
-#define B_RES_VALVE (1u<<0)
-#define B_COL_A     (1u<<1)
-#define B_COL_B     (1u<<2)
-#define B_COL_C     (1u<<3)
-#define B_MIX_VALVE (1u<<4)
-#define B_INVERTER  (1u<<5)
-#define B_TRANSFER  (1u<<6)
-#define B_BOOSTER   (1u<<7)
-#define B_NUT_A     (1u<<9)
-#define B_NUT_B     (1u<<10)
-#define B_NUT_C     (1u<<11)
-#define B_NUT_D     (1u<<12)
-#define B_PH_UP     (1u<<13)
-#define B_PH_DN     (1u<<14)
-#define B_MASTER    (1u<<15)          // P17 master actuator-power cutoff
+const int     I2C_SDA = 21, I2C_SCL = 22;
+const uint8_t PCF_ADDR = 0x20;
+#define B_COL_A    (1u << 1)
+#define B_COL_B    (1u << 2)
+#define B_COL_C    (1u << 3)
+#define B_INVERTER (1u << 5)
+#define B_TRANSFER (1u << 6)
+#define B_BOOSTER  (1u << 7)
+#define B_NUT_A    (1u << 9)
+#define B_NUT_B    (1u << 10)
+#define B_NUT_C    (1u << 11)
+#define B_NUT_D    (1u << 12)
+#define B_PH_UP    (1u << 13)
+#define B_PH_DN    (1u << 14)
+#define B_MASTER   (1u << 15)          // P17 master actuator-power cutoff
+#define B_BATT_SEL (1u << 4)           // P4: the battery DPDT. Masked out of every write below
 
-/* ---- flow pins (match ESP2/src/main.cpp:120-126,1145-1155) ---------------- */
 struct Chan {
   const char *id;
   uint8_t     flowPin;
-  uint16_t    relays;    // ON bits (besides master + column)
-  bool        mainLine;  // true -> short main-line cap; false -> longer dosing cap
-  bool        needCol;   // MIXIRR needs a column valve
-  const char *paste;     // firmware constant this K feeds (or a note)
+  uint16_t    pump;
+  bool        ac;        // needs the inverter + warmup
+  bool        needCol;   // MIXIRR: opens a column valve
+  const char *kKey;      // CalStore key for the K
+  const char *rateKey;   // CalStore key for the rate, or NULL
+  const char *rateConst; // ESP2/src/main.cpp constant for the rate, or NULL
 };
-Chan CH[] = {
-  { "RESMIX", 26,  B_INVERTER|B_RES_VALVE|B_TRANSFER, true,  false, "K_RES_MIX  (main.cpp:136)" },
-  { "MIXIRR",  5,  B_INVERTER|B_MIX_VALVE|B_BOOSTER,  true,  true,  "K_MIX_IRR  (main.cpp:137)" },
-  { "NUTA",   23,  B_NUT_A,                           false, false, "K_NUT[0]   (main.cpp:138)" },
-  { "NUTB",   19,  B_NUT_B,                           false, false, "K_NUT[1]   (main.cpp:138)" },
-  { "NUTC",   18,  B_NUT_C,                           false, false, "K_NUT[2]   (main.cpp:138)" },
-  { "NUTD",   27,  B_NUT_D,                           false, false, "(NutD not metered in normal firmware)" },
-  { "PHUP",    4,  B_PH_UP,                           false, false, "(pH Up flow not metered in normal firmware)" },
-  { "PHDN",   25,  B_PH_DN,                           false, false, "(pH Dn flow not metered in normal firmware)" },
+const Chan CH[] = {
+  { "RESMIX", 26, B_TRANSFER, true,  false, "kRM", NULL,    "TRANSFER_LPM" },
+  { "MIXIRR",  5, B_BOOSTER,  true,  true,  "kMI", NULL,    "BOOSTER_LPM"  },
+  { "NUTA",   23, B_NUT_A,    false, false, "kNA", "pumpA", NULL },
+  { "NUTB",   19, B_NUT_B,    false, false, "kNB", "pumpB", NULL },
+  { "NUTC",   18, B_NUT_C,    false, false, "kNC", "pumpC", NULL },
+  { "NUTD",   27, B_NUT_D,    false, false, "kND", NULL,    NULL },
+  { "PHUP",    4, B_PH_UP,    false, false, "kPU", NULL,    NULL },
+  { "PHDN",   25, B_PH_DN,    false, false, "kPD", NULL,    NULL },
 };
 const int NCH = sizeof(CH) / sizeof(CH[0]);
 
-/* ---- dead-man = on-board BOOT button (GPIO0, active-LOW) ------------------ */
-#define PIN_BOOT 0                             // ESP32 on-board BOOT button; pressed = LOW
-const unsigned long BTN_DEBOUNCE_MS = 25;      // debounce the mechanical button
-const unsigned long CAP_MAIN_MS     = 3000;    // main-line hard cap (high flow, ~1-3 s)
-const unsigned long CAP_DOSING_MS   = 15000;   // dosing-line hard cap (low flow)
-const float OUTLIER_TOL = 0.08f;               // +-8% from median flags a run
-const uint8_t MAX_RUNS  = 6;
+#define PIN_BOOT 0                              // on-board BOOT button; pressed = LOW
+const unsigned long BTN_DEBOUNCE_MS = 25;
+const unsigned long WARMUP_MS  = 5000;          // ESP2's INVERTER_WARMUP_MS: the pump waits for the inverter
+const unsigned long CAP_AC_MS  = 45000;         // ESP2's PRIME_CAP_MS
+const unsigned long CAP_DC_MS  = 90000;         // long enough for a one-minute rate run
+const unsigned long NO_FLOW_MS = 10000;         // ESP2's FLOW_TIMEOUT_MS. AC only: dosing pulses can be seconds apart
+const float OUTLIER_TOL = 0.08f;                // ESP1's CAL_OUTLIER_PCT
+const unsigned long MIN_PULSES = 100;           // below this one pulse is over 1 %
+const uint8_t MAX_RUNS = 6;
+const float K_MIN = 1.0f, K_MAX = 100000.0f;    // what ESP2 will accept (kSane)
 
-/* ---- state --------------------------------------------------------------- */
+enum Phase { IDLE, WARMUP, PUMPING };
+Phase phase = IDLE;
 volatile unsigned long flowPulses = 0;
-int     activeFlowPin = -1;
-int     selCh  = -1;                            // selected channel index
-int     selCol = -1;                            // 0/1/2 for MIXIRR
-bool    running = false;
-unsigned long runOnMs = 0;
-// BOOT-button dead-man tracking
-bool          btnRaw = false, btnStable = false;   // raw + debounced pressed state
-unsigned long btnChangeMs = 0;                     // last raw-edge time (for debounce)
-bool          capLatched = false;                  // hit the cap -> require a release before re-running
+int  activeFlowPin = -1;
+int  selCh = -1, selCol = -1;
+unsigned long phaseMs = 0;                      // when this phase began
+unsigned long pumpMs = 0;                       // pump-on time collected for this run, across bursts
+unsigned long lastPulseMs = 0, lastPulseCount = 0;
+bool btnRaw = false, btnStable = false;
+unsigned long btnChangeMs = 0;
+bool capLatched = false;                        // stopped by a limit: release BOOT before it can run again
+bool stopFailed = false;                        // an all-off write did not reach the PCF: keep trying, loudly
+unsigned long lastRetryMs = 0;
 
-struct Run { unsigned long pulses; float liters; float k; };
-Run     runs[MAX_RUNS];
+struct Run { unsigned long pulses; float liters; float k; float lpm; };
+Run runs[MAX_RUNS];
 uint8_t nRuns = 0;
-bool    pendingVol = false;
-unsigned long burstStartPulses = 0;            // pulses at the start of the current run's bursts
 
 bool liveOn = false;
 unsigned long lastLiveMs = 0;
 String line;
 
 void IRAM_ATTR flowISR() { flowPulses++; }
+unsigned long snapPulses() { noInterrupts(); unsigned long p = flowPulses; interrupts(); return p; }
 
-void pcfWrite(uint16_t bank);
-void safeAll();
-void energize();
-void attachFlow(int pin);
-void detachFlow();
-unsigned long snapPulses();
-void startRun();
-void stopRun(const char *why);
-void printHelp();
-void printLive();
-void listRuns();
-void doCalc();
-int  chFromId(const String &s);
-void handleLine(const String &s);
-
-void setup() {
-  Serial.begin(115200);
-  Wire.begin(I2C_SDA, I2C_SCL);
-  analogReadResolution(12);
-  pinMode(PIN_BOOT, INPUT_PULLUP);             // on-board BOOT button = hardware dead-man
-  safeAll();                                   // outputs SAFE at boot (all OFF)
-  Serial.println();
-  Serial.println("=== 8x FLOW K-FACTOR CALIBRATION (ESP32 #2, BOOT-button dead-man) ===");
-  Serial.println("!!! Pumps/valves run only while the BOOT button is HELD. Have a vessel ready. !!!");
-  printHelp();
-}
-
-void loop() {
-  // Serial: plain line parsing at all times (button is the dead-man now, not keystrokes).
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') { if (line.length()) { handleLine(line); line = ""; } }
-    else if (line.length() < 64) line += c;
-  }
-
-  // BOOT-button dead-man: debounce, then act on the edges.
-  bool pressed = (digitalRead(PIN_BOOT) == LOW);     // active-LOW
-  if (pressed != btnRaw) { btnRaw = pressed; btnChangeMs = millis(); }   // raw edge -> restart debounce
-  if (pressed != btnStable && millis() - btnChangeMs > BTN_DEBOUNCE_MS) {
-    btnStable = pressed;                             // debounced state change
-    if (btnStable) {                                 // pressed: start flowing (if armed + allowed)
-      if (selCh < 0)        Serial.println("no channel armed -- `ch <ID> [A|B|C]` first");
-      else if (capLatched)  Serial.println("cap latched -- already released? re-press to run");
-      else if (!running)    startRun();
-    } else {                                         // released: stop immediately
-      if (running) stopRun("BOOT released");
-      capLatched = false;                            // a release clears the cap latch
-    }
-  }
-
-  // Hard cap while running (per-channel), enforced regardless of the button.
-  if (running) {
-    unsigned long cap = CH[selCh].mainLine ? CAP_MAIN_MS : CAP_DOSING_MS;
-    if (millis() - runOnMs > cap) { stopRun("hard cap"); capLatched = true; }   // release+re-press to continue
-  }
-
-  if (liveOn && millis() - lastLiveMs >= 500) { lastLiveMs = millis(); printLive(); }
-}
-
-/* ---- PCF8575 raw driver (active-LOW; 0xFFFF = all OFF) -------------------- */
-void pcfWrite(uint16_t bank) {
+/* ---- Outputs ---------------------------------------------------------------- */
+bool pcfWriteOnce(uint16_t bank) {
   Wire.beginTransmission(PCF_ADDR);
-  Wire.write(bank & 0xFF);          // P0..P7
-  Wire.write((bank >> 8) & 0xFF);   // P8..P15
-  Wire.endTransmission();
+  Wire.write(bank & 0xFF);
+  Wire.write((bank >> 8) & 0xFF);
+  return Wire.endTransmission() == 0;
 }
-void safeAll() { pcfWrite(0xFFFF); }
-
-// Energize the selected channel's relays (+ master cutoff + column for MIXIRR).
-void energize() {
-  uint16_t on = CH[selCh].relays | B_MASTER;
-  if (CH[selCh].needCol) {
-    on |= (selCol == 0) ? B_COL_A : (selCol == 1) ? B_COL_B : B_COL_C;
-  }
-  pcfWrite((uint16_t)(0xFFFF & ~on));   // clear ON bits (active-LOW)
+bool pcfWrite(uint16_t onBits) {
+  uint16_t bank = 0xFFFF & ~(onBits & ~(uint16_t)B_BATT_SEL);
+  for (uint8_t i = 0; i < 3; i++) if (pcfWriteOnce(bank)) return true;
+  return false;
+}
+void safeAll() {
+  if (pcfWrite(0)) { stopFailed = false; return; }
+  stopFailed = true;
+  Serial.println("!!! COULD NOT REACH THE PCF8575: outputs may still be ON. Retrying. Cut the rig's power if a pump runs.");
+}
+uint16_t lineBits() {     // everything but the pump: the bank's power, the inverter, the column valve
+  const Chan &c = CH[selCh];
+  uint16_t on = B_MASTER;
+  if (c.ac) on |= B_INVERTER;
+  if (c.needCol) on |= (selCol == 0) ? B_COL_A : (selCol == 1) ? B_COL_B : B_COL_C;
+  return on;
 }
 
-/* ---- flow ISR (match ESP2/src/main.cpp:601-608) -------------------------- */
 void attachFlow(int pin) {
-  detachFlow();
-  flowPulses = 0;
+  if (activeFlowPin >= 0) detachInterrupt(digitalPinToInterrupt(activeFlowPin));
+  noInterrupts(); flowPulses = 0; interrupts();
   activeFlowPin = pin;
   pinMode(pin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(pin), flowISR, FALLING);
 }
-void detachFlow() {
-  if (activeFlowPin >= 0) { detachInterrupt(digitalPinToInterrupt(activeFlowPin)); activeFlowPin = -1; }
-}
-unsigned long snapPulses() { noInterrupts(); unsigned long p = flowPulses; interrupts(); return p; }
 
-void startRun() {
-  if (selCh < 0) { Serial.println("select a channel first: ch <ID> [A|B|C]"); return; }
-  if (CH[selCh].needCol && selCol < 0) { Serial.println("MIXIRR needs a column: ch MIXIRR <A|B|C>"); return; }
-  running = true;
-  runOnMs = millis();
-  burstStartPulses = snapPulses();   // pulses carry across bursts within this run
-  energize();
-  Serial.print("RUN ["); Serial.print(CH[selCh].id); Serial.println("] -- flowing while BOOT held; release/cap = STOP.");
+void startPump() {
+  if (!pcfWrite(lineBits() | CH[selCh].pump)) { safeAll(); phase = IDLE; capLatched = true; Serial.println("FAILED: no PCF8575."); return; }
+  phase = PUMPING; phaseMs = millis();
+  lastPulseMs = phaseMs; lastPulseCount = snapPulses();
+  Serial.println("Pump ON. Release BOOT to stop.");
 }
 
-void stopRun(const char *why) {
+void startLine() {
+  if (selCh < 0) { Serial.println("Pick a line first: ch <ID>"); return; }
+  capLatched = false;
+  if (CH[selCh].ac) {
+    if (!pcfWrite(lineBits())) { safeAll(); Serial.println("FAILED: no PCF8575. ESP2's rail is switched by ESP1's GPIO4: is it on?"); return; }
+    phase = WARMUP; phaseMs = millis();
+    Serial.println("Inverter starting, pump in 5 s. Keep holding BOOT.");
+  } else startPump();
+}
+
+void stopLine(const char *why) {
   safeAll();
-  running = false;
+  if (phase == PUMPING) pumpMs += millis() - phaseMs;
+  phase = IDLE;
   unsigned long p = snapPulses();
-  Serial.print("STOP ("); Serial.print(why); Serial.print("). pulses so far = "); Serial.println(p);
-  Serial.println("hold BOOT again to add more, or `vol <liters>` to record this run.");
-  pendingVol = true;
+  Serial.print("STOP ("); Serial.print(why); Serial.print("). Pulses so far: "); Serial.println(p);
+  Serial.println("NEXT: hold BOOT to add more, or type what you caught: ml <mL> or vol <L>");
 }
 
-/* ---- reporting / K math -------------------------------------------------- */
+/* ---- Results ----------------------------------------------------------------- */
 void printHelp() {
   Serial.println("Commands:");
-  Serial.println("  h                 this help");
-  Serial.println("  ch <ID> [A|B|C]   select+arm channel (col only for MIXIRR); zeros ISR");
-  Serial.println("  <HOLD BOOT btn>   flow while held; release/cap stops (hardware dead-man)");
-  Serial.println("  r / live          pulse count (live toggles)");
-  Serial.println("  vol <liters>      record run K = pulses/liters, re-zero for next run");
-  Serial.println("  runs / calc       list runs / median-outlier final K");
-  Serial.println("  x / clear         drop last run / all runs");
-  Serial.println("  off               force ALL outputs SAFE");
-  Serial.println("  IDs: RESMIX MIXIRR NUTA NUTB NUTC NUTD PHUP PHDN");
+  Serial.println("  ch <ID> [A|B|C]  pick a line (column only for MIXIRR). IDs:");
+  Serial.println("                   RESMIX MIXIRR NUTA NUTB NUTC NUTD PHUP PHDN");
+  Serial.println("  <hold BOOT>      run the pump; release to stop");
+  Serial.println("  ml <mL> / vol <L>  what you caught: records this run");
+  Serial.println("  calc             check the runs and print the result");
+  Serial.println("  runs             list runs       drop <n>  remove a run      clear  remove all");
+  Serial.println("  r / live         pulses now      off       stop everything now");
 }
 
 void printLive() {
-  Serial.print("pulses="); Serial.print(snapPulses());
-  if (selCh >= 0) { Serial.print("  ch="); Serial.print(CH[selCh].id); }
-  Serial.println(running ? "  [RUNNING]" : "  [idle]");
+  unsigned long p = snapPulses();
+  Serial.print("pulses="); Serial.print(p);
+  if (selCh >= 0) { Serial.print("  line="); Serial.print(CH[selCh].id); }
+  Serial.println(phase == PUMPING ? "  [PUMP ON]" : phase == WARMUP ? "  [INVERTER WARMUP]" : "  [off]");
 }
 
 void listRuns() {
-  if (!nRuns) { Serial.println("(no runs yet)"); return; }
+  if (!nRuns) { Serial.println("No runs yet."); return; }
   for (uint8_t i = 0; i < nRuns; i++) {
-    Serial.print("  run "); Serial.print(i + 1);
-    Serial.print(": pulses="); Serial.print(runs[i].pulses);
-    Serial.print(" liters="); Serial.print(runs[i].liters, 3);
-    Serial.print(" K="); Serial.println(runs[i].k, 1);
+    Serial.printf("  run %u: %lu pulses, %.3f L, K=%.1f, %.3f L/min\n", i + 1, runs[i].pulses, runs[i].liters, runs[i].k, runs[i].lpm);
   }
 }
 
-void doCalc() {
-  if (nRuns < 3) { Serial.print("need >=3 runs (have "); Serial.print(nRuns); Serial.println(") -- spec sec.A.4.1.6"); return; }
-  float ks[MAX_RUNS];
-  for (uint8_t i = 0; i < nRuns; i++) ks[i] = runs[i].k;
-  for (uint8_t i = 1; i < nRuns; i++) { float key = ks[i]; int j = i - 1; while (j >= 0 && ks[j] > key) { ks[j+1] = ks[j]; j--; } ks[j+1] = key; }
-  float median = ks[nRuns / 2];
+float medianOf(float *v, uint8_t n) {
+  for (uint8_t i = 1; i < n; i++) { float key = v[i]; int j = i - 1; while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; } v[j + 1] = key; }
+  return (n % 2) ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0f;
+}
 
+void doCalc() {
+  if (selCh < 0) { Serial.println("Pick a line first: ch <ID>"); return; }
+  if (nRuns < 3) { Serial.printf("Need at least 3 runs, you have %u.\n", nRuns); return; }
+  float ks[MAX_RUNS], rs[MAX_RUNS];
+  for (uint8_t i = 0; i < nRuns; i++) { ks[i] = runs[i].k; rs[i] = runs[i].lpm; }
+  float medK = medianOf(ks, nRuns), medRate = medianOf(rs, nRuns);
   int worst = -1; float worstDev = 0;
-  Serial.println("---- calc ----");
-  Serial.print("median K = "); Serial.println(median, 1);
   for (uint8_t i = 0; i < nRuns; i++) {
-    float dev = fabs(runs[i].k - median) / median;
-    Serial.print("  run "); Serial.print(i + 1); Serial.print(" K="); Serial.print(runs[i].k, 1);
-    Serial.print(" dev="); Serial.print(dev * 100.0f, 1); Serial.print('%');
-    if (dev > OUTLIER_TOL) Serial.print("  <-- OUTLIER");
-    Serial.println();
+    float dev = fabs(runs[i].k - medK) / medK;
+    Serial.printf("  run %u: K=%.1f, %.1f %% from the median%s\n", i + 1, runs[i].k, dev * 100.0f, dev > OUTLIER_TOL ? "  <-- OUT" : "");
     if (dev > worstDev) { worstDev = dev; worst = i; }
   }
   if (worstDev > OUTLIER_TOL) {
-    Serial.print("Run "); Serial.print(worst + 1);
-    Serial.println(" disagrees > 8%. Redo it (drop the worst, re-run) then `calc` again.");
+    Serial.printf("Not averaging bad data. NEXT: type drop %d, do that run again, then calc.\n", worst + 1);
     return;
   }
-  float sum = 0; for (uint8_t i = 0; i < nRuns; i++) sum += runs[i].k;
-  float avg = sum / nRuns;
-  Serial.print("All runs within +-8%. FINAL K = "); Serial.println(avg, 1);
-  Serial.print("// paste into "); Serial.println(CH[selCh].paste);
+  float sumK = 0, sumR = 0;
+  for (uint8_t i = 0; i < nRuns; i++) { sumK += runs[i].k; sumR += runs[i].lpm; }
+  float k = sumK / nRuns, lpm = sumR / nRuns;
+  const Chan &c = CH[selCh];
+  Serial.println("======== RESULT ========");
+  Serial.printf("%s: K = %.1f pulses/L, pump = %.3f L/min (%.1f mL/min)\n", c.id, k, lpm, lpm * 1000.0f);
+  if (k < K_MIN || k > K_MAX) { Serial.println("That K is outside what ESP2 accepts: check the sensor and the volumes."); return; }
+  if (fabs(medRate - lpm) > OUTLIER_TOL * lpm)
+    Serial.println("The rate varied between runs. Fine for K. For the rate, redo with one long hold per run.");
+  Serial.println("CalStore on ESP1 (flash Calibration/ESP1/CalStore, paste, flash the firmware back):");
+  Serial.printf("  set %s %.1f\n", c.kKey, k);
+  if (c.rateKey) Serial.printf("  set %s %.1f\n", c.rateKey, lpm * 1000.0f);
+  if (c.rateConst) {
+    Serial.println("Rate goes in ESP2/src/main.cpp, then reflash ESP2:");
+    Serial.printf("  const float %s = %.2ff;\n", c.rateConst, lpm);
+  }
+  Serial.println("========================");
 }
 
 int chFromId(const String &s) {
   for (int i = 0; i < NCH; i++) if (s.equalsIgnoreCase(CH[i].id)) return i;
   return -1;
+}
+
+void recordRun(float liters) {
+  if (selCh < 0) { Serial.println("Pick a line first: ch <ID>"); return; }
+  if (phase != IDLE) { Serial.println("Release BOOT first."); return; }
+  if (!(liters > 0.0f)) { Serial.println("usage: ml <millilitres caught>  or  vol <litres caught>"); return; }
+  if (nRuns >= MAX_RUNS) { Serial.println("Six runs is plenty: type calc, or drop one."); return; }
+  unsigned long p = snapPulses();
+  if (p == 0) { Serial.println("0 pulses: nothing to record. Hold BOOT first. If water moved, check the sensor with FlowPinFinder."); return; }
+  float k = (float)p / liters;
+  float lpm = pumpMs ? liters / (pumpMs / 60000.0f) : 0.0f;
+  runs[nRuns++] = Run{ p, liters, k, lpm };
+  noInterrupts(); flowPulses = 0; interrupts();
+  pumpMs = 0;
+  Serial.printf("Run %u: K = %.1f pulses/L, %.3f L/min\n", nRuns, k, lpm);
+  if (p < MIN_PULSES) Serial.println("WARNING: under 100 pulses. Catch more water for a better K.");
+  if (nRuns >= 3) Serial.println("NEXT: type calc");
+  else Serial.printf("NEXT: empty the vessel and do run %u: hold BOOT\n", nRuns + 1);
 }
 
 void handleLine(const String &in) {
@@ -293,57 +258,95 @@ void handleLine(const String &in) {
   arg.trim();
   cmd.toLowerCase();
 
-  if (cmd == "h")    { printHelp(); return; }
+  if (cmd == "h" || cmd == "help") { printHelp(); return; }
   if (cmd == "r")    { printLive(); return; }
-  if (cmd == "live") { liveOn = !liveOn; Serial.print("live="); Serial.println(liveOn ? "ON" : "OFF"); return; }
-  if (cmd == "off")  { safeAll(); running = false; capLatched = false; Serial.println("ALL OUTPUTS SAFE"); return; }
+  if (cmd == "live") { liveOn = !liveOn; Serial.println(liveOn ? "live ON" : "live OFF"); return; }
+  if (cmd == "off")  { if (phase != IDLE) stopLine("off"); safeAll(); capLatched = true; Serial.println("All outputs off."); return; }
   if (cmd == "runs") { listRuns(); return; }
   if (cmd == "calc") { doCalc(); return; }
-  if (cmd == "clear"){ nRuns = 0; pendingVol = false; Serial.println("all runs cleared"); return; }
-  if (cmd == "x")    { if (nRuns) { nRuns--; Serial.println("last run dropped"); } else Serial.println("no runs"); return; }
-  if (cmd == "run")  { Serial.println("`run` is gone -- HOLD the on-board BOOT button to flow, release to stop."); return; }
-
+  if (cmd == "clear") { nRuns = 0; noInterrupts(); flowPulses = 0; interrupts(); pumpMs = 0; Serial.println("All runs removed."); return; }
+  if (cmd == "drop" || cmd == "x") {
+    int n = arg.length() ? arg.toInt() : nRuns;
+    if (n < 1 || n > nRuns) { Serial.println("usage: drop <run number>"); return; }
+    for (int i = n - 1; i < nRuns - 1; i++) runs[i] = runs[i + 1];
+    nRuns--;
+    Serial.printf("Run %d removed. %u left.\n", n, nRuns);
+    return;
+  }
+  if (cmd == "ml")  { recordRun(arg.toFloat() / 1000.0f); return; }
+  if (cmd == "vol") { recordRun(arg.toFloat()); return; }
   if (cmd == "ch") {
     int sp2 = arg.indexOf(' ');
     String id  = (sp2 < 0) ? arg : arg.substring(0, sp2);
     String col = (sp2 < 0) ? ""  : arg.substring(sp2 + 1);
+    col.trim(); col.toUpperCase();
     int ci = chFromId(id);
-    if (ci < 0) { Serial.println("unknown ID (RESMIX MIXIRR NUTA NUTB NUTC NUTD PHUP PHDN)"); return; }
+    if (ci < 0) { Serial.println("Unknown line. Use: RESMIX MIXIRR NUTA NUTB NUTC NUTD PHUP PHDN"); return; }
+    int colIdx = -1;
     if (CH[ci].needCol) {
-      col.toUpperCase();
-      if (col == "A") selCol = 0; else if (col == "B") selCol = 1; else if (col == "C") selCol = 2;
-      else { Serial.println("MIXIRR needs a column: ch MIXIRR <A|B|C>"); return; }
-    } else selCol = -1;
-    if (running) stopRun("channel changed");     // never leave a pump running across a channel switch
-    selCh = ci;
-    nRuns = 0; pendingVol = false;
-    capLatched = false;                          // fresh channel -> clear any prior cap latch
-    attachFlow(CH[ci].flowPin);                 // arm + zero this channel's ISR
-    Serial.print("armed "); Serial.print(CH[ci].id);
-    Serial.print(" (flow GPIO"); Serial.print(CH[ci].flowPin); Serial.print(")");
-    if (CH[ci].needCol) { Serial.print(" col "); Serial.print((char)('A' + selCol)); }
-    Serial.print(" cap "); Serial.print((CH[ci].mainLine ? CAP_MAIN_MS : CAP_DOSING_MS) / 1000); Serial.println("s");
-    Serial.println("HOLD the on-board BOOT button to flow; release to stop.");
+      colIdx = (col == "A") ? 0 : (col == "B") ? 1 : (col == "C") ? 2 : -1;
+      if (colIdx < 0) { Serial.println("MIXIRR needs a column: ch MIXIRR A"); return; }
+    }
+    if (phase != IDLE) stopLine("line changed");          // never leave a pump running across a switch
+    selCh = ci; selCol = colIdx;
+    nRuns = 0; pumpMs = 0; capLatched = false;
+    attachFlow(CH[ci].flowPin);
+    Serial.printf("Line %s ready (flow GPIO%u%s), up to %lu s per hold.\n", CH[ci].id, CH[ci].flowPin,
+                  CH[ci].ac ? ", AC: 5 s inverter warmup first" : "", (CH[ci].ac ? CAP_AC_MS : CAP_DC_MS) / 1000);
+    Serial.println("NEXT: put a vessel in place, hold BOOT to run, release to stop.");
     return;
   }
+  Serial.println("Unknown command: type h");
+}
 
-  if (cmd == "vol") {
-    if (selCh < 0) { Serial.println("select a channel first"); return; }
-    if (arg.length() == 0) { Serial.println("usage: vol <liters>"); return; }
-    float liters = arg.toFloat();
-    if (liters <= 0.0f) { Serial.println("liters must be > 0"); return; }
-    if (nRuns >= MAX_RUNS) { Serial.println("run buffer full -- `clear` first"); return; }
-    unsigned long p = snapPulses();
-    if (p == 0) { Serial.println("0 pulses -- run the pump (hold BOOT) before `vol`"); return; }
-    float k = (float)p / liters;
-    runs[nRuns].pulses = p; runs[nRuns].liters = liters; runs[nRuns].k = k;
-    nRuns++;
-    noInterrupts(); flowPulses = 0; interrupts();   // re-zero for the next independent run
-    pendingVol = false;
-    Serial.print("run "); Serial.print(nRuns); Serial.print(" K = "); Serial.print(k, 1); Serial.println(" pulses/L");
-    if (nRuns >= 3) Serial.println("have >=3 runs -- type `calc`");
-    return;
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setTimeOut(50);
+  pinMode(PIN_BOOT, INPUT_PULLUP);
+  delay(300);
+  safeAll();
+  Serial.println();
+  Serial.println("=== FLOW K + PUMP RATE CALIBRATION (ESP32 #2) ===");
+  Serial.println("Pumps run only while the BOOT button is HELD. WATER ONLY, vessel in place.");
+  Wire.beginTransmission(PCF_ADDR);
+  if (Wire.endTransmission() != 0) Serial.println("PCF8575 NOT FOUND: no pump can run. Its rail is switched by ESP1's GPIO4, so that must be on.");
+  printHelp();
+  Serial.println("START: ch NUTA");
+}
+
+void loop() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') { if (line.length()) { handleLine(line); line = ""; } }
+    else if (line.length() < 64) line += c;
   }
 
-  Serial.println("? unknown command -- type h");
+  if (stopFailed && millis() - lastRetryMs >= 200) { lastRetryMs = millis(); safeAll(); }
+
+  bool pressed = (digitalRead(PIN_BOOT) == LOW);
+  if (pressed != btnRaw) { btnRaw = pressed; btnChangeMs = millis(); }
+  if (pressed != btnStable && millis() - btnChangeMs > BTN_DEBOUNCE_MS) {
+    btnStable = pressed;
+    if (btnStable) {
+      if (capLatched) Serial.println("Release BOOT, then press again to continue.");
+      else if (phase == IDLE) startLine();
+    } else {
+      if (phase != IDLE) stopLine("BOOT released");
+      capLatched = false;
+    }
+  }
+
+  if (phase == WARMUP && millis() - phaseMs >= WARMUP_MS) startPump();
+  if (phase == PUMPING) {
+    unsigned long now = millis(), p = snapPulses();
+    if (p != lastPulseCount) { lastPulseCount = p; lastPulseMs = now; }
+    if (now - phaseMs >= (CH[selCh].ac ? CAP_AC_MS : CAP_DC_MS)) { stopLine("time limit"); capLatched = true; }
+    else if (CH[selCh].ac && now - lastPulseMs >= NO_FLOW_MS) {
+      stopLine("no flow for 10 s: dry line, or the wrong sensor");
+      capLatched = true;
+    }
+  }
+
+  if (liveOn && millis() - lastLiveMs >= 500) { lastLiveMs = millis(); printLive(); }
 }

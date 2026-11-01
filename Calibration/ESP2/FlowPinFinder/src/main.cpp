@@ -17,12 +17,15 @@
  *      with the rig plumbed. Releasing BOOT, the 30 s cap, or `off` returns all
  *      outputs to SAFE. Without an armed selection it is read-only (pins only). !!!
  *
- *  PINS (ESP2/src/main.cpp:120-126, CORRECTED wiring):
+ *  P4 IS NEVER DRIVEN: it is the battery-select DPDT now, and energizing it would move the boards to the
+ *  secondary battery. AC loads wait 5 s for the inverter, as ESP2's stages do.
+ *
+ *  PINS (the FLOW_* defines in ESP2/src/main.cpp, CORRECTED wiring):
  *      RES_MIX 26   MIX_IRR 5    NUT_A 23   NUT_B 19
  *      NUT_C  18    NUT_D  27    pH_UP 4    pH_DN 25
  *  Each flow pin is INPUT_PULLUP + FALLING-edge counted (matches the firmware ISR).
  *  PCF8575 relays: I2C SDA21/SCL22 addr 0x20, ACTIVE-LOW (0xFFFF = all OFF); bits +
- *  combos from ESP2/src/main.cpp:99-115,240-243. Master cutoff bit 15 (P17) powers
+ *  combos from ESP2/src/main.cpp (OUT_*, COMBO_*). Master cutoff bit 15 (P17) powers
  *  the bank and is energized whenever a relay/combo runs. BOOT button = GPIO0.
  *
  *  SERIAL 115200 -- commands (type + Enter):
@@ -56,11 +59,10 @@ const int NPINS = sizeof(PINS) / sizeof(PINS[0]);
 /* ---- PCF8575 relays (match ESP2/src/main.cpp:94-115) --------------------- */
 const int      I2C_SDA = 21, I2C_SCL = 22;
 const uint8_t  PCF_ADDR = 0x20;
-#define B_RES_VALVE (1u<<0)
 #define B_COL_A     (1u<<1)
 #define B_COL_B     (1u<<2)
 #define B_COL_C     (1u<<3)
-#define B_MIX_VALVE (1u<<4)
+#define B_BATT_SEL  (1u<<4)           // P4: the battery DPDT, not a valve. Never driven by this tool
 #define B_INVERTER  (1u<<5)
 #define B_TRANSFER  (1u<<6)
 #define B_BOOSTER   (1u<<7)
@@ -75,17 +77,19 @@ const uint8_t  PCF_ADDR = 0x20;
 
 // Single-relay names by bit (match ESP1 TEST_NAMES; spaces stripped for `sel <name>`).
 const char *RELAY_NAMES[16] = {
-  "ResValve", "ColAVlv", "ColBVlv", "ColCVlv", "MixValve", "Inverter", "Transfer", "Booster",
+  "SpareP0", "ColAVlv", "ColBVlv", "ColCVlv", "BattSel", "Inverter", "Transfer", "Booster",
   "Mixer", "NutA", "NutB", "NutC", "NutD", "pHUp", "pHDown", "MastCutoff"
 };
-// Valve+pump combos (identical to the ESP1 Testing menu, ESP2/src/main.cpp:240-243).
+// Valve+pump combos, the same as ESP2's COMBO_* (there is no mix valve or reservoir valve any more).
 struct Combo { const char *name; uint16_t mask; };
 Combo COMBOS[] = {
-  { "FILL",  B_INVERTER | B_RES_VALVE | B_TRANSFER },              // Reservoir -> Mixing
-  { "PUSHA", B_INVERTER | B_MIX_VALVE | B_COL_A | B_BOOSTER },     // Mixing -> Column A
-  { "PUSHB", B_INVERTER | B_MIX_VALVE | B_COL_B | B_BOOSTER },     // Mixing -> Column B
-  { "PUSHC", B_INVERTER | B_MIX_VALVE | B_COL_C | B_BOOSTER },     // Mixing -> Column C
+  { "FILL",  B_INVERTER | B_TRANSFER },              // Reservoir -> Mixing
+  { "PUSHA", B_INVERTER | B_COL_A | B_BOOSTER },     // Mixing -> Column A
+  { "PUSHB", B_INVERTER | B_COL_B | B_BOOSTER },     // Mixing -> Column B
+  { "PUSHC", B_INVERTER | B_COL_C | B_BOOSTER },     // Mixing -> Column C
 };
+const uint16_t AC_LOADS = B_TRANSFER | B_BOOSTER | B_MIXER;   // these wait for the inverter
+const unsigned long WARMUP_MS = 5000;                         // ESP2's INVERTER_WARMUP_MS
 const int NCOMBO = sizeof(COMBOS) / sizeof(COMBOS[0]);
 
 /* ---- dead-man = on-board BOOT button (GPIO0, active-LOW) ------------------ */
@@ -114,18 +118,31 @@ String line;
 void IRAM_ATTR flowIsr(void *arg) { counts[(uint32_t)(uintptr_t)arg]++; }
 
 /* ---- PCF8575 raw driver (active-LOW; 0xFFFF = all OFF) -------------------- */
-void pcfWrite(uint16_t bank) {
-  Wire.beginTransmission(PCF_ADDR);
-  Wire.write(bank & 0xFF);          // P0..P7
-  Wire.write((bank >> 8) & 0xFF);   // P8..P15
-  Wire.endTransmission();
+bool pcfWrite(uint16_t bank) {
+  for (uint8_t i = 0; i < 3; i++) {
+    Wire.beginTransmission(PCF_ADDR);
+    Wire.write(bank & 0xFF);          // P0..P7
+    Wire.write((bank >> 8) & 0xFF);   // P8..P15
+    if (Wire.endTransmission() == 0) return true;
+  }
+  return false;
 }
-void safeAll() { pcfWrite(0xFFFF); }
-void driveOn() { pcfWrite((uint16_t)(0xFFFF & ~(armMask | B_MASTER))); }   // armed bits + master cutoff ON
+bool stopFailed = false;              // an all-off write did not arrive: loop() keeps trying, loudly
+bool warming = false;                 // the inverter is up, an AC load waits for it
+void safeAll() {
+  stopFailed = !pcfWrite(0xFFFF);
+  if (stopFailed) Serial.println("!!! COULD NOT REACH THE PCF8575: outputs may still be ON. Retrying.");
+}
+void writeOn(uint16_t on) { pcfWrite((uint16_t)(0xFFFF & ~((on & ~(uint16_t)B_BATT_SEL) | B_MASTER))); }
+void driveOn() {
+  // The inverter gets its warmup before an AC load, the same as ESP2's stages.
+  warming = (armMask & B_INVERTER) && (armMask & AC_LOADS);
+  writeOn(warming ? (armMask & ~AC_LOADS) : armMask);
+}
 
 void stopDrive(const char *why) {
   safeAll();
-  running = false;
+  running = false; warming = false;
   Serial.print("STOP ("); Serial.print(why); Serial.println("). all outputs SAFE.");
 }
 
@@ -159,6 +176,10 @@ String norm(const String &s) {
 }
 
 void armSingle(int bit) {
+  if (bit == 4) {
+    Serial.println("Refused: P4 moves the boards to the secondary battery. Test it from ESP1's LCD Testing row Batt->2nd.");
+    return;
+  }
   if (running) stopDrive("re-arm");
   armed = true; armMask = (uint16_t)(1u << bit); armName = RELAY_NAMES[bit]; capLatched = false;
   Serial.print("armed relay "); Serial.print(bit); Serial.print(" ("); Serial.print(armName);
@@ -181,7 +202,7 @@ void handleLine(const String &in) {
   if (c == "h")    { printPins(); return; }
   if (c == "z")    { zeroAll(); return; }
   if (c == "list") { listRelays(); return; }
-  if (c == "off")  { safeAll(); running = false; capLatched = false; Serial.println("ALL OUTPUTS SAFE"); return; }
+  if (c == "off")  { stopDrive("off"); capLatched = false; Serial.println("ALL OUTPUTS SAFE"); return; }
 
   if (c == "sel") {
     if (!arg.length()) { Serial.println("usage: sel <idx 0-15 | name>"); return; }
@@ -205,6 +226,7 @@ void handleLine(const String &in) {
 void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setTimeOut(50);
   pinMode(PIN_BOOT, INPUT_PULLUP);             // BOOT button = hardware dead-man
   safeAll();                                   // relays SAFE at boot
   for (int i = 0; i < NPINS; i++) {
@@ -240,7 +262,10 @@ void loop() {
       capLatched = false;
     }
   }
+  if (running && warming && millis() - runOnMs >= WARMUP_MS) { warming = false; writeOn(armMask); Serial.println("Inverter warm: load ON."); }
   if (running && millis() - runOnMs > CAP_MS) { stopDrive("30s hard cap"); capLatched = true; }
+  static unsigned long lastRetryMs = 0;
+  if (stopFailed && millis() - lastRetryMs >= 200) { lastRetryMs = millis(); safeAll(); }
 
   // flow-pin activity print
   if (millis() - lastRefreshMs < REFRESH_MS) return;

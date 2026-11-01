@@ -1,116 +1,120 @@
-# Calibration — standalone sensor-calibration bench tools
+# Calibration
 
-Standalone, per-sensor calibration firmware for the Smart Irrigation rig. Each tool runs on the
-target controller **on its own** — no ESP32 #1, no UART link, no framed packets, no main firmware —
-and talks to you over the USB serial monitor at **115200 baud**. You calibrate one sensor, the tool
-prints a **paste-ready constant**, and you drop that value into the real firmware
-(`Nano/Nano.ino`, `ESP2/src/main.cpp`). See `../Settings_Calibration_and_Safe_Edit_Spec.md` §A for
-the methods these implement.
+One small tool per component. Each runs on its own board with no other firmware, talks to you over USB at 115200 baud, and tells you the next step as you go. **Every tool here has been compiled, and the INA226, Flow, CalStore, pH and opto tools have run against a simulated board. None has run on real hardware yet.**
 
-These are the bench basis for the eventual on-device Calibration Mode; they deliberately reuse the
-**exact pins and formulas** of the real firmware so measured values transfer 1:1.
+## Using a tool
 
-## Layout
+From this folder, in PowerShell:
 
-```
-Calibration/
-  Nano/        Arduino .ino tools (open in Arduino IDE, or `pio run` per folder)
-    Soil/         per-column capacitive air/water endpoints
-    Ultrasonic/   empty-tank reference distances (2 tanks)
-    DHT22/        temp + humidity offset trims
-    BH1750/       lux offset trim
-    NPK/          raw RS485 registers + guarded N/P/K offset trim
-    Flow/         reservoir flow K-factor (pulses/L), 3-run + outlier
-  ESP2/        PlatformIO projects (env esp32dev)
-    pH/           linear pH fit -> PH_CAL_M / PH_CAL_B
-    EC/           linear EC fit -> EC_CAL_M / EC_CAL_B
-    ACS712/       mixer-current zero offset (+ optional sensitivity)
-    Flow/         8x flow K-factors; DRIVES the paired pump/valve under a dead-man
-    FlowPinFinder/ identify which flow sensor is on which GPIO (reads all flow pins)
-  ESP1/        PlatformIO projects (env esp32dev)
-    ACS758/       high-current zero offset + sensitivity, read via an ADS1115 I2C ADC
+```powershell
+.\cal.ps1                 # list the tools
+.\cal.ps1 ina226          # flash it, then open its serial monitor
+.\cal.ps1 ina226 -Monitor # only open the monitor
 ```
 
-Flow is separated from the other sensors on both controllers, as required.
+**Set your COM ports once, in `common.ini`.** On this PC auto-detect can pick a Bluetooth port, so the ports are named there. Close the monitor with Ctrl+C.
 
-## Building & flashing
+Every tool works the same way: `h` is help, `r` reads once, `live` switches a live readout on and off, and each result ends with a block to paste. Flashing a tool replaces that board's firmware until you flash the firmware back.
 
-**PlatformIO** (`pio` is at `"$HOME/.platformio/penv/Scripts/pio.exe"`, not on PATH here):
+On the Nano, **disconnect D0/D1** (the link to ESP1) while flashing and while using the tool. The sketches also open in the Arduino IDE (board Arduino Nano, ATmega328P, Old Bootloader on older clones).
 
-```bash
-# ESP2 tools (from the tool folder)
-cd ESP2/pH   && pio run -e esp32dev            # -t upload to flash (set upload_port first)
-cd ESP2/Flow && pio run -e esp32dev
+## Where a result goes
 
-# ESP1 tools
-cd ESP1/ACS758 && pio run -e esp32dev
+Almost every result goes to **ESP1's NVS**, using the `set` lines the tools print:
 
-# Nano tools (each folder has a platformio.ini so it builds in CI / on a phone too)
-cd Nano/Soil && pio run -e nanoatmega328       # -t upload to flash
-```
+1. Run the tool. It ends with lines like `set kNA 452.3`.
+2. `.\cal.ps1 calstore`, on ESP1, and paste those lines in.
+3. Flash ESP1's main firmware back. It loads them at boot. Flashing does not erase NVS; only `pio run -t erase` does.
 
-**Arduino IDE (Nano):** open the folder's `.ino` (folder name matches the sketch), Board *Arduino
-Nano*, Processor *ATmega328P* (Old Bootloader on older clones). Install libraries where noted:
-DHT22 → *DHT sensor library* + *Adafruit Unified Sensor*; BH1750 → *BH1750* (Christopher Laws).
-**Disconnect D0/D1** (the UART-to-ESP1 header) while flashing the Nano, then reconnect.
+**Why not just edit the source?** ESP1 loads NVS over the constants in its source, and pushes its flow, pH, EC and mixer-zero values to ESP2 at startup and in every work order. So:
 
-Every tool prints a **help banner** on boot; type `h` any time. All use a common command style:
-`h` help · `r` read once · `live` toggle a ~2 Hz readout · plus per-sensor capture/compute verbs.
+- A value pasted into ESP1's source loses to anything already in NVS, including an old LCD calibration.
+- A value pasted into ESP2's `K_RES_MIX`, `K_NUT`, `PH_CAL_M`, `EC_CAL_M` or `ACS712_ZERO_V` **is overwritten and does nothing.** Earlier versions of these tools told you to do exactly that.
 
-## What each tool measures → where it goes
+`calstore`'s `show` lists what is stored, `export` prints it as `set` lines for your records, and `clear <key>` goes back to the compiled default.
 
-| Tool | Method (spec §A) | Prints → paste into |
-|---|---|---|
-| Nano/Soil | 2-pt air/water per column | ESP32 #1 soil map (air_raw/water_raw) |
-| Nano/Ultrasonic | 1-pt empty-tank reference | ESP32 #1 ultrasonic geometry |
-| Nano/DHT22 | offset vs reference (default 0) | ESP32 #1 ENV temp/hum offset |
-| Nano/BH1750 | offset vs reference (default 0) | ESP32 #1 LIGHT offset |
-| Nano/NPK | raw registers + guarded trim (default 0) | ESP32 #1 NPK offset (bias-guarded) |
-| Nano/Flow | K = pulses/L, 3-run + outlier | `Nano.ino` `FLOW_K_PULSES_PER_LITER` |
-| ESP2/pH | linear least-squares (2–3 buffers) | `main.cpp` `PH_CAL_M` / `PH_CAL_B` |
-| ESP2/EC | linear least-squares (zero + standard) | `main.cpp` `EC_CAL_M` / `EC_CAL_B` |
-| ESP2/ACS712 | zero-offset (motor OFF) | `main.cpp` `ACS712_ZERO_V` |
-| ESP2/Flow | K = pulses/L, 3-run + outlier, per channel | `main.cpp` `K_RES_MIX`/`K_MIX_IRR`/`K_NUT[]` |
-| ESP1/ACS758 | zero-offset (load OFF) + V/A from a known current, via ADS1115 | ESP1 `ACS758_ZERO_V` / `ACS758_SENS_V_PER_A` / `ACS758_DIV_RATIO` |
+The LCD's Settings > Calibration menu is the other way in, and saves to the same place without any flashing. It covers soil, pH, EC, the mixer zero, tank-empty distance, flow K, offsets and NPK trim. It does not cover the INA226s, tank-full distance, pump rates, the mixer's sensitivity or the fallback sensors.
 
-## ⚠️ ESP1/ACS758 — the ACS758 output can destroy the ADS1115
+## The tools
 
-The ACS758 is a 5 V part whose output swings to ~5 V. The ADS1115's absolute maximum input is
-**VDD + 0.3 V**, so a direct connection to an ADS1115 powered from 3.3 V will damage the ADC. Put a
-divider on the sensor output (10k/10k → ratio 2.0) and power the ADS1115 from **3.3 V**, not 5 V — at
-5 V its logic-high threshold is 0.7 × VDD = 3.5 V, which the ESP32's 3.3 V I2C lines cannot reliably
-reach. Tell the tool your measured ratio with `div`.
+| Tool | Board | Component | What you need | Result goes to |
+|---|---|---|---|---|
+| `ina226` | ESP1 | Solar, main battery and secondary INA226 | Clamp meter, multimeter | Its own `save`, straight to NVS |
+| `calstore` | ESP1 | Stores everything else | The other tools' output | NVS |
+| `opto` | ESP1 | Fallback battery voltage | Bench supply, multimeter | Its own `calc`, straight to NVS |
+| `acs758` | ESP1 | Fallback battery current | Clamp meter, multimeter | `set acsDiv`, `acsZero`, `acsSens` |
+| `flow` | ESP2 | 8 flow K-factors, **and pump rates** | Measuring jug or cylinder | `set kRM` `kMI` `kNA`..`kPD`, `pumpA`..`pumpC`. Mains pump rates go in ESP2's `TRANSFER_LPM`, `BOOSTER_LPM` |
+| `pinfinder` | ESP2 | Which flow sensor is on which GPIO | Nothing | ESP2's `FLOW_*` defines |
+| `ph` | ESP2 | pH probe | pH 7, pH 4 buffers | `set phM`, `phB` |
+| `ec` | ESP2 | EC probe | A standard solution | `set ecM`, `ecB` |
+| `acs712` | ESP2 | Mixer current | Clamp meter | `set acs`, and ESP2's `ACS712_SENS_V_PER_A` |
+| `soil` | Nano | Soil dry and wet readings, per column | Water | `set s0a2` `s0w2` and so on |
+| `ultrasonic` | Nano | Tank empty and full distances | Tape measure helps | `set reCm` `rfCm` `meCm` `mfCm` |
+| `resflow` | Nano | Reservoir flow K | Measuring jug | `set frS` |
+| `dht22` | Nano | Temperature, humidity offsets | Reference instrument | `set tOff`, `hOff` |
+| `bh1750` | Nano | Light offset | Lux meter | `set lOff` |
+| `npk` | Nano | NPK bus check, guarded offset | Lab result, if trimming at all | `set s0N` and so on |
 
-The ACS758 is also **ratiometric**: both its zero point (VCC/2 for "B" parts, 0.12 × VCC for "U") and
-its sensitivity scale with its supply. Measure the rail with a DMM and enter it with `vcc` — a rail
-that is really 4.85 V instead of 5.00 V shifts the zero by 75 mV, which on a 40 mV/A part reads as a
-phantom **1.9 A**. That single step is the most common source of a wrong ACS758 calibration.
+## A good order
 
-Procedure: `variant 50B` (your part number) → `vcc 4.98` (measured) → `div 2.003` (measured resistors)
-→ **load OFF** → `zero` → load at a known current (clamp meter) → `sens 12.5` → `show` to print the
-paste-ready constants. `scan` finds the ADS1115 if it doesn't answer at 0x48; `stats` reports the
-ripple, which is the honest floor below which a current is not measurable.
+1. **`ina226`** first: solar, main and secondary. They are simple, and you then trust the battery readings for everything else.
+2. **`pinfinder`** if the flow sensors have been touched, then **`flow`**, for every line: everything downstream is scaled by these. Water only. Pump rates come from the same runs.
+3. **`soil`**, including column C when it is connected.
+4. **`ph`** and **`ec`**, then **`ultrasonic`** and **`resflow`**.
+5. **`acs712`**, then `dht22` and `bh1750` if you have reference instruments.
+6. The fallbacks last, **`opto`** and **`acs758`**: they only matter if the main INA226 stops answering.
 
-## ⚠️ ESP2/Flow drives real actuators
+`Calibration_Worksheet.md` lists every constant and what goes wrong if it is wrong.
 
-The ESP2 flow tool opens the line's valve(s) and runs its paired pump (per the Prime pairing table,
-spec §A.4.2.1) so water actually moves — but **only while you physically hold the ESP32's on-board
-BOOT button (GPIO0)** (a hardware dead-man), and never past a hard per-class cap (~3 s main-line,
-~15 s dosing). Releasing BOOT or hitting the cap **stops everything and returns all outputs to SAFE**;
-after a cap-stop you must release and re-press to continue. Only run it with the rig plumbed and a
-measuring vessel in place. `off` is a panic-to-SAFE at any time.
+## Solar and battery INA226 modules
 
-Flow procedure (one channel): `ch RESMIX` (or `ch MIXIRR A`) → **hold the BOOT button** to fill your
-vessel → release → `vol 3.0` (the liters you caught) → repeat 3× → `calc` (median outlier check, then
-the averaged K). Dosing channels accumulate pulses across several hold/release bursts within a run, so
-you can fill a graduated cylinder to a clean mark.
+| Type | Address | Module | Where | Shunt | Full scale |
+|---|---|---|---|---|---|
+| `solar` | 0x41 | A1 GND, A0 VCC | Behind the isolator | R010 on the module | 8.19 A |
+| `batt` | 0x44 | A1 VCC, A0 GND | Behind the isolator | 50 A / 75 mV bar | 54.6 A |
+| `sec` | 0x40 | Both GND | Boards' side | R010 on the module | 8.19 A |
 
-## Don't know which flow sensor is on which pin? — `ESP2/FlowPinFinder`
+For each one: `zero <m>` with no current through the shunt, `amps <m> <A>` at a steady load, `volts <m> <V>` across VBS and GND, then `save <m>`. Flash the tool to **ESP1 itself**, because `save` writes to the board it runs on.
 
-Flash `ESP2/FlowPinFinder`, open serial 115200, then **spin / blow through one flow sensor at a time**.
-It watches all 8 flow GPIOs at once and prints the pin whose pulse counter climbs — e.g.
-`>>> THIS SENSOR IS ON GPIO18 (currently labeled NUT_A)`. It drives no actuators (read-only), so you
-move the sensor by hand. Type `z` to zero the counters between sensors. Once you've mapped every
-sensor, put the correct GPIO numbers into `ESP2/src/main.cpp` (`FLOW_*` at :120-126 + `flowPinForId()`
-at :1145-1155) and into `ESP2/Flow`'s `CH[]` table. If a sensor never registers, its wire is on a pin
-not in the list — add that GPIO to `PINS[]` in the sketch and re-flash.
+- **The isolator is an ISO1540**, a bidirectional I²C isolator. An ISO1450 is an RS-485 transceiver and will not pass I²C: if nothing answers behind it, read the marking on the chip.
+- **`bustest`** counts failed reads. Run it with the inverter off, then on, to see if the bus through the isolator is really reliable.
+- **Take `zero solar` at night and the rest in good sun.** Take `amps batt` at the highest steady load you can. It warns if the bar reads over 8 % low, which usually means the module's own R010 was left on.
+
+## Tools that move things
+
+`flow` and `acs712` run real pumps and motors, and `pinfinder` will if you arm a relay. **All three run only while you hold the ESP32's BOOT button.**
+
+- Releasing BOOT stops everything. So does a hard time limit, or `off`. After a limit stop, release and press again.
+- On an AC line, the inverter gets the same 5 s warmup as ESP2's stages before the pump starts. `flow` also stops an AC line after 10 s with no flow, so it cannot run dry.
+- **P4 is never driven.** It used to be the mix valve; it is the battery-select DPDT now, and energizing it moves the boards to the secondary. The old `MIXIRR` and `PUSH` runs did exactly that.
+- ESP2's PCF8575 is on the rail ESP1 switches with GPIO4. If a tool says it is not found, that rail is off.
+- **Water only**, with the rig plumbed and a vessel in place.
+
+For a **pump rate**, hold BOOT in one go for about a minute (90 s limit on dosing pumps, 45 s on AC lines). Stopping and restarting spoils the timing, though not the K.
+
+## ⚠️ ACS758: the sensor can destroy the ADS1115
+
+The ACS758 is a 5 V part whose output swings to about 5 V, and the ADS1115's maximum input is VDD + 0.3 V. Put a divider on the output (10k/10k, ratio 2.0) and power the ADS1115 from **3.3 V**. Tell the tool your real ratio with `div`.
+
+Both its zero and its sensitivity follow its supply, so measure the rail and enter it with `vcc`. A rail of 4.85 V instead of 5.00 V reads as a phantom 1.9 A on a 40 mV/A part.
+
+Order: `variant 50B`, `vcc 4.98`, `div 2.003`, load off: `zero`, known current: `sens 12.5`, then `show`.
+
+## Keys CalStore accepts
+
+`keys` in the tool lists all of these with their ranges. ESP1 ignores a value outside its range and uses its compiled default, printing a line on its serial monitor.
+
+| Keys | Meaning |
+|---|---|
+| `s0a2` `s0w2` `s1a2` `s1w2` `s2a2` `s2w2` | Soil dry and wet, columns A, B, C |
+| `reCm` `rfCm` `meCm` `mfCm` | Reservoir and mixing tank, empty and full distance |
+| `tOff` `hOff` `lOff` | Temperature, humidity, light offsets |
+| `s0N` `s0P` `s0K`, `s1...`, `s2...` | NPK offsets per column (default 0) |
+| `frS` | Reservoir flow correction scale |
+| `kRM` `kMI` `kNA` `kNB` `kNC` `kND` `kPU` `kPD` | Flow K-factors |
+| `pumpA` `pumpB` `pumpC` | Nutrient pump rate, mL/min |
+| `phM` `phB` `ecM` `ecB` `acs` | pH, EC, mixer current zero |
+| `acsDiv` `acsZero` `acsSens` | ACS758 fallback |
+| `iSolO/A/B/I` `iMainO/A/B/I` `iSecO/A/B/I` | INA226 shunt, offset, bus factor, invert. `ina226` writes these |
+
+The table in `ESP1/CalStore/src/main.cpp` must stay in step with `loadCal()` and `loadPowerCal()` in `ESP1/src/main.cpp`.
