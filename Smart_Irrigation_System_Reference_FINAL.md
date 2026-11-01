@@ -3428,7 +3428,7 @@ Note: P17 is no longer the Nano hardware-reset line. It is now a master cutoff t
 3. The existing `INVERTER_WARMUP_MS` follows, extended by the settle time (`AC_WARMUP_MS`).
 4. When the inverter stops, P4 returns the boards to main after `BATT_RETURN_DELAY_MS` (1000 ms). On a normal end, P17 stays up until that return; faults cut everything at once.
 
-ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 logs them, publishes them, and holds off cutting ESP2's power until the return (`ESP2_BATT_RETURN_WAIT_MS`, 2.5 s bound).
+ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 logs them, publishes them, and holds off cutting ESP2's power until the return (`ESP2_BATT_RETURN_WAIT_MS`, 4 s bound).
 
 **Policy (ESP1).** Thresholds are [CONFIRM]:
 - **Block:** with switching enabled, no inverter use may *start* when either of these holds. A run already in progress is never aborted.
@@ -3451,6 +3451,14 @@ ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 log
 - **Clearing the latch:** LCD Settings → Batt Switch, SMS `BATTSW,CLEAR`, or the dashboard System tab (`CLEAR_BATT_SWITCH`). It also clears itself 24 h after the last strike when the RTC is good.
 
 Independently of the battery switch, any `READY` from ESP2 during a live run, held fault or exercise is now handled as "ESP2 restarted". The job is released at once (`ESP2_RESTARTED`, then `STARTUP_SYNC`). Before this, it waited for the 10-minute completion timeout and ended in an emergency stop.
+
+**A real blackout during a switch.** If the boards actually lose power for a moment, the DPDT coil drops with them and all three controllers restart on main. Nothing decided before the reset is lost or repeated:
+- **Recharge wait:** no inverter use for `BSW_RECHARGE_MS` (60 s, [MEASURE]) after a boot or strike, because the hold-up is flat.
+- **No double dose:** ESP2 keeps what the tank already holds in NVS, and a re-run doses only what is still owed. A dose started but not finished counts as delivered, so the error is always towards under-dosing. No dose starts until a switch back to main has finished.
+- **The batch reaches its column:** the column the tank was dosed for runs first, regardless of its window or soil reading, except at night or if the operator snoozed, disabled or skipped it. A batch stopped on purpose is not restarted automatically, but its doses still count when the column next runs. An order for a different column adds no dose and raises `DOSE_CARRY`.
+- **Faults, stops and commands:** a fault is written to NVS before its own P4 drop and reported after the reset, and its column is skipped for the day. An E-stop or cancel is written down before its cut and restored after the reset. A dashboard command in flight is marked failed.
+
+**Backup for a critical main battery — ready, not active** (`SECONDARY_BACKUP_ENABLED 0`, ESP1 and ESP2). When main stays below `BATT_CRIT_V` for 60 s with nothing running, ESP1 texts `ALERT,CRIT,MAIN_BATT_CRIT`, waits for the text to leave the modem, and has ESP2 hold the boards on the secondary (`BATTBK,ON`). ESP2 stays powered and holds P4 and P17; all inverter use is blocked from the alert onward, because the inverter would load the flat main battery. The boards return when main holds `BACKUP_MAIN_RECOVER_V` (12.6 V, [CONFIRM]) for 5 minutes, or when the pack reaches `SEC_BATT_CRIT_V` or stops being monitored (`ALERT,CRIT,BACKUP_EXHAUSTED`). Needs `SECONDARY_BATT_ENABLED` and a calibrated main voltage. **Limits:** the pack does not charge while it powers the boards; if the boards return to a main too weak to run them, the rig stays dark until main recovers; and the charger needs its own low-voltage cutoff so it does not drain a critical main.
 
 ### 19.4.8. 🔹 P17 Master Actuator-Power Cutoff & Fault Hold
 

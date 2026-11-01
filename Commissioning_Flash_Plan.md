@@ -186,6 +186,32 @@ and `PWR2` in the log. Do this stage only once the controllers ride through the 
     dashboard), and confirm a run switches cleanly again.
 - `READY` mid-run: pull ESP2's power for 2 s during a run. ESP1 must raise `ESP2_RESTARTED` within
   seconds (not wait 10 min for `ESP2_DONE_TIMEOUT`), go through `STARTUP_SYNC`, and re-run the column.
+- **Prove a real blackout is harmless** (water only in the nutrient lines, so doses can be measured).
+  With the hold-up disconnected, or by cutting board power for ~1 s at the moment listed:
+  - During the switch before **Mixing** (all doses done): the re-run must log `INFO,DOSE_RESUME`, pump no
+    more into the tank, then mix, deliver and flush. **Measure the nutrient lines' draw: it must not double.**
+  - The column's service window closed or the soil is wet: the dosed batch must still go to that column
+    (`DUE->FINISH_DOSED`). At night it must wait until morning.
+  - Close a hand valve so `FLOW_FAIL` fires during a fill: after the reset expect
+    `FLOW_FAIL…|BOARD_RESET`, with the column skipped for the day and no restart.
+  - MODE+BACK during a fill: the rig must come back **still stopped** (`ESTOP_KEPT`), and nothing runs until
+    it is confirmed on the LCD. Repeat with a cancel: the column stays snoozed.
+  - A dashboard forced run: the command must end as `failed`, not stay on `accepted`.
+  - After any of these, inverter use is refused for about a minute. Then scope the hold-up and set
+    `BSW_RECHARGE_MS` from what it really needs.
+- Unplug the pack's negative or VBUS lead: expect `B2: no pack - wiring`, and a forced run refused with that reason.
+
+**Backup for a critical main (optional, only after everything above passes).** `calBattV` must be calibrated.
+Set `SECONDARY_BACKUP_ENABLED 1` in **both** firmwares and reflash both. Use a bench supply as the main battery:
+- Lower it below `BATT_CRIT_V`. After 60 s expect `ALERT,CRIT,MAIN_BATT_CRIT,…SWITCHING_TO_BACKUP`, the
+  text arriving **before** the boards move, then `INFO,BACKUP,ON`. A forced run must be refused.
+- Leave it 40 min: ESP2 must not self-reboot or be powered off, and `boardSupply` stays `secondary`.
+- Raise it to `BACKUP_MAIN_RECOVER_V`. After 5 min expect `INFO,BACKUP,OFF`, and ESP2 powers off.
+- Cut power during the switch to backup: after the reboot there must be **no second text**, a retry about a
+  minute later, and at most two resets before `BATT_SWITCH_FAULT`.
+- Run the pack down (or lower a bench supply feeding the INA226 side) below 12.8 V: expect
+  `BACKUP_EXHAUSTED` and a return to main.
+- Note how long a full pack lasts: it does not charge while on backup.
 
 > **Abort if** any controller reboots on a switch *with the hold-up fitted*, the DPDT chatters, the
 > boards are ever left on the secondary after a run ends (`boardSupply` stuck at `secondary`), or a

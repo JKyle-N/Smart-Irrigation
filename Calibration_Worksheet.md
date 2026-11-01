@@ -53,6 +53,8 @@ Wrong here and the rig either stops when it should not, or fails to stop when it
 | `SEC_BATT_LOW_V` / `SEC_BATT_RECOVER_V` / `SEC_BATT_CRIT_V` | `ESP1` (secondary battery block) | `13.6` / `14.0` / `12.8` | Secondary (4S Li-ion) level below which no inverter use may start, the level that releases it, and the critical alert | 📄 the pack's datasheet (3.4 / 3.5 / 3.2 V per cell), then ⏱️ check the voltage under the boards' load | Too low drains the pack; too high blocks irrigation needlessly |
 | `SEC_BATT_FULL_V` / `SEC_BATT_EMPTY_V` | `ESP1` | `16.8` / `12.8` | Secondary battery % scale (display only) | 📄 4.20 / 3.20 V per cell | Wrong % on the dashboard only |
 | `BATT_SWITCH_SETTLE_MS` / `BATT_RETURN_DELAY_MS` | `ESP2` | `500` / `1000` | Settle after the DPDT moves the boards to the secondary before the inverter starts; wait after the inverter stops before returning to main | ⏱️ scope the board rail through a switch once the hold-up stage is fitted | Too short and the inverter starts (or the boards return) while the transfer is still settling |
+| `BSW_RECHARGE_MS` | `ESP1` | `60000` | How long inverter use waits after a boot or a switch reset, so the hold-up can recharge | ⏱️ scope the hold-up voltage from a cold boot until it is full, then add a margin | Too short and the retry fails too, using up the second strike; too long only delays the re-run |
+| `BACKUP_MAIN_RECOVER_V` | `ESP1` | `12.6` | Main voltage (held for `BACKUP_RECOVER_MS`, 5 min) at which the boards leave the backup. Entry uses `BATT_CRIT_V` | 📄 your main battery's resting curve; must sit well above `BATT_CRIT_V` | Too low and the boards return to a battery that drops again; too high and the pack runs down waiting |
 | `INVERTER_WARMUP_MS` | `ESP2` | `5000` | Inverter settle before an AC pump starts (plus the settle above when switching is on) | ⏱️ watch the inverter output come up | Too short and pumps start on a ramping supply (PWR_FAIL) |
 
 ## Tier 3 — sensor scaling
@@ -67,8 +69,6 @@ These make readings wrong, which mostly shows up as bad decisions rather than ba
 | `EC_STD_MSCM` | `ESP1:1254` | `1.413` | 📄 Printed on the standard solution bottle | Confirm it matches the bottle you actually have |
 | `ACS712_SENS_V_PER_A` | `ESP2:189` | `0.100` | 📄 Module rating: 20 A ≈ 100 mV/A, 30 A ≈ 66 mV/A | **Check which module is fitted** — the wrong one is a 50 % current error |
 | `ACS_DIV`, `ACS_ZERO_V`, `ACS_SENS_V_PER_A` | `ESP1:216-218` | `2.0`, `2.5`, `0.040` | 🔧 `Calibration/ESP1/ACS758` | `ACS_DIV` is the physical divider in front of A0 — measure the two resistors |
-| `INA226_SHUNT_OHMS` | `ESP1:200` | `0.002` | 📄 Printed on the shunt | Not a measurement — read the part |
-| `INA226_MAX_CURRENT_A` | `ESP1:201` | `10.0` | 🌱 Decide from expected load | Only sets the LSB resolution |
 | `calNpkScale[7]` | `ESP1:167` | `{10,10,1,10,1,1,1}` | 🔧 `Calibration/Nano/NPK` | Raw register → engineering units, per channel. Now that all 7 channels are used, **all 7 need confirming**, not just N/P/K |
 | `calNpkOff[3][3]` | `ESP1:168` | all `0` | 🔧 `Calibration/Nano/NPK` | Per-column N/P/K offset trim against the lab result |
 | `calTempOff`, `calHumOff`, `calLuxOff` | `ESP1:169` | `0` | 🔧 `Calibration/Nano/DHT22`, `Calibration/Nano/BH1750` | Offset trims only |
@@ -117,6 +117,7 @@ silent, so check them as a set whenever you change one.
 | `COLUMN_ENABLED` | `ESP1:104`, `ESP2:162`, `Nano:74` | A column that one controller thinks exists and another does not |
 | Reservoir flow K | `Nano:139` (`FLOW_K_PULSES_PER_LITER`), `ESP1` (`NANO_FLOW_K`) | Reservoir volume accounting disagrees between the two |
 | `SECONDARY_BATT_ENABLED` | `ESP1`, `ESP2` | ESP2 switches the boards but ESP1 neither blocks a low secondary nor waits for the return (or the reverse: ESP1 blocks runs on a monitor ESP2 never uses) |
+| `SECONDARY_BACKUP_ENABLED` | `ESP1`, `ESP2` | ESP1 alerts and asks for the backup but ESP2 answers `INVALID` and the boards never move, so it reports `BACKUP_SWITCH_FAILED` every minute |
 
 ## Suggested order
 

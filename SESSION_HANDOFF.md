@@ -3,8 +3,9 @@
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 
-Last updated: **2026-11-01** — whole-system verification and its fixes (clock trust, secrets in logs, I²C from core 0); open decisions in §5 (items 19–24, 26).
-Earlier the same day: SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
+Last updated: **2026-11-02** — secondary battery checked end to end, reset-proofing for a real blackout during a switch, and the backup feature (ready, compiled off); see §4.
+2026-11-01: whole-system verification and its fixes (clock trust, secrets in logs, I²C from core 0); open decisions in §5 (items 19–24, 26).
+Earlier that day: SIM800L replaced by the A7670C (`ESP1/include/gsm_modem.h`); see §4 and
 `CLAUDE.md` "LOCKED: GSM behavior". Commissioning stage M covers it.
 Previous: 2026-10-30, toolchain pinned after ESP1 stopped linking on the newest platform; LCD
 Thresholds/Column Mode truncation fixed; new open decisions logged in §5 (items 15–18).
@@ -71,8 +72,8 @@ cd ESP2 && pio run
 cd Nano && pio run
 
 # host unit tests -- ~10 seconds each, no hardware needed
-cd ESP1 && pio test -e native     # 86 cases (37 pure maths + 49 simulated A7670C)
-cd ESP2 && pio test -e native     # 13 cases
+cd ESP1 && pio test -e native     # 95 cases (46 pure maths + 49 simulated A7670C)
+cd ESP2 && pio test -e native     # 17 cases
 
 # website
 node --check Website/script.js
@@ -81,20 +82,32 @@ node -e "JSON.parse(require('fs').readFileSync('Website/firebase-rules.json','ut
 firebase deploy --only database --dry-run   # validates rules WITHOUT deploying (run from Website/)
 ```
 
-Known-good build sizes after the A7670C swap (both `SECONDARY_BATT_ENABLED 0`) — a sharp deviation
-means something unintended was picked up. With all optional flags at 1 (ESP1 `SECONDARY_BATT_ENABLED`,
-`BATTERY_SAFETY_ENABLED`; ESP2 `SECONDARY_BATT_ENABLED`, `RES_VALVE_FITTED`) both still compile: ESP1
-1,321,377 B flash, ESP2 341,117 B. Host tests: ESP1 86 cases, ESP2 13.
+Known-good build sizes as of 2026-11-02 (`SECONDARY_BATT_ENABLED 0`, `SECONDARY_BACKUP_ENABLED 0`) — a
+sharp deviation means something unintended was picked up. With all optional flags at 1 (ESP1
+`SECONDARY_BATT_ENABLED`, `SECONDARY_BACKUP_ENABLED`, `BATTERY_SAFETY_ENABLED`; ESP2
+`SECONDARY_BATT_ENABLED`, `SECONDARY_BACKUP_ENABLED`, `RES_VALVE_FITTED`) both still compile: ESP1
+1,329,085 B flash, ESP2 345,729 B. Host tests: ESP1 95 cases, ESP2 17.
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 24.6 % (80,672 B) | 41.9 % (1,319,045 B) |
-| ESP2 | 7.1 % (23,252 B) | 25.9 % (339,665 B) |
+| ESP1 | 24.6 % (80,768 B) | 42.1 % (1,323,233 B) |
+| ESP2 | 7.1 % (23,292 B) | 26.2 % (343,021 B) |
 | Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
 
 ---
 
 ## 4. What the last sessions added
+
+**2026-11-02 — secondary battery: reset-proofing + backup (ready, off).** See `CLAUDE.md` "a real blackout
+during a switch" and "secondary as backup". The user confirmed: 4S Li-ion 16.8 V, INA226 at the default
+0x40 (`INA226-Dual`'s 0x41/0x44 were bench settings only), hold-up fitted (not proven on the rig).
+- **Found by tracing a real 1 s blackout:** a re-run dosed nutrients a second time; an E-stop or cancel on
+  the secondary was forgotten and the schedule resumed; a fault's own P4 drop could lose the fault; the
+  retry hit a still-flat hold-up. All fixed.
+- **Live at every flag setting:** the dose journal and finishing a dosed batch cover **any** ESP2 reset, so
+  they change the default build too. The rest only acts with the boards on the secondary.
+- **Both flags stay 0.** `SECONDARY_BATT_ENABLED` needs stage H first. **All of this compiles and only the
+  pure logic is host-tested; the `main.cpp` paths have never run.**
 
 **2026-11-01 (latest) — whole-system verification and fixes.** New this time: `CLAUDE.md` "Trusted clock",
 secrets kept out of logs, and the lockout covering LCD Testing and priming. Also fixed: `WIFIPORTAL` on its
@@ -203,11 +216,13 @@ Roughly in priority order.
 8. **Website operators** — decide whether the user's own account should be an operator; that is a
    rules + `delete-user-api` edit and a redeploy, and needs explicit approval.
 9. **Nothing has been flashed or hardware-validated** (§1).
-10. **Secondary-battery switching needs hardware before it can be enabled.** Without a hold-up after the
-    DPDT, every switch resets all three controllers, and the P4/DPDT coils drop the boards straight
-    back to main. Fit a hold-up stage that also keeps the coils powered. Then bench-test with the
-    Testing `Batt->2nd` row, calibrate the INA226 (worksheet Tier 3), and set
-    `SECONDARY_BATT_ENABLED 1` in **both** ESP1 and ESP2.
+10. **Secondary-battery switching is waiting on stage H.** The hold-up is reported fitted (2026-11-02) but
+    is unproven. Without one that carries the boards and the coils, every switch resets all three
+    controllers and the DPDT drops straight back to main. Check the `B2:` reading against a multimeter
+    while on main (the DPDT breaks both + and −, so the pack's negative must still be common with board
+    ground for the INA226 to read it), bench-test with the Testing `Batt->2nd` row, calibrate the INA226
+    (worksheet Tier 3), and set `SECONDARY_BATT_ENABLED 1` in **both** ESP1 and ESP2. The backup
+    (`SECONDARY_BACKUP_ENABLED`) comes after that, and also needs `calBattV` calibrated.
 11. **The dashboard's `mixer` Timed Pulse / hold drives TEST row 8 alone, without the inverter.** The
     mixer is an AC load, so it probably gets no power that way. This was found while mapping inverter
     rows for this change and left unchanged; confirm on the rig.
@@ -218,7 +233,8 @@ Roughly in priority order.
     in ESP2's NVS. This is documented, not changed. A fix would mean keeping GPIO4 high across a
     software reset, or refusing reboots while busy — a design decision.
 14. **A dashboard command in flight when ESP1 itself resets** stays `accepted` forever: ESP1 keeps
-    the command id in RAM only. Also documented, not changed.
+    the command id in RAM only. Narrowed 2026-11-02: while the boards are on the secondary or mid-switch
+    the id is on NVS and a boot marks it failed. Any other ESP1 reset is unchanged.
 
 Found in the 2026-10-30 review — **left open for the user to decide** (not changed):
 
@@ -263,6 +279,10 @@ Found in the 2026-11-01 audit — **left open for the user to decide** (not chan
     once on change, so a lost one leaves the wrong cadence until the next change. Display-only impact.
 24. **`SUPA,<url>,<key>` by SMS cannot work for a real key.** A `service_role` JWT plus the URL does not
     fit one SMS, and each part of a long text arrives as a separate command. Use the portal.
+27. **Two switch resets in 24 h stop all irrigation until cleared.** `BATT_SWITCH_FAULT` refuses every
+    inverter use, by design, so a failing hold-up can't reset the rig in a loop. The crops go unwatered
+    meanwhile (the user gets the alert). Running the inverter on main without isolation would keep them
+    watered with noisier sensor readings. That is a policy decision for the user; not built.
 26. **The soil stop threshold (`soilStopPct`) does nothing.** It can be set from the LCD, SMS and the web and
     is saved, but nothing reads it: a run delivers its fixed water budget once a day. Either stop a run
     early when the soil reaches it, or remove the setting. That changes irrigation behaviour, so it is left
