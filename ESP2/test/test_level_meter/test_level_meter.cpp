@@ -109,7 +109,7 @@ void test_wrong_way_transfer_selected_tank_falls(void) {
 void test_wrong_way_booster_selected_tank_rises_or_reservoir_falls(void) {
   TEST_ASSERT_FLOAT_WITHIN(1e-4f, 0.7f, levelWrongWayL(-1, +0.7f, 0.0f, true));
   TEST_ASSERT_FLOAT_WITHIN(1e-4f, 0.9f, levelWrongWayL(-1, 0.1f, -0.9f, true));    // reservoir is the witness
-  TEST_ASSERT_FLOAT_WITHIN(1e-4f, 0.0f, levelWrongWayL(-1, 0.1f, -0.9f, false));   // ... only when readable
+  TEST_ASSERT_FLOAT_WITHIN(1e-4f, 0.1f, levelWrongWayL(-1, 0.1f, -0.9f, false));   // ... only when readable (the tank's own 0.1 L rise still counts)
   TEST_ASSERT_FLOAT_WITHIN(1e-4f, 0.0f, levelWrongWayL(-1, -1.0f, 0.0f, true));    // the right way
 }
 void test_wrong_way_must_last_and_grow(void) {
