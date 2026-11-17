@@ -3857,7 +3857,7 @@ ESP2 sends `INFO,INV_ON,<pump>` the moment it switches the inverter relay on. Un
 
 #### 19.4.9.27. Field check, 17 Nov evening (18:11–18:30)
 
-With the 17 Nov fixes flashed, `20261117.CSV` from 18:11 to 18:30:
+With the LEVEL_BLIND fixes of §19.4.9.24–25 flashed (not yet those of §19.4.9.23 and §19.4.9.26), `20261117.CSV` from 18:11 to 18:30. Column A had been switched back on by hand (LCD Settings, `MODE_SET|COL_A` at 18:12:39) after reading §19.4.9.26.
 
 | Armed | Run | What happened | Receipt |
 | --- | --- | --- | --- |
