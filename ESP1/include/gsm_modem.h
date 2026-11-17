@@ -618,7 +618,9 @@ private:
           const char ctrlZ = 0x1A;
           writeStr(cur.msg);
           cb.write(&ctrlZ, 1);
-          logf("TX|%s", cur.msg);
+          // The modem has the text, the network does not yet. TX_OK (on +CMGS) is the success record; a
+          // "TX|" row here read as a sent message, and old logs hold 1,500 of them with no TX_OK behind any.
+          logf("TX_SUBMIT|%s", cur.msg);
           txAt = now;
           tx = T_RESULT;
         } else if (txOutcome == TX_REJECTED) {

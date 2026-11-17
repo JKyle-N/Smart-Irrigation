@@ -38,3 +38,7 @@ Thumbs.db
 desktop.ini
 *.swp
 *~
+
+# ESP1's commissioning secrets (owner phone number, setup-AP password, admin PIN). The firmware falls back to
+# ESP1/include/secrets.example.h (placeholders) when this file is absent, so CI and a fresh clone still build.
+secrets.h

@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Real owner number / AP password / admin PIN: never committed (see secrets.example.h)
+include/secrets.h

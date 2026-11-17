@@ -70,4 +70,10 @@ static inline float doseJournalTrim(float journalMl, float targetMl, float measu
   return v > 0.0f ? v : 0.0f;
 }
 
+/* Mixer overcurrent is judged only once the RMS ring is full. A part-filled ring holds a slice of one mains
+ * half wave, whose RMS can sit near the peak and trip a healthy motor. A full ring spans a whole cycle. */
+static inline bool mixerOvercurrent(float rmsA, float limitA, int samples, int ringSize) {
+  return samples >= ringSize && rmsA > limitA;
+}
+
 #endif // FLOW_MATH_H

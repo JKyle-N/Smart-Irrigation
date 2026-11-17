@@ -40,7 +40,8 @@ Three microcontrollers with strict role separation:
 - **Non-blocking everywhere** — no `delay()` in normal loop flow (one 40 ms hand-off before an emergency power cut excepted); task watchdogs on both ESP32s, internal WDT on the Nano.
 - **ESP2 powered off during idle** (power saving); ESP32 #1 powers it up on demand for each run and powers it back off.
 - **GSM (A7670C)** alerts for all fault tiers, scheduled-run notices and on-demand reports, with send retries, delivery reports, a modem watchdog, a weekly `SIMTEST` text and an optional second alert number.
-- **Web dashboard + cloud** — Firebase RTDB live status and remote commands, ThingSpeak graphs, daily CSV upload to Supabase, all from a core-0 task. SMS and the LCD remain the authoritative stop paths.
+- **Pure ultrasonic water metering (web v.4)** — the two tank ultrasonics measure every litre the transfer and booster pumps move (the main-line flow meters are no longer used). A fill is a timed transfer run counted from the inverter switch-on, then a 1-minute settle, a measurement and a top-up; a delivery runs the booster until the mixing tank is under 5 % for 10 s. Pump lines come from bench measurements and can be re-measured on the LCD (Settings → Calibration → Transfer / Booster pump est).
+- **Web dashboard + cloud** — Firebase RTDB live status (every 2–4 s while the website is open, with a Refresh button), remote commands, ThingSpeak graphs, and the SD card's daily CSV logs uploaded to Firebase and downloaded on the website (Supabase only while Firebase is off), all from a core-0 task. SMS and the LCD remain the authoritative stop paths.
 - **SD logging** — RTC-timestamped CSV, one file per day (`YYYYMMDD.CSV`), buffered/batched writes.
 - **Nano recovery ladder (2 layers)** — Nano internal WDT → ESP32 #1 `RESET_REQ` (after 5 consecutive garbage packets). The old hardware-reset layer was removed when PCF8575 **P17** became the master actuator-power cutoff.
 - **P17 master cutoff + tank-aware fault hold** — on a hard ESP2 fault, ESP2 drops the P17 master power relay (bank goes dead, fail-safe), pauses, and *stays alive* holding the metered mixing-tank volume (persisted to NVS). ESP1 keeps ESP2 powered and alerts over GSM with the operation + column; recovery is user-gated: reply `STOP` / `RELEASE` / `IRRIGATE` / `NORMAL`.
@@ -51,15 +52,20 @@ Three microcontrollers with strict role separation:
 ## Repository layout
 
 ```
-ESP1/          ESP32 #1 master controller   (PlatformIO, env: esp32dev)
-ESP2/          ESP32 #2 actuator controller (PlatformIO, env: esp32dev)
-Nano/          Arduino Nano sensor hub      (Arduino IDE .ino)
+ESP1/          ESP32 #1 master controller   (PlatformIO, env: esp32dev; host tests: env native)
+ESP2/          ESP32 #2 actuator controller (PlatformIO, env: esp32dev; host tests: env native)
+Nano/          Arduino Nano sensor hub      (Arduino IDE .ino, or PlatformIO)
+shared/        Headers used by more than one board: rig constants, tank shape -> litres, pump lines
+Calibration/   Bench calibration tools per board (each its own PlatformIO project)
+Website/       The dashboard (static site + Firebase rules); published separately on GitHub Pages
 Test Code/     Bench sketches & per-sensor test programs (Arduino IDE + PlatformIO)
 Smart_Irrigation_System_Reference_FINAL.md   Full specification (source of truth)
 CLAUDE.md      Locked architecture & conventions
 ```
 
-`.pio/` build output and downloaded libraries are gitignored.
+`.pio/` build output and downloaded libraries are gitignored. So is `ESP1/include/secrets.h` (owner phone
+number, setup-AP password, admin PIN): copy `ESP1/include/secrets.example.h` to `secrets.h` and fill it in.
+Without it the firmware builds with the placeholders.
 
 ---
 
@@ -144,12 +150,13 @@ and `Commissioning_Flash_Plan.md` stages the testing.
 
 ## Status
 
-All three controllers compile cleanly (PlatformIO `esp32dev` / `nanoatmega328`) and the host
-tests pass (`pio test -e native`: 86 on ESP1, 13 on ESP2). **The current firmware has not been
-flashed to the rig**, so none of it is proven on hardware yet. **With the shipped constants
-fertigation doses nothing:** the 4 L batch is under the 5 L dosing floor, and most preset targets
-sit below the lab soil baseline. See `SESSION_HANDOFF.md` §5, item 19. This is active thesis work —
-values marked for commissioning are not yet final.
+**web v.4 "pure ultrasonic", 17 Nov 2026.** All three controllers compile cleanly (PlatformIO `esp32dev` /
+`nanoatmega328`), and the host tests run in GitHub Actions on every push (`pio test -e native` on ESP1 and ESP2).
+The firmware was flashed and checked on the rig on 17 Nov: forced irrigation runs on columns A and B completed
+(timed fill, settle and check, delivery to under 5 %). What is still open, and the change history, is in
+[`Smart_Irrigation_System_Reference_FINAL.md`](Smart_Irrigation_System_Reference_FINAL.md) §19.4.9.11–§19.4.9.27
+and §29.10. Most important: ESP32 #1 restarts when its supply dips (give it and the A7670C a 2 A supply and a
+large capacitor at the modem). This is active thesis work; values marked for commissioning are not yet final.
 
 ---
 

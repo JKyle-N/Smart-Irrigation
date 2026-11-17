@@ -5,24 +5,76 @@
         ".read": "auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
         ".write": "auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2'"
       },
+      "viewer": {
+        ".read": "auth != null && (auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2' || root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
+        ".write": "auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
+        "at": { ".validate": "newData.isNumber() && newData.val() <= now && newData.val() > now - 60000" },
+        "refreshAt": { ".validate": "newData.isNumber() && newData.val() <= now && newData.val() > now - 60000 && (!data.exists() || data.val() === newData.val() || data.val() < now - 2000)" },
+        "$other": { ".validate": false }
+      },
+      "logRequest": {
+        ".read": "auth != null && (auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2' || (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true))))",
+        ".write": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true)))",
+        ".validate": "newData.hasChildren(['day', 'at'])",
+        "day": { ".validate": "newData.isNumber() && newData.val() >= 20200101 && newData.val() <= 20991231" },
+        "at": { ".validate": "newData.isNumber() && newData.val() <= now && newData.val() > now - 60000 && (!data.exists() || data.val() < now - 5000)" },
+        "$other": { ".validate": false }
+      },
       "config": {
         ".read": "auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
-        ".write": "auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')"
+        "zones": {
+          ".write": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true || root.child('users').child(auth.uid).child('zoneEditAccess').val() === true)))",
+          "$zone": {
+            "name": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 60" }
+          }
+        },
+        "crops": {
+          ".write": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true)))",
+          "$crop": {
+            ".validate": "newData.child('removed').val() === true ? (!newData.child('stages').exists() && !newData.child('name').exists()) : newData.hasChildren(['name', 'stages'])",
+            "name": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 40" },
+            "variety": { ".validate": "newData.isString() && newData.val().length <= 40" },
+            "notes": { ".validate": "newData.isString() && newData.val().length <= 300" },
+            "removed": { ".validate": "newData.isBoolean()" },
+            "updatedAt": { ".validate": "newData.isNumber()" },
+            "updatedBy": { ".validate": "newData.isString() && newData.val().length <= 80" },
+            "stages": {
+              "$stage": {
+                ".validate": "newData.hasChildren(['name', 'order', 'n', 'p', 'k', 'ph', 'ec', 'moisture'])",
+                "name": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 30" },
+                "order": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() < 20" },
+                "n": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 2000" },
+                "p": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 2000" },
+                "k": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 2000" },
+                "ph": { ".validate": "newData.isNumber() && newData.val() >= 3 && newData.val() <= 9" },
+                "ec": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 20" },
+                "moisture": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 100" },
+                "days": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 365" },
+                "notes": { ".validate": "newData.isString() && newData.val().length <= 200" },
+                "$other": { ".validate": false }
+              }
+            },
+            "$other": { ".validate": false }
+          }
+        }
       },
       "manual": {
         ".read": "auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')",
-        ".write": "auth != null && (newData.child('want').val() === false || ((root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true))) && newData.hasChildren(['seq', 'want']) && newData.child('seq').isNumber() && newData.child('want').isBoolean()"
+        ".write": "auth != null && (newData.child('want').val() === false || ((root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true) && root.child('irrigation/live/diagnostics/system/lcdLocked').val() !== true)) && newData.hasChildren(['seq', 'want']) && newData.child('seq').isNumber() && newData.child('want').isBoolean()"
       },
       "testHold": {
         ".read": "auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')",
-        ".write": "auth != null && (newData.child('want').val() === false || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true) && newData.hasChildren(['seq', 'bit', 'want']) && newData.child('seq').isNumber() && newData.child('want').isBoolean() && newData.child('bit').isString() && (newData.child('bit').val() === 'transfer' || newData.child('bit').val() === 'colA' || newData.child('bit').val() === 'colB' || newData.child('bit').val() === 'colC' || newData.child('bit').val() === 'mixer' || newData.child('bit').val() === 'nutA' || newData.child('bit').val() === 'nutB' || newData.child('bit').val() === 'nutC' || newData.child('bit').val() === 'phUp' || newData.child('bit').val() === 'phDn')"
+        ".write": "auth != null && (newData.child('want').val() === false || ((auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true))) && root.child('irrigation/live/diagnostics/system/lcdLocked').val() !== true)) && newData.hasChildren(['seq', 'bit', 'want']) && newData.child('seq').isNumber() && newData.child('want').isBoolean() && newData.child('bit').isString() && (newData.child('bit').val() === 'transfer' || newData.child('bit').val() === 'colA' || newData.child('bit').val() === 'colB' || newData.child('bit').val() === 'colC' || newData.child('bit').val() === 'mixer' || newData.child('bit').val() === 'nutA' || newData.child('bit').val() === 'nutB' || newData.child('bit').val() === 'nutC' || newData.child('bit').val() === 'phUp' || newData.child('bit').val() === 'phDn')"
       },
       "commands": {
         ".read": "auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')",
         "$commandId": {
-          ".write": "(auth != null && (root.child('users').child(auth.uid).child('status').val() === 'approved' || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && !data.exists() && newData.child('source').val() === 'dashboard' && newData.child('status').val() === 'queued' && ((newData.child('type').val() === 'RUN_PUMP_TEST' || newData.child('type').val() === 'SET_EXERCISE' || newData.child('type').val() === 'TEST_PULSE' || newData.child('type').val() === 'SET_CLOCK' || newData.child('type').val() === 'SET_THRESH' || newData.child('type').val() === 'RESTORE_DEFAULTS' || newData.child('type').val() === 'CLEAR_BATT_SWITCH') ? (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true) : true)) || (auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')",
+          ".write": "(auth != null && !data.exists() && newData.child('source').val() === 'dashboard' && newData.child('status').val() === 'queued' && (newData.child('type').val() === 'SET_AC_VOLT' ? ((auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true))) && newData.child('payload').hasChildren(['vMin', 'vMax']) && newData.child('payload/vMax').val() - newData.child('payload/vMin').val() >= 5) : newData.child('type').val() === 'SET_AC_AMP' ? ((auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true))) && newData.child('payload').hasChildren(['aMin10', 'aMax10']) && newData.child('payload/aMax10').val() - newData.child('payload/aMin10').val() >= 2) : (newData.child('type').val() === 'RUN_PUMP_TEST' || newData.child('type').val() === 'SET_EXERCISE' || newData.child('type').val() === 'TEST_PULSE' || newData.child('type').val() === 'SET_CLOCK' || newData.child('type').val() === 'SET_THRESH' || newData.child('type').val() === 'RESTORE_DEFAULTS' || newData.child('type').val() === 'CLEAR_BATT_SWITCH' || newData.child('type').val() === 'LCD_LOCK') ? (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true))) : newData.child('type').val() === 'SET_COLUMN' ? (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true || root.child('users').child(auth.uid).child('zoneEditAccess').val() === true))) : (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true || root.child('users').child(auth.uid).child('controlAccess').val() === true)))) && (root.child('irrigation/live/diagnostics/system/lcdLocked').val() !== true || newData.child('type').val() === 'EMERGENCY_STOP' || newData.child('type').val() === 'DISABLE_ACTUATIONS' || newData.child('type').val() === 'CANCEL_FORCE' || newData.child('type').val() === 'ACK_FAULT' || newData.child('type').val() === 'LCD_LOCK') && ((newData.child('type').val() !== 'EMERGENCY_STOP' && newData.child('type').val() !== 'DISABLE_ACTUATIONS' && newData.child('type').val() !== 'CANCEL_FORCE') || (root.child('irrigation/live/meta/updatedAt').isNumber() && root.child('irrigation/live/meta/updatedAt').val() > now - 180000))) || (auth != null && data.exists() && data.child('status').val() === 'queued' && newData.child('status').val() === 'withdrawn' && newData.child('type').val() === data.child('type').val() && data.child('type').val() !== 'EMERGENCY_STOP' && data.child('type').val() !== 'DISABLE_ACTUATIONS' && data.child('type').val() !== 'CANCEL_FORCE' && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true || root.child('users').child(auth.uid).child('controlAccess').val() === true || (data.child('type').val() === 'SET_COLUMN' && root.child('users').child(auth.uid).child('zoneEditAccess').val() === true))))) || (auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2')",
           "type": {
-            ".validate": "newData.isString() && (newData.val() === 'FORCE_RUN' || newData.val() === 'EMERGENCY_STOP' || newData.val() === 'RECOVER' || newData.val() === 'ESTOP_RECOVER' || newData.val() === 'ENABLE_ACTUATIONS' || newData.val() === 'DISABLE_ACTUATIONS' || newData.val() === 'CANCEL_FORCE' || newData.val() === 'ACK_FAULT' || newData.val() === 'SET_COLUMN' || newData.val() === 'SET_EXERCISE' || newData.val() === 'RUN_PUMP_TEST' || newData.val() === 'REBOOT' || newData.val() === 'TEST_PULSE' || newData.val() === 'DIAG_SWEEP' || newData.val() === 'SET_CLOCK' || newData.val() === 'SET_THRESH' || newData.val() === 'RESTORE_DEFAULTS' || newData.val() === 'CLEAR_BATT_SWITCH')"
+            ".validate": "newData.isString() && (newData.val() === 'FORCE_RUN' || newData.val() === 'EMERGENCY_STOP' || newData.val() === 'RECOVER' || newData.val() === 'ESTOP_RECOVER' || newData.val() === 'ENABLE_ACTUATIONS' || newData.val() === 'DISABLE_ACTUATIONS' || newData.val() === 'CANCEL_FORCE' || newData.val() === 'ACK_FAULT' || newData.val() === 'SET_COLUMN' || newData.val() === 'SET_EXERCISE' || newData.val() === 'RUN_PUMP_TEST' || newData.val() === 'REBOOT' || newData.val() === 'TEST_PULSE' || newData.val() === 'DIAG_SWEEP' || newData.val() === 'SET_CLOCK' || newData.val() === 'SET_THRESH' || newData.val() === 'RESTORE_DEFAULTS' || newData.val() === 'CLEAR_BATT_SWITCH' || newData.val() === 'LCD_LOCK' || newData.val() === 'SET_AC_VOLT' || newData.val() === 'SET_AC_AMP')"
+          },
+          "byName": {
+            ".validate": "newData.isString() && (newData.val() === root.child('users').child(auth.uid).child('name').val() || ((auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && newData.val() === 'Operator'))"
           },
           "payload": {
             "liters":       { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() > 0 && newData.val() <= 20)" },
@@ -31,6 +83,17 @@
             "targetP":      { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 2000)" },
             "targetK":      { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 2000)" },
             "targetPH":     { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 3 && newData.val() <= 9)" },
+            "vMin":         { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 80 && newData.val() <= 255)" },
+            "vMax":         { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 85 && newData.val() <= 260)" },
+            "aMin10":       { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 1 && newData.val() <= 98)" },
+            "aMax10":       { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 3 && newData.val() <= 100)" },
+            "windows": {
+              ".validate": "newData.hasChildren()",
+              "$i": {
+                ".validate": "($i === '0' || $i === '1' || $i === '2' || $i === '3') && newData.hasChildren(['0', '1'])",
+                "$j": { ".validate": "($j === '0' || $j === '1') && newData.isNumber() && newData.val() >= 0 && newData.val() <= 1439" }
+              }
+            },
             "doseMl": {
               "A": { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 500)" },
               "B": { ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 500)" },
@@ -40,19 +103,48 @@
         }
       }
     },
+    "logs": {
+      ".read": "auth != null && (auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2' || (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2' || (root.child('users').child(auth.uid).child('status').val() === 'approved' && ((root.child('users').child(auth.uid).child('tempAccessUntil').exists() && root.child('users').child(auth.uid).child('tempAccessUntil').val() > now) || root.child('users').child(auth.uid).child('subOperator').val() === true))))",
+      "index": {
+        "$day": {
+          ".write": "auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2'",
+          ".validate": "$day.matches(/^[0-9]{8}$/)"
+        }
+      },
+      "files": {
+        "$day": {
+          ".write": "auth != null && auth.uid === '6hNg56ldAaSmpnodG1Xla0vn61O2'",
+          ".validate": "$day.matches(/^[0-9]{8}$/)",
+          "$chunk": { ".validate": "newData.isString() && newData.val().length <= 40000" }
+        }
+      }
+    },
     "presence": {
       ".read": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
       "$uid": {
         ".read": "auth != null && (auth.uid === $uid || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
         ".write": "auth != null && auth.uid === $uid",
-        ".validate": "newData.hasChildren(['online', 'lastChanged']) && newData.child('online').isBoolean() && newData.child('lastChanged').isNumber()"
+        "sessions": {
+          "$session": {
+            ".validate": "newData.hasChildren(['since', 'lastActive', 'visible'])",
+            "since": { ".validate": "newData.isNumber()" },
+            "lastActive": { ".validate": "newData.isNumber()" },
+            "visible": { ".validate": "newData.isBoolean()" },
+            "$other": { ".validate": false }
+          }
+        },
+        "lastActive": { ".validate": "newData.isNumber()" },
+        "lastSeen": { ".validate": "newData.isNumber()" },
+        "online": { ".validate": "newData.isBoolean()" },
+        "lastChanged": { ".validate": "newData.isNumber()" },
+        "$other": { ".validate": false }
       }
     },
     "activity": {
       ".read": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
       "$uid": {
-        ".write": "auth != null && auth.uid === $uid",
         "$activityId": {
+          ".write": "auth != null && auth.uid === $uid && !data.exists()",
           ".validate": "newData.hasChildren(['what', 'at']) && newData.child('what').isString() && newData.child('what').val().length > 0 && newData.child('what').val().length <= 80 && newData.child('at').isNumber()"
         }
       }
@@ -61,7 +153,7 @@
       ".read": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
       "$uid": {
         ".read": "auth != null && (auth.uid === $uid || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
-        ".write": "auth != null && ((auth.uid === $uid && !data.exists() && newData.child('status').val() === 'pending') || ((auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && $uid !== 'KaiqrwlOHeVdebbokPxZfcFLZiu2' && $uid !== 'C8V39t4EDgUgjOt9GA6OeMukMsw2'))",
+        ".write": "auth != null && ((auth.uid === $uid && !data.exists() && newData.child('status').val() === 'pending' && !newData.child('subOperator').exists() && !newData.child('tempAccessUntil').exists() && !newData.child('kickToken').exists() && !newData.child('controlAccess').exists() && !newData.child('zoneEditAccess').exists()) || ((auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && $uid !== 'KaiqrwlOHeVdebbokPxZfcFLZiu2' && $uid !== 'C8V39t4EDgUgjOt9GA6OeMukMsw2'))",
         ".validate": "newData.hasChildren(['name', 'email', 'status', 'createdAt'])",
         "name": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 80" },
         "email": { ".validate": "newData.isString() && newData.val().length > 0" },
@@ -78,6 +170,28 @@
         "subOperator": {
           ".write": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && $uid !== 'KaiqrwlOHeVdebbokPxZfcFLZiu2' && $uid !== 'C8V39t4EDgUgjOt9GA6OeMukMsw2'",
           ".validate": "!newData.exists() || newData.isBoolean()"
+        },
+        "controlAccess": {
+          ".write": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && $uid !== 'KaiqrwlOHeVdebbokPxZfcFLZiu2' && $uid !== 'C8V39t4EDgUgjOt9GA6OeMukMsw2'",
+          ".validate": "!newData.exists() || newData.isBoolean()"
+        },
+        "zoneEditAccess": {
+          ".write": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && $uid !== 'KaiqrwlOHeVdebbokPxZfcFLZiu2' && $uid !== 'C8V39t4EDgUgjOt9GA6OeMukMsw2'",
+          ".validate": "!newData.exists() || newData.isBoolean()"
+        }
+      }
+    },
+    "accessRequests": {
+      ".read": "auth != null && (auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2')",
+        "$kind": {
+          ".write": "auth != null && (((auth.uid === 'KaiqrwlOHeVdebbokPxZfcFLZiu2' || auth.uid === 'C8V39t4EDgUgjOt9GA6OeMukMsw2') && $uid !== 'KaiqrwlOHeVdebbokPxZfcFLZiu2' && $uid !== 'C8V39t4EDgUgjOt9GA6OeMukMsw2') || (auth.uid === $uid && ((newData.exists() && newData.child('state').val() === 'waiting' && (!data.exists() || data.child('state').val() === 'declined') && (($kind === 'approval' && (root.child('users').child($uid).child('status').val() === 'pending' || root.child('users').child($uid).child('status').val() === 'rejected')) || ($kind === 'unrestrict' && root.child('users').child($uid).child('status').val() === 'restricted') || ($kind === 'zones' && root.child('users').child($uid).child('status').val() === 'approved' && root.child('users').child($uid).child('zoneEditAccess').val() !== true && root.child('users').child($uid).child('subOperator').val() !== true) || ($kind === 'control' && root.child('users').child($uid).child('status').val() === 'approved' && root.child('users').child($uid).child('controlAccess').val() !== true && root.child('users').child($uid).child('subOperator').val() !== true))) || (!newData.exists() && data.child('state').val() === 'waiting'))))",
+          ".validate": "($kind === 'approval' || $kind === 'unrestrict' || $kind === 'zones' || $kind === 'control') && newData.hasChildren(['state', 'at'])",
+          "state": { ".validate": "newData.val() === 'waiting' || newData.val() === 'declined'" },
+          "at": { ".validate": "newData.isNumber() && (newData.val() === now || newData.val() === data.val())" },
+          "decidedAt": { ".validate": "newData.isNumber()" },
+          "$other": { ".validate": false }
         }
       }
     }

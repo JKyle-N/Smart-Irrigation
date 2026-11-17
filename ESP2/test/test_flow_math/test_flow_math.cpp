@@ -134,8 +134,17 @@ void test_stall_needs_flow_first_and_an_ac_pump(void) {
   TEST_ASSERT_FALSE(flowStalled(true, false, 60000UL, 10000UL));   // dosing pumps pulse slowly
 }
 
+void test_mixer_overcurrent_waits_for_a_full_ring(void) {
+  TEST_ASSERT_FALSE(mixerOvercurrent(9.0f, 5.0f, 1, 24));    // one sample: a slice of a half wave
+  TEST_ASSERT_FALSE(mixerOvercurrent(9.0f, 5.0f, 23, 24));
+  TEST_ASSERT_TRUE(mixerOvercurrent(9.0f, 5.0f, 24, 24));    // a whole mains cycle: believe it
+  TEST_ASSERT_FALSE(mixerOvercurrent(5.0f, 5.0f, 24, 24));   // at the limit is allowed
+  TEST_ASSERT_FALSE(mixerOvercurrent(2.0f, 5.0f, 24, 24));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
+  RUN_TEST(test_mixer_overcurrent_waits_for_a_full_ring);
   RUN_TEST(test_dose_owed_subtracts_what_is_already_in_the_tank);
   RUN_TEST(test_dose_owed_never_goes_negative);
   RUN_TEST(test_dose_journal_counts_a_started_dose_as_delivered);

@@ -133,7 +133,7 @@ struct FakeA7670 {
       size_t idx = (size_t)atoi(c.c_str() + 8);
       if (idx >= 1 && idx <= stored.size() && !stored[idx - 1].empty()) {
         const std::string &t = stored[idx - 1];
-        say("\r\n+CMGR: \"REC UNREAD\",\"+639150424784\",\"\",\"26/11/01,10:00:00+32\",145,4,0,0,\"+639170000000\",145,"
+        say("\r\n+CMGR: \"REC UNREAD\",\"+639000000000\",\"\",\"26/11/01,10:00:00+32\",145,4,0,0,\"+639170000000\",145,"
             + std::to_string(t.size()) + "\r\n" + t + "\r\n\r\nOK\r\n");
       } else line("OK");
       return;
@@ -160,7 +160,7 @@ struct FakeA7670 {
     return false;
   }
   // Inbound SMS with the AT+CSDH=1 header, the form the driver configures.
-  void pushCmt(const std::string &text, const std::string &from = "+639150424784") {
+  void pushCmt(const std::string &text, const std::string &from = "+639000000000") {
     say("\r\n+CMT: \"" + from + "\",\"\",\"26/11/01,10:00:00+32\",145,4,0,0,\"+639170000000\",145,"
         + std::to_string(text.size()) + "\r\n" + text + "\r\n");
   }
@@ -265,8 +265,8 @@ void test_split_without_separator_still_progresses(void) {
 }
 
 void test_number_validation(void) {
-  TEST_ASSERT_TRUE(gsmNumberOk("09150424784"));
-  TEST_ASSERT_TRUE(gsmNumberOk("+639150424784"));
+  TEST_ASSERT_TRUE(gsmNumberOk("09000000000"));
+  TEST_ASSERT_TRUE(gsmNumberOk("+639000000000"));
   TEST_ASSERT_FALSE(gsmNumberOk("GLOBE"));
   TEST_ASSERT_FALSE(gsmNumberOk(""));
   TEST_ASSERT_FALSE(gsmNumberOk("0915\";AT+CFUN=0"));   // cannot break out of AT+CMGS="..."
@@ -406,7 +406,7 @@ void test_inbound_cmt_reaches_handler_with_sender(void) {
   fake->pushCmt("STATUS");
   run(200);
   TEST_ASSERT_EQUAL_INT(1, (int)inbox.size());
-  TEST_ASSERT_EQUAL_STRING("+639150424784", inbox[0].from.c_str());
+  TEST_ASSERT_EQUAL_STRING("+639000000000", inbox[0].from.c_str());
   TEST_ASSERT_EQUAL_STRING("STATUS", inbox[0].body.c_str());
 }
 
@@ -414,7 +414,7 @@ void test_inbound_cmt_reaches_handler_with_sender(void) {
 // a stranger could forge the owner's +CMT header inside their message and pass senderIsOwner().
 void test_forged_cmt_inside_a_message_is_not_parsed(void) {
   startReady();
-  fake->pushCmt("hi\r\n+CMT: \"+639150424784\",\"\",\"26/11/01,10:00:00+32\"\r\nSTOP,ALL", "+639990000000");
+  fake->pushCmt("hi\r\n+CMT: \"+639000000000\",\"\",\"26/11/01,10:00:00+32\"\r\nSTOP,ALL", "+639990000000");
   run(200);
   TEST_ASSERT_EQUAL_INT(1, (int)inbox.size());
   TEST_ASSERT_EQUAL_STRING("+639990000000", inbox[0].from.c_str());
@@ -443,7 +443,7 @@ void test_body_that_looks_like_modem_output_is_just_a_body(void) {
 
 void test_truncated_body_times_out_and_parser_recovers(void) {
   startReady();
-  fake->say("\r\n+CMT: \"+639150424784\",\"\",\"26/11/01,10:00:00+32\",145,4,0,0,\"+639170000000\",145,50\r\nSTOP");
+  fake->say("\r\n+CMT: \"+639000000000\",\"\",\"26/11/01,10:00:00+32\",145,4,0,0,\"+639170000000\",145,50\r\nSTOP");
   run(3000);
   TEST_ASSERT_EQUAL_INT(1, (int)inbox.size());
   TEST_ASSERT_EQUAL_STRING("STOP", inbox[0].body.c_str());
@@ -462,7 +462,7 @@ void test_stored_message_path_reads_then_deletes(void) {
   run(10000);
   TEST_ASSERT_EQUAL_INT(1, (int)inbox.size());
   TEST_ASSERT_EQUAL_STRING("STOP,ALL", inbox[0].body.c_str());
-  TEST_ASSERT_EQUAL_STRING("+639150424784", inbox[0].from.c_str());
+  TEST_ASSERT_EQUAL_STRING("+639000000000", inbox[0].from.c_str());
   TEST_ASSERT_TRUE(fake->sawCmd("AT+CMGD=1"));
 }
 
@@ -477,10 +477,10 @@ void test_old_backlog_is_wiped_not_replayed(void) {
 
 void test_send_reaches_modem_with_cr_only_and_ctrl_z(void) {
   startReady();
-  modem->enqueue("ALERT,MAJ,TEST", "09150424784", 2);
+  modem->enqueue("ALERT,MAJ,TEST", "09000000000", 2);
   run(5000);
   TEST_ASSERT_EQUAL_INT(1, (int)fake->sent.size());
-  TEST_ASSERT_EQUAL_STRING("09150424784", fake->sent[0].to.c_str());
+  TEST_ASSERT_EQUAL_STRING("09000000000", fake->sent[0].to.c_str());
   TEST_ASSERT_EQUAL_STRING("ALERT,MAJ,TEST", fake->sent[0].body.c_str());   // no stray LF up front
   TEST_ASSERT_EQUAL_INT(1, modem->txOk());
   TEST_ASSERT_EQUAL_INT(0, modem->queued());
@@ -491,16 +491,29 @@ void test_send_reaches_modem_with_cr_only_and_ctrl_z(void) {
 void test_slow_network_send_is_not_declared_failed(void) {
   fake->sendLatencyMs = 35000;
   startReady();
-  modem->enqueue("A", "09150424784", 2);
+  modem->enqueue("A", "09000000000", 2);
   run(40000);
   TEST_ASSERT_FALSE(logged("TX_UNKNOWN"));
   TEST_ASSERT_EQUAL_INT(1, modem->txOk());
 }
 
+// REGRESSION: rig logs held 1,500 "TX|ALERT..." rows and no confirmation behind any of them. Handing the
+// text to the modem must not read as sent: only the network's +CMGS may log TX_OK.
+void test_only_the_network_confirmation_logs_success(void) {
+  fake->sendLatencyMs = 20000;
+  startReady();
+  modem->enqueue("ALERT,MAJ,TEST", "09000000000", 2);
+  run(5000);
+  TEST_ASSERT_TRUE(logged("TX_SUBMIT|ALERT"));
+  TEST_ASSERT_FALSE(logged("TX_OK"));
+  run(20000);
+  TEST_ASSERT_TRUE(logged("TX_OK"));
+}
+
 void test_failed_send_retries_then_succeeds(void) {
   fake->failSends = 2;
   startReady();
-  modem->enqueue("ALERT,CRIT,X", "09150424784", 2);
+  modem->enqueue("ALERT,CRIT,X", "09000000000", 2);
   run(120000);
   TEST_ASSERT_EQUAL_INT(1, (int)fake->sent.size());
   TEST_ASSERT_EQUAL_INT(2, loggedCount("TX|RETRY"));
@@ -510,8 +523,8 @@ void test_failed_send_retries_then_succeeds(void) {
 void test_retries_are_bounded_and_order_kept(void) {
   fake->failSends = 3;
   startReady();
-  modem->enqueue("FIRST", "09150424784", 2);
-  modem->enqueue("SECOND", "09150424784", 2);
+  modem->enqueue("FIRST", "09000000000", 2);
+  modem->enqueue("SECOND", "09000000000", 2);
   run(120000);
   TEST_ASSERT_EQUAL_INT(1, modem->txGaveUp());
   TEST_ASSERT_TRUE(logged("TX|GAVE_UP|FIRST"));
@@ -522,7 +535,7 @@ void test_retries_are_bounded_and_order_kept(void) {
 void test_no_prompt_aborts_with_esc_and_retries(void) {
   fake->noPrompt = true;
   startReady();
-  modem->enqueue("A", "09150424784", 0);
+  modem->enqueue("A", "09000000000", 0);
   run(15000);
   TEST_ASSERT_TRUE(logged("TX|FAIL_NO_PROMPT"));
   TEST_ASSERT_EQUAL_INT(1, modem->txGaveUp());
@@ -531,7 +544,7 @@ void test_no_prompt_aborts_with_esc_and_retries(void) {
 void test_unanswered_send_times_out_at_the_manual_limit(void) {
   fake->neverAnswerSend = true;
   startReady();
-  modem->enqueue("A", "09150424784", 0);
+  modem->enqueue("A", "09000000000", 0);
   run(30000);
   TEST_ASSERT_FALSE(logged("TX_UNKNOWN"));
   run(20000);
@@ -542,7 +555,7 @@ void test_gt_in_an_inbound_message_is_not_taken_as_the_prompt(void) {
   fake->sendLatencyMs = 100;
   startReady();
   fake->noPrompt = true;
-  modem->enqueue("A", "09150424784", 0);
+  modem->enqueue("A", "09000000000", 0);
   run(1000);
   fake->pushCmt("a>b");
   run(1000);
@@ -553,7 +566,7 @@ void test_gt_in_an_inbound_message_is_not_taken_as_the_prompt(void) {
 void test_alphanumeric_recipient_is_dropped_without_blocking_the_queue(void) {
   startReady();
   modem->enqueue("ERR,AUTH", "GLOBE", 0);
-  modem->enqueue("REAL", "09150424784", 2);
+  modem->enqueue("REAL", "09000000000", 2);
   run(5000);
   TEST_ASSERT_TRUE(logged("TX|BAD_NUMBER"));
   TEST_ASSERT_EQUAL_INT(1, (int)fake->sent.size());
@@ -562,7 +575,7 @@ void test_alphanumeric_recipient_is_dropped_without_blocking_the_queue(void) {
 
 void test_control_chars_cannot_end_the_body_early(void) {
   startReady();
-  modem->enqueue("a\x1A" "b\x1B" "c\nd", "09150424784", 0);
+  modem->enqueue("a\x1A" "b\x1B" "c\nd", "09000000000", 0);
   run(5000);
   TEST_ASSERT_EQUAL_INT(1, (int)fake->sent.size());
   TEST_ASSERT_EQUAL_STRING("a b c\nd", fake->sent[0].body.c_str());
@@ -574,7 +587,7 @@ void test_queue_overflow_keeps_newest(void) {
   char b[8];
   for (int i = 0; i < GSM_QUEUE_SIZE + 2; i++) {
     snprintf(b, sizeof(b), "M%d", i);
-    modem->enqueue(b, "09150424784", 0);
+    modem->enqueue(b, "09000000000", 0);
   }
   TEST_ASSERT_EQUAL_INT(GSM_QUEUE_SIZE, modem->queued());
   TEST_ASSERT_EQUAL_INT(2, loggedCount("TX|DROP_QUEUE_FULL"));
@@ -587,7 +600,7 @@ void test_queue_overflow_keeps_newest(void) {
 void test_queue_waits_for_modem_ready(void) {
   fake->bootAt = simNow + 20000;
   start();
-  modem->enqueue("BOOT_ALERT", "09150424784", 0);
+  modem->enqueue("BOOT_ALERT", "09000000000", 0);
   run(60000);
   TEST_ASSERT_EQUAL_INT(1, (int)fake->sent.size());
   TEST_ASSERT_EQUAL_INT(0, modem->txGaveUp());
@@ -599,7 +612,7 @@ void test_short_outage_holds_messages_without_using_retries(void) {
   fake->ceregStat = 2;
   run(20000);
   TEST_ASSERT_FALSE(modem->registered());
-  modem->enqueue("A", "09150424784", 0);
+  modem->enqueue("A", "09000000000", 0);
   run(60000);
   TEST_ASSERT_EQUAL_INT(0, (int)fake->sent.size());
   fake->ceregStat = 1;
@@ -611,14 +624,14 @@ void test_long_outage_tries_anyway(void) {
   startReady();
   fake->cregStat = 0;
   fake->ceregStat = 0;
-  modem->enqueue("A", "09150424784", 0);
+  modem->enqueue("A", "09000000000", 0);
   run(GSM_UNREG_HOLD_MS + 30000);
   TEST_ASSERT_EQUAL_INT(1, (int)fake->sent.size());     // CREG/CEREG might be the thing that is wrong
 }
 
 void test_battery_switch_quiet_window_holds_sends(void) {
   startReady();
-  modem->enqueue("A", "09150424784", 0);
+  modem->enqueue("A", "09000000000", 0);
   run(3000, true);
   TEST_ASSERT_EQUAL_INT(0, (int)fake->sent.size());
   run(3000, false);
@@ -629,9 +642,9 @@ void test_battery_switch_quiet_window_holds_sends(void) {
 
 void test_delivery_report_outcomes(void) {
   startReady();
-  fake->line("+CDS: 6,41,\"+639150424784\",145,\"26/11/01,10:00:00+32\",\"26/11/01,10:00:05+32\",0");
-  fake->line("+CDS: 6,42,\"+639150424784\",145,\"26/11/01,10:00:00+32\",\"26/11/01,10:00:05+32\",48");
-  fake->line("+CDS: 6,43,\"+639150424784\",145,\"26/11/01,10:00:00+32\",\"26/11/01,10:00:05+32\",65");
+  fake->line("+CDS: 6,41,\"+639000000000\",145,\"26/11/01,10:00:00+32\",\"26/11/01,10:00:05+32\",0");
+  fake->line("+CDS: 6,42,\"+639000000000\",145,\"26/11/01,10:00:00+32\",\"26/11/01,10:00:05+32\",48");
+  fake->line("+CDS: 6,43,\"+639000000000\",145,\"26/11/01,10:00:00+32\",\"26/11/01,10:00:05+32\",65");
   run(200);
   TEST_ASSERT_TRUE(logged("TX_DELIVERED|41"));
   TEST_ASSERT_TRUE(logged("TX_PENDING|42|st=48"));
@@ -681,8 +694,8 @@ void test_long_unregistered_soft_resets_at_most_hourly(void) {
 void test_repeated_abandoned_messages_soft_reset(void) {
   fake->failSends = 2;
   startReady();
-  modem->enqueue("A", "09150424784", 0);
-  modem->enqueue("B", "09150424784", 0);
+  modem->enqueue("A", "09000000000", 0);
+  modem->enqueue("B", "09000000000", 0);
   run(20000);
   TEST_ASSERT_EQUAL_INT(2, modem->txGaveUp());
   TEST_ASSERT_EQUAL_INT(1, fake->resets);
@@ -767,6 +780,7 @@ int main(int, char **) {
   RUN_TEST(test_old_backlog_is_wiped_not_replayed);
   RUN_TEST(test_send_reaches_modem_with_cr_only_and_ctrl_z);
   RUN_TEST(test_slow_network_send_is_not_declared_failed);
+  RUN_TEST(test_only_the_network_confirmation_logs_success);
   RUN_TEST(test_failed_send_retries_then_succeeds);
   RUN_TEST(test_retries_are_bounded_and_order_kept);
   RUN_TEST(test_no_prompt_aborts_with_esc_and_retries);

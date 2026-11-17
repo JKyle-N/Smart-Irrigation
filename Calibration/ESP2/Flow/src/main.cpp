@@ -55,8 +55,8 @@ struct Chan {
   const char *rateConst; // ESP2/src/main.cpp constant for the rate, or NULL
 };
 const Chan CH[] = {
-  { "RESMIX", 26, B_TRANSFER, true,  false, "kRM", NULL,    "TRANSFER_LPM" },
-  { "MIXIRR",  5, B_BOOSTER,  true,  true,  "kMI", NULL,    "BOOSTER_LPM"  },
+  { "RESMIX", 26, B_TRANSFER, true,  false, "kRM2", NULL,   "TRANSFER_LPM" },
+  { "MIXIRR",  5, B_BOOSTER,  true,  true,  "kMI2", NULL,   "BOOSTER_LPM"  },
   { "NUTA",   23, B_NUT_A,    false, false, "kNA", "pumpA", NULL },
   { "NUTB",   19, B_NUT_B,    false, false, "kNB", "pumpB", NULL },
   { "NUTC",   18, B_NUT_C,    false, false, "kNC", "pumpC", NULL },

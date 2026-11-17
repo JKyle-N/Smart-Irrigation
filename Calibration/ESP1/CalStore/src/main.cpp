@@ -57,8 +57,8 @@ const Key KEYS[] = {
   { "s2K", K_FLOAT, -5000, 5000, 0, "NPK offset, column C, K" },
   // Flow, pushed to ESP2 at startup and in every work order
   { "frS", K_FLOAT, 0.05, 20, 1, "reservoir flow (Nano) correction scale" },
-  { "kRM", K_FLOAT, 1, 100000, 450, "flow K: reservoir -> mixing, pulses/L" },
-  { "kMI", K_FLOAT, 1, 100000, 450, "flow K: mixing -> irrigation, pulses/L" },
+  { "kRM2", K_FLOAT, 1, 100000, 583.8, "flow K: reservoir -> mixing, pulses/L" },   // key + default from ESP1, 2026-11-16
+  { "kMI2", K_FLOAT, 1, 100000, 458.5, "flow K: mixing -> irrigation, pulses/L" },
   { "kNA", K_FLOAT, 1, 100000, 450, "flow K: nutrient A, pulses/L" },
   { "kNB", K_FLOAT, 1, 100000, 450, "flow K: nutrient B, pulses/L" },
   { "kNC", K_FLOAT, 1, 100000, 450, "flow K: nutrient C, pulses/L" },

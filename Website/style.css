@@ -11,6 +11,13 @@
   --warning: #f2ae49;
   --danger: #ef6262;
   --shadow: 0 14px 36px rgb(0 0 0 / .24);
+  /* The rig drawing and the moisture gauges (2026-11-05). */
+  --water: #3f9bff;
+  --water-back: rgb(63 155 255 / .38);
+  --nutrient: #3fd0a2;
+  --soil: #2c2219;
+  --soil-edge: #5b4634;
+  --pipe: #2b3b53;
 }
 
 :root[data-theme="light"] {
@@ -26,6 +33,12 @@
   --warning: #a55c00;
   --danger: #c7353d;
   --shadow: 0 14px 36px rgb(30 64 100 / .10);
+  --water: #2c84e6;
+  --water-back: rgb(44 132 230 / .30);
+  --nutrient: #0e9f74;
+  --soil: #e9dccd;
+  --soil-edge: #b89c80;
+  --pipe: #c3d1e1;
 }
 
 /* Type system (2026-09-11): IBM Plex Sans/Mono, chosen for an instrumentation-panel character --
@@ -44,11 +57,12 @@
 html { color-scheme: dark; }
 html[data-theme="light"] { color-scheme: light; }
 body { min-height: 100vh; margin: 0; background: var(--bg); color: var(--text); font-family: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button { min-height: 42px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text); font-weight: 600; cursor: pointer; transition: border-color .15s ease, background .15s ease, transform .15s ease; }
 button:hover:not(:disabled) { border-color: var(--accent); transform: translateY(-1px); }
 button:disabled { cursor: not-allowed; opacity: .48; }
-input, select { width: 100%; min-height: 42px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-muted); color: var(--text); }
+input, select, textarea { width: 100%; min-height: 42px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-muted); color: var(--text); }
+textarea { resize: vertical; line-height: 1.45; }
 label { display: grid; gap: 7px; color: var(--muted); font-size: .88rem; font-weight: 600; }
 h1, h2, h3, h4, p { margin-top: 0; }
 h1 { margin-bottom: 0; font-size: clamp(1.5rem, 2.4vw, 2.35rem); font-weight: 700; letter-spacing: -.01em; }
@@ -60,7 +74,7 @@ small, .muted, .hint, .field-note { color: var(--muted); }
 /* Live telemetry gets a monospace/tabular face -- these update in place, so digits should hold their
    width instead of the line reflowing as a reading changes; it also just reads as instrumentation
    rather than prose, which is the point for a sensor readout. */
-.card p, .diagnostic-card dd, .command-badge, .device-status {
+.diagnostic-card dd, .command-badge, .device-status {
   font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   font-variant-numeric: tabular-nums;
 }
@@ -76,6 +90,25 @@ small, .muted, .hint, .field-note { color: var(--muted); }
 .login-card[hidden] { display: none; }
 .login-card p { color: var(--muted); line-height: 1.5; }
 .login-card button { border-color: var(--accent); background: var(--accent); color: white; }
+/* The waiting page (2026-11-05): one filled button, the ask; signing out and taking a request back stay quiet. */
+.login-card button.secondary { border-color: var(--border); background: transparent; color: var(--text); }
+.login-card button.link-button, .request-actions .link-button { width: auto; min-height: 0; margin: 0; padding: 0; border: 0; background: none; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.login-card .request-state, .request-panel .request-state { margin: 0; padding: 9px 11px; border-left: 3px solid var(--accent); border-radius: 7px; background: var(--surface-muted); color: var(--text); line-height: 1.45; }
+.request-state[hidden] { display: none; }
+
+/* Asking for access (2026-11-05): where an approved account without it would find the controls. */
+.request-panel { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px 24px; margin: 0 0 22px; padding: 18px 20px; border: 1px solid var(--border); border-left: 5px solid var(--accent); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
+.request-panel[hidden] { display: none; }
+.request-panel > div:first-child { display: grid; flex: 1 1 320px; gap: 8px; }
+.request-panel h3 { margin: 0; }
+.request-panel p { margin: 0; color: var(--muted); line-height: 1.5; }
+.request-actions { display: grid; justify-items: start; gap: 8px; }
+.request-actions button:not(.link-button):not(:disabled) { border-color: var(--accent); background: var(--accent); color: var(--bg); }
+/* The waiting and blocked pages replace the site rather than covering it, so nothing of it is laid out behind them. */
+body.takeover > .sidebar, body.takeover > .main-content { display: none; }
+.tab-badge { display: inline-grid; place-items: center; min-width: 20px; height: 20px; margin-left: 8px; padding: 0 6px; border-radius: 999px; background: var(--warning); color: var(--bg); font-size: .72rem; font-weight: 800; }
+.requests-group h3 { color: var(--warning); }
+.user-row.request-row { border-left: 4px solid var(--warning); }
 .login-error { min-height: 1.2em; margin: 0; color: var(--danger) !important; font-size: .85rem; }
 
 .sidebar { position: fixed; z-index: 3; top: 0; bottom: 0; left: 0; display: flex; flex-direction: column; width: 250px; padding: 28px 20px; border-right: 1px solid var(--border); background: var(--sidebar); }
@@ -94,26 +127,50 @@ small, .muted, .hint, .field-note { color: var(--muted); }
 .connection-status { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: .86rem; }
 .online-dot { display: inline-block; width: 9px; height: 9px; border-radius: 999px; background: var(--danger); }
 .snapshot-age { padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); font-size: .82rem; white-space: nowrap; }
+.refresh-status { font-size: .82rem; max-width: 22rem; }
+.logs-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 6px; }
+.log-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px; }
+.log-row span { min-width: 0; overflow-wrap: anywhere; }
+#refreshBtn[disabled] { opacity: .7; cursor: progress; }
 
 .view { display: none; }
 .view.active { display: block; }
-.metric-grid { grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); }
-.card-grid, .control-grid, .forced-grid, .diagnostics-grid { display: grid; gap: 16px; }
-.card-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 22px; }
-.card, .panel, .control-card, .form-card, .diagnostic-card, .zone-block { border: 1px solid var(--border); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
-.card { padding: 18px; }
-.card h3, .diagnostic-card h3 { color: var(--muted); font-size: .74rem; letter-spacing: .08em; text-transform: uppercase; }
-.card p { margin-bottom: 0; font-size: 1.24rem; font-weight: 750; }
+.control-grid, .forced-grid, .diagnostics-grid { display: grid; gap: 16px; }
+.panel, .control-card, .form-card, .diagnostic-card, .zone-block { border: 1px solid var(--border); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
+.diagnostic-card h3 { color: var(--muted); font-size: .74rem; letter-spacing: .08em; text-transform: uppercase; }
 .panel { margin-top: 22px; padding: 20px; }
+.panel h4 { margin: 20px 0 6px; }
+.panel > .panel-heading + .control-grid { margin-top: 14px; }
+.panel-heading .device-status { flex: 0 0 auto; white-space: nowrap; }
 .panel-heading h3, .control-card h3, .form-card h4, .emergency-panel h3 { margin-bottom: 7px; }
 .panel-heading p, .control-card p, .emergency-panel p, .limitation-panel p { margin-bottom: 0; color: var(--muted); line-height: 1.5; }
 .device-status { display: inline-flex; width: fit-content; padding: 6px 9px; border-radius: 7px; background: rgb(159 176 199 / .12); color: var(--muted); font-size: .72rem; font-weight: 850; letter-spacing: .05em; }
 .device-status.active { background: rgb(40 199 142 / .14); color: var(--success); }
 .device-status.off { background: rgb(159 176 199 / .12); color: var(--muted); }
 .device-status.danger { background: rgb(239 98 98 / .14); color: var(--danger); }
+.device-status.warn { background: rgb(242 174 73 / .14); color: var(--warning); }
 .progress-layout { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 16px; margin-top: 18px; }
 .progress-layout > div { display: grid; gap: 7px; padding: 14px; border-radius: 9px; background: var(--surface-muted); }
 .progress-layout strong { line-height: 1.35; }
+
+/* Current run with Up next beside it (6 Nov 2026), one above the other on narrower screens. The run panel is a size
+   container so its four boxes go two by two when it is narrow; the phone rules further down still win below 600 px. */
+.run-row { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(280px, 1fr); gap: 0 22px; align-items: start; }
+.run-panel { container-type: inline-size; }
+@container (max-width: 700px) { .progress-layout { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.next-panel .hint { margin-bottom: 12px; }
+.next-status { margin: 0 0 14px; padding: 9px 12px; border-left: 3px solid var(--warning); border-radius: 6px; background: var(--surface-muted); font-size: .86rem; line-height: 1.45; }
+.next-status[hidden] { display: none; }
+.next-list { display: grid; gap: 16px; }
+.next-day h4 { margin: 0 0 4px; color: var(--muted); font-size: .8rem; font-weight: 600; }
+.next-day ul { margin: 0; padding: 0; list-style: none; }
+.next-day li { display: grid; grid-template-columns: 7.2rem minmax(0, 1fr); gap: 2px 12px; padding: 9px 0; border-top: 1px solid var(--border); }
+.next-day li:first-child { border-top: 0; }
+.next-time { font-variant-numeric: tabular-nums; font-weight: 600; }
+.next-day li.is-open .next-time, .next-day li.is-forced .next-time { color: var(--accent); }
+.next-what { display: grid; gap: 2px; min-width: 0; }
+.next-note { color: var(--muted); font-size: .84rem; line-height: 1.4; }
+.next-none, .next-foot { margin: 0; color: var(--muted); font-size: .86rem; }
 
 .command-status { margin: 17px 0 12px; padding: 11px 13px; border: 1px solid var(--border); border-left: 4px solid var(--muted); border-radius: 8px; line-height: 1.45; }
 .command-status.pending { border-left-color: var(--warning); }
@@ -128,16 +185,143 @@ small, .muted, .hint, .field-note { color: var(--muted); }
 .command-badge.completed { background: rgb(40 199 142 / .14); color: var(--success); }
 .command-badge.error { background: rgb(239 98 98 / .14); color: var(--danger); }
 
+/* Zone profiles (redesign 2026-11-05): one card per column. Left, what its soil reads now; right, what ESP1
+   does with it, said in words, and the editor that replaces those words while it is open. The column's
+   accent edge goes grey while it is off, so an off column reads as resting at a glance. */
 .zone-block { margin-bottom: 22px; padding: 22px; border-left: 5px solid var(--accent); }
-.zone-header { align-items: center; margin-bottom: 18px; }
-.zone-header h3 { margin-bottom: 0; }
-.zone-selectors { display: flex; flex-wrap: wrap; gap: 10px; }
-.zone-selectors label { min-width: 155px; }
-.matrix-grid { grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); margin-bottom: 12px; }
-.matrix-card { background: var(--surface-muted); box-shadow: none; }
-.matrix-card small { display: block; margin-top: 9px; }
-.zone-note { margin: 0; color: var(--muted); font-size: .86rem; }
+.zone-block.is-off { border-left-color: var(--border); }
+.zone-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+.zone-head h3 { margin: 0; font-size: 1.3rem; }
+.zone-sub { margin: 4px 0 0; color: var(--muted); font-size: .88rem; }
+/* A text-sized action inside a line of text (Rename beside a column's name). */
+.inline-link { min-height: 0; margin-left: 6px; padding: 0; border: 0; background: none; color: var(--accent); font-size: .86rem; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+.inline-link:hover:not(:disabled) { color: var(--text); transform: none; }
+.zone-rename { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; margin-top: 8px; }
+.zone-rename label { flex: 1 1 220px; }
+.zone-rename button { min-height: 42px; }
+.zone-power { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 10px; }
+.zone-power-state { min-width: 6ch; color: var(--muted); font-weight: 600; text-align: right; }
+.zone-block:not(.is-off) .zone-power-state { color: var(--text); }
+.zone-body { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 26px; }
+.zone-section-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.zone-section-head h4 { margin: 0; font-size: 1rem; }
+.zone-compare { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: .86rem; font-weight: 600; }
+.zone-compare select { width: auto; min-height: 36px; padding: 6px 8px; font-size: .86rem; }
+.zone-off-note { margin: 0 0 12px; padding: 10px 12px; border-left: 4px solid var(--muted); border-radius: 8px; background: var(--surface-muted); color: var(--muted); font-size: .88rem; line-height: 1.45; }
+.zone-off-note[hidden] { display: none; }
+.reading-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 0; }
+/* An off column has no readings to show (ESP1 stops sending them), and the note above already says so. */
+.zone-block.is-off .reading-grid { display: none; }
+.reading { padding: 12px 13px; border-radius: 9px; background: var(--surface-muted); }
+.reading dt { display: flex; align-items: center; color: var(--muted); font-size: .82rem; font-weight: 600; }
+.reading dd { margin: 0; }
+.reading-value { margin-top: 5px !important; font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 1.15rem; font-variant-numeric: tabular-nums; font-weight: 700; }
+.reading-note { margin-top: 5px !important; color: var(--muted); font-size: .78rem; line-height: 1.35; }
+.zone-summary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 12px 18px; margin: 0 0 16px; }
+.zone-summary dt { display: flex; align-items: flex-start; color: var(--muted); font-weight: 600; }
+.zone-summary dd { margin: 0; line-height: 1.5; }
+.zone-form fieldset { min-width: 0; margin: 0 0 16px; padding: 0; border: 0; }
+.zone-form legend { display: flex; align-items: center; margin-bottom: 8px; padding: 0; font-weight: 600; }
+.zone-form .choice { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; color: var(--text); font-size: .95rem; font-weight: 500; cursor: pointer; }
+.zone-form input[type="radio"] { width: 18px; height: 18px; min-height: 0; margin: 0; padding: 0; accent-color: var(--accent); }
+.time-row, .target-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin: 8px 0; }
+.target-row { grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); }
+/* The one step that changes the rig, so it is the one filled button. The page background colour for its text
+   keeps the contrast in both themes: dark text on the light dark-theme blue, light text on the light-theme one. */
+.zone-form button[type="submit"]:not(:disabled) { border-color: var(--accent); background: var(--accent); color: var(--bg); }
+.time-row input:disabled { opacity: .5; }
+.time-row[hidden], .runs-pick[hidden] { display: none; }
+/* Several watering times: each row carries its place in the day, so an error naming "the 2nd" can be found. A time
+   box won't shrink below its own width, so on a phone the label sits above its two boxes rather than beside them. */
+.time-row-label { display: none; }
+.several-windows .time-row { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; margin-top: 12px; }
+.several-windows .time-row-label { display: block; grid-column: 1 / -1; margin-bottom: -4px; color: var(--text); font-size: .88rem; font-weight: 600; }
+@media (min-width: 640px) {
+  .several-windows .time-row { grid-template-columns: 2.6em repeat(2, minmax(0, 1fr)); margin-top: 8px; }
+  .several-windows .time-row-label { grid-column: auto; margin-bottom: 0; padding-bottom: 11px; color: var(--muted); }
+}
+.runs-pick { max-width: 180px; margin: 10px 0 4px; }
+.zone-summary .zone-today { grid-column: 2; margin-top: -6px; color: var(--muted); font-size: .9rem; }
+.zone-form .field-note { margin-top: 4px; }
+.zone-setups { margin: 0 0 16px; }
+.zone-setups summary { display: inline-flex; align-items: center; color: var(--muted); font-weight: 600; cursor: pointer; }
+.zone-setups[open] summary { margin-bottom: 10px; color: var(--text); }
+.setup-save { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-top: 10px; }
+.setup-save label { flex: 1 1 200px; }
+.zone-changes { margin: 0 0 12px; padding: 10px 12px; border-left: 4px solid var(--accent); border-radius: 8px; background: var(--surface-muted); line-height: 1.45; }
+.zone-changes.error { border-left-color: var(--danger); color: var(--danger); }
 .lacking-nutrient { color: var(--danger) !important; }
+
+/* ON/OFF switch. A real button with role="switch", so it is keyboard- and screen-reader-operable; its
+   position follows what ESP1 reports, not the click, until ESP1 confirms the change. */
+.switch { position: relative; width: 52px; min-width: 52px; height: 30px; min-height: 0; padding: 0; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-muted); }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 999px; background: var(--muted); transition: transform .15s ease, background .15s ease; }
+.switch[aria-checked="true"] { border-color: var(--success); background: rgb(40 199 142 / .18); }
+.switch[aria-checked="true"]::after { transform: translateX(22px); background: var(--success); }
+.switch:hover:not(:disabled) { transform: none; }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 1100px) {
+  .zone-body { grid-template-columns: 1fr; }
+}
+
+/* Crop profiles (2026-11-05): one card per crop with its stages as a table, since stage by number is what people
+   compare. The table scrolls inside its card on a phone rather than widening the page. */
+.crop-library { margin-top: 34px; }
+.crop-library > .section-heading button { flex: 0 0 auto; }
+/* minmax(0, 1fr), not the default auto column: the stage table's nowrap cells would otherwise widen every card to
+   the table's width on a phone, instead of the table scrolling inside its card. */
+.crop-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.crop-card, .crop-form { min-width: 0; padding: 18px 20px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
+.crop-form { border-left: 5px solid var(--accent); }
+.crop-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 16px; }
+.crop-head h3 { margin: 0; font-size: 1.12rem; }
+.crop-variety { color: var(--muted); font-weight: 500; }
+.crop-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin: 6px 0 0; color: var(--muted); font-size: .86rem; }
+.crop-badge { padding: 2px 8px; border-radius: 999px; background: var(--surface-muted); color: var(--muted); font-size: .78rem; font-weight: 600; }
+.crop-badge.own { background: rgb(78 161 255 / .14); color: var(--accent); }
+.crop-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.crop-actions button { min-height: 36px; padding: 6px 12px; }
+.crop-notes { margin: 12px 0 0; color: var(--text); line-height: 1.5; }
+.table-scroll { max-width: 100%; margin-top: 12px; overflow-x: auto; }
+.stage-table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+.stage-table th, .stage-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+.stage-table thead th { color: var(--muted); font-size: .78rem; font-weight: 600; }
+.stage-table th[scope="row"], .stage-table thead th:first-child { text-align: left; }
+.stage-table td { font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+.stage-table td.stage-notes { min-width: 180px; color: var(--muted); font-family: inherit; text-align: left; white-space: normal; }
+.crop-removed { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0 0; color: var(--muted); }
+.crop-removed[hidden] { display: none; }
+button.small { min-height: 32px; padding: 5px 10px; font-size: .84rem; }
+.crop-form > h3 { margin-bottom: 14px; }
+.crop-form > label { margin-bottom: 14px; }
+.crop-form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; margin-bottom: 14px; }
+.stage-editor { display: grid; gap: 12px; min-width: 0; margin: 0 0 14px; padding: 0; border: 0; }
+.stage-editor legend { margin-bottom: 8px; padding: 0; font-weight: 600; }
+.stage-edit { display: grid; gap: 10px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
+.stage-edit input { background: var(--surface); }
+.stage-edit-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.stage-edit-actions { display: inline-flex; gap: 6px; }
+.stage-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 10px; }
+.stage-fields .stage-name { grid-column: span 2; }
+.crop-problems[hidden] { display: none; }
+
+/* Help tab: plain reading width, one topic per fold, findable by typing. */
+.help-search { max-width: 560px; margin-bottom: 8px; }
+#helpNoMatch { margin-bottom: 16px; }
+.help-group { max-width: 880px; margin: 22px 0 30px; }
+.help-group[hidden] { display: none; }
+.help-group > h3 { margin-bottom: 12px; font-size: 1.12rem; }
+.help-item { margin-bottom: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); scroll-margin-top: 90px; }
+.help-item summary { padding: 13px 16px; font-weight: 600; cursor: pointer; }
+.help-item summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 10px; }
+.help-item[open] summary { border-bottom: 1px solid var(--border); }
+.help-item > :not(summary) { max-width: 72ch; margin: 12px 16px; color: var(--text); line-height: 1.6; }
+.help-item ol, .help-item ul { padding-left: 22px; }
+.help-item li { margin-bottom: 5px; }
+.info-popover-more { min-height: 0; margin-top: 10px; padding: 0; border: 0; background: none; color: var(--accent); font-size: .86rem; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+.info-popover-more:hover:not(:disabled) { transform: none; color: var(--text); }
+.info-popover-more[hidden] { display: none; }
 
 .control-grid { grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); }
 .control-card { display: grid; align-content: start; gap: 13px; padding: 20px; }
@@ -159,14 +343,91 @@ button.danger { min-width: 200px; border-color: var(--danger); background: var(-
 .form-card h4 { font-size: 1.08rem; }
 .form-card button { margin-top: 4px; }
 .field-note { margin: 0; font-size: .82rem; line-height: 1.4; }
-.limitation-panel { background: var(--surface-muted); }
 
-/* Forced run. This is a REAL actuating command now, not the greyed-out "review" it used to be, so
-   it is styled as a live control -- warning-toned, because it overrides the schedule and the soil
-   threshold and starts pumps immediately. */
-.forced-section { margin-top: 34px; }
-.forced-section > h3 { margin-bottom: 8px; }
-.force-form { display: grid; gap: 14px; padding: 22px; border: 1px solid var(--border); border-left: 5px solid var(--warning); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
+/* Emergency stop that stays on screen on every tab. A solid full-width band rather than a floating
+   button: content scrolls underneath it, so the stop can never sit on top of another control and take
+   a click meant for that control. */
+.estop-bar { position: sticky; z-index: 5; top: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin: -10px 0 14px; padding: 10px 0; background: var(--bg); }
+.estop-bar[hidden] { display: none; }
+button.estop-top { min-width: 0; width: auto; }
+/* While ESP1 isn't reporting the stop button is off (6 Nov 2026), and this says how else to stop the rig. */
+.estop-top-wrap { display: inline-flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px 12px; }
+.estop-bar-note { max-width: 44ch; color: var(--danger); font-size: .86rem; line-height: 1.35; text-align: right; }
+.estop-bar-note[hidden] { display: none; }
+
+/* The rig lock (2026-11-05): ESP1's own Lock Screen flag, so this switch and the LCD always agree. Locked is
+   the "on" position, drawn in the warning colour rather than the column switches' green: a lock is a
+   restriction someone chose, not a healthy running state. */
+.rig-lock { display: inline-flex; align-items: center; gap: 10px; }
+.rig-lock-label { font-weight: 600; }
+.rig-lock-state { min-width: 9ch; color: var(--muted); font-size: .9rem; }
+.switch.lock-switch[aria-checked="true"] { border-color: var(--warning); background: rgb(242 174 73 / .18); }
+.switch.lock-switch[aria-checked="true"]::after { background: var(--warning); }
+.lock-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px 24px; margin-bottom: 26px; padding: 18px 20px; border: 1px solid var(--border); border-left: 6px solid var(--warning); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
+.lock-banner[hidden] { display: none; }
+.lock-banner h2 { margin-bottom: 6px; }
+.lock-detail { max-width: 80ch; margin: 0 0 6px; color: var(--muted); line-height: 1.5; }
+.lock-detail:first-of-type { color: var(--text); }
+.lock-banner button { flex: 0 0 auto; border-color: var(--warning); }
+
+/* Readings on the Live dashboard: grouped by what they are about, label over value, like a column's soil
+   readings, instead of a wall of identical cards. */
+.reading-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); align-items: start; gap: 0 22px; }
+.reading-panel { margin-top: 0; margin-bottom: 22px; }
+.reading-panel > h3 { margin-bottom: 14px; }
+.reading-panel .reading-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.reading-grid[hidden] { display: none; }
+.reading-value.reading-words { font-family: inherit; font-size: 1rem; font-weight: 600; line-height: 1.35; }
+.lamp-note { color: var(--muted); font-size: .8rem; }
+
+/* A held fault's four ways out, each saying what it does on the button itself. */
+.fault-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 10px; margin-top: 16px; }
+.fault-choices[hidden] { display: none; }
+.fault-choices-title { grid-column: 1 / -1; display: flex; align-items: center; margin: 0; font-weight: 600; }
+.fault-choices button { display: grid; align-content: start; gap: 4px; padding: 12px 14px; text-align: left; }
+.fault-choices button span { color: var(--muted); font-size: .84rem; font-weight: 500; line-height: 1.4; }
+
+/* A panel whose main control is one ON/OFF switch (pumps and valves, the rig lock on System). */
+.switch-row { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 10px; }
+.switch-state { min-width: 6ch; color: var(--muted); font-weight: 600; text-align: right; }
+
+/* Controls: one forced-run panel, its countdown inside it; restarts as a list of button + what it does. */
+.force-panel { border-left: 5px solid var(--warning); }
+.force-panel > .hint { margin-bottom: 14px; }
+.armed-panel { margin-top: 18px; padding: 16px; border: 1px solid var(--border); border-left: 5px solid var(--warning); border-radius: 10px; background: var(--surface-muted); }
+.armed-panel .panel-heading p { margin-bottom: 0; color: var(--muted); }
+.armed-panel .field-note { margin: 10px 0 12px; }
+.action-list { display: grid; gap: 10px; margin: 12px 0 0; padding: 0; list-style: none; }
+.action-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.action-list button { min-width: 160px; }
+.action-list span { flex: 1 1 260px; color: var(--muted); font-size: .9rem; line-height: 1.45; }
+.hold-grid { margin-top: 4px; }
+
+/* Diagnostics: the summary in words first, each line coloured by how much it matters. */
+.health-list { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.health-list li { padding: 10px 12px; border-left: 4px solid var(--border); border-radius: 8px; background: var(--surface-muted); line-height: 1.45; }
+.health-list li.bad { border-left-color: var(--danger); }
+.health-list li.warn { border-left-color: var(--warning); }
+.health-list li.ok { border-left-color: var(--success); }
+.group-heading { margin: 28px 0 12px; }
+
+/* "Now on ESP1" lines on System. */
+.now-list { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 0 0 16px; }
+.now-list dt { color: var(--muted); font-weight: 600; }
+.now-list dd { margin: 0; font-weight: 600; }
+
+/* Solar and secondary battery group on the dashboard. Without the [hidden] rules, display:grid here
+   and on label would win over the browser's own [hidden] -- the same gotcha as .force-row below. */
+.offline-help { margin: 0 0 22px; border-left: 5px solid var(--warning); }
+.offline-help p, .offline-help ul { color: var(--muted); line-height: 1.5; }
+.offline-help p:last-child { margin-bottom: 0; }
+.offline-help li { margin-bottom: 4px; }
+label[hidden] { display: none; }
+.command-actions { display: inline-flex; align-items: center; gap: 8px; }
+
+/* Forced run. A REAL actuating command, styled as a live control -- warning-toned (on .force-panel), because it
+   overrides the schedule and the soil threshold and starts pumps. */
+.force-form { display: grid; gap: 14px; }
 .force-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 14px; }
 /* Without this, the plain `display:grid` above wins over the browser's own [hidden]{display:none}
    (equal specificity, author rule wins regardless of order) -- same gotcha already fixed for
@@ -175,9 +436,11 @@ button.danger { min-width: 200px; border-color: var(--danger); background: var(-
    Schedule was left at Automatic -- cosmetic only (submitColumnConfig() still only sends winStart/
    winEnd while Manual is actually selected), but contradicted the adjacent field-note text. */
 .force-row[hidden] { display: none; }
-.force-form button[type="submit"] { border-color: var(--warning); background: var(--warning); color: #14203a; }
+/* The page background colour for the text keeps the contrast in both themes: dark on the light dark-theme amber,
+   light on the deep light-theme one (navy on that was hard to read). */
+.force-form button[type="submit"] { border-color: var(--warning); background: var(--warning); color: var(--bg); }
 .dose-fieldset { display: grid; gap: 14px; margin: 0; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
-.dose-fieldset legend { padding: 0 7px; color: var(--muted); font-size: .74rem; font-weight: 850; letter-spacing: .08em; text-transform: uppercase; }
+.dose-fieldset legend { padding: 0 7px; color: var(--muted); font-size: .88rem; font-weight: 600; }
 .pump-lamps { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-top: 16px; }
 .pump-lamps > div { display: grid; gap: 7px; padding: 14px; border-radius: 9px; background: var(--surface-muted); }
 
@@ -213,9 +476,6 @@ button.warn { border-color: var(--warning); color: var(--warning); }
 button.secondary { background: transparent; color: var(--muted); font-weight: 600; }
 .config-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 
-.armed-panel { border-left: 5px solid var(--warning); }
-.zone-config { display: grid; gap: 14px; margin: 18px 0; padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
-.zone-config h4 { margin-bottom: 4px; }
 .raw-panel h4 { margin: 22px 0 6px; }
 
 .diagnostics-grid { grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); }
@@ -243,6 +503,10 @@ dialog ul { padding-left: 22px; line-height: 1.65; }
 dialog a { color: var(--accent); }
 .closeDialog { float: right; min-height: 34px; padding: 5px 10px; }
 
+@media (max-width: 1260px) {
+  .run-row { grid-template-columns: minmax(0, 1fr); }
+}
+
 @media (max-width: 900px) {
   .sidebar { position: static; width: auto; min-height: auto; padding: 18px; border-right: 0; border-bottom: 1px solid var(--border); }
   .sidebar > div:first-child { display: none; }
@@ -255,6 +519,10 @@ dialog a { color: var(--accent); }
 
 @media (max-width: 600px) {
   .topbar, .section-heading, .panel-heading, .zone-header, .emergency-panel { flex-direction: column; }
+  .estop-bar { justify-content: flex-start; }
+  .estop-top-wrap { width: 100%; justify-content: flex-start; }
+  .estop-bar-note { text-align: left; }
+  .lock-banner button, .action-list button { width: 100%; }
   .topbar-actions { justify-content: flex-start; }
   .snapshot-age { white-space: normal; }
   .tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -306,6 +574,8 @@ h2 .info-icon, h3 .info-icon, h4 .info-icon { transform: translateY(-1px); }
 /* Wraps an actuating button + its info icon as one inline group without changing the button's own
    click target -- used wherever the icon would otherwise have to sit inside the button itself. */
 .btn-with-info { display: inline-flex; align-items: center; gap: 8px; }
+/* A hidden button takes its info icon with it, instead of leaving a stray "i" explaining nothing. */
+.btn-with-info:has(> button[hidden]) { display: none; }
 /* Keeps a label's leading text + icon on the SAME grid row as each other (labels on this page are
    `display:grid`, text over control) instead of the icon becoming its own row under the control. */
 .label-row { display: inline-flex; align-items: center; }
@@ -338,6 +608,14 @@ h2 .info-icon, h3 .info-icon, h4 .info-icon { transform: translateY(-1px); }
 
 /* User Management (operator-only). */
 .user-list { display: grid; gap: 12px; }
+/* One group per status, waiting-for-approval first, each with its count, so the accounts that need something
+   done are at the top instead of mixed into one long list. */
+.user-group { display: grid; gap: 10px; margin-bottom: 18px; }
+.user-group > h3 { display: flex; align-items: baseline; gap: 8px; margin: 0 0 2px; }
+.user-count { color: var(--muted); font-size: .9rem; font-weight: 500; }
+.user-access { color: var(--text); font-size: .88rem; }
+.user-online { color: var(--success); }
+.user-idle { color: var(--warning); }
 .user-row { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
 .user-row-info { display: grid; gap: 2px; flex: 1 1 220px; min-width: 0; }
 .user-row-info strong { overflow-wrap: anywhere; }
@@ -386,4 +664,89 @@ h2 .info-icon, h3 .info-icon, h4 .info-icon { transform: translateY(-1px); }
 @media (max-width: 600px) {
   :root { --toast-enter: -18px; }
   .toast-stack { top: 14px; right: 14px; bottom: auto; left: 14px; width: auto; flex-direction: column-reverse; }
+}
+
+/* ---- The rig drawing (2026-11-05) ----------------------------------------------------------------------------------
+   The one bold thing on the Live dashboard: the rig as ESP1 last reported it. Water is the only colour that moves;
+   everything else stays in the page's quiet greys. Nothing here moves for a phone that asks for reduced motion. */
+.rig-panel .panel-heading p { margin: 0; }
+.rig-drawing { margin-top: 12px; }
+.rig-svg { display: block; width: 100%; height: auto; overflow: visible; font-family: "IBM Plex Sans", system-ui, sans-serif; }
+.rig-svg.narrow { max-width: 520px; margin: 0 auto; }
+.rig-shell { fill: var(--surface-muted); stroke: var(--border); stroke-width: 2; }
+.rig-water { fill: var(--water); opacity: .9; }
+.rig-water.back { fill: var(--water-back); opacity: 1; }
+.rig-tank.low .rig-water { fill: var(--warning); }
+.rig-tank.low .rig-water.back { fill: rgb(242 174 73 / .32); }
+.rig-tank.fed .rig-water { fill: color-mix(in srgb, var(--water) 55%, var(--nutrient)); }
+.rig-low { stroke: var(--warning); stroke-width: 1.5; stroke-dasharray: 5 5; }
+.rig-note { fill: var(--warning); font-size: 12px; font-weight: 600; }
+.rig-value { fill: var(--text); font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 26px; font-weight: 700; paint-order: stroke; stroke: var(--surface-muted); stroke-width: 6px; stroke-linejoin: round; }
+.rig-label { fill: var(--muted); font-size: 15px; font-weight: 600; }
+.rig-pipe { fill: none; stroke: var(--pipe); stroke-width: 9; stroke-linecap: round; stroke-linejoin: round; }
+.rig-pipe.thin { stroke-width: 4; }
+.rig-flow { fill: none; stroke: var(--water); stroke-width: 5; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 10 14; opacity: 0; transition: opacity .3s ease; }
+.rig-flow.thin { stroke: var(--nutrient); stroke-width: 3; stroke-dasharray: 5 8; }
+.rig-flow.on { opacity: 1; animation: rig-flow .9s linear infinite; }
+.rig-flow.thin.on { animation-name: rig-flow-thin; animation-duration: .6s; }
+@keyframes rig-flow { to { stroke-dashoffset: -24; } }
+@keyframes rig-flow-thin { to { stroke-dashoffset: -13; } }
+.rig-pump-body { fill: var(--surface); stroke: var(--border); stroke-width: 2.5; transition: stroke .3s ease, fill .3s ease; }
+.rig-impeller { fill: var(--muted); transform-box: fill-box; transform-origin: center; }
+.rig-pump.on .rig-pump-body { stroke: var(--water); fill: color-mix(in srgb, var(--water) 16%, var(--surface)); }
+.rig-pump.on .rig-impeller { fill: var(--water); animation: rig-spin .8s linear infinite; }
+.rig-mixer .rig-shaft { stroke: var(--muted); stroke-width: 3; }
+.rig-mixer.on .rig-impeller { fill: var(--text); animation: rig-spin .5s linear infinite; }
+@keyframes rig-spin { to { transform: rotate(360deg); } }
+.rig-bottle rect { fill: var(--surface); stroke: var(--nutrient); stroke-width: 2; transition: fill .3s ease; }
+.rig-bottle text { fill: var(--nutrient); font-size: 15px; font-weight: 700; }
+.rig-bottle.on rect { fill: color-mix(in srgb, var(--nutrient) 24%, var(--surface)); }
+.rig-valve { fill: var(--surface); stroke: var(--muted); stroke-width: 2; stroke-linejoin: round; transition: fill .3s ease, stroke .3s ease; }
+.rig-valve.open { fill: var(--water); stroke: var(--water); }
+.rig-soil { fill: var(--soil); stroke: var(--soil-edge); }
+.rig-moist { fill: var(--water); opacity: .55; transform-box: fill-box; transform-origin: bottom; transform: scaleY(0); transition: transform .9s cubic-bezier(.2, .8, .2, 1); }
+.rig-col.dry .rig-moist { fill: var(--warning); opacity: .5; }
+.rig-start { stroke: var(--warning); stroke-width: 2; stroke-dasharray: 4 4; }
+.rig-col-value { fill: var(--text); font-family: "IBM Plex Mono", ui-monospace, monospace; font-weight: 700; }
+.rig-col.off { opacity: .4; }
+
+/* Soil moisture gauge on each column card. It takes two rows of the card's readings, so the others sit beside it. */
+.reading-gauge { grid-row: span 2; }
+.gauge-wrap { margin: 8px 0 0; }
+.moisture-gauge { display: block; width: 100%; max-width: 190px; height: auto; overflow: visible; }
+.gauge-track { fill: none; stroke: var(--border); stroke-width: 10; stroke-linecap: round; }
+.gauge-fill { fill: none; stroke: var(--water); stroke-width: 10; stroke-linecap: round; stroke-dasharray: 100 200; stroke-dashoffset: 100; transition: stroke-dashoffset .9s cubic-bezier(.2, .8, .2, 1), stroke .4s ease; }
+.gauge-fill.dry { stroke: var(--warning); }
+.gauge-fill.unknown { stroke: transparent; }
+.gauge-tick { stroke-width: 3; stroke-linecap: round; }
+.gauge-start { stroke: var(--warning); }
+.gauge-crop { stroke: var(--success); }
+.note-start::before, .note-crop::before { content: ""; display: inline-block; width: 12px; height: 3px; margin-right: 6px; border-radius: 2px; vertical-align: middle; }
+.note-start::before { background: var(--warning); }
+.note-crop::before { background: var(--success); }
+
+/* Transitions: a tab fades in, a Help topic unfolds. Readings roll to their new values in script.js (rollNumber()). */
+@media (prefers-reduced-motion: no-preference) {
+  .view.active { animation: view-in .26s ease-out; }
+  .help-item[open] > :not(summary), .request-panel:not([hidden]) { animation: fold-in .22s ease-out; }
+  @keyframes view-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @keyframes fold-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rig-flow.on, .rig-pump.on .rig-impeller, .rig-mixer.on .rig-impeller { animation: none; }
+  .rig-moist, .gauge-fill, .rig-flow { transition: none; }
+}
+
+/* Pump selector switch (Manual/Test, 2026-11-16): a two-way switch, Transfer | Booster. The pressed side is where
+   ESP1 last saw the Nano put the servo (system.servoSide); the side being moved to shows in amber until ESP1 answers. */
+.servo-switch { display: inline-grid; grid-template-columns: 1fr 1fr; margin: 0 0 12px; border: 1px solid var(--border); border-radius: 11px; overflow: hidden; background: var(--surface-muted); }
+.servo-switch .servo-option { min-width: 150px; border: 0; border-radius: 0; background: transparent; color: var(--muted); }
+.servo-switch .servo-option + .servo-option { border-left: 1px solid var(--border); }
+.servo-switch .servo-option[aria-pressed="true"] { background: rgb(40 199 142 / .16); color: var(--success); }
+.servo-switch .servo-option.is-moving { background: rgb(242 174 73 / .16); color: var(--warning); }
+.servo-switch .servo-option:hover:not(:disabled) { color: var(--text); transform: none; }
+.servo-switch .servo-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+@media (max-width: 600px) {
+  .servo-switch { display: grid; width: 100%; }
+  .servo-switch .servo-option { min-width: 0; }
 }

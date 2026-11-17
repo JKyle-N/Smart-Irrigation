@@ -45,6 +45,18 @@
 #include <DNSServer.h>           // captive-portal DNS for the provisioning AP
 #include "pure_math.h"           // soil/level/pulse maths -- host-testable, see ESP1/test/
 #include "gsm_modem.h"           // A7670C SMS driver -- host-tested against a simulated modem
+#include "../../shared/rig_constants.h"   // WATER_BUDGET_L, MIXING_TANK_MAX_L, MIX_HIGH_PCT: shared with ESP2
+// A millis() stamp that is never 0 (0 = "not set") and never in the future (2026-11-17). The old `t | 1` made every even
+// stamp 1 ms ahead of the clock, so `now - stamp` taken in the same millisecond wrapped to ~49 days and a timeout fired
+// at once -- e.g. LEVEL_BLIND|NO_SETTLED_LEVEL the instant a forced run started.
+static inline unsigned long nzMs(unsigned long t) { return t ? t : 1UL; }
+#include "../../shared/tank_volume.h"     // ultrasonic cm -> litres (frustum + calibration points), web v.4
+#include "../../shared/pump_line.h"       // a pump's litres from its run time (LCD "... pump est", 2026-11-17)
+#if __has_include("secrets.h")            // owner number, AP password, admin PIN: git-ignored, this repo is public
+#include "secrets.h"
+#else
+#include "secrets.example.h"              // placeholders, so CI and a fresh clone still build
+#endif
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
 #endif
@@ -89,7 +101,13 @@
 #define ESP2_BAUD      9600
 // The A7670C's baud is auto-detected (GSM_BAUDS in gsm_modem.h, 115200 first).
 #define SIM_RX_BUFFER  2048     // ~180 ms of 115200 traffic; the default 256 B is only ~22 ms of loop stall
-#define NANO_RX_BUFFER  128     // ~130 ms at 9600; the library default of 64 B is only ~65 ms of loop stall
+// Nano link (EspSoftwareSerial). 2026-11-16 hardening: 128 -> 512 B, and the bit-edge buffer the receive interrupt
+// fills is sized explicitly. The ISR timestamps every edge; the bytes are only decoded when the loop next polls, so a
+// loop pass stretched by an SD write, an LCD redraw or an NVS write used to overflow the 1280-edge default (~0.2 s of
+// traffic) and corrupt lines -- the rig logs showed 11-28 % of Nano lines failing their checksum. 5120 edges = ~0.6 s
+// even for the busiest bytes (~20 KB of RAM; there is plenty). Overflows are counted (nanoRxOverflows).
+#define NANO_RX_BUFFER      512
+#define NANO_RX_ISR_BUFFER  (NANO_RX_BUFFER * 10)
 
 /* ---- I2C addresses ------------------------------------------------------- */
 #define LCD_ADDR     0x27
@@ -99,7 +117,7 @@
 // DS3231 0x68 and EEPROM 0x57 are auto-addressed by their libraries / unused.
 
 /* ---- GSM ----------------------------------------------------------------- */
-String PHONE_NUMBER = "09150424784";    // [CONFIRM] recipient for alerts/reports
+String PHONE_NUMBER = SECRET_OWNER_NUMBER;   // [CONFIRM] recipient for alerts/reports (secrets.h)
 String ALERT_NUMBER2 = "";              // second recipient, ALERT texts only and no command rights (SMS ALERTNUM, NVS)
 String USSD_CODE     = "";              // carrier balance code for BAL / the weekly check (SMS USSD, NVS); carrier-specific
 const uint8_t SIM_CHECK_WEEKDAY = 0;    // weekly SIMTEST text goes with this day's report (0 = Sunday)
@@ -115,10 +133,10 @@ const char COL_TAG[NUM_COLUMNS] = { 'A', 'B', 'C' };
 
 /* ---- Irrigation thresholds & windows (spec sec.14.1.3, windowed) --------- *
  * Windowed scheduling: a column is serviced only inside its RTC window, and
- * within the window the soil start/stop hysteresis triggers the run.          */
+ * within the window a soil reading below soilStartPct triggers the run. A run delivers a metered
+ * volume and then ends, so there is no stop threshold (decision D11).          */
 // Editable at commissioning AND on-device via Settings menu (persisted to NVS).
 int soilStartPct = 35;   // start irrigation below this %   [TBD]
-int soilStopPct  = 45;   // stop irrigation above this %    [TBD]
 /* ---- NPK 7-in-1 trust thresholds ----------------------------------------- *
  * The probe reads moisture and N/P/K unreliably in unsaturated soil, so neither is trusted blindly:
  *  AGREE  how far its moisture may sit from the capacitive pair before it is dropped from the
@@ -138,9 +156,34 @@ uint16_t COL_WIN_END[NUM_COLUMNS]   = { 8*60, 10*60, 8*60 };
 // Schedule axis per column: AUTO = use DEF_* window; MANUAL = use COL_WIN_* (perpetual).
 enum SchedMode { SCHED_AUTO = 0, SCHED_MANUAL = 1 };
 uint8_t colSchedMode[NUM_COLUMNS] = { SCHED_AUTO, SCHED_AUTO, SCHED_AUTO };
+// Several waterings a day (2026-11-05, asked for by the project owner): on MANUAL a column may have up to
+// MAX_RUNS_PER_DAY windows. Window 1 is COL_WIN_START/END above, unchanged; windows 2.. are COL_EXTRA_*.
+// The column is watered at most once in each window, still only while its soil is drier than soilStartPct,
+// and nutrients go in at most once a day (col[].fertStamp). AUTO always has the one default window.
+// Windows are kept in order and apart (end of one < start of the next) by every path that sets them.
+const uint8_t MAX_RUNS_PER_DAY = 4;
+uint8_t  colRuns[NUM_COLUMNS] = { 1, 1, 1 };                     // MANUAL windows in use, 1..MAX_RUNS_PER_DAY
+uint16_t COL_EXTRA_START[NUM_COLUMNS][MAX_RUNS_PER_DAY - 1] = { { 12*60, 16*60, 18*60 }, { 12*60, 16*60, 18*60 }, { 12*60, 16*60, 18*60 } };
+uint16_t COL_EXTRA_END[NUM_COLUMNS][MAX_RUNS_PER_DAY - 1]   = { { 13*60, 17*60, 19*60 }, { 13*60, 17*60, 19*60 }, { 13*60, 17*60, 19*60 } };
 
 /* ---- Fertigation decision (spec sec.14.2.0) ------------------------------ */
 float fertGap = 30.0f;                        // mg/kg below target -> fertigate (FERTIGATE_TRIGGER_GAP, §6; NVS) [TBD]
+
+/* ---- AC supply window for ESP2's PZEM check (2026-11-14) ------------------ *
+ * Whole volts; LCD Settings > AC Voltage, website System tab (SET_AC_VOLT); NVS "acvlo"/"acvhi". ESP1 is
+ * the owner and sends it to ESP2 as SET_CAL,PZEM_V on every ESP2 power-up and on every change (see
+ * setAcVoltWindow / pushAcVoltToEsp2). Defaults and the accepted range live in pure_math.h.            */
+int acVMin = AC_V_DEFAULT_LOW, acVMax = AC_V_DEFAULT_HIGH;
+// AC pump current limits, tenths of an amp (LCD Settings > AC Current, website System tab (SET_AC_AMP, 2026-11-16);
+// NVS "acalo"/"acahi"; sent to ESP2 as SET_CAL,PZEM_I with the voltage window). Defaults and the accepted range
+// live in pure_math.h.
+int acAMin10 = AC_A_DEFAULT_MIN, acAMax10 = AC_A_DEFAULT_MAX;
+float acLastI = -1.0f;                        // last AC pump current ESP2 measured (TELE / a current trip)
+unsigned long acLastIMs = 0;                  // when acLastI was measured (0 = none since ESP1 started)
+// The last AC voltage ESP2 measured (TELE during a run, or the reading in a VOLTAGE fault), shown next to
+// the setting on the LCD and the website so the window is chosen from a real reading. -1 = none yet.
+float acLastV = -1.0f;
+unsigned long acLastMs = 0;
 const float FLUSH_PCT             = 20.0f;    // post-fertigation flush % (sec.14.2.0.2)
 const unsigned long MIXING_DURATION_MS = 30000UL;  // homogenize time           [TBD]
 
@@ -165,19 +208,99 @@ const float PH_MIN = 5.0f,  PH_MAX = 7.0f;    // [TBD]
 //   C: disabled -> defaults          [MEASURE per rig]
 int   calSoilAir[NUM_COLUMNS]   = { 656, 707, 800 };   // raw ADC when DRY  (maps to 0%)
 int   calSoilWater[NUM_COLUMNS] = { 524, 391, 300 };   // raw ADC when WET  (maps to 100%)
+// Per-PROBE endpoints (2026-11-16), [column][probe 0 = "1", 1 = "2"], probe n = the Nano's SOIL_PINS[c][n]
+// (A1 = pin A0, A2 = A1, B1 = A2, B2 = A3, C1 = A6, C2 = A7). These are what the moisture % uses
+// (soilCombineProbes). Captured per probe on the LCD: Settings > Calibration > Soil A1 / A2 / B1 / B2 / ..,
+// saved as NVS "s<c>p<n>d" / "s<c>p<n>w" (n = 1 or 2). A probe never calibrated that way starts from its
+// column's endpoints above (or CalStore's s<c>a2/s<c>w2), so behaviour is unchanged until it is.
+int   calProbeDry[NUM_COLUMNS][2] = { { 656, 656 }, { 707, 707 }, { 800, 800 } };   // = the column pairs until
+int   calProbeWet[NUM_COLUMNS][2] = { { 524, 524 }, { 391, 391 }, { 300, 300 } };   //   loadCal() runs
+// LCD capture: the probe's live raw must sit within SOIL_CAL_STEADY_ADC over the last SOIL_CAL_WIN samples
+// (~0.6 s apart from the Nano) to show STEADY; ENTER locks the window's mean.              [MEASURE]
+const int SOIL_CAL_WIN        = 8;
+const int SOIL_CAL_MIN_SAMPLES = 5;
+const int SOIL_CAL_STEADY_ADC  = 4;
+int  soilCalRing[SOIL_CAL_WIN];
+int  soilCalN = 0, soilCalIdx = 0;
+void soilCalReset() { soilCalN = 0; soilCalIdx = 0; }
+void soilCalPush(int v) {
+  soilCalRing[soilCalIdx] = v;
+  soilCalIdx = (soilCalIdx + 1) % SOIL_CAL_WIN;
+  if (soilCalN < SOIL_CAL_WIN) soilCalN++;
+}
+// The window's mean (what ENTER locks), its spread, and whether it is steady. False with no samples yet.
+bool soilCalStats(int *mean, int *lo, int *hi, bool *steady) {
+  if (soilCalN == 0) return false;
+  long sum = 0; int mn = 1 << 14, mx = -1;
+  for (int i = 0; i < soilCalN; i++) { int v = soilCalRing[i]; sum += v; if (v < mn) mn = v; if (v > mx) mx = v; }
+  *mean = (int)((sum + soilCalN / 2) / soilCalN); *lo = mn; *hi = mx;
+  *steady = soilCalSteady(soilCalN, SOIL_CAL_MIN_SAMPLES, mn, mx, SOIL_CAL_STEADY_ADC);
+  return true;
+}
 // SOIL_ADC_RAIL_LO/HI live in include/pure_math.h beside soilCombineCal(), which applies them.
-// Measured on the rig: sensor-to-water 38 cm = empty (0 %), 11 cm = full (100 %).
-// NOTE: loadCal() overrides these from the `calib` NVS namespace, so a value captured earlier by
-// the Calibration menu WINS over these defaults. If the tank still reads wrong after flashing,
-// re-run Calibration > ultrasonic (or clear NVS) -- editing the constant alone will not take.
-float calResEmptyCm = 38.0f, calResFullCm = 11.0f;     // ultrasonic geometry (moved from Nano) [MEASURED]
-float calMixEmptyCm = 50.0f, calMixFullCm = 4.0f;
+// Ultrasonic geometry, sensor-to-water distance. Measured 2026-11-15 (user's calibration run), the SAME
+// for both tanks: 42.9 cm = empty (0 %), 24.0 cm = full (100 %). An 18.9 cm span, so 1 cm ~= 5.3 %;
+// on the mixing tank the 90 % fill stop is at ~25.9 cm and ESP1's 97 % backstop at ~24.6 cm.
+// (Before: reservoir 38/11 and mixing 50/4 -- the mixing pair was never measured.)
+// The Nano only sends raw cm; this conversion lives here on ESP1, not on the Nano.
+// loadCal() reads the `calib` NVS keys reCm2/rfCm2/meCm2/mfCm2 over these. The keys were BUMPED from
+// reCm/rfCm/meCm/mfCm (same reason as the soil "a2"/"w2" keys): an older on-device value no longer
+// overrides these measured defaults after flashing. Calibration > "Ultra ... empty" writes the new keys.
+float calResEmptyCm = 42.9f, calResFullCm = 24.0f;     // ultrasonic geometry (moved from Nano) [MEASURED]
+float calMixEmptyCm = 42.9f, calMixFullCm = 24.0f;     //                                        [MEASURED]
+const float CAL_LEVEL_MIN_SPAN_CM = 2.0f;               // empty must sit this far beyond full, or it is ignored
+
+/* ---- Tank litres (web v.4 "pure ultrasonic", shared/tank_volume.h) ------------------------------------ *
+ * The ResMix / MixIrr flow meters are gone: ESP2 meters every transfer and delivery on the mixing-tank level
+ * in LITRES, which this board works out from the raw cm and sends with each LEVEL line. Each tank is a
+ * truncated cone -- ~31.0 cm across at the 0 % level, ~39.4 cm at 100 % (user, 2026-11-16) -- corrected by the
+ * operator's own "level -> litres" points (Calibration > "Tank Mix liters" / "Tank Res liters", up to 8 each,
+ * NVS blobs "tvM" / "tvR"). The diameters are the same for both tanks; change them here if a tank differs.  */
+const float TANK_D_BOTTOM_CM = 31.0f;                  // inner diameter at the 0 % (EMPTY) level   [MEASURE]
+const float TANK_D_TOP_CM    = 39.4f;                  // inner diameter at the 100 % (FULL) level  [MEASURE]
+// The mixer standing on the mixing tank's bottom (user, 2026-11-17): 6 cm across, 11.4 cm tall = 322.3 cm^3 the water
+// cannot fill. tank_volume.h takes it out of the shape; the ultrasonic is not in its way.
+const float MIXER_DIAM_CM = 6.0f, MIXER_H_CM = 11.4f;   //                                            [MEASURED]
+TankVolCal calMixVol = { 42.9f, 24.0f, TANK_D_BOTTOM_CM, TANK_D_TOP_CM, 0, {0}, {0}, MIXER_DIAM_CM, MIXER_H_CM };
+TankVolCal calResVol = { 42.9f, 24.0f, TANK_D_BOTTOM_CM, TANK_D_TOP_CM, 0, {0}, {0} };
+// Hardening of the reading itself (the Nano sends the MEDIAN of its last 5 pings and their spread):
+// a median whose pings spread more than this is a splash / ripple / multipath, not a level -- it is shown but
+// NOT used for control (sent to ESP2 as -1, which ESP2 treats as "no reading").                      [MEASURE]
+// 2.0 -> 4.0 cm (2026-11-17): with the transfer pouring in, the mixing tank's surface ripples and its pings spread past
+// 2 cm, so ESP2 got "no reading" (-1) for second after second and held forced runs as LEVEL_BLIND while the LCD (which
+// shows every echo) read fine. ESP2 takes a 5-sample median with a jump gate on top of the Nano's own median.
+const float ULTRA_MAX_SPREAD_CM = 4.0f;
+// Physically possible distances for these tanks: closer than the sensor's dead zone, or far past the empty
+// level, is an echo off something else.                                                              [MEASURE]
+const float ULTRA_MIN_CM = 3.0f;
+const float ULTRA_MAX_OVER_EMPTY_CM = 15.0f;
+// Speed-of-sound temperature compensation (tvTempCorrectCm). The geometry above was measured near this air
+// temperature; distances are scaled to it using the Nano's DHT22 reading. 0 = off.                 [CONFIRM]
+#define ULTRA_TEMP_COMP 1
+const float ULTRA_TEMP_REF_C = 30.0f;
+// Recompute both tanks' geometry from the empty/full cm (they live in calResEmptyCm.. for the % maths). The
+// calibration points belong to a sensor DISTANCE, so when the empty mark moves their heights move with it.
+static void tankVolSyncGeom() {
+  float dM = calMixEmptyCm - calMixVol.emptyCm, dR = calResEmptyCm - calResVol.emptyCm;
+  for (uint8_t i = 0; i < calMixVol.n && i < TV_MAX_PTS; i++) calMixVol.hCm[i] += dM;
+  for (uint8_t i = 0; i < calResVol.n && i < TV_MAX_PTS; i++) calResVol.hCm[i] += dR;
+  calMixVol.emptyCm = calMixEmptyCm; calMixVol.fullCm = calMixFullCm;
+  calResVol.emptyCm = calResEmptyCm; calResVol.fullCm = calResFullCm;
+}
+// Litres the mixing tank holds at ESP2's overflow stop: the most a fill may plan to put in it (MIXCAP).
+static float mixCapLiters() {
+  float v = tvLitersAtPct(calMixVol, MIX_HIGH_PCT);
+  if (!(v > 0.5f)) v = MIXING_TANK_MAX_L;
+  if (v > MIXING_TANK_MAX_L) v = MIXING_TANK_MAX_L;
+  return v;
+}
+
 float calFlowResScale = 1.0f;                          // reservoir flow correction factor
 float calNpkScale[7] = { 10, 10, 1, 10, 1, 1, 1 };     // raw register -> engineering (moved from Nano)
 float calNpkOff[NUM_COLUMNS][3] = { {0,0,0}, {0,0,0}, {0,0,0} };  // N/P/K offset trim (default 0, §A.4.3)
 float calTempOff = 0, calHumOff = 0, calLuxOff = 0;    // env/light offset trims
-// ESP2-owned (ESP1 holds authoritative copy, pushes to ESP2):
-float calKResMix = 450, calKMixIrr = 450, calKNut[3] = { 450, 450, 450 };
+// ESP2-owned (ESP1 holds authoritative copy, pushes to ESP2). web v.4: no ResMix / MixIrr K-factors any more.
+float calKNut[3] = { 450, 450, 450 };
 float calKNutD = 450, calKPhUp = 450, calKPhDn = 450;
 float calPhM = 0.0036621f, calPhB = 0, calEcM = 0.0009766f, calEcB = 0;
 float calAcs712Zero = 1.65f;
@@ -187,19 +310,20 @@ String calRxId = "";                    // sensor id of the last CAL sample rece
 float  calRxRaw = 0; bool calRxValid = false; unsigned long calRxMs = 0;
 
 /* The soil maths itself lives in include/pure_math.h so it can be compiled and tested on a host PC
- * without an ESP32 -- see ESP1/test/test_pure_math.cpp. These two wrappers are the only difference
- * between the firmware and the tested code: they look up this column's calibration endpoints and
- * hand them over as plain arguments. levelPct() and pulseRowForTarget() were already pure and moved
- * across unchanged. Behaviour is identical; imap() reproduces Arduino map()'s integer truncation. */
-static int soilPct(int col, int raw) {
-  return soilPctCal(raw, calSoilAir[col], calSoilWater[col]);
-}
+ * without an ESP32 -- see ESP1/test/test_pure_math.cpp. This wrapper is the only difference between
+ * the firmware and the tested code: it looks up this column's calibration endpoints and hands them
+ * over as plain arguments. levelPct() and pulseRowForTarget() were already pure and moved across
+ * unchanged. Behaviour is identical; imap() reproduces Arduino map()'s integer truncation. */
 static int soilCombine(int col, int v1, int v2, int npkPct, SoilBlend *why) {
-  return soilCombineCal(v1, v2, npkPct, calSoilAir[col], calSoilWater[col], why);
+  return soilCombineProbes(v1, v2, npkPct, calProbeDry[col][0], calProbeWet[col][0],
+                           calProbeDry[col][1], calProbeWet[col][1], why);
 }
 
 /* ---- Tank levels (%) (spec sec.14.4) ------------------------------------- */
-const float RES_LOW_PCT      = 15.0f;   // reservoir too low -> block ops  [TBD]
+// Reservoir too low -> block new runs (+ RES_LOW alert). 2026-11-16: = its filter zone (RES_FILTER_PCT, 18 %,
+// shared/rig_constants.h) -- its ultrasonic stops at ~15 % and cannot see the water left below. Was 15 %, which an
+// empty reservoir sitting on its filter reads, so it never tripped.                                   [TBD]
+const float RES_LOW_PCT      = RES_FILTER_PCT;
 const float MIX_TARGET_PCT   = 70.0f;   // mixing tank fill target          [TBD]
 const float MIX_MAX_PCT      = 95.0f;   // mixing tank overflow guard       [TBD]
 
@@ -211,7 +335,7 @@ const unsigned long BATT_FLAG_HOLD_MS = 60000;  // below the line this long befo
 
 /* ---- SECONDARY battery: INA226 (R010 shunt) on this I2C bus at INA226_ADDR ------------------- *
  * A 4S Li-ion battery (16.8 V full) that powers ESP1, ESP2, the Nano, the sensors and the relay
- * coils while the inverter runs the AC motors. ESP2's P4 (the old mix-valve relay) drives a DPDT
+ * coils while the inverter runs the AC motors. ESP2's P0 (the old transfer-pump relay; P6 until 2026-11-15) drives a DPDT
  * that breaks BOTH + and - from the main solar battery for that time, so no electrical link to
  * the inverter's battery remains and the sensor readings stay clean; idle, the boards run from
  * the main battery, which also charges the secondary. ESP1 owns the monitor and the policy:
@@ -221,7 +345,7 @@ const unsigned long BATT_FLAG_HOLD_MS = 60000;  // below the line this long befo
  * boards through the ~10-20 ms DPDT transfer is fitted. At 0 the INA226 is still read, logged
  * (PWR2) and published, but nothing is blocked or alerted.
  * Calibrated with Calibration/ESP1/INA226, whose results load from NVS over these defaults (loadCal). */
-#define SECONDARY_BATT_ENABLED 0
+#define SECONDARY_BATT_ENABLED 1   // ON since 2026-11-16 (user: hold-up fitted). Must match ESP2.
 /* Secondary battery as a BACKUP for a critically low main battery: READY, NOT ACTIVE. At 1: when main
  * stays below BATT_CRIT_V for BACKUP_TRIGGER_MS with nothing running, ESP1 texts a critical alert (it
  * does NOT use raiseFault('C'): that E-stops, and the GPIO4 cut would drop the boards straight back to
@@ -251,15 +375,18 @@ const bool     SEC_INVERT_CURRENT   = false;     // true if IN+/IN- are wired re
 const uint16_t SEC_INA_CONFIG       = 0x4527;    // AVG16, 1.1 ms bus/shunt, continuous
 const float SEC_BATT_FULL_V    = 16.8f;          // 4.20 V/cell -> 100 %                         [CONFIRM]
 const float SEC_BATT_EMPTY_V   = 12.8f;          // 3.20 V/cell ->   0 %                         [CONFIRM]
-const float SEC_BATT_LOW_V     = 13.6f;          // 3.40 V/cell: block inverter use below this   [CONFIRM]
-const float SEC_BATT_RECOVER_V = 14.0f;          // 3.50 V/cell: allow it again (hysteresis)    [CONFIRM]
+// Inverter use is blocked at or below SEC_BLOCK_PCT and allowed again from SEC_UNBLOCK_PCT (user, 2026-11-17: "do not
+// attempt it at 30 % and below"), judged on the pack's RESTING charge (secRestV) -- not on the raw voltage, which the
+// charger lifts and the boards' load pulls down. (Was 13.6 V raw to block, 14.0 V to allow.)
+const float SEC_BLOCK_PCT      = 30.0f;          // = 14.0 V resting                               [CONFIRM]
+const float SEC_UNBLOCK_PCT    = 35.0f;          // = 14.2 V resting (hysteresis)
 const float SEC_BATT_CRIT_V    = 12.8f;          // 3.20 V/cell: critical alert                  [CONFIRM]
 const unsigned long SEC_READ_MS  = 2000;         // read cadence once found
 const unsigned long SEC_RETRY_MS = 10000;        // re-probe cadence while missing
 
 /* ---- SOLAR + MAIN BATTERY: two INA226 behind an ISO1540 I2C isolator -------------------------- *
  * An INA226 must share a ground with what it measures, while these boards must not share one with
- * the main battery (inverter noise, and the P4 DPDT breaks both + and -). So the two modules live on
+ * the main battery (inverter noise, and the P0 DPDT breaks both + and -). So the two modules live on
  * the main-battery side of an ISO1540: GND = main negative, VCC = a 3.3 V supply on that side. They stay
  * readable through every inverter run and battery switch, and nothing but the isolator crosses over.
  * The main INA226 is the first choice for main battery V/I/P; if it stops answering, the opto ADC and
@@ -313,8 +440,14 @@ float ACS_SENS_V_PER_A = 0.040f;        // 40 mV/A = ACS758LCB-050B             
 const uint8_t ACS_PGA        = 1;       // 1 = +/-4.096 V full scale (125 uV/LSB)
 // ThingSpeak Ch3 ("Chem") slot for the battery current. Ch2 "System" is full (all 8 fields).
 // Must stay ABOVE 2 x (enabled columns), since the EC/pH loop claims 2 fields per enabled column.
-const int TS3_CURRENT_FIELD  = 5;       // safe while <=2 columns are enabled  [CONFIRM if C is on]
-const int TS3_SOLAR_V_FIELD  = 7;       // free even with all 3 columns on (they take fields 1-6)
+// Ch3 layout since 2026-11-15 (user: "sacrifice EC, replace with solar"):
+//   1 solar current (A) | 2 pH col A | 3 solar energy today (Wh) | 4 pH col B | 5 battery current (A)
+//   6 pH col C (if enabled) | 7 solar voltage (V) | 8 solar power (W)
+// Rename fields 1 and 3 in the ThingSpeak channel settings; their old history is soil EC.
+const int TS3_SOLAR_I_FIELD  = 1;       // was column A soil EC
+const int TS3_SOLAR_WH_FIELD = 3;       // was column B soil EC
+const int TS3_CURRENT_FIELD  = 5;       // was column C's EC slot -- free now that EC is not uploaded
+const int TS3_SOLAR_V_FIELD  = 7;       // free even with all 3 columns on (pH takes 2/4/6)
 const int TS3_SOLAR_W_FIELD  = 8;
 bool  acsOk = false;                   // last ADS1115 read succeeded -- a dead ADC must be VISIBLE,
                                         // not silently read as 0 A, which is how the opto failure hid
@@ -389,7 +522,12 @@ bool exerciseEnabled = true;    // master on/off                                
 int  exerciseRunS    = 5;       // seconds per exercise, EX_RUN_MIN..EX_RUN_MAX           [TBD]
 const int EX_RUN_MIN = 1, EX_RUN_MAX = 10;
 void saveExercise();
-const unsigned long PUMP_EXERCISE_TIMEOUT_MS  = 20000;        // from dispatch: AC warmup + run (<=10 s) + margin
+// From dispatch. 2026-11-15: an AC pump now waits for the Nano servo first (ESP2 gives it up to 10 s, plus the
+// PZEM dead-check) before the inverter and the run (<=10 s) start -- 20 s no longer covered the worst case.
+// Stuck-selector re-seats (up to 2, each ~11 s: decay + 4 servo moves) can add ~22 s more.
+const unsigned long PUMP_EXERCISE_TIMEOUT_MS  = 150000;  // 60 -> 150 s (2026-11-16): from ESP2 power-up it covers boot,
+                                                          // the servo pre-seat (3 swings) and the rest below;
+                                                          // boot, battery switch, AC dead wait, servo, inverter confirm and the run
 
 /* ---- Power logging throttle (B3, spec sec.25.2.1: not every read) --------- */
 const unsigned long PWR_LOG_INTERVAL_MS = 60000;     // log a PWR snapshot ~1/min (+ on state change)
@@ -440,11 +578,12 @@ const int   MIN_DOSE_PULSES = 3;         // ~12 mL floor; below this -> skip + l
 // ---- Timed-ceiling backstop (§2.4) ----
 const float CEILING_MARGIN  = 2.0f;      // ceiling_s = 2x expected runtime (LOCKED)
 float PUMP_FLOWRATE_MLPM[3] = { 50.0f, 50.0f, 50.0f };   // pre-cal default mL/min, NVS "calib" overrides [MEASURE]
+const float PUMP_FLOWRATE_DEFAULT_MLPM = 50.0f;          // what a cleared ("not set") nutrient rate goes back to
 // ---- Mixing tank (§1.1): batch volume is VARIABLE; MAX is a ceiling, not the formula input ----
-const float MIXING_TANK_MAX_VOLUME = 50.0f;   // L (safety ceiling)
+const float MIXING_TANK_MAX_VOLUME = MIXING_TANK_MAX_L;   // L (safety ceiling, shared/rig_constants.h)
 const float MIXING_TANK_SAFE_MIN   = 5.0f;    // L (refuse dosing below)
-// Per-column water budget per service (must mirror ESP2's WATER_BUDGET_L) [TBD]
-const float WATER_BUDGET_L[NUM_COLUMNS] = { 5.0f, 5.0f, 5.0f };
+// Per-column water budget per service: WATER_BUDGET_L, in shared/rig_constants.h with ESP2 [TBD]
+static_assert(NUM_COLUMNS == sizeof(WATER_BUDGET_L) / sizeof(WATER_BUDGET_L[0]), "one budget per column");
 
 // Built-in crop presets (mg/kg, §6) -> target N,P,K + pH (pH is the EC/pH-window concern, not in §6).
 struct CropPreset { const char* name; float N, P, K, pH; };
@@ -526,7 +665,9 @@ struct ColumnConfig {
   uint8_t mode;
   float   targetN, targetP, targetK, targetPH;
   char    name[17];
-  long    lastServicedStamp;     // yyyymmdd of last service (once/day in window)
+  long    lastServicedStamp;     // yyyymmdd that servicedMask belongs to
+  uint8_t servicedMask;          // bit w = window w watered that day; 0xFF = the whole day is done or skipped
+  long    fertStamp;             // yyyymmdd nutrients last went in (at most once a day)
 };
 ColumnConfig col[NUM_COLUMNS];
 
@@ -544,12 +685,46 @@ struct SensorData {
   // --- RAW signals retained for the Sensor Diag screen (pre-conversion, honest -1 on fault) ---
   float rawTemp, rawHum, rawLux;         // ENV / LIGHT raw (Nano sends engineering, no offset)
   float rawResCm, rawMixCm, rawFlow;     // TANK: raw ultrasonic distances (cm) + raw flow L/min
+  // web v.4: litres from the tank calibration (shared/tank_volume.h), -1 = no usable reading; the Nano's
+  // median spread per sensor (cm, -1 = an older Nano that does not send it); the temperature-corrected cm.
+  float resL, mixL;
+  float resSpreadCm, mixSpreadCm;
+  float resCm, mixCm;
+  bool  resOk, mixOk;                    // usable for CONTROL (valid echo, calm enough, sane geometry)
+  char  resSt, mixSt;                    // the Nano's pinger status per tank (K E R F S X; '?' = not sent)
   int   rawSoil[NUM_COLUMNS][2];         // raw per-probe soil ADC (0..1023); [c][0]=probe1 [c][1]=probe2
   float rawNpk[NUM_COLUMNS][7];          // raw Modbus registers per column
   // Per-branch last-seen so a single dead Nano sensor is detectable (lastNanoMs is whole-link).
   unsigned long msEnv, msTank, msSoil, msLight, msNpk[NUM_COLUMNS];
 };
 SensorData sensor;
+
+/* ---- Nano TANK link statistics (web v.4 hardening, 2026-11-16) ------------ *
+ * The Nano numbers its TANK frames 0..999. A repeat is ignored (it was applied once); a gap is frames lost on the
+ * way -- dropped on a bad checksum, or eaten by a receive-buffer overflow. tankRxN / tankLostN are a decaying
+ * window (halved every 200 frames), so tankLinkPct() shows the link of the last minute or so.                  */
+int      tankSeqLast = -1;               // -1 = none yet (or the Nano restarted)
+uint32_t tankRxN = 0, tankLostN = 0;
+uint32_t tankLostTotal = 0;              // since boot
+unsigned long lastTankMs = 0;            // the last TANK accepted (FAST gap watchdog)
+const unsigned long NANO_FIRST_DATA_RETRY_MS = 30000;   // no TANK since boot: ask for a cycle again this often
+bool     tankGapLogged = false;          // the current FAST gap has been logged
+unsigned long fastSinceMs = 0;           // FAST was (re)entered here (the gap watchdog's start)
+uint16_t levelSeqOut = 0;                // our LEVEL line number to ESP2 (0..9999): ESP2 drops repeats, counts gaps
+uint32_t nanoRxOverflows = 0;            // EspSoftwareSerial buffer overflows (the loop stalled too long)
+const unsigned long NANO_TANK_GAP_MS = 2500;   // FAST sends a TANK every ~0.3 s: this much silence = re-send FAST
+const char *TANK_ST_CHARS = "KERFSX";    // the Nano's per-tank pinger status letters
+static bool tankSeqAccept(int seq) {
+  if (tankSeqLast >= 0) {
+    int d = (seq - tankSeqLast + 1000) % 1000;
+    if (d == 0) return false;                         // the same frame twice
+    if (d > 1 && d < 500) { tankLostN += d - 1; tankLostTotal += d - 1; }   // a big jump = the Nano restarted
+  }
+  tankSeqLast = seq; tankRxN++;
+  if (tankRxN + tankLostN >= 200) { tankRxN /= 2; tankLostN /= 2; }
+  return true;
+}
+static int tankLinkPct() { uint32_t t = tankRxN + tankLostN; return t ? (int)(tankRxN * 100UL / t) : -1; }
 
 /* ---- Nano garbage tracking / recovery ------------------------------------ */
 uint8_t garbageCount = 0;
@@ -572,8 +747,9 @@ struct WorkOrder {
   String   cmd;            // full framed command (for retries)
   uint8_t  retries;
   unsigned long sentMs;
+  int8_t   window;         // the column's window this run counts for (-1 = none); set after sending
 };
-WorkOrder wo = { false, WO_IDLE, -1, false, "", 0, 0 };
+WorkOrder wo = { false, WO_IDLE, -1, false, "", 0, 0, -1 };
 bool esp2Available = false;
 unsigned long lastEsp2Ms = 0;
 uint8_t       silenceProbes  = 0;    // consecutive unanswered STATUS_REQ probes (silence confirmation)
@@ -597,8 +773,8 @@ unsigned long esp2SlowRetryMs = 0;      // last gentle slow-retry attempt while 
  * pendingRun   : a column run waiting for ESP2 to finish booting (warm-up phase).
  * esp2WarmupMs : start of the current warm-up wait (READY budget).                  */
 bool esp2Powered = false;
-struct PendingRun { bool active; int colIdx; bool fertigate; };
-PendingRun pendingRun = { false, -1, false };
+struct PendingRun { bool active; int colIdx; bool fertigate; int8_t window; };
+PendingRun pendingRun = { false, -1, false, -1 };
 unsigned long esp2WarmupMs = 0;
 // Minimum ESP2 on-time + periodic idle heartbeat poll (so a too-brief power-up can't leave ESP2 unable to
 // boot/ACK, and ESP2 is proven alive on a cadence while idle). See esp2SetPower() + esp2PowerTick().
@@ -630,10 +806,10 @@ const uint8_t       TEST_ARM_MAX_TRIES  = 20;  // stop re-sending after this (li
 // Mirrors ESP2's flowPinForBit(); kept here so the pulse result can be reported as a volume.
 static float pulseKForRow(int row) {
   switch (row) {
-    case 16: case 6:                     return calKResMix;
-    case 17: case 18: case 19: case 7:   return calKMixIrr;
-    case 9:  return calKNut[0];
-    case 10: return calKNut[1];
+    // Fill (16) / Push (17..19) combos: no meter since web v.4 -- ESP2 reports the mixing-tank level change
+    // (TEST,LEVEL), handled in pulseFinish.
+    case 1:  return calKNut[0];          // nutrient A on P1 (2026-11-16, swapped with B)
+    case 7:  return calKNut[1];          // nutrient B on P7 (2026-11-16)
     case 11: return calKNut[2];
     case 12: return calKNutD;
     case 13: return calKPhUp;
@@ -654,8 +830,18 @@ const unsigned long PULSE_ARM_TIMEOUT_MS = 14000; // ESP2 boot + TEST,ENTER ACK 
 // reported as "fluid moved" or "nothing moved" -- the whole point of the test. Bounded: an ESP2 that
 // never answers must not leave the command unresolved.
 const unsigned long PULSE_REPORT_WAIT_MS = 800;
+// Longest a Fill/Push combo may take to power its pump (see PU_RUN): 45 -> 90 s (2026-11-16), ESP2 pre-seats the servo
+// (3 swings) before every pump start.
+const unsigned long PULSE_AC_START_MAX_MS = 90000;
 bool          puFlowSeen = false;
 unsigned long puFlowPulses = 0, puReportMs = 0;
+bool          puLevelSeen = false;         // web v.4: TEST,LEVEL,<row>,<dMixL> for a Fill / Push combo
+bool          puInvOnSeen = false;         // ESP2 said INV_ON for this pulse: its seconds count from that (2026-11-17)
+float         puLevelL = 0.0f;
+// A timed pulse on a servo row (servoL / servoR, the website's pump-selector switch) ends as soon as the move is
+// settled either way (2026-11-16): the Nano's confirmation (testServoDoneRow), or ESP2's SERVO_FAIL,TEST|<why>,
+// kept here. Before, it held ESP2 in Testing for the whole of its seconds and then answered.
+char          puServoFailWhy[24] = "";
 // Web "hold-to-run" (2026-09-10, irrigation/testHold): press-and-hold from the Manual/Test tab,
 // mirrors the LCD's own dead-man testHoldTick() but driven by a periodically-refreshed Firebase flag
 // instead of a physical button, since a browser tab cannot hold a physical dead-man switch. Reuses
@@ -734,8 +920,8 @@ String   replyTarget = "";
  * runs in a core-0 FreeRTOS task so blocking HTTP never disturbs the core-1 loop
  * or the 8 s task WDT. Credentials + write keys are set by SMS (Part B), NVS-kept.
  * Channel 1 "Columns" = per-column moisture + N,P,K. Channel 2 "System" = temp,
- * hum, lux, reservoir%, mixing%, battV, battW, flow. Channel 3 "Chem" = per-column
- * EC + pH.                                                                       */
+ * hum, lux, reservoir%, mixing%, battV, battW, flow. Channel 3 "Chem" = solar I,
+ * pH A, solar Wh today, pH B, battery A, pH C, solar V, solar W (EC dropped 2026-11-15). */
 const char *TS_HOST = "api.thingspeak.com";
 const unsigned long TS_UPLOAD_IDLE_MS   = 60000;   // upload cadence when idle
 const unsigned long TS_UPLOAD_ACTIVE_MS = 20000;   // faster during ACTIVE_STATE
@@ -766,9 +952,22 @@ const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
 const unsigned long FIREBASE_UPLOAD_IDLE_MS   = 60000;  // ~1 min dashboard refresh when idle
 const unsigned long FIREBASE_UPLOAD_ACTIVE_MS = 20000;  // faster during ACTIVE_STATE
 const unsigned long FB_PUSH_MIN_GAP_MS        = 5000;   // floor between error-triggered out-of-band pushes
+const unsigned long FB_PUSH_FRESH_WAIT_MS     = 2500;   // longest a push waits for a snapshot taken after its event
 // Command poll cadence. The TLS connection is REUSED between polls (fbClient/fbHttp below),
 // so this is one small GET on an open socket -- not a handshake every 3 s.
 const unsigned long FIREBASE_COMMAND_POLL_MS  = 3000;
+// Live viewing (2026-11-17, user: "a very realtime website, and a refresh button"). While a dashboard page is open and on
+// screen it touches irrigation/viewer/at every ~15 s; its Refresh button touches irrigation/viewer/refreshAt. ESP1 polls
+// that node with the commands and, while someone is watching, uploads the snapshot every FIREBASE_UPLOAD_LIVE_ACTIVE_MS
+// during a run / FIREBASE_UPLOAD_LIVE_IDLE_MS otherwise, instead of every 20 / 60 s. Nobody watching: nothing extra
+// goes up. A Refresh is answered at once (at most every FB_REFRESH_MIN_GAP_MS). Core 0 (netTask) only.
+const unsigned long FIREBASE_UPLOAD_LIVE_ACTIVE_MS = 2000;
+const unsigned long FIREBASE_UPLOAD_LIVE_IDLE_MS   = 4000;
+const unsigned long FB_VIEWER_HOLD_MS              = 45000;   // one touch keeps the fast pace this long
+const unsigned long FB_REFRESH_MIN_GAP_MS          = 1500;
+unsigned long fbViewerUntilMs = 0;
+bool          fbRefreshPending = false;
+static bool fbViewerWatching() { return fbViewerUntilMs != 0 && (long)(fbViewerUntilMs - millis()) > 0; }
 /* ---- Operator FORCE run limits -------------------------------------------- *
  * A FORCE_RUN is a full irrigation/fertigation with operator-supplied volume and doses -- far more
  * consequential than the bounded 5 s pump test the other remote commands allow. These are the caps
@@ -847,12 +1046,20 @@ struct FirebaseCommand       { char id[48]; char type[32]; char pump[16];
                                char  colMode[20];    // "AUTO" | "IRRIGATION_ONLY" ("" = absent)
                                int8_t enabled, schedMode;
                                int   winStart, winEnd;
+                               // SET_COLUMN windows[] (2026-11-05): -1 absent, else how many {start,end} pairs
+                               // came (MAX_RUNS_PER_DAY + 1 = too many); -1 in a pair = not a whole number.
+                               int8_t  winCount;
+                               int16_t wins[MAX_RUNS_PER_DAY][2];
                                float tgt[4];         // N, P, K, pH  (-1 = absent)
                                char  preset[16];     // SET_COLUMN: crop preset name ("" = absent)
                                // SET_CLOCK, all required together (not optional-absent like above).
                                int16_t clkY; int8_t clkMo, clkD, clkH, clkMi;
                                // SET_THRESH, all required together.
-                               int   thStart, thStop; float thGap; };
+                               int   thStart; float thGap;
+                               // SET_AC_VOLT, both required (-1 = absent or not a whole number).
+                               int   acVMin, acVMax;
+                               // SET_AC_AMP, both required, whole tenths of an amp (-1 = absent or not whole).
+                               int   acAMin10, acAMax10; };
 // A forced run arms a countdown before it fires, so the operator can see the rig accepted it and
 // can still stop it. The default is deliberately non-zero: an immediate start leaves no window to
 // catch a mistyped volume. 0 is still allowed for a deliberate fire-now.
@@ -870,11 +1077,26 @@ unsigned long fbLastRemoteActionMs = 0;
 const unsigned long FB_REMOTE_MIN_GAP_MS = 10000;
 volatile uint32_t fbHandshakes = 0;                 // TLS connects; the keep-alive health metric (H-1)
 
-/* Google Trust Services Root R1 (https://pki.goog/repo/certs/gtsr1.pem, valid to 2036-06-22)
- * -- the CA behind *.googleapis.com and *.firebasedatabase.app. With this set, the Firebase
- * client VALIDATES the server certificate, so the provisioning sign-in cannot be MITM'd for
+/* Google Trust Services roots R1..R4 (https://pki.goog/repo/certs/gtsr{1,2,3,4}.pem, all valid to
+ * 2036-06-22) -- the CAs behind *.googleapis.com and *.firebasedatabase.app. With these set, the
+ * Firebase client VALIDATES the server certificate, so the provisioning sign-in cannot be MITM'd for
  * the device password. Blank it to fall back to setInsecure() (encrypted but unauthenticated).
- * If Google ever re-roots, TLS starts failing and PAGE_GSM shows FB:!! -- replace this PEM.  */
+ *
+ * WHY ALL FOUR (2026-11-09 fix for the rig's FB:!! / "transport error code -1"): this used to pin
+ * R1 alone. Google's sign-in hosts (identitytoolkit + securetoken.googleapis.com) now serve an ECDSA
+ * chain, leaf -> WE2 -> GTS Root R4, so with R1 alone EVERY sign-in failed the handshake and the
+ * device could never get a token, while the RTDB host itself (-> WR1 -> R1) still verified fine.
+ * Google can serve any of its four roots depending on host and on which key type the client offers,
+ * so trusting only the one in use today is what broke this. Checked 2026-11-09 with
+ * openssl s_client -CAfile <these four>: identitytoolkit, securetoken and the project's RTDB host all
+ * verify (code 0), whether the client prefers ECDSA or RSA. SHA-256 fingerprints, to re-check:
+ *   R1 D9:47:43:2A:BD:E7:B7:FA:90:FC:2E:6B:59:10:1B:12:80:E0:E1:C7:E4:E4:0F:A3:C6:88:7F:FF:57:A7:F4:CF
+ *   R2 8D:25:CD:97:22:9D:BF:70:35:6B:DA:4E:B3:CC:73:40:31:E2:4C:F0:0F:AF:CF:D3:2D:C7:6E:B5:84:1C:7E:A8
+ *   R3 34:D8:A7:3E:E2:08:D9:BC:DB:0D:95:65:20:93:4B:4E:40:E6:94:82:59:6E:8B:6F:73:C8:42:6B:01:0A:6F:48
+ *   R4 34:9D:FA:40:58:C5:E2:63:12:3B:39:8A:E7:95:57:3C:4E:13:13:C8:3F:E6:8F:93:55:6C:D5:E8:03:1B:3C:7D
+ * mbedTLS parses a concatenated PEM bundle like this one in a single setCACert() call.
+ * If TLS ever starts failing again (PAGE_GSM FB:!!, portal "transport error code -1"), compare
+ * the hosts' chains against this list first.  */
 const char FB_ROOT_CA[] = R"EOF(-----BEGIN CERTIFICATE-----
 MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
 CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
@@ -905,6 +1127,63 @@ Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT
 0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm
 2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb
 bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIFVzCCAz+gAwIBAgINAgPlrsWNBCUaqxElqjANBgkqhkiG9w0BAQwFADBHMQsw
+CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+MBIGA1UEAxMLR1RTIFJvb3QgUjIwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw
+MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp
+Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjIwggIiMA0GCSqGSIb3DQEBAQUA
+A4ICDwAwggIKAoICAQDO3v2m++zsFDQ8BwZabFn3GTXd98GdVarTzTukk3LvCvpt
+nfbwhYBboUhSnznFt+4orO/LdmgUud+tAWyZH8QiHZ/+cnfgLFuv5AS/T3KgGjSY
+6Dlo7JUle3ah5mm5hRm9iYz+re026nO8/4Piy33B0s5Ks40FnotJk9/BW9BuXvAu
+MC6C/Pq8tBcKSOWIm8Wba96wyrQD8Nr0kLhlZPdcTK3ofmZemde4wj7I0BOdre7k
+RXuJVfeKH2JShBKzwkCX44ofR5GmdFrS+LFjKBC4swm4VndAoiaYecb+3yXuPuWg
+f9RhD1FLPD+M2uFwdNjCaKH5wQzpoeJ/u1U8dgbuak7MkogwTZq9TwtImoS1mKPV
++3PBV2HdKFZ1E66HjucMUQkQdYhMvI35ezzUIkgfKtzra7tEscszcTJGr61K8Yzo
+dDqs5xoic4DSMPclQsciOzsSrZYuxsN2B6ogtzVJV+mSSeh2FnIxZyuWfoqjx5RW
+Ir9qS34BIbIjMt/kmkRtWVtd9QCgHJvGeJeNkP+byKq0rxFROV7Z+2et1VsRnTKa
+G73VululycslaVNVJ1zgyjbLiGH7HrfQy+4W+9OmTN6SpdTi3/UGVN4unUu0kzCq
+gc7dGtxRcw1PcOnlthYhGXmy5okLdWTK1au8CcEYof/UVKGFPP0UJAOyh9OktwID
+AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQUu//KjiOfT5nK2+JopqUVJxce2Q4wDQYJKoZIhvcNAQEMBQADggIBAB/Kzt3H
+vqGf2SdMC9wXmBFqiN495nFWcrKeGk6c1SuYJF2ba3uwM4IJvd8lRuqYnrYb/oM8
+0mJhwQTtzuDFycgTE1XnqGOtjHsB/ncw4c5omwX4Eu55MaBBRTUoCnGkJE+M3DyC
+B19m3H0Q/gxhswWV7uGugQ+o+MePTagjAiZrHYNSVc61LwDKgEDg4XSsYPWHgJ2u
+NmSRXbBoGOqKYcl3qJfEycel/FVL8/B/uWU9J2jQzGv6U53hkRrJXRqWbTKH7QMg
+yALOWr7Z6v2yTcQvG99fevX4i8buMTolUVVnjWQye+mew4K6Ki3pHrTgSAai/Gev
+HyICc/sgCq+dVEuhzf9gR7A/Xe8bVr2XIZYtCtFenTgCR2y59PYjJbigapordwj6
+xLEokCZYCDzifqrXPW+6MYgKBesntaFJ7qBFVHvmJ2WZICGoo7z7GJa7Um8M7YNR
+TOlZ4iBgxcJlkoKM8xAfDoqXvneCbT+PHV28SSe9zE8P4c52hgQjxcCMElv924Sg
+JPFI/2R80L5cFtHvma3AH/vLrrw4IgYmZNralw4/KBVEqE8AyvCazM90arQ+POuV
+7LXTWtiBmelDGDfrs7vRWGJB82bSj6p4lVQgw1oudCvV0b4YacCs1aTPObpRhANl
+6WLAYv7YTVWW4tAR+kg0Eeye7QUd5MjWHYbL
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPluILrIPglJ209ZjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjMwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjMwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AAQfTzOHMymKoYTey8chWEGJ6ladK0uFxh1MJ7x/JlFyb+Kf1qPKzEUURout736G
+jOyxfi//qXGdGIRFBEFVbivqJn+7kAHjSxm65FSWRQmx1WyRRK2EE46ajA2ADDL2
+4CejQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBTB8Sa6oC2uhYHP0/EqEr24Cmf9vDAKBggqhkjOPQQDAwNpADBmAjEA9uEglRR7
+VKOQFhG/hMjqb2sXnh5GmCCbn9MN2azTL818+FsuVbu/3ZL3pAzcMeGiAjEA/Jdm
+ZuVDFhOD3cffL74UOO0BzrEXGhF16b0DjyZ+hOXJYKaV11RZt+cRLInUue4X
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi
+QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR
+HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D
+9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8
+p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
 -----END CERTIFICATE-----
 )EOF";
 
@@ -941,6 +1220,27 @@ volatile int  uploadResult   = 0;                  // netTask -> core1: 0 none /
 volatile long uploadResStamp = 0;                  // which day the result is for
 volatile int  uploadHttp     = 0;                  // last HTTP status (for the FAIL log)
 volatile long manualUploadStamp = 0;               // SMS/admin one-shot request (core 1), prioritized
+// CSV logs to the dashboard (2026-11-17, user: "Supabase has expired"). Each day's SD CSV now goes to the Firebase RTDB
+// that already serves the website, as text pieces: logs/files/<yyyymmdd>/<nnnn> (LOG_CHUNK_BYTES each) plus
+// logs/index/<yyyymmdd> = {state, size, chunks, partial, at}. The website lists them and joins the pieces into a download.
+// Completed days go up by themselves, oldest first after fbLogLast; a day asked for on the website (irrigation/logRequest,
+// today included -- as far as it is written) goes first. Only days from logKeepFrom on (LOG_KEEP_DAYS) are sent or kept.
+// One piece per netTask pass, so commands and the live report keep flowing during an upload. Supabase stays the target
+// only while Firebase is off.
+// 12288 -> 6144 (2026-11-17 evening): the 12 KB piece buffer was a static array, so it took 12 KB of heap for good. ESP1 then
+// ran at 55-60 KB free during runs, under FIREBASE_MIN_HEAP, and skipped every Firebase request (no FBASE,OK after any
+// restart from 17:58). Now a piece is read in small blocks into its JSON text, which is freed after each request.
+const uint16_t LOG_CHUNK_BYTES = 6144;
+const uint16_t LOG_READ_BLOCK  = 512;              // bytes read from the SD card at a time (netTask stack)
+// Why the last Firebase log upload failed, for core 1's UPLOAD,FAIL line (2026-11-17: "http=-1" alone was a dead end).
+char     fbLogFailStep[24] = "";
+uint32_t fbLogFailHeap = 0, fbLogFailBlock = 0;
+const int      LOG_KEEP_DAYS   = 14;
+long          fbLogLast = 0;                       // last completed day uploaded to Firebase (NVS "fblogl")
+volatile long logKeepFrom = 0;                     // core 1 -> core 0: the oldest day kept (yyyymmdd; 0 = unknown)
+volatile long webLogReqStamp = 0;                  // core 0 -> core 1: a day the website asked for (0 = none)
+volatile bool uploadWasFb = false;                 // the attempt in flight / just done went to Firebase
+volatile bool uploadReqPartial = false;            // core 1 -> core 0: the requested day is today (still growing)
 volatile bool adminUploadReq    = false;           // SoftAP admin "Upload logs" button (core0 -> core1)
 volatile bool wifiEnabled   = true;                // Settings > WiFi master switch (STA + telemetry); NVS-kept
 volatile bool wifiConnected = false;
@@ -968,7 +1268,7 @@ const unsigned long NET_STALL_RESET_MS = 600000;   // 10 min -> self-reset, but 
 // The ESP32 briefly hosts its own WPA2 AP + a web form so creds can be set without SMS/buttons.
 // Runs entirely in netTask (core 0); NVS is written by the core-1 loop (wifiPersistPending).
 const char *AP_SSID = "Irrig-Setup";               // provisioning AP name
-const char *AP_PASS = "irrigate123";               // WPA2 (>=8 chars) -- NOT open (documented in manual)
+const char *AP_PASS = SECRET_AP_PASS;              // WPA2 (>=8 chars) -- NOT open (secrets.h)
 const unsigned long PORTAL_TIMEOUT_MS = 600000;    // auto-close after 10 min unused
 volatile bool portalRequested    = false;          // core1/SMS -> netTask: start the portal
 volatile bool portalActive       = false;          // netTask -> core1: AP is up (LCD banner)
@@ -979,7 +1279,7 @@ char portalApIp[16] = "192.168.4.1";               // softAP IP, shown on LCD/SM
 // ---- Portal admin (PIN-gated: SD format/download/review + owner-number edit) ----
 // Admin actions run on core 0 (portal) but touch core-1-owned resources: SD (guarded by sdMux) and
 // PHONE_NUMBER (staged to core 1 via pendingOwner). PIN + owner persist in NVS on core 1.
-const char *ADMIN_PIN_DEFAULT = "1234";            // change at commissioning (documented in manual)
+const char *ADMIN_PIN_DEFAULT = SECRET_ADMIN_PIN;  // change at commissioning (secrets.h)
 String   adminPin = ADMIN_PIN_DEFAULT;             // NVS "apin"
 volatile bool portalAdminUnlocked = false;         // set by correct PIN; cleared every portalStop()
 String   pendingOwner = "";                        // core0 -> core1: new owner number to persist
@@ -999,8 +1299,9 @@ volatile bool smsMute = false;                     // when set, sendSMS() drops 
 // ESP2 sensors are pulled live one-at-a-time via a CAL round-robin (not streamed in normal
 // operation). Declared here rather than with the rest of the diag globals because
 // TelemetrySnapshot below sizes its mirror array from DIAG_ESP2_N.
+// web v.4: FLOW_RESMIX / FLOW_MIXIRR are gone (no meters); the tank litres come from the Nano instead.
 const char *DIAG_ESP2_ID[] = { "PH", "EC", "ACS712", "PZEM_V", "PZEM_I", "PZEM_P",
-                               "FLOW_RESMIX", "FLOW_MIXIRR", "FLOW_NUTA", "FLOW_NUTB", "FLOW_NUTC",
+                               "FLOW_NUTA", "FLOW_NUTB", "FLOW_NUTC",
                                // NUTD / pH up / pH down are wired but were never swept, so nothing
                                // read them at all. Needed for the Manual/Test flow table to cover
                                // every meter. ~3 s more per full sweep, well inside the 60 s window.
@@ -1011,6 +1312,7 @@ const uint8_t DIAG_ESP2_N = sizeof(DIAG_ESP2_ID) / sizeof(DIAG_ESP2_ID[0]);
 // read on core 0 by the upload task.
 struct TelemetrySnapshot {
   float temp, hum, lux, resLevel, mixLevel, flow;
+  float resL, mixL;                                  // web v.4: tank litres (-1 = not usable)
   int   soil[NUM_COLUMNS];
   float npkN[NUM_COLUMNS], npkP[NUM_COLUMNS], npkK[NUM_COLUMNS];
   float npkEC[NUM_COLUMNS], npkPH[NUM_COLUMNS];
@@ -1047,8 +1349,13 @@ struct TelemetrySnapshot {
   bool     rtcOk_, sdOk_, acsOk_;
   bool     secOk_, secLow_, onSecondary_;           // secondary battery (INA226) + supply in use
   bool     bswLatched_; uint8_t bswStrikes_;        // battery-switch fault latch + strike count
+  int16_t  acVMin_, acVMax_;                        // AC supply window ESP2 enforces (PZEM)
+  float    acLastV_; uint32_t acLastAgeMs_;         // last AC voltage measured (-1 / 0xFFFFFFFF = none)
+  int16_t  acAMin10_, acAMax10_;                    // AC pump current limits, tenths of an amp (2026-11-16)
+  float    acLastI_; uint32_t acLastIAgeMs_;        // last AC pump current measured (-1 / 0xFFFFFFFF = none)
+  uint8_t  servoSide_; uint32_t servoSideAgeMs_;    // pump selector's confirmed side (0 = unknown; age 0xFFFFFFFF = from NVS)
   uint8_t  bkState_;                                // backup state (BkState)
-  float    secV_, secI_, secP_;
+  float    secV_, secI_, secP_, secRest_;
   bool     simOk, netReg;
   int      rssi, creg;
   bool     battLow, battCrit;
@@ -1066,6 +1373,11 @@ struct TelemetrySnapshot {
   long     ackLeftS;              // >0 = operator asked to be re-prompted in this many seconds
   bool     actDisabled;
   bool     exEnabled;      // preventive pump exercise on/off
+  // Today's tally per column, and each pump's minutes to its next exercise (2026-11-06), for the website. Copied on
+  // core 1 like everything else here.
+  float    dayWaterL[NUM_COLUMNS], dayNutMl[NUM_COLUMNS];
+  uint8_t  dayWaterings[NUM_COLUMNS], dayFeedings[NUM_COLUMNS];
+  long     exNextMin[3];
   bool     wmHeld;         // dashboard manual-mode hold
   long     wmLeftS;
   char     wmState[10], wmWhy[40];
@@ -1078,6 +1390,7 @@ struct TelemetrySnapshot {
   char     fcCols[4];
   // Raw sensor block for the web diagnostics tab -- the same values the LCD Sensor Diag pages show.
   float    rTemp, rHum, rLux, rResCm, rMixCm, rFlow;
+  char     rResSt, rMixSt;                        // the Nano's pinger status per tank (K E R F S X, '?' = not sent)
   int      rSoil[NUM_COLUMNS][2];
   float    rNpk[NUM_COLUMNS][7];
   unsigned long agEnv, agTank, agSoil, agLight, agNpk[NUM_COLUMNS];
@@ -1092,6 +1405,7 @@ struct TelemetrySnapshot {
   bool  envValid, tankValid, lightValid, battVCalValid;
   SystemState state;
   bool  woActive;
+  uint32_t pushSeq;     // the newest fbRequestPush() this snapshot was taken after (see fbPushSeq)
   bool  valid;
 };
 TelemetrySnapshot telem = {};
@@ -1116,9 +1430,17 @@ WebEvent      webEvt[WEB_EVT_N] = {};
 uint8_t       webEvtHead = 0;        // next slot to write
 uint8_t       webEvtCount = 0;       // entries filled (saturates at WEB_EVT_N)
 portMUX_TYPE  evtMux = portMUX_INITIALIZER_UNLOCKED;
-// Set when an event the operator should not wait for lands (fault / rejection). netTask uses it as
+// Raised when an event the operator should not wait for lands (fault / rejection). netTask uses it as
 // an extra upload trigger so an error surfaces in seconds instead of at the next 60 s tick.
-volatile bool fbPushNow = false;
+// A counter, not a flag (2026-11-05). The upload reads the telemetry snapshot, which telemetryCollect()
+// refreshes only once a second, so a push sent the moment the flag was seen could carry the state from
+// BEFORE the event that asked for it -- and the next regular upload is a minute away. Seen on the host
+// build: a held FLOW_FAIL took 45 s to reach the dashboard, an LCD take-over of manual mode 15 s. Core 1
+// numbers every request, each snapshot records the newest number already raised when it was taken, and
+// netTask pushes only a snapshot that includes the request. A counter also cannot lose a request the way
+// netTask clearing a shared flag could, when a new one landed between its check and its clear.
+volatile uint32_t fbPushSeq = 0;                     // written by core 1 only
+static inline void fbRequestPush() { fbPushSeq++; }  // core 1 only
 
 /* ---- Web manual-mode hold ------------------------------------------------- *
  * While the dashboard's Manual/Test tab is open it holds the rig out of automatic, so a scheduled
@@ -1203,6 +1525,23 @@ float    secOffsetA = SEC_CURRENT_OFFSET_A, secBusFactor = SEC_BUS_V_FACTOR;
 bool     secInvert = SEC_INVERT_CURRENT;
 bool  secInaOk = false, secHaveV = false;          // monitor answering / have a reading
 float secV = 0, secI = 0, secP = 0;                // filtered V, signed current, power
+// Resting charge (2026-11-17, user: "while charging the level reads higher; the real % shows once the system switches
+// to the 2nd battery"). The pack reads HIGH while the charger pushes current in and LOW while the boards draw from it,
+// by I x the pack's resistance. secRestV = secV + secI x secRint (+ = discharging) is the voltage it would rest at; the %
+// (LCD B2, dashboard) and the 30 % block are worked out from it. secRint is LEARNED at every switch to the secondary:
+// the last reading on main (charging) and the first steady one on the secondary (discharging) are the same charge, so
+// (V before - V after) / (I after - I before) is the resistance (NVS "secR"). Until then SEC_RINT_DEFAULT.
+const float SEC_RINT_DEFAULT = 0.25f, SEC_RINT_MIN = 0.03f, SEC_RINT_MAX = 1.5f;   // ohm               [MEASURE]
+float secRint = SEC_RINT_DEFAULT;
+float secRestV = 0.0f;
+bool  secRintDirty = false;                        // learned on the secondary: saved once back on main
+// Secondary battery charge %, linear between SEC_BATT_EMPTY_V and SEC_BATT_FULL_V (the LCD B2 row and Firebase).
+static int secBattPct(float v) {
+  float p = (v - SEC_BATT_EMPTY_V) * 100.0f / (SEC_BATT_FULL_V - SEC_BATT_EMPTY_V);
+  if (!(p > 0.0f)) p = 0.0f;
+  if (p > 100.0f) p = 100.0f;
+  return (int)roundf(p);
+}
 bool  secLow = false, secCrit = false;             // low latch (hysteresis) / critical
 bool  secNoPack = false;                           // the chip answers but sees no pack: wiring or no common ground
 BkState bkState = BK_IDLE;                         // secondary-as-backup state (see backupTick)
@@ -1212,8 +1551,21 @@ unsigned long bswCutMs = 0;                        // a stop was journaled (bswN
 char  bswCmdSaved[48] = "";                        // dashboard command id on flash while the boards can be reset
 bool  esp2OnSecondary = false;                     // ESP2 reported INFO,BATT,SECONDARY (boards isolated)
 unsigned long esp2BattWaitUntil = 0;               // ESP2 power-off held for the secondary->main return
-uint8_t  bswPendingDir = 0;        // ESP2 announced a P4 switch not yet confirmed (1 to secondary, 2 to main)
+uint8_t  bswPendingDir = 0;        // ESP2 announced a P0 switch not yet confirmed (1 to secondary, 2 to main)
 unsigned long bswPendingMs = 0;
+// "Did anything reboot in the switch?" (2026-11-16, see INFO,BATT,VERIFY). ESP2 only turns the inverter on
+// after BATTSW,OK: ESP1 still running since it said GO, and the Nano answered after the switch without a BOOT.
+unsigned long bswGoMs = 0;         // when this boot answered BATTSW,GO (~ when P0 moved); 0 = never this boot
+uint8_t       bswGoDir = 0;        // its direction (1 to secondary, 2 to main)
+unsigned long bswVerifyStartMs = 0;  // ESP2 asked INFO,BATT,VERIFY (0 = no verification running)
+const char   *bswVerdict = nullptr;  // "OK" or the reason; re-sent on every repeat of VERIFY
+unsigned long nanoBootMs = 0;      // last STATUS,NANO,BOOT (the Nano restarted)
+// 2026-11-16 (run buffers): 1.5 s -> 3 s. The Nano may be inside one NPK read (NPK_RESPONSE_TIMEOUT_MS = 1 s) when
+// FAST arrives, then needs two pings and ~50 ms of link: ~1.3 s worst case left 0.2 s of margin, and a miss ends the
+// pump start as BATT_SWITCH_FAIL|NANO_SILENT. A real Nano reset is still caught by its BOOT line (NANO_RESET).
+// ESP2's BATT_VERIFY_MS (5 s) must stay longer than this.
+const unsigned long BSW_VERIFY_NANO_MS      = 3000;    // the Nano must answer FAST within this after VERIFY
+const unsigned long BSW_NANO_BOOT_WINDOW_MS = 30000;   // a Nano BOOT this soon after a switch = a switch reset
 volatile unsigned long battQuietUntilMs = 0;   // quiet window end (core 1 writes, core 0 reads; 0 = none)
 bool     bswLatched = false;       // battery-switch fault latched: no inverter use until cleared
 uint8_t  bswStrikes = 0;           // switch-caused resets in the current window
@@ -1221,6 +1573,9 @@ uint32_t bswLastStrikeT = 0;       // RTC unix time of the last strike (0 = unkn
 unsigned long bswLastStrikeMs = 0; // millis() of the last strike counted THIS boot (report dedupe)
 bool     bswBootStruck = false;    // this boot already counted ESP1's own switch reset: ESP2's report of
                                    // the same event (it was cut by our boot) must not count again
+// A run was lost in a way that can leave ESP2's saved tank volume too low, so the next fill could overfill.
+// No run starts until the operator has looked at the tank and confirmed. Kept in NVS across reboots.
+volatile bool tankCheckNeeded = false;
 static inline bool battQuietActive() {
   unsigned long u = battQuietUntilMs;
   return u != 0 && (long)(millis() - u) < 0;
@@ -1236,9 +1591,39 @@ uint16_t faultsToday[3] = { 0, 0, 0 };   // CRIT, MAJ, MIN
 uint16_t nanoResetsToday = 0;
 float    waterUsedToday[NUM_COLUMNS]    = { 0 };
 float    nutrientUsedToday[NUM_COLUMNS] = { 0 };
+// Runs that reached each column today, and how many of them added nutrients (2026-11-06, asked for by the project
+// owner for the website's column cards). Kept in NVS with the litres and mL above and the day they belong to, so a
+// restart in the middle of the day no longer zeroes today's totals (the STATUS SMS reads them too).
+uint8_t  wateringsToday[NUM_COLUMNS] = { 0 };
+uint8_t  feedingsToday[NUM_COLUMNS]  = { 0 };
 bool     reportSentToday = false;
 bool     nanoDailyResetDone = false;
 long     currentDayStamp = -1;
+
+// NVS: "tdd" = the day stored; per column "c<n>tw" litres, "c<n>tn" nutrient mL, "c<n>tr" runs, "c<n>tf" feedings.
+// Written once per finished run, so a few times a day.
+static void saveDayTotals() {
+  if (currentDayStamp < 0) return;                 // no clock: today unknown, nothing worth keeping
+  prefs.putLong("tdd", currentDayStamp);
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    String k = String("c") + c;
+    prefs.putFloat((k + "tw").c_str(), waterUsedToday[c]);
+    prefs.putFloat((k + "tn").c_str(), nutrientUsedToday[c]);
+    prefs.putUChar((k + "tr").c_str(), wateringsToday[c]);
+    prefs.putUChar((k + "tf").c_str(), feedingsToday[c]);
+  }
+}
+// After a restart: today's totals come back if they were saved today; anything older stays zero.
+static void restoreDayTotals(long day) {
+  if (day < 0 || prefs.getLong("tdd", -1) != day) return;
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    String k = String("c") + c;
+    waterUsedToday[c]    = prefs.getFloat((k + "tw").c_str(), 0.0f);
+    nutrientUsedToday[c] = prefs.getFloat((k + "tn").c_str(), 0.0f);
+    wateringsToday[c]    = prefs.getUChar((k + "tr").c_str(), 0);
+    feedingsToday[c]     = prefs.getUChar((k + "tf").c_str(), 0);
+  }
+}
 
 /* ---- Logging buffer ------------------------------------------------------ */
 String   logBuf;
@@ -1286,6 +1671,7 @@ String   sumErrCode[SUM_MAX_ERRORS]; String sumErrTs[SUM_MAX_ERRORS]; uint8_t su
 /* ---- Paced report streaming (build once, emit one segment per tick) -------- */
 String   sumReport = "";                   // full assembled report text
 int      sumSegIdx = 0, sumSegTotal = 0;   // segment cursor / count
+int      sumPos = 0;                        // where the next page starts in sumReport (pages end at line breaks)
 
 /* ---- LCD UI -------------------------------------------------------------- */
 enum LcdPage { PAGE_HOME, PAGE_SENSORS, PAGE_COLUMNS, PAGE_POWER, PAGE_GSM, PAGE_FAULT, PAGE_COUNT };
@@ -1326,14 +1712,17 @@ void setActuationsEnabled(bool on, const char *why);
 // Settings on a locked-out rig, "Enable Actuations" is the row already under the cursor. The LCD can
 // only RE-ENABLE, never disable: a stray button press must not be able to take the farm offline, so
 // disabling stays a deliberate web/SMS action. See setRowVisible/setRowAt.
-enum SetItem { SET_ENABLE, SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_EXERCISE, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_BATTSW, SET_EXIT, SET_COUNT };
+enum SetItem { SET_ENABLE, SET_CLOCK, SET_SCHEDULE, SET_COLMODE, SET_PRESET, SET_THRESH, SET_ACVOLT, SET_ACAMP, SET_EXERCISE, SET_FORCE, SET_CALIB, SET_DIAG, SET_TESTING, SET_WIFI, SET_SOFTAP, SET_RESTORE, SET_LOCK, SET_RESET, SET_BATTSW, SET_TANKCHK, SET_EXIT, SET_COUNT };
 // SET_WIFI and SET_SOFTAP show a live [ON]/[OFF] suffix via setRowLabel(); their base names here are placeholders.
-const char *SET_NAMES[SET_COUNT] = { "Enable Actuations", "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "Pump Exercise", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Batt Switch", "Exit" };
+const char *SET_NAMES[SET_COUNT] = { "Enable Actuations", "Set Clock", "Schedule", "Column Mode", "Preset", "Thresholds", "AC Voltage", "AC Current", "Pump Exercise", "Force Run", "Calibration", "Sensor Diag", "Testing", "WiFi", "Setup AP", "Restore Defaults", "Lock Screen", "Reboot ESP1", "Batt Switch", "TankCheck >confirm", "Exit" };
 // Row visibility + position<->item mapping, so the windowed 3-row render and the UP/DOWN wrap both
 // operate on what is actually on screen rather than on the raw enum.
 static bool setRowVisible(int i)  {
   if (i == SET_ENABLE) return actuationsDisabled;
-  if (i == SET_BATTSW) return SECONDARY_BATT_ENABLED || bswLatched;   // only when switching exists
+  // 2026-11-16 (user): the switch's OK status lives on the LCD Power page only. The row shows up here just when a
+  // latched switch fault needs clearing -- the one action it carries.
+  if (i == SET_BATTSW) return bswLatched;
+  if (i == SET_TANKCHK) return tankCheckNeeded;                       // only when there is something to confirm
   return true;
 }
 static int  setRowCount()         { int k = 0; for (int i = 0; i < SET_COUNT; i++) if (setRowVisible(i)) k++; return k; }
@@ -1371,6 +1760,8 @@ ForceSeq fcSeq[2] = { { 20, {0,0,0}, 30, 0 }, { 20, {0,0,0}, 30, 0 } };  // slot
 uint8_t  fcMode  = 0;        // 0=A  1=B  2=AB-together  3=A-then-B
 uint8_t  fcField = 0;        // editor cursor (0 = mode, then 5 per active slot)
 const char *FC_MODE_NAMES[4] = { "Col A", "Col B", "A+B together", "A then B" };
+// The columns a Force Run mode waters (bit 0 = A, bit 1 = B).
+static inline uint8_t fcModeColumns(uint8_t mode) { return (mode == 0) ? 0b001 : (mode == 1) ? 0b010 : 0b011; }
 // Editor steps. handleButtons is edge-triggered (no hold-repeat), so every press is one step --
 // these are coarse on purpose to keep a full entry to a sane number of presses.
 const uint16_t FC_STEP_DL = 5, FC_STEP_ML = 25, FC_STEP_DELAY = 10;
@@ -1418,31 +1809,97 @@ const unsigned long FAULT_REPROMPT_MS = 120000;     // 2 minutes, per the operat
 // Remote SMS config-write deferral while a local edit is open (companion spec §B.3.1).
 String pendingCfgSms = "";   // queued config SMS, applied when the local edit exits
 // Testing submenu: PCF8575 OUT_* bit -> short name (MUST match ESP2 OUT_* numbering)
+// P0 = 2nd-battery select, P5/P11/P12 = spares, P6 = column C valve (rewired 2026-11-15). Nutrient A = P1 and
+// nutrient B = P7 since 2026-11-16 (swapped the same day) (user: the P11/P12 relays did not run them). The pumps have no relays: AC on the
+// old pump-relay contacts upset every flow sensor; they are picked by the Nano D3 servo and run only through the Fill / Push
+// combos. "Inverter": bare P2 relay, allowed by user override (2026-11-15) -- it runs whichever pump the servo is on.
 const char *TEST_NAMES[16] = {
-  "Spare P0", "Col A Vlv", "Col B Vlv", "Col C Vlv", "Batt->2nd", "Inverter",
-  "Transfer", "Booster", "Mixer", "Nut A", "Nut B", "Nut C", "Nut D",
+  "Batt->2nd", "Nut A", "Inverter", "Col A Vlv", "Col B Vlv", "Spare P5", "Col C Vlv",
+  "Nut B", "Mixer", "Spare P11", "Spare P12", "Nut C", "Nut D",
   "pH Up", "pH Down", "Mast Cutoff"
 };
 int  testSel   = 0;          // selected component row
 int  testOnBit = -1;         // which bit is currently ON (-1 = none)
 unsigned long testBlockedUntilMs = 0;   // header shows the secondary-battery refusal until this
-// Testing rows: 16 single relays (0..15) + Fill combo (16) + one Push>Col combo per column (17+c).
-// These extra indices double as the TEST,HOLD value; ESP2 treats idx>15 as a valve+pump priming combo.
+// Re-arm gap (user, 2026-11-17): once a Testing or Calibration button that ran something is released, the next press
+// is ignored for ACT_REARM_MS -- pressing again and again switched the relay bank and the master cut-off (P17) so fast
+// that the PCF8575 faulted. The press must be made again after the gap. ESP2 keeps the same gap (TEST/PRIME_REARM_MS).
+const unsigned long ACT_REARM_MS = 1500;
+unsigned long actRearmUntilMs = 0;
+unsigned long actWaitMsgUntilMs = 0;    // the Testing header says "too fast" until this
+static inline bool actRearmWaiting() { return (long)(actRearmUntilMs - millis()) > 0; }
+static inline void actRearmStart()   { actRearmUntilMs = millis() + ACT_REARM_MS; }
+// Hold-to-run buttons (Testing rows, the tank-litres pumps, hold-to-prime): a RELEASE counts only after the button has
+// been up for BTN_RELEASE_MS (2026-11-17). Read raw, a one-pass blip -- contact bounce, or the noise a relay coil or the
+// inverter makes as it switches -- ended the hold, and the re-arm gap then refused the press still being held.
+const unsigned long BTN_RELEASE_MS = 120;
+struct HoldBtn { bool held; unsigned long upSinceMs; };
+static bool holdBtnRead(HoldBtn &b, uint8_t pin) {
+  bool down = (digitalRead(pin) == LOW);
+  unsigned long now = millis();
+  if (down) { b.held = true; b.upSinceMs = 0; }
+  else if (b.held) {
+    if (b.upSinceMs == 0) b.upSinceMs = nzMs(now);
+    if (now - b.upSinceMs >= BTN_RELEASE_MS) b.held = false;
+  }
+  return b.held;
+}
+unsigned long testUseComboUntilMs = 0;  // header: an older ESP2 refused the bare Inverter row (use Fill / Push)
+// Header: a Testing servo/Fill/Push step failed (SERVO_FAIL,TEST|<why>). raiseFault() is silent in TEST_MODE,
+// so without this the operator saw nothing at all when the selector did not move.
+unsigned long testServoFailUntilMs = 0;
+bool          testServoFailAcLive  = false;   // the reason was AC still live (not the Nano link)
+bool          testBattSwitchFail   = false;   // it was the battery switch (BATT_SWITCH_FAIL), not the servo
+bool          testInverterNoAc     = false;   // the inverter gave no voltage within 6 s (INVERTER_FAIL)
+// Testing rows: 16 single relays (0..15) + Fill combo (16) + one Push>Col combo per column (17+c)
+// + the two pump-selector servo rows (20 = Servo>Transfer, 21 = Servo>Booster; 2026-11-15). These extra
+// indices double as the TEST,HOLD value; ESP2 treats idx>15 as a combo. The servo rows only MOVE the
+// selector (ESP2 runs the inverter-off/dead-check path and leaves the inverter OFF) and answer
+// TEST,SERVO,<pump>,OK. The Mixer combo (TEST_ROWS = 22) is dashboard-only, not on the LCD list.
+// MUST match ESP2's testComboOn() and pure_math.h's pulseRowForTarget().
 const int TEST_FILL_ROW = 16;
-const int TEST_ROWS = 16 + 1 + NUM_COLUMNS;        // = 20
+const int TEST_SERVO_L_ROW = 17 + NUM_COLUMNS;    // = 20: servo to the transfer pump (LEFT)
+const int TEST_SERVO_R_ROW = 18 + NUM_COLUMNS;    // = 21: servo to the booster pump (RIGHT)
+const int TEST_ROWS = 16 + 1 + NUM_COLUMNS + 2;    // = 22
+int  testServoDoneRow = -1;    // servo row whose move ESP2 confirmed (TEST,SERVO,..,OK) -- LCD [OK], pulse result
 
 /* ---- Calibration UI (companion spec §A) ---------------------------------- */
-enum CalKind { CK_SOIL, CK_PH, CK_EC, CK_ACS, CK_LEVEL_RES, CK_LEVEL_MIX, CK_FLOW, CK_OFFSET, CK_NPK, CK_FLOW_RES };
+enum CalKind { CK_SOIL, CK_PH, CK_EC, CK_ACS, CK_LEVEL_RES, CK_LEVEL_MIX, CK_FLOW, CK_OFFSET, CK_NPK, CK_FLOW_RES,
+               CK_VOL_MIX, CK_VOL_RES,     // web v.4: "level -> litres" points per tank (shared/tank_volume.h)
+               CK_RATE,                    // 2026-11-17: a pump's constant flow rate, measured by hand and typed in
+               CK_PEST };                  // 2026-11-17: run a water pump for N s, weigh it, >= 5 tries -> its line
 struct CalTgt { const char *name; const char *id; uint8_t kind; int col; };
 const CalTgt CAL_TGTS[] = {
-  { "Soil A",      "SOIL_A",      CK_SOIL,      0 },
-  { "Soil B",      "SOIL_B",      CK_SOIL,      1 },
-  { "Soil C",      "SOIL_C",      CK_SOIL,      2 },
+  // One row per capacitive probe (2026-11-16): WET (in water) is locked first, then DRY. The probe number is
+  // the id's last digit; the Nano streams that single channel (SOIL_A1 = pin A0 ... SOIL_C2 = pin A7).
+  { "Soil A1 pin A0", "SOIL_A1",  CK_SOIL,      0 },
+  { "Soil A2 pin A1", "SOIL_A2",  CK_SOIL,      0 },
+  { "Soil B1 pin A2", "SOIL_B1",  CK_SOIL,      1 },
+  { "Soil B2 pin A3", "SOIL_B2",  CK_SOIL,      1 },
+  { "Soil C1 pin A6", "SOIL_C1",  CK_SOIL,      2 },
+  { "Soil C2 pin A7", "SOIL_C2",  CK_SOIL,      2 },
   { "pH (7 then 4)", "PH",        CK_PH,       -1 },
   { "EC (0 then std)", "EC",      CK_EC,       -1 },
   { "ACS712 zero", "ACS712",      CK_ACS,      -1 },
   { "Ultra Res empty", "ULTRA_RES", CK_LEVEL_RES, -1 },
   { "Ultra Mix empty", "ULTRA_MIX", CK_LEVEL_MIX, -1 },
+  // web v.4 (pure ultrasonic): lock the water level, type the litres really in the tank. Up to 8 points per tank;
+  // the tank's cone shape fills in between. Mix: hold UP = transfer pump in, hold DOWN = booster out to column A.
+  { "Tank Mix liters", "ULTRA_MIX", CK_VOL_MIX,   -1 },
+  { "Tank Res liters", "ULTRA_RES", CK_VOL_RES,   -1 },
+  // 2026-11-17 (user): each pump's constant flow rate, measured by hand (a bucket and a stopwatch) and typed in.
+  // ESP2 uses rate x run time as an estimate of its own beside the ultrasonics (water) or the flow meter (doses).
+  // col = which pump: 0 transfer, 1 booster (L/min), 2..4 nutrient A..C (mL/min). Nothing streams for these.
+  { "Rate Transfer",  "RATE_XFER",  CK_RATE,      0 },
+  { "Rate Booster",   "RATE_BOOST", CK_RATE,      1 },
+  { "Rate Nut A",     "RATE_NUTA",  CK_RATE,      2 },
+  { "Rate Nut B",     "RATE_NUTB",  CK_RATE,      3 },
+  { "Rate Nut C",     "RATE_NUTC",  CK_RATE,      4 },
+  // 2026-11-17 (user): run the transfer (col 0) or the booster (col 1) for a chosen number of seconds, timed by ESP2
+  // from the inverter switch-on, weigh the water and type the grams; at least 5 tries give the pump's line (rate +
+  // start litres). Until then the user's own readings of 17 Nov are the line (shared/pump_line.h).
+  { "Transfer pump est", "PEST_XFER",  CK_PEST,   0 },
+  { "Booster pump est",  "PEST_BOOST", CK_PEST,   1 },
   { "Flow Reservoir", "FLOW",      CK_FLOW_RES,  -1 },   // Nano fill-flow: manual run, scale cal
   { "Temp offset", "DHT_T",       CK_OFFSET,    0 },   // col selects tOff/hOff/lOff (0/1/2)
   { "Hum offset",  "DHT_H",       CK_OFFSET,    1 },
@@ -1450,11 +1907,17 @@ const CalTgt CAL_TGTS[] = {
   { "NPK trim A",  "NPK_A",       CK_NPK,       0 },
   { "NPK trim B",  "NPK_B",       CK_NPK,       1 },
   { "NPK trim C",  "NPK_C",       CK_NPK,       2 },
-  { "Flow ResMix", "FLOW_RESMIX", CK_FLOW,     -1 },
-  { "Flow MixIrr", "FLOW_MIXIRR", CK_FLOW,     -1 },
+  // ("Flow ResMix" / "Flow MixIrr" removed in web v.4: the main-line meters are no longer used.)
   { "Flow Nut A",  "FLOW_NUTA",   CK_FLOW,      0 },
   { "Flow Nut B",  "FLOW_NUTB",   CK_FLOW,      1 },
   { "Flow Nut C",  "FLOW_NUTC",   CK_FLOW,      2 },
+  // 2026-11-16 (owner's request, overriding "Nut D unused"): the three meters ESP2 already counts but that had no
+  // LCD calibration, so calKNutD/calKPhUp/calKPhDn (NVS kND/kPU/kPD) could never be set. Same 3-run dead-man flow
+  // cal as Nut A-C; ESP2 already accepts CAL_START/PRIME_START/SET_CAL for them. Their K only converts pulses to
+  // volume on ESP1 (pulseKForRow: Testing/website pulse results); no automated sequence doses with them.
+  { "Flow Nut D",  "FLOW_NUTD",   CK_FLOW,     -1 },
+  { "Flow pH Up",  "FLOW_PHUP",   CK_FLOW,     -1 },
+  { "Flow pH Down","FLOW_PHDN",   CK_FLOW,     -1 },
 };
 const int CAL_TGT_COUNT = sizeof(CAL_TGTS) / sizeof(CAL_TGTS[0]);
 int   calSel = 0;            // selected target in the list
@@ -1468,6 +1931,107 @@ bool  calEnterWasDown = false;    // edge tracking for the flow dead-man
 float calKRuns[3] = { 0, 0, 0 };
 int   calRunIdx = 0;
 float calNpkEdit[3] = { 0, 0, 0 };   // N/P/K offsets being edited in the NPK trim screen
+// Pump rates (CK_RATE, 2026-11-17). Transfer / booster in L/min, kept in NVS "rXfer" / "rBoost"; 0 = not measured
+// (ESP2 then meters on the levels alone and uses its default rates for caps and timers). The nutrient rates are
+// PUMP_FLOWRATE_MLPM (NVS "pumpA".."pumpC", shared with the bench tools); pumpRateSet = one was really measured.
+// Accepted ranges MUST match ESP2 (RATE_LPM_* / RATE_MLPM_*): out of range there refuses the whole SET_CAL.
+const float RATE_LPM_MIN  = 0.5f, RATE_LPM_MAX  = 60.0f;
+const float RATE_MLPM_MIN = 1.0f, RATE_MLPM_MAX = 5000.0f;
+float calRateXfer = 0.0f, calRateBoost = 0.0f;
+bool  pumpRateSet[3] = { false, false, false };
+float rateSeen[5] = { -1.0f, -1.0f, -1.0f, -1.0f, -1.0f };   // last INFO,PUMP_RATE "seen" per pump (-1 = none yet)
+bool  calRatePushOk = false;         // the saved rate reached ESP2 (else it gets it at its next power-up)
+// Pump lines (CK_PEST, 2026-11-17): litres = start + rate x seconds from the inverter switch-on. The rate is the Rate
+// Transfer / Rate Booster value above; the start litres are kept here (NVS "xStartL" / "bStartL", NAN = not measured).
+// Not measured -> the user's readings (plDef*, fitted at boot from shared/pump_line.h).
+PlFit plDefXfer  = { false, 0.0f, 0.0f, 0 }, plDefBoost = { false, 0.0f, 0.0f, 0 };
+float calXferStartL = NAN, calBoostStartL = NAN;
+// The estimate screens' tries and state (see pestButton).
+const int     PEST_SECS_MIN = 3, PEST_SECS_MAX = 60;
+const uint8_t PEST_MAX_TRIES = 10;
+float   pestT[PEST_MAX_TRIES], pestV[PEST_MAX_TRIES];   // seconds from the switch-on, litres weighed
+uint8_t pestN = 0;
+int     pestSecs = 10, pestCol = 0, pestGrams = 0;
+bool    pestRunning = false, pestReseat = false, pestPushOk = false;
+unsigned long pestStartMs = 0, pestKeepMs = 0;
+unsigned long pestInvOnMs = 0;                 // ESP2's INFO,INV_ON for this run: the counter starts here (0 = not yet)
+long    pestRanMs = -1;                        // ESP2's run time from the switch-on (-1 = none yet)
+PlFit   pestFit = { false, 0.0f, 0.0f, 0 };
+static float pestRate(bool xfer) {
+  float typed = xfer ? calRateXfer : calRateBoost;
+  if (typed > 0.0f) return typed;
+  return xfer ? plDefXfer.rateLpm : plDefBoost.rateLpm;
+}
+static float pestStart(bool xfer) {
+  float s = xfer ? calXferStartL : calBoostStartL;
+  if (isfinite(s)) return s;
+  return xfer ? plDefXfer.startL : plDefBoost.startL;
+}
+static String rateNutWire() {        // SET_CAL,NRATE payload: 0 = not measured
+  String s;
+  for (int i = 0; i < 3; i++) s += String(pumpRateSet[i] ? PUMP_FLOWRATE_MLPM[i] : 0.0f, 1) + (i < 2 ? "," : "");
+  return s;
+}
+static String rateWaterWire() { return String(calRateXfer, 2) + "," + String(calRateBoost, 2); }
+// Tank litres capture (CK_VOL_*): the level is locked as the median of the last few streamed raw cm, and only
+// when they agree (a moving or rippling surface is refused) -- the same idea as the soil steadiness window.
+const int   VOL_CAL_WIN = 7;
+const int   VOL_CAL_MIN_SAMPLES = 5;
+const float VOL_CAL_STEADY_CM = 0.6f;      // max - min of the window                             [MEASURE]
+float volCalRing[VOL_CAL_WIN];
+int   volCalN = 0, volCalIdx = 0;
+float volCalLockCm = 0;                    // the locked (temperature-corrected) distance
+float volCalLockH = 0;                     // its height above the 0 % level
+const float VOL_CAL_STEP_L = 0.1f;         // UP/DOWN step when typing the litres (held = x10 after 1.5 s)
+unsigned long volCalHeldSinceMs = 0;
+int   volCalHeldBtn = -1;                  // the UP/DOWN button pressed in the litres step (auto-repeat)
+unsigned long volCalRepeatMs = 0;
+bool  volCalPumpWasOn = false;             // Mix target, step 0: a hold-to-run pump is going
+static void volCalReset() { volCalN = 0; volCalIdx = 0; }
+static void volCalPush(float cm) {
+  if (!(cm >= 0.0f)) return;
+  volCalRing[volCalIdx] = cm; volCalIdx = (volCalIdx + 1) % VOL_CAL_WIN;
+  if (volCalN < VOL_CAL_WIN) volCalN++;
+}
+// The window's median (what ENTER locks), its spread, and whether it is steady. False with too few samples.
+static bool volCalStats(float *med, float *lo, float *hi, bool *steady) {
+  if (volCalN < 1) return false;
+  float s[VOL_CAL_WIN];
+  for (int i = 0; i < volCalN; i++) s[i] = volCalRing[i];
+  for (int i = 1; i < volCalN; i++) { float x = s[i]; int j = i - 1; while (j >= 0 && s[j] > x) { s[j + 1] = s[j]; j--; } s[j + 1] = x; }
+  *med = (volCalN & 1) ? s[volCalN / 2] : 0.5f * (s[volCalN / 2 - 1] + s[volCalN / 2]);
+  *lo = s[0]; *hi = s[volCalN - 1];
+  *steady = volCalN >= VOL_CAL_MIN_SAMPLES && (*hi - *lo) <= VOL_CAL_STEADY_CM;
+  return true;
+}
+
+/* ---- Ultrasonic reading -> control value (web v.4) ------------------------ */
+// Speed-of-sound correction with the Nano's air temperature (tank_volume.h). No valid temperature = raw.
+static float ultraCorrectCm(float rawCm) {
+#if ULTRA_TEMP_COMP
+  if (sensor.envValid && sensor.msEnv != 0) return tvTempCorrectCm(rawCm, sensor.temp, ULTRA_TEMP_REF_C);
+#endif
+  return rawCm;
+}
+// Usable for CONTROL: a real echo, inside the tank (past the sensor's dead zone, not far beyond the empty
+// level), pings that agree (spread within ULTRA_MAX_SPREAD_CM; -1 = an older Nano that does not send it --
+// the web v.4 Nano sends -1 only together with a -1 distance), and a geometry that gives litres.
+// Why a tank reading is not used for control, for the log (2026-11-17): "ok" when it is.
+static const char *ultraWhy(bool invalid, float cm, float spreadCm, float emptyCm, float liters, char st) {
+  if (invalid) return "no_reading";
+  if (st != '?' && st != 'K') return st == 'E' ? "status_E_no_echo" : st == 'S' ? "status_S_stuck" : st == 'R' ? "status_R_range"
+                                   : st == 'F' ? "status_F_few_pings" : "status_X_not_pinging";
+  if (!(cm >= ULTRA_MIN_CM)) return "too_close";
+  if (cm > emptyCm + ULTRA_MAX_OVER_EMPTY_CM) return "beyond_empty";
+  if (spreadCm > ULTRA_MAX_SPREAD_CM) return "pings_spread";
+  if (!(liters >= 0.0f)) return "no_litres_geometry";
+  return "ok";
+}
+static bool ultraUsable(bool invalid, float cm, float spreadCm, float emptyCm, float liters) {
+  if (invalid || !(cm >= ULTRA_MIN_CM) || cm > emptyCm + ULTRA_MAX_OVER_EMPTY_CM) return false;
+  if (spreadCm > ULTRA_MAX_SPREAD_CM) return false;
+  return liters >= 0.0f;
+}
 const unsigned long CAL_STALE_MS = 2500;   // raw sample considered stale after this
 const float CAL_OUTLIER_PCT = 8.0f;        // 3-run K disagreement tolerance [TBD]
 const float EC_STD_MSCM = 1.413f;          // EC calibration standard solution [TBD]
@@ -1486,7 +2050,9 @@ uint8_t diagPage = 0;
 // the values in engineering units at a readable size -- the raw registers are on the web page.
 const uint8_t DIAG_PAGES = 12;
 const uint8_t DIAG_NPK_FIRST = 4;          // first per-column NPK detail page
-const unsigned long NANO_STALE_MS = 90000; // a Nano sensor is "stale" after this (~2x the active TX interval)
+// A Nano sensor is "stale" after this. Matches the silence alarm: the Nano sends TANK and SOIL at most every
+// 120 s by night and ESP1 misses frames, so 90 s blocked the scheduler on a healthy link (decision D5).
+const unsigned long NANO_STALE_MS = NANO_SILENCE_TIMEOUT_MS;
 float         diagEsp2Raw[DIAG_ESP2_N];
 bool          diagEsp2Valid[DIAG_ESP2_N];
 unsigned long diagEsp2Ms[DIAG_ESP2_N];
@@ -1554,8 +2120,66 @@ String        ctrlReason[NUM_COLUMNS];
 unsigned long ctrlReasonMs[NUM_COLUMNS] = { 0 };
 
 /* ---- Nano interval pacing (A2: ACTIVE / DAY / NIGHT, sent only on change) -- */
-enum NanoPace { PACE_NONE, PACE_ACTIVE, PACE_DAY, PACE_NIGHT };
+enum NanoPace { PACE_NONE, PACE_ACTIVE, PACE_DAY, PACE_NIGHT, PACE_FAST };
 NanoPace lastNanoPace = PACE_NONE;
+
+/* ---- Pump-selector servo relay + FAST level watch (2026-11-15) ------------- *
+ * The transfer/booster pumps lost their relays: ESP2 selects one with the Nano's D3 servo (LEFT = transfer,
+ * RIGHT = booster) while its inverter is OFF, then turns the inverter on. ESP2 cannot reach the Nano, so:
+ *   ESP2 SERVO_REQ,<pump>,<seq> -> here -> Nano SERVO,<side>,<seq>,*CRC (resent until OK, or FAIL)
+ *   Nano SERVO,<side>,OK,<seq>  -> here -> ESP2 SERVO,<pump>,OK,<seq>
+ *   ESP2 PUMP,<pump>,ON .. PUMP,OFF: the Nano runs FAST (TANK ~3 Hz) and every valid TANK is relayed to
+ *   ESP2 as LEVEL,<mix%>,<res%> -- ESP2 stops a fill at its overflow limit and holds a blind fill.
+ * ESP1 adds its own last line: mix >= MIX_HIGHHIGH_PCT on MIX_HIGHHIGH_COUNT readings while the transfer
+ * pump is still on after MIX_HIGHHIGH_GRACE_MS = ESP2 did not stop it -> Critical MIX_OVERFLOW (E-stop,
+ * which also cuts ESP2's power and with it the whole relay bank).                                       */
+bool          levelWatch = false;          // an AC pump is powered (PUMP,<p>,ON .. PUMP,OFF)
+bool          levelWatchTransfer = false;  // ... and it is the transfer pump (filling the mixing tank)
+unsigned long levelWatchSinceMs = 0;
+// web v.4: ESP2's LEVEL_FEED lease -- relay the levels (and keep the Nano FAST) with no pump on as well, for the
+// whole of a run: ESP2 takes a settled baseline before every fill and delivery. 0 = no lease.
+unsigned long levelFeedUntilMs = 0;
+// Litres the Nano's reservoir flow meter has counted INTO the reservoir since boot (web v.4, 2026-11-16). Sent
+// with every LEVEL: ESP2 meters a fill on the reservoir's drop, and water poured in during it would otherwise
+// read as "less transferred". Integrated from each TANK's L/min over the gap since the previous TANK.
+float resInflowL = 0.0f;
+unsigned long resInflowMs = 0;
+const unsigned long RES_INFLOW_MAX_GAP_MS = 10000;   // a longer gap is not integrated (unknown flow meanwhile)
+const unsigned long LEVEL_FEED_LEASE_MS = 12000;   // ESP2 renews every 4 s
+static inline bool levelFeedActive() { return levelFeedUntilMs != 0 && (long)(levelFeedUntilMs - millis()) > 0; }
+// Is the LEVEL relay running (a pump on, or a feed lease)? The Nano is then FAST and must not be reset.
+static inline bool levelRelayActive() { return levelWatch || levelFeedActive(); }
+bool          servoReqActive = false;      // a SERVO_REQ is being carried to the Nano
+String        servoReqPump = "", servoReqSeq = "";
+unsigned long servoReqStartMs = 0, servoReqSentMs = 0;
+// 2026-11-16 (run buffers): the last Nano OK relayed to ESP2. Between it and PUMP,ON (SERVO_POST_MS + the inverter
+// confirm, up to INV_CONFIRM_MAX_MS) neither the level relay nor servoReqActive is true, so nanoPaceTick() used to drop
+// the Nano back to ACTIVE for those seconds and send FAST again at PUMP,ON. FAST is kept through that bridge now.
+unsigned long servoOkRelayMs = 0;
+const unsigned long SERVO_TO_PUMP_FAST_MS = 20000;   // > SERVO_POST_MS + INV_CONFIRM_MAX_MS, with margin
+// Where the selector is, for the website's pump-selector switch (2026-11-16): the side the Nano last confirmed
+// (SERVO,<side>,OK), for any move -- a run's, a Testing row's or the website's. NVS "svside" keeps it over an
+// ESP1 restart; the Nano keeps its own copy in EEPROM, and only ESP1 ever sends it a move. It is the commanded
+// side the Nano drove the servo to: a lever that did not follow shows up as SERVO_MISMATCH instead.
+const uint8_t SERVO_SIDE_NONE = 0, SERVO_SIDE_TRANSFER = 1, SERVO_SIDE_BOOSTER = 2;
+uint8_t       servoSideNow = SERVO_SIDE_NONE;
+unsigned long servoSideMs  = 0;            // when the Nano confirmed it since this boot (0 = from NVS, or never)
+unsigned long lastFastSentMs = 0;          // FAST is a lease on the Nano: renewed every NANO_FAST_RENEW_MS
+uint8_t       mixHighHighRun = 0;
+unsigned long mixHighHighSinceMs = 0;      // 0 = not over the backstop limit
+unsigned long lastFastTankLogMs = 0;
+bool          nanoResetDeferred = false;   // a Nano RESET_REQ waits until no pump is running
+const unsigned long SERVO_NANO_RETRY_MS  = 1500;   // re-send SERVO to the Nano (lost line / still moving)
+const unsigned long SERVO_NANO_GIVEUP_MS = 8000;   // no OK -> tell ESP2 FAIL (its own limit is 10 s)
+const unsigned long NANO_FAST_RENEW_MS   = 5000;   // the Nano's lease is 15 s
+// 2026-11-16: the steady ACTIVE/DAY/NIGHT pace is re-sent this often even when unchanged. A Nano that reset
+// on its own (WDT/brown-out) boots ACTIVE (10 s) and otherwise stayed there until the next DAY/NIGHT switch.
+const unsigned long NANO_PACE_REFRESH_MS = 1800000UL;
+const unsigned long LEVEL_WATCH_MAX_MS   = 1800000UL;   // a lost PUMP,OFF cannot keep the Nano FAST forever
+const unsigned long FAST_TANK_LOG_MS     = 5000;   // TANK log rows while FAST (3 Hz would flood SD + Supabase)
+const float         MIX_HIGHHIGH_PCT     = 97.0f;  // above ESP2's 90 % stop                        [TBD]
+const uint8_t       MIX_HIGHHIGH_COUNT   = 3;
+const unsigned long MIX_HIGHHIGH_GRACE_MS = 3000;
 
 /* ---- LCD lock (Part D: manual stranger-lock, independent of uiMode) -------- *
  * lcdLocked gates ONLY the buttons + LCD render -- automation still runs because
@@ -1638,7 +2262,11 @@ void rtcHealthTick();
 void loadConfig();
 void loadCal();
 void pushAllCalToEsp2();
+void pushAcVoltToEsp2();
+void setAcVoltWindow(int lo, int hi, const char *src);
+void setAcAmpWindow(int min10, int max10, const char *src);
 bool setCalPushBlocking(const String &id, const String &payload);
+void pestOnDone(const String &arg);
 void saveColumn(int c);
 void saveSchedule(int c);
 void saveColEnable(int c);
@@ -1648,7 +2276,9 @@ void testHoldTick();
 void pollNano();
 bool classifyAndApply(const String &payload, const String &raw);
 void escalateNanoRecovery();
-void sendNanoCommand(const char *cmd);
+void sendNanoCommand(const char *cmd, bool log = true);
+void servoRelayTick();
+void levelWatchStop(const char *why);
 
 void pollESP2();
 void sendWorkOrder(int c, bool fertigate);
@@ -1684,7 +2314,18 @@ void gsmTxTick();
 void gsmBegin();
 void simHealthCheck();
 void handleSms(const String &body);
-void sendSMS(const String &msg);
+void sendSMS(const String &msg);                        // reply/notice -> the sender, else the owner
+void smsAlert(const String &msg);                       // alert -> the owner AND the second alert number
+void smsErr(const char *logCode, const String &msg);    // refused command -> sender; logs SMS_ERR|<logCode>
+void smsFault(char tier, const char *code, const String &rawLoc);   // plain-language fault alert
+void smsSendPages(const String &title, const String &body);         // multi-SMS text, "TITLE i/N" pages
+const int SMS_MAX = 160;                                // one SMS, in GSM-7 septets
+static String smsPlain(const String &raw);
+static String smsClock();
+static String smsDate(long stamp);
+static String smsCol(int c);
+static String smsCut(const String &s, int maxSeptets);
+static String smsFaultText(char tier, const char *code, const String &detail);
 void smsEnqueueSplit(const String &msg, const String &to, uint8_t retries);
 void sendDailyReport();
 void startSummaryJob(SumMode mode, long targetStamp);
@@ -1712,6 +2353,8 @@ void diagStopStream();
 void diagButton(int i);
 void lcdRenderDiag();
 void sendEsp2(const String &body);
+void sendEsp2Quiet(const String &body);
+void sendEsp2KeepAlive(const String &body, bool first);
 void lcdTick();
 void wakeBacklight();
 
@@ -1722,14 +2365,23 @@ void powerTick();
 void secBattTick();
 void powerInaTick();
 bool secBattBlocksAc(const char **why = nullptr);
+const char *secBlockLcd();      // what blocks inverter use, in 20 LCD characters ("" = nothing)
+const char *secBlockTag();      // the same as a log / SMS token
 void bswBoot();
 void bswTick();
+void bswVerifyAnswer();
+static void bswStrike(uint8_t dir, const char *by);
 void bswNoteCut(uint8_t kind, int c, int mode);
 void bswCmdJournal();
 void backupTick();
 bool backupHoldsEsp2();
 const char *bkName(BkState s);
 void bswForgetPending();
+const char *rebootBusyReason();
+void tankCheckSet(const char *why);
+void tankCheckClear(const char *by);
+void tankCheckBoot();
+void tankCheckTick();
 void bswClear(const char *by);
 static void bswSavePending(uint8_t dir);
 static void bswStrike(uint8_t dir, const char *by);
@@ -1864,7 +2516,10 @@ void setup() {
   loadCal();                          // calibration constants (separate namespace, §A.5)
 
   // ---- UART links ----
-  nanoSerial.begin(NANO_BAUD, SWSERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN, false, NANO_RX_BUFFER);
+  nanoSerial.begin(NANO_BAUD, SWSERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN, false, NANO_RX_BUFFER, NANO_RX_ISR_BUFFER);
+  // 1 KB receive buffer for ESP2's lines (2026-11-17; default 256 B = ~0.27 s at 9600 baud): an SD flush, a GSM
+  // exchange or an LCD redraw that stretches one loop pass must not cost a fault line. Kept by esp2ReinitUart().
+  esp2Serial.setRxBufferSize(1024);
   esp2Serial.begin(ESP2_BAUD, SERIAL_8N1, ESP2_RX_PIN, ESP2_TX_PIN);
   gsmBegin();                               // opens UART2; the modem itself comes up from loop()
 
@@ -1885,6 +2540,14 @@ void setup() {
 
   logBuf.reserve(1024);
   logEvent("SYS", "STATE", "BOOT_STATE");
+  // Why this board restarted (2026-11-17: the log had 14 restarts in the afternoon and no way to tell a flash or a
+  // power-up from a crash, a watchdog or a brown-out).
+  { esp_reset_reason_t rr = esp_reset_reason();
+    const char *why = rr == ESP_RST_POWERON ? "POWER_ON" : rr == ESP_RST_EXT ? "EXT_PIN" : rr == ESP_RST_SW ? "SOFTWARE"
+                    : rr == ESP_RST_PANIC ? "PANIC" : rr == ESP_RST_INT_WDT ? "INT_WDT" : rr == ESP_RST_TASK_WDT ? "TASK_WDT"
+                    : rr == ESP_RST_WDT ? "WDT" : rr == ESP_RST_BROWNOUT ? "BROWNOUT" : rr == ESP_RST_DEEPSLEEP ? "DEEPSLEEP"
+                    : "OTHER";
+    logEvent("SYS", "BOOT", String("reason=") + why + "|rr=" + (int)rr); }
 
   // ---- WiFi/ThingSpeak uplink task on core 0 (Part A) ----
   // Started after NVS load so creds are ready. Runs network I/O off the core-1 loop.
@@ -1902,9 +2565,10 @@ void setup() {
   bswBoot();                                // battery-switch latch + was THIS boot caused by a switch?
   wdtSetup();                               // arm task watchdog (core-1 loop only)
   setState(STARTUP_SYNC);
+  tankCheckBoot();                          // was a run live when this boot happened? (after bswBoot)
   if (bswEstopRestore) {                    // an operator or critical stop must not end because it reset us
     logEvent("ESP1", "PWR2", "BATTSW|ESTOP_RESTORED");
-    sendSMS("ALERT,CRIT,ESTOP_KEPT,the stop reset the controllers - confirm on the LCD to resume");
+    smsFault('C', "ESTOP_KEPT", "");
     enterEmergencyStop(false);
   }
   Serial.println(F("Setup complete -> STARTUP_SYNC"));
@@ -1933,12 +2597,14 @@ void loop() {
   g_lastStage = 'P'; powerTick();          // main battery: main INA226, else opto ADC + ACS758
   g_lastStage = 'b'; secBattTick();        // secondary battery: INA226 I2C read + run-block policy
   g_lastStage = 'w'; bswTick();            // battery-switch journal expiry + 24 h auto re-arm
+  tankCheckTick();                         // journal whether a run is live, for tankCheckBoot()
   g_lastStage = 'b'; backupTick();         // secondary as backup for a critical main (compiled out at 0)
   g_lastStage = 'D'; scheduleTick();
   g_lastStage = 'H'; heartbeatTick();
   g_lastStage = 'p'; esp2PowerTick();      // ESP2 min-on hold + periodic idle heartbeat poll (sec.18.8)
   g_lastStage = 'r'; esp2CommRetryTick();  // gentle 20-min retry while ESP2_COMM_LOST is latched (sec.18.9)
-  g_lastStage = 'n'; nanoPaceTick();       // drive Nano ACTIVE/DAY/NIGHT interval (A2)
+  g_lastStage = 'v'; servoRelayTick();     // ESP2 SERVO_REQ -> Nano pump selector; overflow backstop
+  g_lastStage = 'n'; nanoPaceTick();       // drive Nano ACTIVE/DAY/NIGHT/FAST interval (A2)
   g_lastStage = 'd'; deviceHealthTick();   // device-loss watchdog -> daily self-reset (Part C)
   g_lastStage = 'h'; netHealthTick();      // netTask liveness: core 0 has no task watchdog
   g_lastStage = 'w'; webManualTick();      // grant/expire the dashboard's manual-mode hold
@@ -1987,12 +2653,18 @@ void loop() {
   if (fbCredsPersistPending) { fbCredsPersistPending = false; saveFbAuth(); logEvent("ESP1", "CFG", "FBASE|AUTH"); }
   // Manual reboot requested (Settings > Reboot or the SoftAP button). Always run on core 1 so logs flush
   // cleanly (config persists in NVS). NOTE: setup() drives ESP2_PWR_PIN LOW, so an ESP1 reboot also cuts
-  // ESP2's power -- an in-flight run is lost (ESP2 keeps mixTankL in NVS; a still-due column re-runs).
+  // ESP2's power, which is why a manual reboot is refused while a run, test or held fault is live
+  // (decision D12). Stop or cancel it first. Checked again here: the portal asks from the other core.
   if (rebootPending) {
     rebootPending = false;
-    logEvent("ESP1", "RESET", "MANUAL|REBOOT");
-    logFlush(true); delay(60);
-    bswForgetPending(); ESP.restart();
+    const char *busy = rebootBusyReason();
+    if (busy) {
+      logEvent("ESP1", "RESET", String("MANUAL|REFUSED|") + busy);
+    } else {
+      logEvent("ESP1", "RESET", "MANUAL|REBOOT");
+      logFlush(true); delay(60);
+      bswForgetPending(); ESP.restart();
+    }
   }
   // Remote reboot: hold off until core 0 has PATCHed the "completed" status, so the command cannot
   // still read "queued" after we come back and trigger another reboot. Bounded -- if the link is
@@ -2179,6 +2851,55 @@ void setState(SystemState s) {
 /* =============================================================================
  *  CONFIG (NVS)
  * ========================================================================== */
+/* ---- Watering windows (2026-11-05): up to MAX_RUNS_PER_DAY a day on MANUAL, one on AUTO ---------------- */
+static uint8_t windowCount(int c) {
+  if (colSchedMode[c] != SCHED_MANUAL) return 1;
+  return (colRuns[c] >= 1 && colRuns[c] <= MAX_RUNS_PER_DAY) ? colRuns[c] : 1;
+}
+static uint16_t windowStart(int c, int w) {
+  if (colSchedMode[c] != SCHED_MANUAL) return DEF_WIN_START[c];
+  return w == 0 ? COL_WIN_START[c] : COL_EXTRA_START[c][w - 1];
+}
+static uint16_t windowEnd(int c, int w) {
+  if (colSchedMode[c] != SCHED_MANUAL) return DEF_WIN_END[c];
+  return w == 0 ? COL_WIN_END[c] : COL_EXTRA_END[c][w - 1];
+}
+// The window minute-of-day `mod` falls in, or -1. Windows are inclusive at both ends, as the original check was.
+static int windowAt(int c, uint16_t mod) {
+  for (int w = 0; w < windowCount(c); w++) if (mod >= windowStart(c, w) && mod <= windowEnd(c, w)) return w;
+  return -1;
+}
+// Windows as {start,end} pairs are valid if each lies in the day, starts before it ends, and ends before the next
+// one starts (so no minute belongs to two windows, and a column can't be watered twice in one).
+static bool windowsValid(const uint16_t (*win)[2], int n) {
+  if (n < 1 || n > MAX_RUNS_PER_DAY) return false;
+  for (int w = 0; w < n; w++) {
+    if (win[w][0] > 1439 || win[w][1] > 1439 || win[w][0] >= win[w][1]) return false;
+    if (w > 0 && win[w - 1][1] >= win[w][0]) return false;
+  }
+  return true;
+}
+static bool windowDoneToday(int c, int w) {
+  return col[c].lastServicedStamp == currentDayStamp && (col[c].servicedMask & (1 << w));
+}
+static bool dayDoneToday(int c) {
+  return col[c].lastServicedStamp == currentDayStamp && col[c].servicedMask == 0xFF;
+}
+// Marks window w watered today (w < 0: the whole day, as a STOP reply or a lost fault does). `persist` keeps it
+// across a reboot, so a column that finished can't be re-run, or re-dosed, by a restart inside the same window.
+static void markServiced(int c, int w, bool persist) {
+  if (col[c].lastServicedStamp != currentDayStamp) { col[c].lastServicedStamp = currentDayStamp; col[c].servicedMask = 0; }
+  col[c].servicedMask |= (w < 0) ? 0xFF : (uint8_t)(1 << w);
+  if (!persist) return;
+  prefs.putLong((String("c") + c + "ls").c_str(), col[c].lastServicedStamp);
+  prefs.putUChar((String("c") + c + "lm").c_str(), col[c].servicedMask);
+}
+static uint8_t runsDoneToday(int c) {
+  if (col[c].lastServicedStamp != currentDayStamp) return 0;
+  if (col[c].servicedMask == 0xFF) return windowCount(c);
+  return (uint8_t)__builtin_popcount(col[c].servicedMask & ((1 << MAX_RUNS_PER_DAY) - 1));
+}
+
 void loadConfig() {
   for (int c = 0; c < NUM_COLUMNS; c++) {
     char key[8];
@@ -2194,16 +2915,45 @@ void loadConfig() {
     // Persisted: a reboot inside the window must not re-run (and, for fertigation, re-dose) a column that
     // already finished today. An interrupted run never reaches DONE, so it still re-runs when due.
     col[c].lastServicedStamp = prefs.getLong((String(key) + "ls").c_str(), -1);
+    // Which windows of that day are done. 0xFF when absent: firmware before 2026-11-05 saved only the day, and
+    // that meant the whole day. The day nutrients last went in, so a reboot can't dose twice in one day.
+    col[c].servicedMask = prefs.getUChar((String(key) + "lm").c_str(), 0xFF);
+    col[c].fertStamp    = prefs.getLong((String(key) + "fd").c_str(), -1);
     // per-column schedule (manual window + AUTO/MANUAL axis) and enable flag
     COL_WIN_START[c] = prefs.getUShort((String(key) + "ws").c_str(), COL_WIN_START[c]);
     COL_WIN_END[c]   = prefs.getUShort((String(key) + "we").c_str(), COL_WIN_END[c]);
     colSchedMode[c]  = prefs.getUChar((String(key) + "sm").c_str(), colSchedMode[c]);
+    colRuns[c]       = prefs.getUChar((String(key) + "r").c_str(), 1);
+    for (int x = 0; x < MAX_RUNS_PER_DAY - 1; x++) {
+      COL_EXTRA_START[c][x] = prefs.getUShort((String(key) + "x" + (x + 1) + "s").c_str(), COL_EXTRA_START[c][x]);
+      COL_EXTRA_END[c][x]   = prefs.getUShort((String(key) + "x" + (x + 1) + "e").c_str(), COL_EXTRA_END[c][x]);
+    }
+    {   // a stored set that doesn't hold together falls back to the one window, rather than none
+      uint16_t win[MAX_RUNS_PER_DAY][2];
+      int n = (colRuns[c] >= 1 && colRuns[c] <= MAX_RUNS_PER_DAY) ? colRuns[c] : 0;
+      for (int w = 0; w < n; w++) {
+        win[w][0] = w == 0 ? COL_WIN_START[c] : COL_EXTRA_START[c][w - 1];
+        win[w][1] = w == 0 ? COL_WIN_END[c]   : COL_EXTRA_END[c][w - 1];
+      }
+      if (!windowsValid(win, n)) colRuns[c] = 1;
+    }
     COLUMN_ENABLED[c] = prefs.getBool((String(key) + "en").c_str(), COLUMN_ENABLED[c]);
   }
   // global thresholds (settable on-device, sec.10.10.1)
   soilStartPct = prefs.getInt("sstart", soilStartPct);
-  soilStopPct  = prefs.getInt("sstop",  soilStopPct);
   fertGap      = prefs.getFloat("fgap", fertGap);
+  { // AC supply window (PZEM): a missing or unusable pair keeps the compiled defaults.
+    int lo = prefs.getInt("acvlo", AC_V_DEFAULT_LOW), hi = prefs.getInt("acvhi", AC_V_DEFAULT_HIGH);
+    if (acVoltWindowOk(lo, hi)) { acVMin = lo; acVMax = hi; }
+  }
+  { // AC pump current limits (PZEM), tenths of an amp: same rule.
+    int lo = prefs.getInt("acalo", AC_A_DEFAULT_MIN), hi = prefs.getInt("acahi", AC_A_DEFAULT_MAX);
+    if (acAmpWindowOk(lo, hi)) { acAMin10 = lo; acAMax10 = hi; }
+  }
+  { // The pump selector's last confirmed side (website switch): anything but 1/2 = not known.
+    uint8_t s = prefs.getUChar("svside", SERVO_SIDE_NONE);
+    servoSideNow = (s == SERVO_SIDE_TRANSFER || s == SERVO_SIDE_BOOSTER) ? s : SERVO_SIDE_NONE;
+  }
   lcdLocked    = prefs.getBool("lock", false);   // LCD lock persists across reboot (Part D)
   // Deliberately survives a reboot: see the actuationsDisabled comment. A power blip must not
   // re-arm the actuators behind the operator's back.
@@ -2225,6 +2975,7 @@ void loadConfig() {
   supaUrl  = prefs.getString("supaurl", "");        // Supabase project URL + service_role key (NVS-only)
   supaKey  = prefs.getString("supakey", "");
   supaLast = prefs.getLong("supalast", 0);          // last day (yyyymmdd) successfully uploaded
+  fbLogLast = prefs.getLong("fblogl", 0);           // ... to Firebase (2026-11-17)
   fbUrl    = prefs.getString("fburl", "");          // Firebase RTDB base URL (NVS-only, like the Supabase creds)
   firebaseEnabled = prefs.getBool("fben", true);    // master switch; URL still has to be set for it to run
   fbEmail    = prefs.getString("fbmail", "");       // device-account creds (NVS-only, never in tracked source)
@@ -2237,6 +2988,39 @@ void loadConfig() {
  *  CALIBRATION NVS + DISTRIBUTION  (companion spec §A.5.1)
  * ========================================================================== */
 static void loadPowerCal();
+
+/* ---- Tank "level -> litres" points in NVS (web v.4) ----------------------- *
+ * Stored as sensor DISTANCES (cm, temperature-corrected), not heights, so a later "Ultra ... empty"
+ * re-capture moves the 0 % mark without moving the points: height = emptyCm - distance is worked out on
+ * load and again by tankVolSyncGeom(). Keys: "tvM" (mixing tank), "tvR" (reservoir).                    */
+struct TankVolBlob { uint8_t n; float dCm[TV_MAX_PTS]; float L[TV_MAX_PTS]; };
+static void tankVolSave(bool mix) {
+  const TankVolCal &c = mix ? calMixVol : calResVol;
+  TankVolBlob b; memset(&b, 0, sizeof(b));
+  b.n = c.n;
+  for (uint8_t i = 0; i < c.n && i < TV_MAX_PTS; i++) { b.dCm[i] = c.emptyCm - c.hCm[i]; b.L[i] = c.L[i]; }
+  prefsCal.putBytes(mix ? "tvM" : "tvR", &b, sizeof(b));
+}
+static void tankVolLoadOne(bool mix) {
+  TankVolCal &c = mix ? calMixVol : calResVol;
+  c.n = 0;
+  const char *key = mix ? "tvM" : "tvR";
+  if (!prefsCal.isKey(key)) return;
+  TankVolBlob b;
+  if (prefsCal.getBytes(key, &b, sizeof(b)) != sizeof(b) || b.n > TV_MAX_PTS) return;
+  TankVolCal t = c;
+  t.n = b.n;
+  for (uint8_t i = 0; i < b.n; i++) { t.hCm[i] = t.emptyCm - b.dCm[i]; t.L[i] = b.L[i]; }
+  if (tvPointsSane(t)) c = t;
+  else Serial.printf("CAL: tank litres points %s in NVS are not usable, using the cone only\n", key);
+}
+// After the empty/full cm are final (loadCal reads them first).
+static void tankVolLoad() {
+  tankVolSyncGeom();
+  tankVolLoadOne(true);
+  tankVolLoadOne(false);
+}
+
 void loadCal() {
   prefsCal.begin("calib", false);                 // separate namespace; Restore-Defaults never touches it
   for (int c = 0; c < NUM_COLUMNS; c++) {
@@ -2246,20 +3030,30 @@ void loadCal() {
     int savedAir   = prefsCal.getInt((k + "a2").c_str(), calSoilAir[c]);
     int savedWater = prefsCal.getInt((k + "w2").c_str(), calSoilWater[c]);
     if (soilCalOk(savedAir, savedWater, (int)CAL_MIN_SPAN_ADC)) { calSoilAir[c] = savedAir; calSoilWater[c] = savedWater; }
+    // Per-probe endpoints: each probe's own LCD calibration if it has one, else its column's pair.
+    for (int p = 0; p < 2; p++) {
+      String pk = k + "p" + String(p + 1);
+      int d = prefsCal.getInt((pk + "d").c_str(), calSoilAir[c]);
+      int w = prefsCal.getInt((pk + "w").c_str(), calSoilWater[c]);
+      if (!soilCalOk(d, w, (int)CAL_MIN_SPAN_ADC)) { d = calSoilAir[c]; w = calSoilWater[c]; }
+      calProbeDry[c][p] = d; calProbeWet[c][p] = w;
+    }
     calNpkOff[c][0] = prefsCal.getFloat((k + "N").c_str(), 0);
     calNpkOff[c][1] = prefsCal.getFloat((k + "P").c_str(), 0);
     calNpkOff[c][2] = prefsCal.getFloat((k + "K").c_str(), 0);
   }
-  calResEmptyCm = prefsCal.getFloat("reCm", calResEmptyCm);
-  calResFullCm  = prefsCal.getFloat("rfCm", calResFullCm);
-  calMixEmptyCm = prefsCal.getFloat("meCm", calMixEmptyCm);
-  calMixFullCm  = prefsCal.getFloat("mfCm", calMixFullCm);
+  // Tank geometry: "2" keys (bumped 2026-11-15, see calResEmptyCm). A saved pair is used only if it is
+  // sane -- empty clearly farther than full -- otherwise the measured defaults stay.
+  { float re = prefsCal.getFloat("reCm2", calResEmptyCm), rf = prefsCal.getFloat("rfCm2", calResFullCm);
+    if (re - rf >= CAL_LEVEL_MIN_SPAN_CM) { calResEmptyCm = re; calResFullCm = rf; }
+    float me = prefsCal.getFloat("meCm2", calMixEmptyCm), mf = prefsCal.getFloat("mfCm2", calMixFullCm);
+    if (me - mf >= CAL_LEVEL_MIN_SPAN_CM) { calMixEmptyCm = me; calMixFullCm = mf; } }
   calFlowResScale = prefsCal.getFloat("frS", calFlowResScale);
   calTempOff = prefsCal.getFloat("tOff", 0);
   calHumOff  = prefsCal.getFloat("hOff", 0);
   calLuxOff  = prefsCal.getFloat("lOff", 0);
-  calKResMix = prefsCal.getFloat("kRM", calKResMix);
-  calKMixIrr = prefsCal.getFloat("kMI", calKMixIrr);
+  // (kRM / kMI -- the ResMix / MixIrr K-factors -- are no longer read: web v.4 has no main-line meters.)
+  tankVolLoad();                                   // web v.4: tank "level -> litres" points (tvM / tvR)
   calKNut[0] = prefsCal.getFloat("kNA", calKNut[0]);
   calKNut[1] = prefsCal.getFloat("kNB", calKNut[1]);
   calKNut[2] = prefsCal.getFloat("kNC", calKNut[2]);
@@ -2294,6 +3088,8 @@ static void loadPowerCal() {
   loadInaTrim("iSol",  SOLAR_SHUNT_OHM, sol.lsb, sol.cal, sol.offsetA, sol.busFactor, sol.invert);
   loadInaTrim("iMain", MAIN_SHUNT_OHM,  mn.lsb,  mn.cal,  mn.offsetA,  mn.busFactor,  mn.invert);
   loadInaTrim("iSec",  SEC_SHUNT_OHM, SEC_CURRENT_LSB, secInaCal, secOffsetA, secBusFactor, secInvert);
+  { float r = prefsCal.getFloat("secR", SEC_RINT_DEFAULT);       // the secondary pack's learned resistance
+    if (r >= SEC_RINT_MIN && r <= SEC_RINT_MAX) secRint = r; }
 
   float div  = prefsCal.getFloat("acsDiv",  ACS_DIV);
   float zero = prefsCal.getFloat("acsZero", ACS_ZERO_V);
@@ -2304,24 +3100,41 @@ static void loadPowerCal() {
 
   const char *PUMP_KEY[3] = { "pumpA", "pumpB", "pumpC" };
   for (int i = 0; i < 3; i++) {
+    pumpRateSet[i] = false;
+    if (!prefsCal.isKey(PUMP_KEY[i])) continue;    // never measured: the default, and ESP2 doses on its meter alone
     float r = prefsCal.getFloat(PUMP_KEY[i], PUMP_FLOWRATE_MLPM[i]);
     // A divisor in every dose's timed ceiling, so an unusable value must never get this far.
-    if (calInRange(r, 1.0f, 5000.0f)) PUMP_FLOWRATE_MLPM[i] = r;
+    if (calInRange(r, RATE_MLPM_MIN, RATE_MLPM_MAX)) { PUMP_FLOWRATE_MLPM[i] = r; pumpRateSet[i] = true; }
     else Serial.printf("CAL: %s in NVS is out of range, using %.1f mL/min\n", PUMP_KEY[i], PUMP_FLOWRATE_MLPM[i]);
   }
+  // Transfer / booster rates (LCD Calibration > Rate ..., 2026-11-17). A bad stored value = not measured.
+  calRateXfer  = prefsCal.isKey("rXfer")  ? prefsCal.getFloat("rXfer", 0.0f)  : 0.0f;
+  calRateBoost = prefsCal.isKey("rBoost") ? prefsCal.getFloat("rBoost", 0.0f) : 0.0f;
+  if (!calInRange(calRateXfer, RATE_LPM_MIN, RATE_LPM_MAX))  calRateXfer = 0.0f;
+  if (!calInRange(calRateBoost, RATE_LPM_MIN, RATE_LPM_MAX)) calRateBoost = 0.0f;
+  // Pump lines (2026-11-17): the user's readings are the default; a re-measured start litres replaces it.
+  plDefXfer  = plFitReadings(PL_XFER_READINGS, 10);
+  plDefBoost = plFitReadings(PL_BOOST_READINGS, 10);
+  calXferStartL  = prefsCal.isKey("xStartL") ? prefsCal.getFloat("xStartL", NAN) : NAN;
+  calBoostStartL = prefsCal.isKey("bStartL") ? prefsCal.getFloat("bStartL", NAN) : NAN;
+  if (!(fabsf(calXferStartL) <= PL_START_L_MAX))  calXferStartL = NAN;
+  if (!(fabsf(calBoostStartL) <= PL_START_L_MAX)) calBoostStartL = NAN;
 }
 
 // Push every ESP2-owned calibration constant (baseline after any ESP2 reset, §A.5.1 #2).
 // Best-effort fire (not block-until-ACK); the work order re-carries job-critical values anyway.
 void pushAllCalToEsp2() {
-  sendEsp2("SET_CAL,FLOW_RESMIX," + String(calKResMix, 1));
-  sendEsp2("SET_CAL,FLOW_MIXIRR," + String(calKMixIrr, 1));
+  sendEsp2("SET_CAL,MIXCAP," + String(mixCapLiters(), 2));   // web v.4: litres at the overflow stop
   sendEsp2("SET_CAL,FLOW_NUTA," + String(calKNut[0], 1));
   sendEsp2("SET_CAL,FLOW_NUTB," + String(calKNut[1], 1));
   sendEsp2("SET_CAL,FLOW_NUTC," + String(calKNut[2], 1));
   sendEsp2("SET_CAL,ACS712," + String(calAcs712Zero, 4));
   sendEsp2("SET_CAL,PH," + String(calPhM, 6) + "," + String(calPhB, 4));
   sendEsp2("SET_CAL,EC," + String(calEcM, 6) + "," + String(calEcB, 4));
+  sendEsp2("SET_CAL,PRATE," + rateWaterWire());   // the pumps' measured rates (2026-11-17; 0 = not measured)
+  sendEsp2("SET_CAL,NRATE," + rateNutWire());
+  sendEsp2("SET_CAL,PSTART," + String(pestStart(true), 3));   // the transfer's start litres (2026-11-17)
+  pushAcVoltToEsp2();                     // not calibration, but ESP2-enforced the same way (PZEM window)
 }
 
 // Save-time push with block-until-ACK (§A.5.1 #1): returns false if ESP2 never confirms.
@@ -2351,7 +3164,8 @@ void setActuationsEnabled(bool on, const char *why) {
   actuationsDisabled = !on;
   prefs.putBool("actdis", actuationsDisabled);
   logEvent("ESP1", "ACT", String("ACTUATION|") + (on ? "ENABLED" : "DISABLED") + "|" + why);
-  sendSMS(String("ACK,ACTUATION,") + (on ? "ENABLED" : "DISABLED"));
+  sendSMS(on ? "OK: Pumps and valves ENABLED.\nWatering can run again."
+             : "OK: Pumps and valves DISABLED.\nNothing waters until enabled again. Sensors, logs and texts keep working.");
   if (!on) {
     // Nothing in flight survives the lockout, or "disabled" would be a lie until the current run
     // finished. The armed force countdown would otherwise fire into a system that has just been
@@ -2431,6 +3245,11 @@ void saveSchedule(int c) {
   prefs.putUShort((String(key) + "ws").c_str(), COL_WIN_START[c]);
   prefs.putUShort((String(key) + "we").c_str(), COL_WIN_END[c]);
   prefs.putUChar((String(key) + "sm").c_str(), colSchedMode[c]);
+  prefs.putUChar((String(key) + "r").c_str(), colRuns[c]);
+  for (int x = 0; x < MAX_RUNS_PER_DAY - 1; x++) {
+    prefs.putUShort((String(key) + "x" + (x + 1) + "s").c_str(), COL_EXTRA_START[c][x]);
+    prefs.putUShort((String(key) + "x" + (x + 1) + "e").c_str(), COL_EXTRA_END[c][x]);
+  }
 }
 void saveColEnable(int c) {
   char key[8];
@@ -2475,7 +3294,6 @@ void saveExercise() {
 }
 void saveThresholds() {
   prefs.putInt("sstart", soilStartPct);
-  prefs.putInt("sstop",  soilStopPct);
   prefs.putFloat("fgap", fertGap);
   // Warn about a combination that silently disables fertigation. Irrigation only starts below
   // soilStartPct, so if that sits at or under the NPK trust floor the probe will always be too dry
@@ -2486,8 +3304,48 @@ void saveThresholds() {
   if (soilStartPct <= NPK_MIN_MOIST_PCT) {
     logEvent("ESP1", "FAULT", String("WARN|THRESH_NO_FERT|start=") + soilStartPct
                               + "|npkMin=" + NPK_MIN_MOIST_PCT);
-    sendSMS(String("ALERT,WARN,THRESH_NO_FERT,start=") + soilStartPct);
+    smsAlert(smsFaultText('W', "THRESH_NO_FERT", "Start is " + String(soilStartPct) + "%, the NPK sensor needs over " +
+                                                 String(NPK_MIN_MOIST_PCT) + "%"));
   }
+}
+
+// AC supply window (PZEM on ESP2). ESP2 keeps its own copy in NVS, but only what reaches it: so it is
+// re-sent at startup sync, on every READY (each power-up), and on every change. Only while ESP2 is
+// powered -- a powered-off ESP2 gets it from the READY of its next power-up.
+void saveAcVolt() {
+  prefs.putInt("acvlo", acVMin);
+  prefs.putInt("acvhi", acVMax);
+}
+// Also carries the AC current limits (SET_CAL,PZEM_I), so every place that refreshes ESP2's voltage window
+// (startup sync, each READY, a change) refreshes both.
+void pushAcVoltToEsp2() {
+  if (!esp2Powered) return;
+  sendEsp2("SET_CAL,PZEM_V," + String(acVMin) + "," + String(acVMax));
+  sendEsp2("SET_CAL,PZEM_I," + String(acAMin10) + "," + String(acAMax10));
+}
+// AC pump current limits: the one way they change (LCD editor, website, Restore Defaults).
+void setAcAmpWindow(int min10, int max10, const char *src) {
+  if (!acAmpWindowOk(min10, max10)) return;
+  int oldLo = acAMin10, oldHi = acAMax10;
+  acAMin10 = min10; acAMax10 = max10;
+  prefs.putInt("acalo", acAMin10);
+  prefs.putInt("acahi", acAMax10);
+  pushAcVoltToEsp2();
+  fbRequestPush();                       // the website shows the new limits without waiting a minute
+  char d[48];
+  snprintf(d, sizeof(d), "ACAMP|%.1f-%.1f|was=%.1f-%.1f", min10 / 10.0f, max10 / 10.0f, oldLo / 10.0f, oldHi / 10.0f);
+  logEvent(src, "CFG", d);
+}
+// The one way the window changes (LCD editor, website, Restore Defaults). Callers check acVoltWindowOk()
+// first; this checks again so a bad pair can never be saved.
+void setAcVoltWindow(int lo, int hi, const char *src) {
+  if (!acVoltWindowOk(lo, hi)) return;
+  int oldLo = acVMin, oldHi = acVMax;
+  acVMin = lo; acVMax = hi;
+  saveAcVolt();
+  pushAcVoltToEsp2();
+  fbRequestPush();                       // the website shows the new window without waiting a minute
+  logEvent(src, "CFG", String("ACVOLT|") + lo + "-" + hi + "|was=" + oldLo + "-" + oldHi);
 }
 
 /* =============================================================================
@@ -2495,6 +3353,11 @@ void saveThresholds() {
  * ========================================================================== */
 void pollNano() {
   static String line;
+  if (nanoSerial.overflow()) {                     // the loop stalled longer than the receive buffers hold
+    nanoRxOverflows++;
+    static unsigned long lastOvfLogMs = 0;
+    if (millis() - lastOvfLogMs > 10000) { lastOvfLogMs = millis(); logEvent("NANO", "LINK", "RX_OVERFLOW|n=" + String(nanoRxOverflows)); }
+  }
   while (nanoSerial.available()) {
     char c = (char)nanoSerial.read();
     if (c == '\n' || c == '\r') {
@@ -2504,13 +3367,20 @@ void pollNano() {
         // structural: framing
         int s = raw.indexOf(FRAME_START);
         int e = raw.indexOf(FRAME_END);
-        bool clean = false;
+        bool clean = false, badCrc = false;
         if (s >= 0 && e > s && raw.length() <= 128) {
           String payload = raw.substring(s + 7, e);   // between markers
           payload.trim();
           if (payload.startsWith(",")) payload = payload.substring(1);
           if (payload.endsWith(","))   payload = payload.substring(0, payload.length() - 1);
-          clean = classifyAndApply(payload, raw);
+          // Checksum first: on this software-serial link a flipped bit can still look like a plausible
+          // number. A frame with a bad or missing checksum counts as garbage (decision D4).
+          size_t bodyLen = 0;
+          if (frameCheckCrc(payload.c_str(), payload.length(), &bodyLen)) {
+            clean = classifyAndApply(payload.substring(0, bodyLen), raw);
+          } else {
+            badCrc = true;
+          }
         }
         if (clean) {
           garbageCount = 0;
@@ -2524,7 +3394,7 @@ void pollNano() {
           static unsigned long lastGarbageLogMs = 0;
           if (millis() - lastGarbageLogMs > 1000) {
             lastGarbageLogMs = millis();
-            String d = "COUNT=" + String(garbageCount) + "|RAW=" + raw.substring(0, 64);
+            String d = "COUNT=" + String(garbageCount) + (badCrc ? "|CRC" : "") + "|RAW=" + raw.substring(0, 64);
             logEvent("NANO", "GARBAGE", d);
           }
           if (garbageCount >= GARBAGE_LIMIT) escalateNanoRecovery();
@@ -2539,7 +3409,9 @@ void pollNano() {
 }
 
 // A field must actually be a number before we believe it. Guards against a spliced frame handing
-// the parser a token like "ENV" or "<START>", which String::toFloat() silently turns into 0.0.
+// the parser a token like "ENV" or "<START>", which String::toFloat() silently turns into 0.0, or a
+// byte lost inside a number. Rig logs show the Nano link corrupting 11-28 % of its lines, and a 0 cm
+// TANK distance would read as a full reservoir.
 static bool isNumericToken(const String &s) {
   if (s.length() == 0) return false;
   int i = 0, digits = 0, dots = 0;
@@ -2558,7 +3430,8 @@ static int npkMoistPct(int c) {
   if (!sensor.npkValid[c] || sensor.npk[c][0] < 0) return -1;
   if (!sensor.msNpk[c] || millis() - sensor.msNpk[c] > NANO_STALE_MS) return -1;
   int p = (int)(sensor.npk[c][0] + 0.5f);
-  if (p < 0) p = 0; if (p > 100) p = 100;
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
   return p;
 }
 
@@ -2610,12 +3483,24 @@ bool classifyAndApply(const String &payload, const String &raw) {
   if (cmd == "CAL" && n == 3) {               // live raw sample from the Nano (§A.3): id,raw
     calRxId = tok[1]; calRxRaw = tok[2].toFloat();
     calRxValid = (tok[2] != "-1"); calRxMs = millis();
+    // LCD soil capture: only samples of the probe being calibrated feed its steadiness window.
+    if (calRxValid && uiMode == UI_CAL && calOpen && CAL_TGTS[calSel].kind == CK_SOIL && calRxId == CAL_TGTS[calSel].id)
+      soilCalPush((int)calRxRaw);
+    // LCD tank-litres capture (web v.4): the level window, in temperature-corrected cm.
+    if (calRxValid && uiMode == UI_CAL && calOpen && calRxId == CAL_TGTS[calSel].id &&
+        (CAL_TGTS[calSel].kind == CK_VOL_MIX || CAL_TGTS[calSel].kind == CK_VOL_RES))
+      volCalPush(ultraCorrectCm(calRxRaw));
     sensor.lastNanoMs = millis();
     return true;                              // expected calibration traffic, not garbage
   }
   if (cmd == "ENV" && n == 3) {
+    if (!isNumericToken(tok[1]) || !isNumericToken(tok[2])) return false;
     float t = tok[1].toFloat(), h = tok[2].toFloat();
     bool tInv = (tok[1] == "-1"), hInv = (tok[2] == "-1");
+    // Exactly 0.0 C / 0.0 % is a failed DHT read (all-zero bits pass its checksum), not weather (2026-11-17 log): not
+    // used -- the tank distances are corrected for the air temperature, and 0 C reads every tank ~5 % wrong.
+    bool dhtZero = !tInv && !hInv && t == 0.0f && h == 0.0f;
+    if (dhtZero) { tInv = true; hInv = true; }
     if (!tInv && (t < TEMP_MIN || t > TEMP_MAX)) return false;   // Tier 2 (raw range)
     if (!hInv && (h < 0 || h > 100)) return false;
     sensor.temp = tInv ? t : t + calTempOff;     // apply calibration offset (§A)
@@ -2623,25 +3508,123 @@ bool classifyAndApply(const String &payload, const String &raw) {
     sensor.envValid = !(tInv || hInv);
     sensor.rawTemp = t; sensor.rawHum = h; sensor.msEnv = millis();   // Sensor Diag: raw + last-seen
     sensor.lastNanoMs = millis();
-    logEvent("NANO", "SENSOR", "ENV|" + tok[1] + "|" + tok[2]);
+    logEvent("NANO", "SENSOR", "ENV|" + tok[1] + "|" + tok[2] + (dhtZero ? "|DHT_ZERO_NOT_USED" : ""));
     return true;
   }
-  if (cmd == "TANK" && n == 4) {
-    // RAW distances in cm (companion spec §A); ESP1 maps to % with the stored geometry.
+  if (cmd == "TANK" && (n == 4 || n == 6 || n == 8)) {
+    // RAW distances in cm (companion spec §A); ESP1 maps to % AND LITRES with the stored geometry (web v.4).
+    // web v.4 Nano: TANK,<resCm>,<mixCm>,<flowLpm>,<resSpread>,<mixSpread> -- each cm is the MEDIAN of the
+    // Nano's last 5 pings, the spread the width of their middle three (-1 = fewer than 3 good pings). An
+    // older Nano sends the first three fields only (spread unknown = not judged).
+    if (!isNumericToken(tok[1]) || !isNumericToken(tok[2]) || !isNumericToken(tok[3])) return false;
+    if (n >= 6 && (!isNumericToken(tok[4]) || !isNumericToken(tok[5]))) return false;
+    // web v.4 link hardening (2026-11-16): TANK,...,<st>,<seq>. <st> = one pinger status letter per tank (K ok,
+    // E no echo, R out of range, F too few good pings, S echo line stuck high, X no pings); <seq> = the Nano's TANK
+    // counter 0..999 -- a repeat is ignored, a gap counted as frames lost (tankLinkPct).
+    char rSt = '?', mSt = '?';
+    if (n == 8) {
+      if (tok[6].length() != 2 || !strchr(TANK_ST_CHARS, tok[6][0]) || !strchr(TANK_ST_CHARS, tok[6][1])) return false;
+      const String &q = tok[7];
+      if (q.length() < 1 || q.length() > 3) return false;
+      for (unsigned i = 0; i < q.length(); i++) if (!isDigit(q[i])) return false;
+      if (!tankSeqAccept(q.toInt())) { sensor.lastNanoMs = millis(); return true; }   // the same frame twice
+      rSt = tok[6][0]; mSt = tok[6][1];
+    }
+    lastTankMs = millis(); tankGapLogged = false;
     float rd = tok[1].toFloat(), md = tok[2].toFloat();
     bool rInv = (tok[1] == "-1"), mInv = (tok[2] == "-1");
     if (!rInv && (rd < 0 || rd > 500)) return false;   // raw distance plausibility (Tier 2)
     if (!mInv && (md < 0 || md > 500)) return false;
-    sensor.resLevel = rInv ? -1 : levelPct(rd, calResEmptyCm, calResFullCm);
-    sensor.mixLevel = mInv ? -1 : levelPct(md, calMixEmptyCm, calMixFullCm);
+    float rs = (n >= 6) ? tok[4].toFloat() : -1.0f, ms = (n >= 6) ? tok[5].toFloat() : -1.0f;
+    // Temperature-corrected distances: the % and the litres both come from these, so ESP2's overflow stop and
+    // its metering read the same level.
+    float rc = rInv ? -1.0f : ultraCorrectCm(rd), mc = mInv ? -1.0f : ultraCorrectCm(md);
+    sensor.resLevel = rInv ? -1 : levelPct(rc, calResEmptyCm, calResFullCm);
+    sensor.mixLevel = mInv ? -1 : levelPct(mc, calMixEmptyCm, calMixFullCm);
+    sensor.resL = rInv ? -1.0f : tvLiters(calResVol, rc);
+    sensor.mixL = mInv ? -1.0f : tvLiters(calMixVol, mc);
+    sensor.resCm = rc; sensor.mixCm = mc;
+    sensor.resSpreadCm = rs; sensor.mixSpreadCm = ms;
+    // The Nano's own verdict first: anything but K (or '?' from an older Nano) is not a level to steer by.
+    sensor.resSt = rSt; sensor.mixSt = mSt;
+    sensor.resOk = ultraUsable(rInv, rc, rs, calResEmptyCm, sensor.resL) && (rSt == '?' || rSt == 'K');
+    sensor.mixOk = ultraUsable(mInv, mc, ms, calMixEmptyCm, sensor.mixL) && (mSt == '?' || mSt == 'K');
     sensor.flow = tok[3].toFloat() * calFlowResScale;
+    {
+      unsigned long nowMs = millis();
+      if (tok[3] != "-1" && sensor.flow > 0.0f && resInflowMs != 0 && nowMs - resInflowMs <= RES_INFLOW_MAX_GAP_MS)
+        resInflowL += sensor.flow * (float)(nowMs - resInflowMs) / 60000.0f;
+      resInflowMs = nowMs;
+    }
     sensor.tankValid = !(rInv || mInv);
     sensor.rawResCm = rInv ? -1 : rd; sensor.rawMixCm = mInv ? -1 : md;   // Sensor Diag: raw cm + L/min
     sensor.rawFlow = tok[3].toFloat(); sensor.msTank = millis();
     // A1: clear the reservoir-low latch once the level recovers (with hysteresis).
     if (!rInv && sensor.resLevel >= RES_LOW_PCT + 5.0f) resLowLatched = false;
     sensor.lastNanoMs = millis();
-    logEvent("NANO", "SENSOR", "TANK|" + tok[1] + "|" + tok[2] + "|" + tok[3]);
+    // While an AC pump runs, or ESP2 holds a feed lease, relay every reading to ESP2 at once (web v.4: it meters
+    // the water with it). A reading not usable for control -- lost echo, pings too scattered (splash, ripple,
+    // multipath), a distance outside the tank, an unusable geometry -- goes as -1, which ESP2 treats as "no
+    // reading". The line carries a CRC-8: ESP2 drops it otherwise, so a bit flip can never become a level.
+    if (levelRelayActive()) {
+      // A reading ESP2 will not get (-1 below), and why -- at most every 10 s (2026-11-17: LEVEL_BLIND was untraceable).
+      if (!sensor.mixOk || !sensor.resOk) {
+        static unsigned long lastWhyMs = 0;
+        if (millis() - lastWhyMs >= 10000UL) {
+          lastWhyMs = millis();
+          logEvent("NANO", "LEVEL", String("NOT_USABLE|mix=") + ultraWhy(mInv, mc, ms, calMixEmptyCm, sensor.mixL, mSt) +
+                   "|res=" + ultraWhy(rInv, rc, rs, calResEmptyCm, sensor.resL, rSt) +
+                   "|cm=" + String(mc, 1) + "/" + String(rc, 1) + "|s=" + String(ms, 1) + "/" + String(rs, 1));
+        }
+      }
+      float mixOut = sensor.mixOk ? sensor.mixLevel : -1.0f;
+      float resOut = sensor.resOk ? sensor.resLevel : -1.0f;
+      String body = "LEVEL," + String(mixOut, 1) + "," + String(resOut, 1) + "," +
+                    String(sensor.mixOk ? sensor.mixL : -1.0f, 2) + "," + String(sensor.resOk ? sensor.resL : -1.0f, 2) +
+                    "," + String(resInflowL, 2) + "," + String(levelSeqOut);
+      levelSeqOut = (uint16_t)((levelSeqOut + 1) % 10000);
+      char crc[5]; crcFieldFor(body.c_str(), body.length(), crc);
+      sendEsp2Quiet(body + crc);
+      // ESP1's own backstop on top of ESP2's stop (see servoRelayTick). It judges every real echo, noisy or
+      // not -- it is the last line, and three readings in a row at 97 % are not a ripple.
+      float mixBack = mInv ? -1.0f : sensor.mixLevel;
+      if (levelWatchTransfer && mixBack >= MIX_HIGHHIGH_PCT) {
+        if (mixHighHighRun < 255) mixHighHighRun++;
+        if (mixHighHighRun >= MIX_HIGHHIGH_COUNT && !mixHighHighSinceMs) mixHighHighSinceMs = nzMs(millis());
+      } else if (mixBack >= 0.0f) { mixHighHighRun = 0; mixHighHighSinceMs = 0; }
+    }
+    // FAST sends ~3 TANK a second: log every FAST_TANK_LOG_MS then, not every packet.
+    if (!levelRelayActive() || millis() - lastFastTankLogMs >= FAST_TANK_LOG_MS) {
+      lastFastTankLogMs = millis();
+      logEvent("NANO", "SENSOR", "TANK|" + tok[1] + "|" + tok[2] + "|" + tok[3] +
+               "|L=" + String(sensor.resL, 2) + "/" + String(sensor.mixL, 2) +
+               (n >= 6 ? "|s=" + tok[4] + "/" + tok[5] : String("")) +
+               (n == 8 ? "|st=" + tok[6] + "|lnk=" + String(tankLinkPct()) + "%" : String("")) +
+               ((sensor.resOk && sensor.mixOk) ? String("") : String("|NOT_USABLE")));
+    }
+    return true;
+  }
+  if (cmd == "SERVO" && n == 4) {         // pump selector: SERVO,<LEFT|RIGHT>,<MOVING|OK>,<seq>
+    if (tok[1] != "LEFT" && tok[1] != "RIGHT") return false;
+    if (tok[2] != "MOVING" && tok[2] != "OK") return false;
+    sensor.lastNanoMs = millis();
+    // Only the OK for the request in flight is passed on -- the side AND the seq must match, so a late
+    // OK for an older request can never let ESP2 power the wrong pump.
+    if (tok[2] == "OK" && servoReqActive && tok[3] == servoReqSeq &&
+        tok[1] == String(servoSideForPump(servoReqPump.c_str()))) {
+      sendEsp2("SERVO," + servoReqPump + ",OK," + servoReqSeq);
+      logEvent("NANO", "SERVO", tok[1] + "|OK|" + servoReqPump + "|seq=" + servoReqSeq);
+      servoReqActive = false;
+      servoOkRelayMs = nzMs(millis());       // keep the Nano FAST until PUMP,ON (see SERVO_TO_PUMP_FAST_MS)
+    }
+    // Any OK, whichever request it answers, means the Nano drove the servo to that side: that is where the
+    // selector is now (the website's switch). After ESP2 has its OK; NVS only when the side changes (wear).
+    if (tok[2] == "OK") {
+      uint8_t side = (tok[1] == "LEFT") ? SERVO_SIDE_TRANSFER : SERVO_SIDE_BOOSTER;
+      servoSideMs = nzMs(millis());
+      if (side != servoSideNow) { servoSideNow = side; prefs.putUChar("svside", side); }
+      fbRequestPush();                     // the switch shows it within seconds, not at the next report
+    }
     return true;
   }
   if (cmd == "SOIL") {
@@ -2654,6 +3637,7 @@ bool classifyAndApply(const String &payload, const String &raw) {
       int c = -1;
       for (int j = 0; j < NUM_COLUMNS; j++) if (tok[i] == String(COL_TAG[j])) c = j;
       if (c < 0) return false;                          // unknown tag = Tier 1 garbage
+      if (!isNumericToken(tok[i + 1]) || !isNumericToken(tok[i + 2])) return false;
       int v1 = tok[i + 1].toInt(), v2 = tok[i + 2].toInt();   // RAW per-probe ADC (companion spec §A)
       if (v1 < 0 || v1 > 1023 || v2 < 0 || v2 > 1023) return false;   // Tier 2: 10-bit ADC range
       rawTmp[c][0] = v1; rawTmp[c][1] = v2;              // keep each raw probe (log + Sensor Diag)
@@ -2707,6 +3691,7 @@ bool classifyAndApply(const String &payload, const String &raw) {
     return true;
   }
   if (cmd == "LIGHT" && n == 2) {
+    if (!isNumericToken(tok[1])) return false;
     float l = tok[1].toFloat();
     if (tok[1] != "-1" && l < 0) return false;
     sensor.lux = (tok[1] == "-1") ? l : l + calLuxOff;   // apply calibration offset (§A)
@@ -2752,7 +3737,16 @@ bool classifyAndApply(const String &payload, const String &raw) {
     logEvent("NANO", "SENSOR", d);
     return true;
   }
-  if (cmd == "STATUS" && n >= 3) {        // heartbeat: STATUS,NANO,OK
+  if (cmd == "STATUS" && n >= 3) {        // heartbeat: STATUS,NANO,OK  /  boot notice: STATUS,NANO,BOOT
+    if (tok[2] == "BOOT") {               // the Nano restarted (2026-11-16): it boots ACTIVE (10 s)
+      nanoBootMs = nzMs(millis());
+      lastNanoPace = PACE_NONE;           // so nanoPaceTick sends our pace (or FAST) again right away
+      tankSeqLast = -1;                   // its TANK counter restarts at 0: not a gap
+      logEvent("NANO", "BOOT", "");
+      // Rebooted by a battery switch: a strike, like an ESP1 or ESP2 reset (bswStrike folds duplicates).
+      if (bswGoMs && millis() - bswGoMs < BSW_NANO_BOOT_WINDOW_MS) bswStrike(bswGoDir ? bswGoDir : 1, "NANO_RESET");
+      return true;                        // not a sign of life from before the reset: lastNanoMs untouched
+    }
     sensor.lastNanoMs = millis();
     return true;
   }
@@ -2764,6 +3758,15 @@ void escalateNanoRecovery() {
   // repurposed to the master actuator-power cutoff (sec.19.4.8) -- the Nano RESET pin is no longer
   // driven. Recovery is now (1) the Nano's own internal WDT and (2) the software RESET_REQ below.
   // Layer 2: software RESET_REQ (sec.18.9.5.0.2)
+  // Not while an AC pump runs or its selector is being moved: a reset blinds the overflow watch for the
+  // Nano's ~2 s boot (ESP2 would then hold a fill as LEVEL_BLIND) and drops a servo move half-way. The
+  // Nano never moves the servo at boot, so this is about the level watch, not the switch. Run it after.
+  if (!nanoResetReqInFlight && (levelRelayActive() || servoReqActive)) {
+    if (!nanoResetDeferred) logEvent("ESP1", "RESET", "NANO|RESET_REQ|DEFERRED_PUMP_RUNNING");
+    nanoResetDeferred = true;
+    garbageCount = 0;
+    return;
+  }
   if (!nanoResetReqInFlight) {
     sendNanoCommand("RESET_REQ");
     nanoResetReqInFlight = true;
@@ -2784,18 +3787,67 @@ void escalateNanoRecovery() {
   }
 }
 
-void sendNanoCommand(const char *cmd) {
+// Every command carries the same ",*XX" checksum the Nano puts on its own frames (2026-11-15). The Nano
+// drops a command whose checksum is wrong, and refuses SERVO -- the one that moves hardware -- without one.
+void sendNanoCommand(const char *cmd, bool log) {
+  char crc[5];
+  crcFieldFor(cmd, strlen(cmd), crc);
   nanoSerial.print(FRAME_START);
   nanoSerial.print(",");
   nanoSerial.print(cmd);
+  nanoSerial.print(crc);
   nanoSerial.print(",");
   nanoSerial.println(FRAME_END);
-  logEvent("ESP1", "CMD", String("NANO|") + cmd);
+  if (log) logEvent("ESP1", "CMD", String("NANO|") + cmd);
+}
+
+// End the level relay (PUMP,OFF, ESP2 restart/power-off, safety timeout). nanoPaceTick then returns the
+// Nano to its normal ACTIVE/DAY/NIGHT pace on its next pass.
+void levelWatchStop(const char *why) {
+  if (levelWatch || servoReqActive) logEvent("ESP1", "PUMP", String("LEVEL_WATCH|OFF|") + why);
+  levelWatch = false; levelWatchTransfer = false;
+  servoReqActive = false;
+  mixHighHighRun = 0; mixHighHighSinceMs = 0;
+}
+
+// Carry ESP2's SERVO_REQ to the Nano until it answers OK (classifyAndApply forwards that), or give up and
+// tell ESP2 FAIL -- it then holds the run with the inverter never having come on. Also: the overflow
+// backstop timer, the level-watch safety timeout, and a Nano reset that was deferred while pumping.
+void servoRelayTick() {
+  unsigned long now = millis();
+  if (servoReqActive) {
+    if (now - servoReqStartMs >= SERVO_NANO_GIVEUP_MS) {
+      sendEsp2("SERVO," + servoReqPump + ",FAIL," + servoReqSeq);
+      logEvent("ESP1", "SERVO", "FAIL|" + servoReqPump + "|seq=" + servoReqSeq + "|NO_NANO_OK");
+      servoReqActive = false;
+    } else if (servoReqSentMs == 0 || now - servoReqSentMs >= SERVO_NANO_RETRY_MS) {
+      bool first = (servoReqSentMs == 0);
+      servoReqSentMs = now ? now : 1;
+      String c = String("SERVO,") + servoSideForPump(servoReqPump.c_str()) + "," + servoReqSeq;
+      sendNanoCommand(c.c_str(), first);           // log the first send only; retries are routine
+    }
+  }
+  if (levelWatch && now - levelWatchSinceMs >= LEVEL_WATCH_MAX_MS) levelWatchStop("TIMEOUT");
+  // Backstop: ESP2 stops a fill at its own limit (90 %). Still filling well past it means ESP2 did not.
+  if (levelWatch && levelWatchTransfer && mixHighHighSinceMs && now - mixHighHighSinceMs >= MIX_HIGHHIGH_GRACE_MS) {
+    String loc = "MIX|pct=" + String(sensor.mixLevel, 0) + "|ESP2_DID_NOT_STOP";
+    levelWatchStop("MIX_OVERFLOW");
+    // raiseFault() is suppressed entirely in TEST_MODE (a Testing Fill combo), so stop ESP2 directly too;
+    // outside Testing the E-stop below sends its own STOP_ALL as well -- a duplicate is harmless.
+    sendEsp2("STOP_ALL");
+    raiseFault('C', "MIX_OVERFLOW", loc.c_str());   // Critical -> E-stop: STOP_ALL + ESP2 power cut
+  }
+  if (nanoResetDeferred && !levelRelayActive() && !servoReqActive) {
+    nanoResetDeferred = false;
+    logEvent("ESP1", "RESET", "NANO|RESET_REQ|RESUMING_DEFERRED");
+    escalateNanoRecovery();
+  }
 }
 
 /* =============================================================================
  *  ESP2 LINK  --  work-order supervisor (spec sec.9.8.1.1)
  * ========================================================================== */
+const unsigned int ESP2_LINE_MAX = 256;     // longest ESP2 line accepted (see the frame check below)
 void pollESP2() {
   static String line;
   while (esp2Serial.available()) {
@@ -2816,7 +3868,10 @@ void pollESP2() {
         // gate and the LOCKED rule "never execute a packet unless both START and END markers validate".
         // Liveness bookkeeping above still counts a garbled line as evidence ESP2 is alive; only the
         // dispatch below is gated, so a dropped/garbled frame can no longer be acted on as if it were real.
-        if (s < 0 || e <= s || raw.length() > 140) {
+        // Cap 256 (was 140, 2026-11-17 bug check): a FILL's FLOW_FAIL carries the level diagnosis (moved/level/base/
+        // link counts/res+mix) and runs ~150 characters. At 140 it was dropped as garbage, so ESP1 never saw the hold
+        // and -- with PROG still refreshing the DONE timeout -- showed the run as live forever. Same cap as ESP2's.
+        if (s < 0 || e <= s || raw.length() > ESP2_LINE_MAX) {
           static unsigned long lastEsp2GarbageLogMs = 0;
           if (millis() - lastEsp2GarbageLogMs > 1000) {
             lastEsp2GarbageLogMs = millis();
@@ -2830,7 +3885,7 @@ void pollESP2() {
           handleEsp2Response(payload);
         }
       }
-    } else if (line.length() < 140) line += c; else line = "";
+    } else if (line.length() < ESP2_LINE_MAX) line += c; else line = "";
   }
 
   // ACK / DONE timeout supervision (suspended while a fault is HELD -- ESP2 is paused, not hung)
@@ -2842,7 +3897,7 @@ void pollESP2() {
     if (resumeAwaitingAck && millis() - resumeSentMs > RESUME_ACK_TIMEOUT_MS) {
       resumeAwaitingAck = false;
       logEvent("ESP1", "RESP", "RESUME|NO_REPLY");
-      sendSMS("ALERT,WARN,RESUME_NO_REPLY,still held - check the link and try again");
+      smsFault('W', "RESUME_NO_REPLY", "");
       // Reuses the existing lastFaultMsg -> diagnostics.system.lastFault / diagnostics.fault.code
       // plumbing (already rendered on the dashboard's Diagnostics tab) so the website has SOME way
       // to distinguish "still held, last attempt got no reply" from a silently-stuck banner.
@@ -2872,6 +3927,7 @@ void pollESP2() {
   }
   if (wo.active && wo.stage == WO_ACKED && millis() - wo.sentMs > UART_DONE_TIMEOUT_MS) {
     logEvent("ESP1", "RESP", "TIMEOUT|" + wo.cmd);
+    tankCheckSet("ESP2_DONE_TIMEOUT");     // a frozen ESP2 never recorded what it filled, and this cut ends it
     raiseFault('C', "ESP2_DONE_TIMEOUT", "ESP2");
     wo.active = false; wo.stage = WO_IDLE;
     forceAbort("ESP2_NO_DONE");
@@ -2882,8 +3938,9 @@ void pollESP2() {
 
 /* ESP2 rebooted under a live job. Same release as the INVALID,NOT_HELD path: the work order is gone,
  * nothing may keep waiting on it. mixTankL survived in ESP2's NVS, so a still-due column re-runs on
- * its own and ESP2 fills only what the tank is missing. */
-static void esp2LostJob() {
+ * its own and ESP2 fills only what the tank is missing. If the reboot was not a battery switch, the
+ * saved volume may be behind what is really in the tank, so the operator has to check it first. */
+static void esp2LostJob(bool tankCheck) {
   int c = wo.colIdx;
   bool hadHold = esp2Held, hadRun = wo.active, hadEx = pendingExercise.active && pendingExercise.sent;
   esp2Held = false; resumeAwaitingAck = false;
@@ -2900,7 +3957,8 @@ static void esp2LostJob() {
   if (hadRun || hadHold) runUiAbort("ESP2_RESTARTED");
   String loc = (c >= 0 && c < NUM_COLUMNS) ? String("COL_") + COL_TAG[c] : String(hadEx ? "EXERCISE" : "-");
   logEvent("ESP1", "RESP", String("JOB_LOST|ESP2_RESTARTED|") + loc + (hadHold ? "|WAS_HELD" : ""));
-  raiseFault('M', "ESP2_RESTARTED", (loc + "|tank kept, column re-runs when due").c_str());
+  raiseFault('M', "ESP2_RESTARTED", (loc + (tankCheck ? "|run lost" : "|tank kept, column re-runs when due")).c_str());
+  if (tankCheck) tankCheckSet("ESP2_RESTARTED");
 }
 
 void handleEsp2Response(const String &payload) {
@@ -2909,6 +3967,15 @@ void handleEsp2Response(const String &payload) {
   String resp = (comma < 0) ? payload : payload.substring(0, comma);
   String arg  = (comma < 0) ? ""      : payload.substring(comma + 1);
 
+  // web v.4: ESP2 meters its water on the tank levels, and needs them BETWEEN pump runs too (settled
+  // baselines before a fill / a delivery). LEVEL_FEED,ON is a lease, renewed every ~4 s; it expires on its
+  // own after LEVEL_FEED_LEASE_MS. Not logged per renewal (it would flood the SD log).
+  if (resp == "LEVEL_FEED") {
+    bool on = (arg == "ON");
+    if (on != levelFeedActive()) logEvent("ESP2", "LEVEL_FEED", on ? "ON" : "OFF");
+    levelFeedUntilMs = on ? nzMs(millis() + LEVEL_FEED_LEASE_MS) : 0;
+    return;
+  }
   if (resp == "CAL") {                                    // live raw sample from ESP2 (§A.3): id,raw
     int c2 = arg.indexOf(',');
     if (c2 > 0) { calRxId = arg.substring(0, c2); calRxRaw = arg.substring(c2 + 1).toFloat();
@@ -2919,6 +3986,14 @@ void handleEsp2Response(const String &payload) {
     // arg = "PZEM,228.0,1.40,319.0,ACS,0.80,ECPH,1.42,6.30" -> log verbatim as pipe-delimited.
     String d = arg; d.replace(",", "|");                  // CSV-safe (sec.25.2: no commas in detail)
     logEvent("ESP2", "SENSOR", d);
+    // The AC voltage, for the AC Voltage setting's "last reading". -1 (PZEM unread, e.g. the inverter
+    // off between AC stages) leaves the previous reading in place.
+    if (arg.startsWith("PZEM,")) {
+      float v = arg.substring(5).toFloat();         // toFloat() stops at the next comma
+      if (v > 0.0f) { acLastV = v; acLastMs = millis(); }
+      int c1 = arg.indexOf(',', 5);                 // PZEM,<v>,<i>,...: the current, for AC Current's "last"
+      if (c1 > 0) { float a = arg.substring(c1 + 1).toFloat(); if (a >= 0.0f && v > 0.0f) { acLastI = a; acLastIMs = millis(); } }
+    }
     // Capture the mixing-tank EC/pH for telemetry. ESP2 only sends these during a run (the tank is
     // empty otherwise), so they are the LAST BATCH's chemistry, not a live idle reading -- which is
     // the only honest thing a single-outlet tank can report. -1 = probe railed / not measured.
@@ -2935,12 +4010,47 @@ void handleEsp2Response(const String &payload) {
     }
     return;
   }
+  // Pump selector (2026-11-15): ESP2 has its inverter OFF and wants the servo on <pump>. servoRelayTick()
+  // carries it to the Nano; nanoPaceTick() already puts the Nano in FAST for the run that follows. ESP2
+  // re-sends the same seq every 3 s while it waits -- that is the same request, not a new one.
+  if (resp == "SERVO_REQ") {                                // SERVO_REQ,<TRANSFER|BOOSTER>,<seq>
+    int c2 = arg.indexOf(',');
+    String pump = (c2 < 0) ? arg : arg.substring(0, c2);
+    String seq  = (c2 < 0) ? "0" : arg.substring(c2 + 1);
+    if (!servoSideForPump(pump.c_str())) { logEvent("ESP2", "SERVO", "REQ_BAD|" + arg); return; }
+    if (servoReqActive && pump == servoReqPump && seq == servoReqSeq) return;
+    servoReqActive = true; servoReqPump = pump; servoReqSeq = seq;
+    servoReqStartMs = millis(); servoReqSentMs = 0;
+    logEvent("ESP2", "SERVO", "REQ|" + pump + "|seq=" + seq);
+    return;
+  }
+  if (resp == "PUMP") {                                     // PUMP,<TRANSFER|BOOSTER>,ON  /  PUMP,OFF
+    if (arg.endsWith(",ON")) {
+      levelWatch = true; levelWatchTransfer = arg.startsWith("TRANSFER");
+      levelWatchSinceMs = millis(); mixHighHighRun = 0; mixHighHighSinceMs = 0;
+      lastFastTankLogMs = 0;
+      logEvent("ESP2", "PUMP", arg);
+      // A timed dashboard pulse on a Fill/Push combo: the servo step took the first seconds, so the pulse's
+      // own length starts now, when the pump is actually powered.
+      // (Only for an ESP2 without INFO,INV_ON: from 2026-11-17 the seconds count from the inverter switch-on.)
+      if (puPhase == PU_RUN && !puHoldMode && puRow >= 16 && puRow <= 19 && !puInvOnSeen)
+        puEndMs = millis() + (unsigned long)puSeconds * 1000UL;
+    } else {
+      levelWatchStop("PUMP_OFF");
+    }
+    return;
+  }
   if (resp == "READY") {
     // ESP2 finished booting (OFF-during-idle model). Fire whatever was waiting on it.
     logEvent("ESP2", "RESP", payload);
+    levelWatchStop("ESP2_READY");                                // a fresh ESP2 has every output off
     esp2CommRecovered();                                         // any READY = link alive -> clear COMM_LOST latch
-    esp2OnSecondary = false;                                     // a fresh ESP2 boots with P4 off
+    // First thing after a boot, ahead of any work order or exercise it is about to get (the UART keeps
+    // order): the AC supply window, in case a change was made while ESP2 was off.
+    pushAcVoltToEsp2();
+    esp2OnSecondary = false;                                     // a fresh ESP2 boots with P0 off
     tankDosedMask = 0;                                           // its INFO,TANK,DOSED follows if one is left
+    bool switchReset = bswPendingDir != 0;                       // read before the next lines clear it
     if (bswPendingDir) {                                         // rebooted mid-switch: the switch reset it
       uint8_t dir = bswPendingDir;
       bswPendingDir = 0; bswSavePending(0); battQuietUntilMs = 0;
@@ -2951,7 +4061,8 @@ void handleEsp2Response(const String &payload) {
     // ESP2_DONE_TIMEOUT emergency stop; a held fault or a sent exercise would be stranded likewise.
     bool lostJob = (wo.active && (wo.stage == WO_SENT || wo.stage == WO_ACKED)) || esp2Held ||
                    (pendingExercise.active && pendingExercise.sent);
-    if (lostJob) esp2LostJob();
+    // A held ESP2 had already stopped and saved its volume, so only a run still going needs the tank check.
+    if (lostJob) esp2LostJob(runLossNeedsTankCheck(wo.active && wo.stage == WO_ACKED && !esp2Held, switchReset));
     // Only a session ESP2 had already CONFIRMED is lost by a reboot. Every pulse/Testing session starts
     // by powering ESP2 up, so the READY of that very boot is expected and must not end it (PU_ARM and
     // an unconfirmed Testing arm simply carry on arming).
@@ -2984,6 +4095,19 @@ void handleEsp2Response(const String &payload) {
       int c1 = arg.indexOf(',', 5);
       if (c1 > 0) { puFlowPulses = (unsigned long)arg.substring(c1 + 1).toInt(); puFlowSeen = true; }
     }
+    // web v.4: TEST,LEVEL,<row>,<dMixL> -- a Fill / Push combo has no meter; the mixing-tank level change since
+    // the pump came on answers "did water move" (-99 = no level to compare).
+    if (arg.startsWith("LEVEL,")) {
+      int c1 = arg.indexOf(',', 6);
+      if (c1 > 0) { puLevelL = arg.substring(c1 + 1).toFloat(); puLevelSeen = true; }
+    }
+    // TEST,SERVO,<TRANSFER|BOOSTER>,OK: a Servo>Transfer / Servo>Booster Testing row finished its move
+    // (the Nano confirmed it; the inverter stayed off). Shown as [OK] on the LCD and in a pulse result.
+    if (arg.startsWith("SERVO,") && arg.endsWith(",OK")) {
+      testServoDoneRow = (arg.indexOf("TRANSFER") > 0) ? TEST_SERVO_L_ROW
+                       : (arg.indexOf("BOOSTER") > 0)  ? TEST_SERVO_R_ROW : -1;
+      wakeBacklight();
+    }
     logEvent("ESP2", "RESP", payload);
     return;
   }
@@ -2998,12 +4122,49 @@ void handleEsp2Response(const String &payload) {
       }
       return;
     }
+    // ESP2 re-asserts a held fault every 30 s (2026-11-17 bug check): INFO,HELD,<work order>,<code>,<loc>. Normally we
+    // already hold it and this is ignored (not logged -- a long hold would fill the log). If ESP2's own hold reply was
+    // lost on the wire, this is how the hold reaches the operator: only for the work order ESP2 acknowledged from us.
+    if (arg.startsWith("HELD,")) {
+      if (esp2Held || !wo.active || wo.stage != WO_ACKED) return;
+      int c1 = arg.indexOf(',', 5), c2 = (c1 > 0) ? arg.indexOf(',', c1 + 1) : -1;
+      if (c2 < 0) return;
+      String name = arg.substring(5, c1);
+      if (wo.cmd.indexOf("," + name + ",") < 0) return;          // not the work order we are running
+      String code = arg.substring(c1 + 1, c2), loc = arg.substring(c2 + 1);
+      logEvent("ESP2", "RESP", payload + "|hold_reply_was_lost");
+      enterFaultHold(code.c_str(), loc.c_str());
+      return;
+    }
     logEvent("ESP2", "RESP", payload);
+    // INFO,PUMP_RATE,<pump>|seen=<rate>|... (2026-11-17): the rate a stage's levels / dose meter really saw. Kept for
+    // the LCD's Calibration > Rate screen, beside the value typed in.
+    // INFO,INV_ON,<pump> (2026-11-17): ESP2 switched the inverter relay ON. A timed run's seconds count from here, the
+    // way the pumps were measured: the LCD pump estimate's counter, and a dashboard Fill/Push pulse's length.
+    if (arg.startsWith("INV_ON,")) {
+      if (pestRunning) pestInvOnMs = nzMs(millis());
+      if (puPhase == PU_RUN && !puHoldMode && puRow >= 16 && puRow <= 19) {
+        puEndMs = millis() + (unsigned long)puSeconds * 1000UL;
+        puInvOnSeen = true;
+      }
+      return;
+    }
+    if (arg.startsWith("PUMP_RATE,")) {
+      int bar = arg.indexOf('|'), sp = arg.indexOf("|seen=");
+      if (bar > 10 && sp > 0) {
+        String pump = arg.substring(10, bar);
+        float v = arg.substring(sp + 6).toFloat();
+        int k = (pump == "TRANSFER") ? 0 : (pump == "BOOSTER") ? 1 : (pump == "NUT_A") ? 2 :
+                (pump == "NUT_B") ? 3 : (pump == "NUT_C") ? 4 : -1;
+        if (k >= 0 && v > 0.0f && v < 100000.0f) rateSeen[k] = v;
+      }
+      return;
+    }
     if (arg.startsWith("DOSE_CARRY,")) {                      // a batch dosed for one column went to another
       raiseFault('M', "DOSE_CARRY", (String("mask=") + arg.substring(11) + "|no extra dose added").c_str());
       return;
     }
-    // A fault whose own P4 drop reset the boards before its reply got out. The hold is gone, so report
+    // A fault whose own P0 drop reset the boards before its reply got out. The hold is gone, so report
     // it here and skip the column for today, as a STOP reply does: re-running into the same fault would
     // only burn the next strike. A forced run can still retry it.
     if (arg.startsWith("FAULT_LOST,")) {
@@ -3015,7 +4176,7 @@ void handleEsp2Response(const String &payload) {
       int c1 = arg.indexOf(',', 11), c2 = (c1 > 0) ? arg.indexOf(',', c1 + 1) : -1;
       if (c2 > 0) {
         uint8_t m = (uint8_t)(arg.substring(c1 + 1, c2).toInt() & 0x07);
-        for (int b = 0; b < NUM_COLUMNS; b++) if (m & (1 << b)) col[b].lastServicedStamp = currentDayStamp;   // RAM only
+        for (int b = 0; b < NUM_COLUMNS; b++) if (m & (1 << b)) markServiced(b, -1, false);   // the whole day; RAM only
         raiseFault('M', arg.substring(11, c1).c_str(), (arg.substring(c2 + 1) + "|BOARD_RESET|skipped today").c_str());
       }
       return;
@@ -3023,7 +4184,7 @@ void handleEsp2Response(const String &payload) {
     // Secondary-battery switch notices: track which battery the boards are on. MAIN also releases a
     // power-off that was being held for exactly this return (see esp2SetPower).
     if (arg.startsWith("BATT,SWITCHING,")) {
-      // ESP2 is about to move P4. Get ready for the rails to drop: log on the card, switch journaled,
+      // ESP2 is about to move P0. Get ready for the rails to drop: log on the card, switch journaled,
       // quiet window, then let it go.
       uint8_t dir = arg.endsWith("SECONDARY") ? 1 : 2;
       logFlush(true);
@@ -3031,7 +4192,18 @@ void handleEsp2Response(const String &payload) {
       bswPendingDir = dir; bswPendingMs = millis();
       bswCmdJournal();                                        // before GO: the switch may be the end of this boot
       battQuietUntilMs = millis() + BSW_QUIET_MS;
+      bswGoMs = nzMs(millis()); bswGoDir = dir;
       sendEsp2("BATTSW,GO");
+      return;
+    }
+    if (arg == "BATT,VERIFY") {
+      // ESP2 is on the secondary and survived it; is everyone else still up? The verdict is reached in bswTick();
+      // a repeat (our answer was lost) just gets the same answer again.
+      if (!bswVerifyStartMs) {
+        bswVerifyStartMs = nzMs(millis()); bswVerdict = nullptr;
+        sendNanoCommand("FAST", false);          // the Nano answers FAST with a TANK at once -- if it is alive
+      }
+      bswVerifyAnswer();
       return;
     }
     if (arg.startsWith("BATT,RESET,")) {                    // ESP2's own journal: a switch reset it
@@ -3047,6 +4219,7 @@ void handleEsp2Response(const String &payload) {
     if (arg == "BATT,SECONDARY" || arg == "BATT,MAIN") {   // switch survived (or was called off)
       esp2OnSecondary = (arg == "BATT,SECONDARY");
       if (bswPendingDir) { bswPendingDir = 0; bswSavePending(0); }
+      bswVerifyStartMs = 0; bswVerdict = nullptr;              // that switch's verification is over
       battQuietUntilMs = 0;
       if (!esp2OnSecondary && esp2OffPending && esp2BattWaitUntil) esp2OffAt = millis();
     }
@@ -3125,7 +4298,9 @@ void handleEsp2Response(const String &payload) {
       String mode = arg.substring(arg.indexOf(',') + 1);
       logEvent("ESP1", "ACT", String("RESUME|CONFIRMED|") + mode + "|COL_" +
                (wo.colIdx >= 0 ? String(COL_TAG[wo.colIdx]) : String("?")));
-      sendSMS(String("ACK,RESUME,") + mode);
+      sendSMS("OK: Run resumed (" + mode + ")\n" +
+              (mode == "IRRIGATE" ? "Water only, no more nutrients." : mode == "RELEASE" ? "The tank goes to the column as it is." : "The paused run continues.") +
+              "\nConfirmed by the pump controller.");
       lastFaultMsg = "Resumed (" + mode + ") - confirmed by ESP2";   // see diagnostics.system.lastFault
       setState(ACTIVE_STATE);                                  // supervising the resumed run again
       // D-M2 fix: enterFaultHold() -> runUiAbort() forced runPhase to RUN_NONE when the fault was
@@ -3141,6 +4316,8 @@ void handleEsp2Response(const String &payload) {
     // ever being sent -- leaving the run to die 10 minutes later in ESP2_DONE_TIMEOUT.
     if (wo.active && (arg.startsWith("SEQ_") || arg.startsWith("RESUME"))) { wo.stage = WO_ACKED; wo.sentMs = millis(); }
   } else if (resp == "DONE") {
+    // LCD "... pump est" run (2026-11-17): its timed prime ended (PRIME_TIMED), or stopped early (PRIME / PRIME_CAP).
+    if (pestRunning && (arg.startsWith("PRIME_TIMED,") || arg == "PRIME" || arg == "PRIME_CAP")) pestOnDone(arg);
     if (arg.startsWith("EXERCISE")) {                          // preventive exercise finished
       int k = pendingExercise.idx;
       if (k >= 0 && k < 3) lastPumpUseMs[k] = millis();        // reset that pump's 2-day clock
@@ -3155,8 +4332,27 @@ void handleEsp2Response(const String &payload) {
       // ESP2 powered off mid-sequence.
       int c = wo.colIdx;
       if (c >= 0 && c < NUM_COLUMNS) {
-        col[c].lastServicedStamp = currentDayStamp;
-        prefs.putLong((String("c") + c + "ls").c_str(), currentDayStamp);   // see loadConfig
+        // The window this run counts for (several a day since 2026-11-05). A run outside every window -- a
+        // forced run then, or a dosed batch finished early -- uses none up: the soil check is what keeps the
+        // next window from watering a column that is still wet. Saved, so a reboot can't re-run it.
+        if (wo.window >= 0) markServiced(c, wo.window, true);
+        // Nutrients went in: no more today, for every column this batch reached (A + B for a joint forced run).
+        if (wo.fertigate) {
+          uint8_t fed = forceMask ? forceMask : (uint8_t)(1 << c);
+          for (int b = 0; b < NUM_COLUMNS; b++) if (fed & (1 << b)) {
+            col[b].fertStamp = currentDayStamp;
+            prefs.putLong((String("c") + b + "fd").c_str(), currentDayStamp);
+          }
+        }
+        // Today's tally (2026-11-06): one watering for every column this run reached, and one feeding when it added
+        // nutrients. Saved with the litres just below (saveDayTotals()).
+        {
+          uint8_t reached = forceMask ? forceMask : (uint8_t)(1 << c);
+          for (int b = 0; b < NUM_COLUMNS; b++) if (reached & (1 << b)) {
+            if (wateringsToday[b] < 255) wateringsToday[b]++;
+            if (wo.fertigate && feedingsToday[b] < 255) feedingsToday[b]++;
+          }
+        }
         // B1: optional measured water volume reported as ...,WATER,<liters>[,EST] on DONE. EST means
         // ESP2 hit a flow-blind (timed, not metered) stage somewhere in this run -- String::toFloat()
         // already safely stops at the trailing comma so `liters` itself is unaffected either way, but
@@ -3165,6 +4361,14 @@ void handleEsp2Response(const String &payload) {
         int wi = payload.indexOf("WATER,");
         float liters = (wi >= 0) ? payload.substring(wi + 6).toFloat() : 0.0f;
         bool waterEstimated = payload.indexOf(",EST") >= 0;
+        // The post-run receipt's water figure (2026-11-05). run.waterGot was only ever set from PROG, but
+        // ESP2 adds a Release stage's litres to its total when that stage ENDS, and DONE follows at once,
+        // so no PROG carried them: every irrigation receipt read WATER=0.00of<target> (LCD, log and the
+        // dashboard's run panel), and fertigation ones lost the last release. DONE's WATER is the same
+        // running total as PROG's third field, only final, so it is the right number for the receipt.
+        // The finished stage's own litres are zeroed with it: the dashboard adds a Release stage's litres
+        // to the total while that stage is still moving water, and would otherwise count them twice now.
+        if (wi >= 0 && runPhase != RUN_NONE) { run.waterGot = liters; run.stageL = 0; run.stageTgt = 0; }
         if (forceMask && __builtin_popcount(forceMask) > 1) {
           // Multi-column FORCE run: one tank, one outlet, one flow meter. The measured litres are a
           // COMBINED total and the per-column split is set by plumbing resistance, not by us. Split
@@ -3186,6 +4390,7 @@ void handleEsp2Response(const String &payload) {
                                     + "|STOP|" + (forceMask ? "FORCE|" : "") + "COL_" + COL_TAG[c]
                                     + "|W=" + String(liters, 2) + (waterEstimated ? "|TIMED" : ""));
         }
+        saveDayTotals();                           // so a restart later today keeps them (2026-11-06)
         if (forceCmdId[0]) {                       // report the run back to the dashboard
           firebaseQueueStatus(forceCmdId, "completed", (String("delivered ") + String(liters, 2) + " L").c_str());
           forceCmdId[0] = 0;
@@ -3229,7 +4434,78 @@ void handleEsp2Response(const String &payload) {
     enterFaultHold("ESP2_ERROR", arg.c_str());   // ESP2 holds (P17 dropped); keep wo for user-gated RESUME
   } else if (resp == "FLOW_FAIL") {
     enterFaultHold("FLOW_FAIL", arg.c_str());
+  } else if (resp == "LEVEL_BLIND") {
+    // ESP2 stopped a fill because the mixing-tank ultrasonic gave no usable reading (Nano silent, lost echo,
+    // too noisy) -- filling blind could overflow -- or (web v.4) it could not get a SETTLED level to plan a
+    // fill / delivery from (|NO_SETTLED_LEVEL). Held like FLOW_FAIL; RELEASE / IRRIGATE then run on a timer.
+    enterFaultHold("LEVEL_BLIND", arg.c_str());
+  } else if (resp == "SERVO_FAIL") {
+    // The pump selector could not be confirmed (Nano did not answer, or the inverter's AC was still live),
+    // so ESP2 never turned the inverter on. In a run ESP2 holds it; for an exercise / prime / Testing combo
+    // ESP2 has already ended that action (its DONE comes separately), so it is an alert only.
+    if (uiMode == UI_TEST || sysState == TEST_MODE) {      // raiseFault() below is suppressed here: show it
+      testServoFailUntilMs = millis() + 4000;
+      testServoFailAcLive  = (arg.indexOf("AC_LIVE") >= 0);
+      testBattSwitchFail   = false;
+      testInverterNoAc     = false;
+      wakeBacklight();
+    }
+    // A website servo move (a timed pulse on a servo row) ends now, with ESP2's reason (see pulseTick).
+    if (puPhase == PU_RUN && !puHoldMode && (puRow == TEST_SERVO_L_ROW || puRow == TEST_SERVO_R_ROW)) {
+      String why = arg.startsWith("TEST|") ? arg.substring(5) : arg;
+      strlcpy(puServoFailWhy, why.length() ? why.c_str() : "?", sizeof(puServoFailWhy));
+    }
+    if (wo.active) enterFaultHold("SERVO_FAIL", arg.c_str());
+    else raiseFault('M', "SERVO_FAIL", arg.c_str());
+  } else if (resp == "BATT_SWITCH_FAIL" || resp == "INVERTER_FAIL") {
+    // 2026-11-16, both handled like SERVO_FAIL under their own names:
+    //  BATT_SWITCH_FAIL: the boards were moved to the secondary (P0) but did not all come through it -- a board or
+    //    the relay bank rebooted, or nobody confirmed (|NANO_RESET, |NANO_SILENT, |PCF_RESET, |NO_CONFIRM,
+    //    |TIMEOUT). ESP2 never turned the inverter on and is returning to main.
+    //  INVERTER_FAIL: the inverter relay was ON for INV_CONFIRM_MAX_MS (6 s) and the PZEM read no voltage on the
+    //    inverter output (|NO_AC|v=none = no PZEM reply at all). ESP2 switched the relay off again.
+    if (uiMode == UI_TEST || sysState == TEST_MODE) {
+      testServoFailUntilMs = millis() + 4000;
+      testServoFailAcLive  = false;
+      testBattSwitchFail   = (resp == "BATT_SWITCH_FAIL");
+      testInverterNoAc     = (resp == "INVERTER_FAIL");
+      wakeBacklight();
+    }
+    if (wo.active) enterFaultHold(resp.c_str(), arg.c_str());
+    else raiseFault('M', resp.c_str(), arg.c_str());
+  } else if (resp == "SERVO_MISMATCH") {
+    // 10 s after the inverter came on, the tank levels said the OTHER pump is running (2026-11-16 user rule:
+    // |WRONG_WAY = they moved the wrong way; |NO_MOVE = a fill moved nothing although the reservoir holds water,
+    // i.e. the booster is powered against its shut valves). ESP2 has already stopped the inverter and is swinging
+    // the servo twice before trying again (try=n/2); the run continues -- no halt. Alert only: a third verdict
+    // comes back as SERVO_FAIL|STUCK, held above (Critical, with the choice to switch it again or not).
+    raiseFault('M', "SERVO_MISMATCH", arg.c_str());
+  } else if (resp == "LEVEL_HIGH") {
+    // The mixing tank reached ESP2's overflow limit (%) before the fill's litres target: the fill was stopped
+    // and the run carries on with the measured litres (user decision). Major: the % (empty/full geometry) and
+    // the litres (tank calibration points) disagree, which is worth a look -- re-check "Tank Mix liters".
+    raiseFault('M', "LEVEL_HIGH", arg.c_str());
+  } else if (resp == "RES_EMPTY") {
+    // The reservoir ran dry during a fill, so ESP2 stopped the transfer pump and the run carries on with the litres
+    // that came in (user decision 2026-11-15). Judged on the MIXING TANK (2026-11-16): the reservoir's ultrasonic
+    // cannot see below its filter (~15 %), so once it reads <= 18 % a 10 s window in which the mixing tank did not
+    // rise = empty (|by=RES_EMPTY_WINDOW); or the transfer stalled for 12 s (|by=STALL). Major + SMS: the reservoir
+    // needs refilling, and a fertigation batch may be stronger than planned (RES_EMPTY,TRANSFER|metered=<L>|
+    // target=<L>|res=<%>|by=<rule>). The mixing tank emptying on a drain is not a fault -- INFO,MIX_EMPTY (the
+    // booster sucked air) or INFO,MIX_LOW_STOP (the 5 % low stop) -- only logged.
+    raiseFault('M', "RES_EMPTY", arg.c_str());
   } else if (resp == "PWR_FAIL") {
+    // A voltage trip carries the reading (VOLTAGE|v=205.3|LOW|min=215): keep it as the last AC reading,
+    // the only one an exercise or AC prime ever reports (they send no TELE).
+    if (arg.startsWith("VOLTAGE|v=")) {
+      float v = arg.substring(10).toFloat();
+      if (v > 0.0f) { acLastV = v; acLastMs = millis(); }
+    }
+    // A current trip carries its reading too (OVERCURRENT|i=4.12|max=3.0, NO_CURRENT|i=0.02|min=0.5).
+    if (arg.startsWith("OVERCURRENT|i=") || arg.startsWith("NO_CURRENT|i=")) {
+      float a = arg.substring(arg.indexOf("i=") + 2).toFloat();
+      if (a >= 0.0f) { acLastI = a; acLastIMs = millis(); }
+    }
     if (wo.active) enterFaultHold("PWR_FAIL", arg.c_str());
     else {
       // Pump exercise or AC prime: ESP2 stopped the load itself and is NOT holding anything. Treating this
@@ -3265,13 +4541,15 @@ void handleEsp2Response(const String &payload) {
     // NOT a fallback -- hold for the user (prime the line, then RELEASE/IRRIGATE/NORMAL).
     enterFaultHold("DOSE_TIMEOUT", arg.c_str());
   } else if (resp == "INVALID") {
+    // An ESP2 flashed before 2026-11-15 refuses the bare Inverter row; the current one allows it (user override).
+    if (arg == "TEST_USE_COMBO") { testUseComboUntilMs = millis() + 3000; return; }
     // ESP2 refuses this column outright: the COLUMN_ENABLED tables disagree (ESP1's is editable at runtime,
     // ESP2's is compiled in). Retrying cannot help, and letting the retries run out would reset a healthy
     // ESP2 for a config mismatch. Say what is wrong and leave the column alone until tomorrow.
     if (wo.active && wo.stage == WO_SENT && (arg.startsWith("COL_DISABLED") || arg.startsWith("COLUMN"))) {
       int c = wo.colIdx;
       wo.active = false; wo.stage = WO_IDLE; wo.colIdx = -1;
-      if (c >= 0 && c < NUM_COLUMNS) col[c].lastServicedStamp = currentDayStamp;   // RAM only: a reboot may retry
+      if (c >= 0 && c < NUM_COLUMNS) markServiced(c, -1, false);   // the whole day; RAM only: a reboot may retry
       forceAbort("COL_MISMATCH");
       if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", "ESP2 has this column disabled"); forceCmdId[0] = 0; }
       forceMask = 0;
@@ -3301,7 +4579,7 @@ void handleEsp2Response(const String &payload) {
       if (forceCmdId[0]) { firebaseQueueStatus(forceCmdId, "failed", "ESP2 restarted during the run"); forceCmdId[0] = 0; }
       forceMask = 0;
       logEvent("ESP1", "RESP", "RESUME_REFUSED|ESP2_RESTARTED");
-      sendSMS("ESP2 restarted; tank volume kept. Column will re-run on its own.");
+      sendSMS("INFO: Pump controller restarted during the hold.\nTank volume kept. The column will re-run on its own.");
       if (sysState == EMERGENCY_STOP) setState(IDLE_STATE);
     }
   }
@@ -3359,7 +4637,7 @@ static bool woFrameFits(const String &cmd, const char *what) {
   logEvent("ESP1", "FAULT", String("WO|OVERSIZE|") + what + "|" + cmd.length() + "B>" + WO_FRAME_MAX);
   // ALERT, not ERR: "ERR," is the reply convention for a REJECTED INBOUND command, and sendSMS now
   // logs those as SMS_ERR -- using it here would file an outbound alarm as an inbound parse failure.
-  sendSMS(String("ALERT,MAJ,WO_OVERSIZE,") + cmd.length() + "B");
+  smsAlert(smsFaultText('M', "WO_OVERSIZE", smsPlain(what) + ", " + String(cmd.length()) + " bytes"));
   return false;
 }
 
@@ -3368,6 +4646,7 @@ void sendWorkOrder(int c, bool fertigate) {
   // a run on the wire, so it refuses independently rather than trusting every future caller.
   if (actuationsDisabled) { logEvent("ESP1", "ACT", "WO|BLOCKED|ACTUATIONS_OFF"); return; }
   if (webManualHeld())    { logEvent("ESP1", "ACT", "WO|BLOCKED|WEB_MANUAL"); return; }
+  if (tankCheckNeeded)    { logEvent("ESP1", "ACT", "WO|BLOCKED|TANK_CHECK"); return; }
   // Doses were computed once in runUiBegin() (so the pre-run receipt and the work order agree, and
   // calcDose's per-nutrient log lines are not emitted twice). Fall back if the run state is stale.
   float mL[3] = { 0, 0, 0 }, ceilS[3] = { 0, 0, 0 };
@@ -3396,7 +4675,7 @@ void sendWorkOrder(int c, bool fertigate) {
   }
   // Job-critical calibration (companion spec §A.5.1 #3): make the job self-contained so a reset
   // moments before it runs can never execute on stale K-factors / EC-pH cal.
-  cmd += ",KMAIN," + String(calKResMix, 1) + "," + String(calKMixIrr, 1);
+  cmd += ",MIXCAP," + String(mixCapLiters(), 2);   // web v.4: no KMAIN (no main-line meters); the fill ceiling instead
   if (fertigate) {
     cmd += ",KNUT," + String(calKNut[0], 1) + "," + String(calKNut[1], 1) + "," + String(calKNut[2], 1);
     cmd += ",ECCAL," + String(calEcM, 6) + "," + String(calEcB, 4);
@@ -3415,6 +4694,7 @@ void sendWorkOrder(int c, bool fertigate) {
   }
 
   wo.active = true; wo.stage = WO_SENT; wo.colIdx = c; wo.fertigate = fertigate;
+  wo.window = -1;                                    // dispatchPendingRun() sets the scheduled run's own window
   wo.cmd = cmd; wo.retries = 0; wo.sentMs = millis();
   esp2Serial.println(cmd);
   logEvent("ESP1", "CMD", "ESP2|" + name);
@@ -3422,7 +4702,9 @@ void sendWorkOrder(int c, bool fertigate) {
                             + "|START|COL_" + COL_TAG[c]);
 
   // Consolidated run notice (one per column service; sec.12.1.2)
-  sendSMS(String("RUN,COL_") + COL_TAG[c] + "," + (fertigate ? "FERTIGATION" : "IRRIGATION"));
+  { String t = smsClock();
+    sendSMS(String("RUN: ") + smsCol(c) + "\n" + (fertigate ? "Fertigation: water + nutrients" : "Irrigation: water only") +
+            (t.length() ? String("\nStarted ") + t : String())); }
 }
 
 /* Abandon a pending/running Settings force sequence and say why. */
@@ -3430,7 +4712,7 @@ void forceAbort(const char *why) {
   if (fcPhase == FP_NONE) return;
   fcPhase = FP_NONE;
   logEvent("ESP1", "ACT", String("FORCE|ABORT|") + why);
-  sendSMS(String("ALERT,MIN,FORCE_ABORT,") + why);
+  smsFault('m', "FORCE_ABORT", why);
   // A web-armed run that is aborted during its countdown must not leave the dashboard command
   // sitting on "accepted" -- it never ran, and the operator needs to see why.
   if (fcCmdId[0]) {
@@ -3454,8 +4736,9 @@ void forceTick() {
   else if (webManualHeld())                                     bad = "WEB_MANUAL";
   else if (wo.active || pendingRun.active || pendingExercise.active) bad = "BUSY";
   else if (esp2Held)                                            bad = "HELD";
-  else if (secBattBlocksAc())                                   bad = "BATT2";
-  else if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT)    bad = "RES_LOW";
+  // (No TANK_CHECK here since 2026-11-17: a forced run is never refused for it -- see sendForceWorkOrder.)
+  else if (secBattBlocksAc())                                   bad = secBlockTag();   // which reason (2026-11-17)
+  else if (reservoirLow(sensor.msTank != 0, sensor.resLevel, RES_LOW_PCT)) bad = "RES_LOW";
   if (bad) { forceAbort(bad); return; }
 
   const ForceSeq &q = fcSeq[fcSlot];
@@ -3488,7 +4771,7 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
   }
   { const char *bw;
     if (secBattBlocksAc(&bw)) {                      // every run uses the AC pumps -> needs the secondary
-      logEvent("ESP1", "ACT", "FORCE|BLOCKED|BATT2");
+      logEvent("ESP1", "ACT", String("FORCE|BLOCKED|") + secBlockTag());
       if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", bw);
       return;
     } }
@@ -3497,6 +4780,11 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
     if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "rejected", "actuations are disabled");
     return;
   }
+  // Forced runs are not limited (user, 2026-11-17): the tank check no longer refuses them. The operator is starting the
+  // run at the rig or on the dashboard, and in web v.4 every fill plans from the mixing tank's MEASURED, settled level
+  // (ESP2 waterStageGate; with no level it holds LEVEL_BLIND instead of filling blind) -- so a saved volume that went
+  // wrong in a lost run can no longer make it overfill. Starting a forced run counts as the confirmation.
+  if (tankCheckNeeded) tankCheckClear("FORCE_RUN");
   int primary = 0;                                   // lowest column in the mask: budget + logging anchor
   while (primary < NUM_COLUMNS && !(mask & (1 << primary))) primary++;
   if (primary >= NUM_COLUMNS) return;
@@ -3536,7 +4824,7 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
     cmd += ",PH," + String(PH_MIN, 1) + "," + String(PH_MAX, 1);
     cmd += ",MIX," + String(MIXING_DURATION_MS);
   }
-  cmd += ",KMAIN," + String(calKResMix, 1) + "," + String(calKMixIrr, 1);
+  cmd += ",MIXCAP," + String(mixCapLiters(), 2);   // web v.4: no KMAIN (no main-line meters); the fill ceiling instead
   if (fert) {
     cmd += ",KNUT," + String(calKNut[0], 1) + "," + String(calKNut[1], 1) + "," + String(calKNut[2], 1);
     cmd += ",ECCAL," + String(calEcM, 6) + "," + String(calEcB, 4);
@@ -3549,6 +4837,9 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
   if (!woFrameFits(cmd, "FORCE")) { forceAbort("WO_OVERSIZE"); return; }
 
   wo.active = true; wo.colIdx = primary; wo.fertigate = fert;
+  // A forced run counts for the window it falls in, if any, so that window doesn't water the column again.
+  // Before several windows a day it used the whole day up; outside a window it now uses none (see DONE).
+  wo.window = (int8_t)windowAt(primary, minuteOfDay());
   wo.cmd = cmd; wo.retries = 0;
   forceMask = mask;                                  // remembered so DONE can be attributed honestly
   strlcpy(forceCmdId, fbCmdId ? fbCmdId : "", sizeof(forceCmdId));
@@ -3572,8 +4863,10 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
   logEvent("ESP1", "ACT", String(fert ? "FERTIGATION" : "IRRIGATION") + "|START|FORCE|COL_" + cols +
                           "|W=" + String(liters, 2) +
                           (fert ? "|mL=" + String(doseMl[0], 0) + "/" + String(doseMl[1], 0) + "/" + String(doseMl[2], 0) : ""));
-  sendSMS(String("RUN,FORCE,COL_") + cols + "," + (fert ? "FERTIGATION" : "IRRIGATION") +
-          "," + String(liters, 1) + "L");
+  { String cl, t = smsClock();
+    for (unsigned i = 0; i < cols.length(); i++) cl += String(i ? "+" : "") + cols[i];
+    sendSMS(String("RUN (manual): Col ") + cl + "\n" + (fert ? "Fertigation: water + nutrients, " : "Irrigation: water only, ") +
+            String(liters, 1) + "L" + (t.length() ? String("\nStarted ") + t : String())); }
   if (fbCmdId && *fbCmdId) firebaseQueueStatus(fbCmdId, "accepted", "force run started");
 }
 
@@ -3674,7 +4967,8 @@ void runUiTick() {
 
 // 8-cell progress bar, e.g. "[####----]". frac is clamped 0..1.
 static String runBar(float frac) {
-  if (!(frac > 0)) frac = 0; if (frac > 1) frac = 1;
+  if (!(frac > 0)) frac = 0;
+  if (frac > 1) frac = 1;
   int on = (int)(frac * 8 + 0.5f);
   String s = "[";
   for (int i = 0; i < 8; i++) s += (i < on) ? '#' : '-';
@@ -3792,7 +5086,7 @@ void esp1SelfResetOncePerDay(const char *reason) {
   uint32_t today = (currentDayStamp > 0) ? (uint32_t)currentDayStamp : 0;
   if (g_lastSelfResetDay == today) return;             // already used today's one reset -> don't loop
   logEvent("ESP1", "RESET", String("SELF|") + reason);
-  sendSMS(String("ALERT,MAJ,SELF_RESET,") + reason);   // best-effort (may not flush before reboot)
+  smsFault('M', "SELF_RESET", reason);                 // best-effort (may not flush before reboot)
   logFlush(true);
   g_lastSelfResetDay = today;
   delay(60);                                            // let the last UART/SD bytes drain
@@ -3804,7 +5098,7 @@ void esp1SelfResetOncePerDay(const char *reason) {
  * while the run finishes. ESP2 keeps executing either way, so waiting is free. */
 /* Core 1: own the manual-mode hold. Core 0 only reports what the page wrote; every decision --
  * grant, refuse, expire, revoke -- is made here, on the core that owns the run state being
- * protected. Each outcome sets fbPushNow so the page learns it in ~1 s instead of waiting up to a
+ * protected. Each outcome calls fbRequestPush() so the page learns it in ~1 s instead of waiting up to a
  * minute for the next scheduled snapshot. */
 void webManualTick() {
   bool ping = webManualPing; webManualPing = false;
@@ -3816,7 +5110,7 @@ void webManualTick() {
       wmPeek = false; wmChooser = false;          // never resume a later hold mid-peek
       strlcpy(webManualState, "idle", sizeof(webManualState)); webManualWhy[0] = '\0';
       logEvent("ESP1", "ACT", "MANUAL|RELEASED|WEB");
-      fbPushNow = true;
+      fbRequestPush();
     }
     return;
   }
@@ -3836,7 +5130,7 @@ void webManualTick() {
       strlcpy(webManualState, "idle", sizeof(webManualState));
       wmPeek = false; wmChooser = false;
       logEvent("ESP1", "ACT", "MANUAL|EXPIRED");
-      fbPushNow = true;
+      fbRequestPush();
     }
     return;
   }
@@ -3857,14 +5151,14 @@ void webManualTick() {
     strlcpy(webManualState, "refused", sizeof(webManualState));
     strlcpy(webManualWhy, why, sizeof(webManualWhy));
     logEvent("ESP1", "ACT", String("MANUAL|REFUSED|") + why);
-    fbPushNow = true;
+    fbRequestPush();
     return;
   }
   webManualUntilMs = millis() + WEB_MANUAL_LEASE_MS;
   strlcpy(webManualState, "held", sizeof(webManualState)); webManualWhy[0] = '\0';
   logEvent("ESP1", "ACT", "MANUAL|GRANTED|WEB");
   wakeBacklight();                                       // the banner is about to appear
-  fbPushNow = true;
+  fbRequestPush();
 }
 
 /* The person at the rig taking control back. Ends any pulse in flight through the normal path so a
@@ -3878,8 +5172,8 @@ void webManualRevoke() {
   strlcpy(webManualState, "revoked", sizeof(webManualState));
   strlcpy(webManualWhy, "the rig operator took control", sizeof(webManualWhy));
   logEvent("ESP1", "ACT", "MANUAL|REVOKED|LCD");
-  sendSMS("ALERT,MIN,MANUAL_REVOKED,LCD");
-  fbPushNow = true;
+  smsFault('m', "MANUAL_REVOKED", "");
+  fbRequestPush();
 }
 
 void netHealthTick() {
@@ -3906,7 +5200,7 @@ void netHealthTick() {
     // fault. The FAULT type still puts it in the SD log and the web event ring, and the SMS goes out
     // over the GSM path, which is independent of the task that just stalled.
     logEvent("ESP1", "FAULT", "WARN|NET_STALL|NETTASK");
-    sendSMS("ALERT,WARN,NET_STALL,NETTASK");
+    smsFault('W', "NET_STALL", "");
     return;
   }
   // Reboot only when there is genuinely nothing to lose: no run, no held fault, no armed force
@@ -3996,7 +5290,8 @@ void esp2CommRecovered() {
   if (esp2CommLost) {
     esp2CommLost = false;
     logEvent("ESP1", "RESET", "ESP2|COMM_RECOVERED");
-    sendSMS("ALERT,MIN,ESP2_COMM_OK,LINK");
+    String t = smsClock();
+    smsAlert(String("OK: Pump controller link is back.\nIt is answering again.\n(") + (t.length() ? t + " " : String()) + "ESP2_COMM_OK)");
   }
 }
 
@@ -4045,7 +5340,8 @@ void esp2SetPower(bool on, bool force) {
   }
   digitalWrite(ESP2_PWR_PIN, LOW);
   esp2Powered = false; esp2OffPending = false;
-  esp2OnSecondary = false; esp2BattWaitUntil = 0;   // PCF unpowered -> P4 drops -> boards on main
+  levelWatchStop("ESP2_OFF");                      // no inverter, no pump: the Nano goes back to normal
+  esp2OnSecondary = false; esp2BattWaitUntil = 0;   // PCF unpowered -> P0 drops -> boards on main
   bswForgetPending();                              // our own cut, not a switch failure
   esp2Available = false; testArmPending = false; esp2TestArmed = false; testArmTries = 0;
 }
@@ -4112,8 +5408,10 @@ void dispatchPendingRun() {
   if (!pendingRun.active) return;
   if (runPhase == RUN_PRE) return;      // hold until the pre-run receipt is acknowledged / times out
   int c = pendingRun.colIdx; bool f = pendingRun.fertigate;
-  pendingRun.active = false; pendingRun.colIdx = -1;
+  int8_t w = pendingRun.window;
+  pendingRun.active = false; pendingRun.colIdx = -1; pendingRun.window = -1;
   sendWorkOrder(c, f);
+  if (wo.active && wo.colIdx == c) wo.window = w;   // DONE marks this window watered (markServiced)
 }
 
 // Warm-up complete: send the EXERCISE command for the selected pump. esp2WarmupMs is
@@ -4139,11 +5437,12 @@ void exerciseTick() {
   if (sysState != IDLE_STATE) return;
   if (uiMode != UI_DATA) return;
   if (wo.active || pendingRun.active || pendingExercise.active) return;
-  if (secBattBlocksAc()) return;           // the exercise runs the inverter -> needs the secondary
+  bool acBlocked = secBattBlocksAc();      // transfer/booster run the inverter -> need the secondary
 #if BATTERY_SAFETY_ENABLED
   if (batteryLow || batteryCritical) return;   // don't exercise on a weak battery (READY, not active)
 #endif
   for (int k = 0; k < 3; k++) {
+    if (k != 2 && acBlocked) continue;     // k 2 = the 12 V DC mixer: no inverter, no secondary needed
     if (millis() - lastPumpUseMs[k] > PUMP_EXERCISE_INTERVAL_MS) {
       pendingExercise.active = true; pendingExercise.idx = k; pendingExercise.sent = false; pendingExercise.acked = false;
       esp2WarmupMs = millis();
@@ -4173,7 +5472,9 @@ static void gsmOnSms(const char *sender, const char *body) {
 }
 
 static void gsmOnUssd(bool ok, const char *text) {
-  sendSMS(String(ok ? "BAL," : "BAL,FAIL,") + text); // ERROR here usually means the carrier/IMS refused USSD
+  // ERROR here usually means the carrier/IMS refused USSD. A long carrier answer is split by smsEnqueueSplit.
+  sendSMS(ok ? String("SIM BALANCE:\n") + text
+             : String("SIM BALANCE check failed: ") + text + "\nThe carrier refused it or the code is wrong (USSD).");
 }
 
 void gsmBegin() {
@@ -4190,9 +5491,15 @@ void pollGSM() {
 // Weekly (and on demand): prove the SIM can still reach the owner. The text itself is the check -- a
 // week without one means the SIM, its load or the modem needs looking at.
 void simHealthCheck() {
-  sendSMS(String("SIMTEST,sig=") + lastRssi + ",reg=" + (netRegistered ? "Y" : "N") + ",stat=" + lastCreg +
-          ",sent=" + gsm.txOk() + ",gaveup=" + gsm.txGaveUp() + ",dlv=" + gsm.delivered() +
-          ",undlv=" + gsm.undelivered() + ",resets=" + gsm.resets());
+  bool known = lastRssi >= 0 && lastRssi != 99;
+  String m = "SIM CHECK (weekly)\nSignal " + (known ? String(lastRssi) + "/31 " : String()) +
+             (!known ? "unknown" : lastRssi >= 20 ? "excellent" : lastRssi >= 15 ? "good" : lastRssi >= 10 ? "fair" : "weak");
+  m += netRegistered ? ", network OK" : ", NO network (" + String(lastCreg) + ")";
+  m += "\nTexts sent " + String(gsm.txOk()) + ", failed " + String(gsm.txGaveUp());
+  m += "\nDelivered " + String(gsm.delivered()) + ", not delivered " + String(gsm.undelivered());
+  m += "\nModem restarts: " + String(gsm.resets());
+  if (gsmSeptets(m.c_str()) + 40 <= SMS_MAX) m += "\nNo text next week = check the SIM load.";
+  sendSMS(m);
   if (USSD_CODE.length()) gsm.requestUssd(USSD_CODE.c_str());
 }
 
@@ -4213,7 +5520,7 @@ void handleSms(const String &body) {
     for (unsigned i = 0; i < replyTarget.length(); i++) if (isDigit(replyTarget[i])) digits++;
     if (digits >= 9 && (!lastAuthReplyMs || millis() - lastAuthReplyMs >= SMS_AUTH_REPLY_GAP_MS)) {
       lastAuthReplyMs = millis();
-      sendSMS("ERR,AUTH");
+      smsErr("AUTH", "Sorry, this number is not allowed to control the irrigation system.");
     } else logEvent("GSM", "SMS_ERR", "AUTH|NO_REPLY");
     return;
   }
@@ -4223,7 +5530,7 @@ void handleSms(const String &body) {
   if ((uiMode == UI_EDIT || editConfirm) &&
       (U.startsWith("SET") || U.startsWith("MODE") || U.startsWith("NAME"))) {
     pendingCfgSms = b;
-    sendSMS("BUSY,local edit; applied after");
+    sendSMS("BUSY: Someone is editing settings on the LCD.\nYour change will be applied when they finish.");
     return;
   }
 
@@ -4235,6 +5542,7 @@ void handleSms(const String &body) {
     if (U == "RELEASE")  { issueRecovery(1); return; }   // dump tank to its column as-is
     if (U == "IRRIGATE") { issueRecovery(2); return; }   // top up water + deliver (no dosing)
     if (U == "NORMAL")   { issueRecovery(3); return; }   // resume the paused sequence
+    if (U == "SERVO")    { issueRecovery(3); return; }   // pump-selector hold: switch it again (= NORMAL, re-seats)
   }
 
   // CANCEL,OFF | CANCEL,30 | CANCEL,10  -- abort the run and suppress the column. Works whether or
@@ -4247,8 +5555,8 @@ void handleSms(const String &body) {
     if      (a == "OFF") mode = 0;
     else if (a == "30")  mode = 1;
     else if (a == "10")  mode = 2;
-    else { sendSMS("ERR,CANCEL,FORMAT (use CANCEL,OFF | CANCEL,30 | CANCEL,10)"); return; }
-    if (!wo.active && !pendingRun.active && !esp2Held) { sendSMS("ERR,CANCEL,NO_RUN"); return; }
+    else { smsErr("CANCEL|FORMAT", "NOT DONE: Unknown CANCEL option.\nCANCEL,30 or CANCEL,10 = end the run, skip the column 30/10 min\nCANCEL,OFF = end it, column off"); return; }
+    if (!wo.active && !pendingRun.active && !esp2Held) { smsErr("CANCEL|NO_RUN", "NOT DONE: Nothing is running, so there is nothing to cancel."); return; }
     cancelRun(mode, "SMS");
     return;
   }
@@ -4256,7 +5564,7 @@ void handleSms(const String &body) {
   // STOP,ALL  (global emergency stop when nothing is held)
   if (U.startsWith("STOP")) {
     enterEmergencyStop(false);
-    sendSMS("ACK,STOP,ALL");
+    sendSMS("OK: EMERGENCY STOP\nAll pumps and valves are stopped.\nClear it on the LCD to resume.");
     return;
   }
   // SUPA,<projectUrl>,<serviceKey>  -- set Supabase creds (case-sensitive; use raw body, not U).
@@ -4267,18 +5575,18 @@ void handleSms(const String &body) {
     rest.trim();
     if (rest.equalsIgnoreCase("CLEAR")) {
       xSemaphoreTake(netMux, portMAX_DELAY); supaUrl = ""; supaKey = ""; xSemaphoreGive(netMux);
-      saveSupa(); sendSMS("ACK,SUPA,CLEAR"); return;
+      saveSupa(); sendSMS("OK: Supabase login cleared. Log uploads are off."); return;
     }
     int c2 = rest.indexOf(',');                          // URL , KEY (key may not contain a comma; JWTs don't)
-    if (c2 <= 0) { sendSMS("ERR,SUPA,FORMAT"); return; }
+    if (c2 <= 0) { smsErr("SUPA|FORMAT", "NOT DONE: Wrong format.\nUse SUPA,<project url>,<service key>\nor SUPA,CLEAR"); return; }
     String u = rest.substring(0, c2); u.trim();
     String k = rest.substring(c2 + 1); k.trim();
     u = supaNormalizeUrl(u);                        // collapse any pasted path down to the origin
-    if (!u.startsWith("http") || k.length() < 20) { sendSMS("ERR,SUPA,FORMAT"); return; }
+    if (!u.startsWith("http") || k.length() < 20) { smsErr("SUPA|FORMAT", "NOT DONE: Wrong format.\nUse SUPA,<project url>,<service key>\nor SUPA,CLEAR"); return; }
     xSemaphoreTake(netMux, portMAX_DELAY); supaUrl = u; supaKey = k; xSemaphoreGive(netMux);
     saveSupa();
     logEvent("ESP1", "CFG", "SUPA|SET");                 // note: NO url/key in the log
-    sendSMS("ACK,SUPA,SET");
+    sendSMS("OK: Supabase login saved.");
     return;
   }
   // FBASE,<rtdbUrl>  -- set the Firebase RTDB base URL (raw body, not U: the URL is case-sensitive).
@@ -4289,14 +5597,14 @@ void handleSms(const String &body) {
     rest.trim();
     if (rest.equalsIgnoreCase("CLEAR")) {
       xSemaphoreTake(netMux, portMAX_DELAY); fbUrl = ""; xSemaphoreGive(netMux);
-      saveFb(); sendSMS("ACK,FBASE,CLEAR"); return;
+      saveFb(); sendSMS("OK: Firebase address cleared. The website stops updating."); return;
     }
     if (rest.equalsIgnoreCase("ON") || rest.equalsIgnoreCase("OFF")) {
       bool en = rest.equalsIgnoreCase("ON");
       xSemaphoreTake(netMux, portMAX_DELAY); firebaseEnabled = en; xSemaphoreGive(netMux);
       saveFb();
       logEvent("ESP1", "CFG", String("FBASE|") + (en ? "ON" : "OFF"));
-      sendSMS(en ? "ACK,FBASE,ON" : "ACK,FBASE,OFF");
+      sendSMS(en ? "OK: Website sync (Firebase) is ON." : "OK: Website sync (Firebase) is OFF.");
       return;
     }
     // FBASE,SIGNOUT -- wipe every credential and the live token. The dashboard goes read-dead
@@ -4312,7 +5620,7 @@ void handleSms(const String &body) {
       fbTokenExpiryMs = 0; fbAuthOk = false;
       saveFbAuth();
       logEvent("ESP1", "CFG", "FBASE|SIGNOUT");
-      sendSMS("ACK,FBASE,SIGNOUT");
+      sendSMS("OK: Signed out of Firebase. Saved logins erased.\nThe website stops updating until you sign in again.");
       return;
     }
     // FBASE,STATUS -- why is it not connecting? Reports the blocking precondition, the last
@@ -4329,18 +5637,26 @@ void handleSms(const String &body) {
       uKey = fbApiKey; uMail = fbEmail; uRefresh = fbRefresh; uPass = fbPassword;
       uUrl = fbUrl; uUid = fbUid; uErr = fbAuthErr;
       xSemaphoreGive(netMux);
-      String m = "FB,";
-      m += fbAuthOk ? "SIGNEDIN" : "NOAUTH";
-      m += ",http=" + String(fbAuthHttp);
-      if (!firebaseEnabled)                     m += ",OFF";
-      else if (uKey.length() < 8)               m += ",NOKEY";
-      else if (!uMail.length())                 m += ",NOMAIL";
-      else if (!uRefresh.length() && !uPass.length()) m += ",NOPASS";
-      else if (!wifiConnected)                  m += ",NOWIFI";
-      else if (uUrl.length() < 8)               m += ",NOURL";
-      m += fbPinCa ? ",TLS=pin" : ",TLS=insecure";
-      if (uUid.length()) m += ",uid=" + uUid;
-      if (uErr.length()) m += "," + uErr.substring(0, 60);
+      String m = String("FIREBASE: ") + (fbAuthOk ? "signed in" : "NOT signed in");
+      const char *block = !firebaseEnabled                      ? "sync is OFF (text FBASE,ON)"
+                        : uKey.length() < 8                     ? "no API key (FBASE,APIKEY)"
+                        : !uMail.length()                       ? "no email (FBASE,AUTH)"
+                        : (!uRefresh.length() && !uPass.length()) ? "no password (FBASE,AUTH)"
+                        : !wifiConnected                        ? "no WiFi (text NET)"
+                        : uUrl.length() < 8                     ? "no address (FBASE,<url>)" : nullptr;
+      if (block) m += String("\nBlocked: ") + block;
+      // The last snapshot upload's HTTP code (the sign-in code below is only the SIGN-IN's). Without it a
+      // signed-in device whose every upload is refused (wrong account vs the rules -> 401) reported
+      // as healthy here. 204/200 = ok, 401 = rules refused this account, <0 = no TLS/TCP, 0 = none yet.
+      int up = fbLastHttp;
+      m += "\nLast upload: " + ((up == 200 || up == 204) ? String("OK")
+                             : up == 401 ? String("refused by the rules (401)")
+                             : up < 0    ? "no connection (" + String(up) + ")"
+                             : up == 0   ? String("none yet") : "code " + String(up));
+      m += "\nSign-in code: " + String(fbAuthHttp);
+      m += fbPinCa ? "\nCertificate check: ON" : "\nCertificate check: OFF (test only)";
+      if (uErr.length()) m += "\n" + smsCut("Error: " + uErr, SMS_MAX - gsmSeptets(m.c_str()) - 1);
+      if (uUid.length() && gsmSeptets(m.c_str()) + 6 + (int)uUid.length() <= SMS_MAX) m += "\nUID: " + uUid;
       sendSMS(m);
       return;
     }
@@ -4348,24 +5664,25 @@ void handleSms(const String &body) {
     // works with it off, the CA pin is the problem, not your credentials. Put it back on.
     if (rest.startsWith("TLS,") || rest.startsWith("tls,")) {
       String v = rest.substring(4); v.trim();
-      if (!v.equalsIgnoreCase("ON") && !v.equalsIgnoreCase("OFF")) { sendSMS("ERR,FBASE,FORMAT"); return; }
+      if (!v.equalsIgnoreCase("ON") && !v.equalsIgnoreCase("OFF")) { smsErr("FBASE|FORMAT", "NOT DONE: Wrong format. Use one of:\nFBASE,<url>  FBASE,ON / OFF\nFBASE,STATUS  FBASE,SIGNOUT\nFBASE,TLS,ON / OFF  FBASE,APIKEY,<key>\nFBASE,AUTH,<email>,<password>"); return; }
       xSemaphoreTake(netMux, portMAX_DELAY); fbPinCa = v.equalsIgnoreCase("ON"); xSemaphoreGive(netMux);
       fbTlsResetPending = true;                         // netTask owns the TLS client; tearing it down from
                                                         // here could free it in the middle of a request
       fbSignInPending = true; fbAuthFails = 0; fbAuthNextTryMs = 0;
       saveFbAuth();
       logEvent("ESP1", "CFG", String("FBASE|TLS|") + (fbPinCa ? "PIN" : "INSECURE"));
-      sendSMS(fbPinCa ? "ACK,FBASE,TLS,ON" : "ACK,FBASE,TLS,OFF");
+      sendSMS(fbPinCa ? "OK: Firebase certificate check is ON."
+                      : "OK: Firebase certificate check is OFF.\nFor testing only. Turn it back on with FBASE,TLS,ON");
       return;
     }
     // FBASE,APIKEY,<webApiKey>
     if (rest.startsWith("APIKEY,") || rest.startsWith("apikey,")) {
       String k = rest.substring(7); k.trim();
-      if (k.length() < 8) { sendSMS("ERR,FBASE,FORMAT"); return; }
+      if (k.length() < 8) { smsErr("FBASE|FORMAT", "NOT DONE: Wrong format. Use one of:\nFBASE,<url>  FBASE,ON / OFF\nFBASE,STATUS  FBASE,SIGNOUT\nFBASE,TLS,ON / OFF  FBASE,APIKEY,<key>\nFBASE,AUTH,<email>,<password>"); return; }
       xSemaphoreTake(netMux, portMAX_DELAY); fbApiKey = k; xSemaphoreGive(netMux);
       saveFbAuth();
       logEvent("ESP1", "CFG", "FBASE|APIKEY");          // note: NO key in the log
-      sendSMS("ACK,FBASE,APIKEY");
+      sendSMS("OK: Firebase API key saved.");
       return;
     }
     // FBASE,AUTH,<email>,<password> -- provisioning. Password is used once to mint a refresh
@@ -4373,25 +5690,25 @@ void handleSms(const String &body) {
     if (rest.startsWith("AUTH,") || rest.startsWith("auth,")) {
       String rem = rest.substring(5);
       int c2 = rem.indexOf(',');
-      if (c2 <= 0) { sendSMS("ERR,FBASE,FORMAT"); return; }
+      if (c2 <= 0) { smsErr("FBASE|FORMAT", "NOT DONE: Wrong format. Use one of:\nFBASE,<url>  FBASE,ON / OFF\nFBASE,STATUS  FBASE,SIGNOUT\nFBASE,TLS,ON / OFF  FBASE,APIKEY,<key>\nFBASE,AUTH,<email>,<password>"); return; }
       String em = rem.substring(0, c2); em.trim();
       String pw = rem.substring(c2 + 1); pw.trim();
-      if (em.indexOf('@') < 0 || pw.length() < 6) { sendSMS("ERR,FBASE,FORMAT"); return; }
+      if (em.indexOf('@') < 0 || pw.length() < 6) { smsErr("FBASE|FORMAT", "NOT DONE: Wrong format. Use one of:\nFBASE,<url>  FBASE,ON / OFF\nFBASE,STATUS  FBASE,SIGNOUT\nFBASE,TLS,ON / OFF  FBASE,APIKEY,<key>\nFBASE,AUTH,<email>,<password>"); return; }
       xSemaphoreTake(netMux, portMAX_DELAY);
       fbEmail = em; fbPassword = pw; fbRefresh = "";   // new creds void any stored refresh token
       xSemaphoreGive(netMux);
       saveFbAuth();
       fbSignInPending = true; fbAuthFails = 0; fbAuthNextTryMs = 0;
       logEvent("ESP1", "CFG", "FBASE|AUTH");           // note: NO email/password in the log
-      sendSMS("ACK,FBASE,AUTH");
+      sendSMS("OK: Firebase email and password saved. Signing in now.\nText FBASE,STATUS in a minute to check.");
       return;
     }
     String u = supaNormalizeUrl(rest);                   // same origin-only reduction as SUPA
-    if (!u.startsWith("http")) { sendSMS("ERR,FBASE,FORMAT"); return; }
+    if (!u.startsWith("http")) { smsErr("FBASE|FORMAT", "NOT DONE: Wrong format. Use one of:\nFBASE,<url>  FBASE,ON / OFF\nFBASE,STATUS  FBASE,SIGNOUT\nFBASE,TLS,ON / OFF  FBASE,APIKEY,<key>\nFBASE,AUTH,<email>,<password>"); return; }
     xSemaphoreTake(netMux, portMAX_DELAY); fbUrl = u; firebaseEnabled = true; xSemaphoreGive(netMux);
     saveFb();
     logEvent("ESP1", "CFG", "FBASE|SET");                // note: NO url in the log
-    sendSMS("ACK,FBASE,SET");
+    sendSMS("OK: Firebase address saved. Website sync is ON.");
     return;
   }
   // UPLOAD             -> queue yesterday's CSV.  UPLOAD,YYYYMMDD -> queue that specific day.
@@ -4404,28 +5721,43 @@ void handleSms(const String &body) {
       stamp = dayStamp(y);
     }
     xSemaphoreTake(netMux, portMAX_DELAY); bool suHave = supaUrl.length() > 0; xSemaphoreGive(netMux);
-    if (!suHave) { sendSMS("ERR,UPLOAD,NOCREDS"); return; }
-    if (stamp <= 0)                    { sendSMS("ERR,UPLOAD,DAY"); return; }
-    if (rtcOk && stamp == currentDayStamp) { sendSMS("ERR,UPLOAD,TODAY"); return; }  // never the open file
+    if (!suHave) { smsErr("UPLOAD|NOCREDS", "NOT DONE: Log upload is not set up.\nSend SUPA,<project url>,<service key> first."); return; }
+    if (stamp <= 0) { smsErr("UPLOAD|DAY", "NOT DONE: Unknown day.\nUse UPLOAD (= yesterday) or UPLOAD,YYYYMMDD e.g. UPLOAD,20261115"); return; }
+    if (rtcOk && stamp == currentDayStamp) {             // never the open file
+      smsErr("UPLOAD|TODAY", "NOT DONE: Today's log is still being written.\nOnly past days can be uploaded."); return;
+    }
     char path[16]; snprintf(path, sizeof(path), "/%08ld.CSV", stamp);
     bool exists;
     { bool got = sdTake(200); exists = got && SD.exists(path); if (got) sdGive(); }
-    if (!exists) { sendSMS(String("ERR,UPLOAD,NOFILE,") + stamp); return; }
+    if (!exists) { smsErr((String("UPLOAD|NOFILE|") + stamp).c_str(), "NOT DONE: There is no log for " + smsDate(stamp) + " on the SD card."); return; }
     manualUploadStamp = stamp;                           // uploadTick prioritizes this
-    sendSMS(String("ACK,UPLOAD,") + stamp);
+    sendSMS("OK: The log for " + smsDate(stamp) + " is queued for upload.");
     return;
   }
   // STATUS
   if (U == "STATUS") {
     if (sysState == ACTIVE_STATE) {
       String prog = (wo.active && wo.colIdx >= 0)
-        ? String("ACK,BUSY,") + (wo.fertigate ? "FERTIGATION" : "IRRIGATION") + ",COL_" + COL_TAG[wo.colIdx]
-        : String("ACK,BUSY,ACTIVE");
-      sendSMS(prog);
+        ? String("BUSY: ") + (wo.fertigate ? "Fertigation" : "Irrigation") + " running on " + smsCol(wo.colIdx) + "."
+        : String("BUSY: The system is running.");
+      sendSMS(prog + "\nThe full report will follow when it finishes.");
       reportPending = true;                 // deferred full report (sec.12.1.3.1)
     } else {
       sendDailyReport();
     }
+    return;
+  }
+  // TANKCHECK -- is a tank check outstanding? TANKCHECK,OK -- the operator has looked at the mixing tank.
+  if (U == "TANKCHECK" || U == "TANKCHECK,OK") {
+    if (U == "TANKCHECK,OK") {
+      if (sysState != IDLE_STATE) { smsErr("TANKCHECK|NOT_IDLE", "NOT DONE: Wait until the system is idle, then send TANKCHECK,OK again."); return; }
+      bool was = tankCheckNeeded;
+      tankCheckClear("SMS");
+      sendSMS(was ? "OK: Tank check confirmed. Runs can start again." : "OK: No tank check was needed.");
+      return;
+    }
+    sendSMS(tankCheckNeeded ? "TANK CHECK NEEDED\nLook at the mixing tank. If it holds water, empty it with Testing (booster).\nThen text TANKCHECK,OK"
+                            : "TANK CHECK: not needed. All good.");
     return;
   }
   // BATTSW -- battery-switch status; BATTSW,CLEAR -- clear a latched switch fault (re-arms switching).
@@ -4433,18 +5765,58 @@ void handleSms(const String &body) {
     if (U == "BATTSW,CLEAR") {
       bool was = bswLatched;
       bswClear("SMS");
-      sendSMS(was ? "ACK,BATTSW,CLEARED" : "ACK,BATTSW,NOT_LATCHED");
+      sendSMS(was ? "OK: Battery switch fault cleared. AC pumps are allowed again." : "OK: There was no battery switch fault to clear.");
       return;
     }
-    sendSMS(String("BATTSW,") + (SECONDARY_BATT_ENABLED ? "ON" : "OFF") + "," + (bswLatched ? "FAULT" : "OK") +
-            ",strikes=" + bswStrikes + "/" + BSW_LATCH_STRIKES + ",supply=" + (esp2OnSecondary ? "SECONDARY" : "MAIN"));
+    String r = String("BATTERY SWITCH\nBackup switching: ") + (SECONDARY_BATT_ENABLED ? "on" : "off");
+    r += bswLatched ? "\nFault lock: ON, AC pumps blocked" : "\nFault lock: none";
+    r += "\nSwitch resets: " + String(bswStrikes) + " (locks at " + String(BSW_LATCH_STRIKES) + ")";
+    r += String("\nRunning on: ") + (esp2OnSecondary ? "backup battery" : "main battery");
+    if (bswLatched) r += "\nText BATTSW,CLEAR to unlock";
+    sendSMS(r);
     return;
   }
   // SIMTEST -- the weekly SIM check, on demand.  BAL -- carrier balance via USSD.
+  // HELP [,RUN | ,CROPS | ,SYSTEM] -- the command list, one SMS per topic (2026-11-16). Owner-gated like
+  // everything above. Anything after HELP that is not a topic gets the main page.
+  if (U == "HELP" || U == "?" || U == "COMMANDS" || U.startsWith("HELP,") || U.startsWith("HELP ")) {
+    String t = U.startsWith("HELP") ? U.substring(4) : String();
+    t.replace(",", " "); t.trim();
+    if (t == "RUN")
+      sendSMS("HELP RUN\n"
+              "CANCEL,30 / CANCEL,10 = end run, skip col 30/10 min\n"
+              "CANCEL,OFF = end run, col off\n"
+              "On hold: NORMAL, IRRIGATE, RELEASE, STOP\n"
+              "TANKCHECK,OK = tank checked");
+    else if (t == "CROPS" || t == "CROP")
+      sendSMS("HELP CROPS\n"
+              "SET,COL_A,N,150,P,40,K,200,pH,5.8\n"
+              "SET,COL_A,PRESET,PECHAY\n"
+              "NAME,COL_A,Lettuce\n"
+              "MODE,COL_A,AUTO or IRRIGATION_ONLY\n"
+              "THRESH,35,30 = start %, gap mg/kg");
+    else if (t == "SYSTEM")
+      sendSMS("HELP SYSTEM\n"
+              "NET = WiFi status\n"
+              "WIFI,<name>,<pass>\n"
+              "WIFIPORTAL = setup page\n"
+              "BATTSW = battery switch\n"
+              "BAL = SIM balance\n"
+              "ALERTNUM,<phone> = 2nd phone\n"
+              "FBASE,STATUS");
+    else
+      sendSMS("HELP: text one command\n"
+              "STATUS = report now\n"
+              "SUMMARY = day averages\n"
+              "FULL SUMMARY = hourly\n"
+              "STOP = emergency stop\n"
+              "More: HELP,RUN  HELP,CROPS  HELP,SYSTEM");
+    return;
+  }
   if (U == "SIMTEST") { simHealthCheck(); return; }
   if (U == "BAL") {
-    if (!USSD_CODE.length()) { sendSMS("ERR,BAL,NOCODE"); return; }
-    if (!gsm.requestUssd(USSD_CODE.c_str())) sendSMS("ERR,BAL,BUSY");
+    if (!USSD_CODE.length()) { smsErr("BAL|NOCODE", "NOT DONE: No balance code saved.\nSend USSD,<code> first, e.g. USSD,*143#"); return; }
+    if (!gsm.requestUssd(USSD_CODE.c_str())) smsErr("BAL|BUSY", "NOT DONE: The modem is busy. Try BAL again in a minute.");
     return;                                 // the answer arrives through gsmOnUssd, to the owner
   }
   // USSD,<code> | USSD,CLEAR -- carrier balance code for BAL and the weekly check. USSD = show it.
@@ -4452,11 +5824,12 @@ void handleSms(const String &body) {
     if (U != "USSD") {
       String code = b.substring(5); code.trim();
       if (code.equalsIgnoreCase("CLEAR")) code = "";
-      else if (!gsmUssdCodeOk(code.c_str())) { sendSMS("ERR,USSD,FORMAT"); return; }
+      else if (!gsmUssdCodeOk(code.c_str())) { smsErr("USSD|FORMAT", "NOT DONE: Use digits, * and # only, e.g. USSD,*143#\nUSSD,CLEAR removes it."); return; }
       USSD_CODE = code;
       prefs.putString("ussd", USSD_CODE);
     }
-    sendSMS("USSD," + (USSD_CODE.length() ? USSD_CODE : String("-")));
+    sendSMS(USSD_CODE.length() ? "Balance code: " + USSD_CODE + "\nText BAL to check the SIM balance."
+                               : String("Balance code: none\nSet one with USSD,<code>"));
     return;
   }
   // ALERTNUM,<number> | ALERTNUM,CLEAR -- second recipient for ALERT texts. It receives only: its
@@ -4465,22 +5838,29 @@ void handleSms(const String &body) {
     if (U != "ALERTNUM") {
       String num = b.substring(9); num.trim();
       if (num.equalsIgnoreCase("CLEAR")) num = "";
-      else if (!gsmNumberOk(num.c_str())) { sendSMS("ERR,ALERTNUM,FORMAT"); return; }
+      else if (!gsmNumberOk(num.c_str())) { smsErr("ALERTNUM|FORMAT", "NOT DONE: Use ALERTNUM,<phone number> (digits, + allowed)\nor ALERTNUM,CLEAR"); return; }
       ALERT_NUMBER2 = num;
       prefs.putString("owner2", ALERT_NUMBER2);
     }
-    sendSMS("ALERTNUM," + (ALERT_NUMBER2.length() ? ALERT_NUMBER2 : String("-")));
+    sendSMS(ALERT_NUMBER2.length() ? "2nd alert number: " + ALERT_NUMBER2 + "\nIt gets alerts only and cannot send commands."
+                                   : String("2nd alert number: none\nAdd one with ALERTNUM,<phone number>"));
     return;
   }
   // NET -- WiFi/ThingSpeak link status (Part B)
   if (U == "NET") {
     String ss; xSemaphoreTake(netMux, portMAX_DELAY); ss = wifiSsid; xSemaphoreGive(netMux);
-    String r = "NET,WiFi:" + String(portalActive ? "PORTAL" : !wifiEnabled ? "OFF" : wifiConnected ? "OK" : "DOWN");
-    if (portalActive) r += ",AP:" + String(AP_SSID) + ",IP" + String(portalApIp);
-    else if (wifiConnected) r += ",RSSI" + String(wifiRssiVal) + ",IP" + String(wifiIpStr);
-    r += ",TS:" + String(lastTsOk ? "ok" : "--");
-    if (lastTsUploadMs) r += ",age" + String((millis() - lastTsUploadMs) / 1000) + "s";
-    r += ",SSID:" + (ss.length() ? ss : String("-"));
+    String r = "NETWORK\nWiFi: ";
+    if (portalActive)       r += String("setup portal ON\nJoin ") + AP_SSID + ", open http://" + portalApIp;
+    else if (!wifiEnabled)  r += "turned OFF (text WIFI,ON)";
+    else if (wifiConnected) r += "connected to " + ss + "\nSignal " + String(wifiRssiVal) + " dBm, IP " + String(wifiIpStr);
+    else                    r += "NOT connected" + (ss.length() ? " (network " + ss + ")" : String(" (no network set)"));
+    if (lastTsUploadMs) {
+      unsigned long ago = (millis() - lastTsUploadMs) / 1000;
+      r += String("\nThingSpeak: last upload ") + (lastTsOk ? "OK, " : "FAILED, ") +
+           (ago < 120 ? String(ago) + " s ago" : String(ago / 60) + " min ago");
+    } else {
+      r += "\nThingSpeak: no upload yet";
+    }
     sendSMS(r);
     return;
   }
@@ -4499,9 +5879,8 @@ void handleSms(const String &body) {
       arg.replace(",", " ");
       arg.trim();
       long target = resolveSummaryDay(arg);
-      if (target == -2) { sendSMS("ERR,SUMDATE"); return; }
+      if (target == -2) { smsErr("SUMDATE", "NOT DONE: Unknown day.\nUse SUMMARY, SUMMARY,YESTERDAY or SUMMARY,YYYYMMDD (same for FULL SUMMARY)"); return; }
       SumMode mode = isFull ? SUM_FULL : SUM_SHORT;
-      const char *ackName = isFull ? "FULLSUMMARY" : "SUMMARY";
       if (sysState == ACTIVE_STATE || portalActive) {   // portal owns the SD -> defer, run when it closes
         if (summaryPending) {
           // A request is already queued and waiting for the system to idle. summaryReplyTo/
@@ -4509,15 +5888,15 @@ void handleSms(const String &body) {
           // used to silently overwrite the first one, so the first requester's report simply never
           // arrived, with no error, and both requests got an ACK,BUSY that looked like a queued
           // success.
-          sendSMS(String("ACK,BUSY,") + ackName + ",ALREADY_QUEUED");
+          sendSMS("BUSY: A summary is already waiting.\nIt will be sent when the system is free.");
           return;
         }
-        sendSMS(String("ACK,BUSY,") + ackName);
+        sendSMS(String("BUSY: The system is running.\nYour ") + (isFull ? "full summary" : "summary") + " will be sent when it is free.");
         summaryReplyTo = replyTarget;
         pendingSumMode = mode; pendingSumTarget = target;
         summaryPending = true;
       } else if (summaryStage != SUM_IDLE) {
-        sendSMS(String("ACK,") + ackName + ",BUSY");   // a job is already running -> don't stack
+        sendSMS("BUSY: A summary is being sent right now.\nTry again in a few minutes.");   // a job is already running -> don't stack
       } else {
         summaryReplyTo = replyTarget;
         startSummaryJob(mode, target);
@@ -4531,38 +5910,43 @@ void handleSms(const String &body) {
     if (i == b.length() || b[i] == ',') { tok[n++] = b.substring(start, i); start = i + 1; }
   }
   String k0 = tok[0]; k0.toUpperCase();
-  if (n < 2 && k0 != "WIFIPORTAL") { sendSMS("ERR,PARSE"); return; }   // the only keyword valid on its own here
+  if (n < 2 && k0 != "WIFIPORTAL") { smsErr("PARSE", "NOT DONE: Command not understood.\nText HELP for the list of commands."); return; }   // the only keyword valid on its own here
 
   // resolve column index from COL_A/B/C
   auto colIdx = [&](const String &s) -> int {
     String t = s; t.toUpperCase();
-    if (t == "COL_A") return 0; if (t == "COL_B") return 1; if (t == "COL_C") return 2;
+    if (t == "COL_A") return 0;
+    if (t == "COL_B") return 1;
+    if (t == "COL_C") return 2;
     return -1;
   };
 
   if (k0 == "MODE") {
     int c = colIdx(tok[1]); String m = tok[2]; m.toUpperCase();
-    if (c < 0) { sendSMS("ERR,COL"); return; }
+    if (c < 0) { smsErr("COL", "NOT DONE: Unknown column. Use COL_A, COL_B or COL_C."); return; }
     if (m == "AUTO")            col[c].mode = MODE_AUTO;
     else if (m == "IRRIGATION_ONLY") col[c].mode = MODE_IRRIGATION_ONLY;
-    else { sendSMS("ERR,MODE"); return; }
+    else { smsErr("MODE", "NOT DONE: Mode must be AUTO or IRRIGATION_ONLY.\nExample: MODE,COL_A,AUTO"); return; }
     saveColumn(c);
-    sendSMS(String("ACK,MODE,COL_") + COL_TAG[c] + "," + m);
+    sendSMS(String("OK: Col ") + COL_TAG[c] + " mode is " +
+            (m == "AUTO" ? "AUTO (nutrients when needed)" : "IRRIGATION ONLY (water only)"));
     return;
   }
   if (k0 == "NAME") {
     int c = colIdx(tok[1]);
-    if (c < 0 || n < 3) { sendSMS("ERR,NAME"); return; }
+    if (c < 0 || n < 3) { smsErr("NAME", "NOT DONE: Use NAME,COL_A,<plant name>"); return; }
     strncpy(col[c].name, tok[2].c_str(), sizeof(col[c].name) - 1);
     col[c].name[sizeof(col[c].name) - 1] = 0;
     saveColumn(c);
-    sendSMS(String("ACK,NAME,COL_") + COL_TAG[c] + "," + col[c].name);
+    sendSMS(String("OK: Col ") + COL_TAG[c] + " plant name is now " + col[c].name);
     return;
   }
   if (k0 == "SET") {
     int c = colIdx(tok[1]);
-    if (c < 0) { sendSMS("ERR,COL"); return; }
-    if (n < 4) { sendSMS("ERR,SET,FORMAT"); return; }    // or the reply would say ACK with nothing changed
+    if (c < 0) { smsErr("COL", "NOT DONE: Unknown column. Use COL_A, COL_B or COL_C."); return; }
+    if (n < 4) {                                         // or the reply would say OK with nothing changed
+      smsErr("SET|FORMAT", "NOT DONE: Use SET,COL_A,N,150,P,40,K,200,pH,5.8\nor SET,COL_A,PRESET,<crop>. Text HELP for more."); return;
+    }
     String t2 = tok[2]; t2.toUpperCase();
     if (t2 == "PRESET") {                   // SET,COL_A,PRESET,NAME
       String pn = tok[3]; pn.toUpperCase();
@@ -4571,11 +5955,14 @@ void handleSms(const String &body) {
           col[c].targetN = CROP_PRESETS[p].N; col[c].targetP = CROP_PRESETS[p].P;
           col[c].targetK = CROP_PRESETS[p].K; col[c].targetPH = CROP_PRESETS[p].pH;
           saveColumn(c);
-          sendSMS(String("ACK,SET,COL_") + COL_TAG[c] + ",PRESET," + CROP_PRESETS[p].name);
+          sendSMS(String("OK: ") + smsCol(c) + " uses preset " + CROP_PRESETS[p].name + "\nN" + String((int)col[c].targetN) +
+                  " P" + String((int)col[c].targetP) + " K" + String((int)col[c].targetK) + " mg/kg, pH " + String(col[c].targetPH, 1));
           return;
         }
       }
-      sendSMS("ERR,PRESET"); return;
+      String names;
+      for (int p = 0; p < NUM_PRESETS; p++) names += String(p ? ", " : "") + CROP_PRESETS[p].name;
+      smsErr("PRESET", "NOT DONE: Unknown crop preset.\nChoose one of: " + names); return;
     }
     // explicit: SET,COL_A,N,150,P,40,K,200,pH,5.8  (key/value pairs)
     // Shares applyColumnTarget()/columnTargetInRange() with the dashboard's SET_COLUMN, now via the
@@ -4588,20 +5975,21 @@ void handleSms(const String &body) {
     String err;
     for (int i = 2; i + 1 < n; i += 2) {
       if (!columnTargetInRange(tok[i], tok[i + 1].toFloat(), err)) {
-        sendSMS(String("ERR,SET,") + err); return;
+        smsErr((String("SET|") + err).c_str(), "NOT DONE: " + err + ".\nNothing was changed."); return;
       }
     }
     for (int i = 2; i + 1 < n; i += 2) {
       applyColumnTarget(c, tok[i], tok[i + 1].toFloat(), err);   // already validated -- cannot fail here
     }
     saveColumn(c);
-    sendSMS(String("ACK,SET,COL_") + COL_TAG[c]);
+    sendSMS(String("OK: ") + smsCol(c) + " targets saved\nN" + String((int)col[c].targetN) + " P" + String((int)col[c].targetP) +
+            " K" + String((int)col[c].targetK) + " mg/kg, pH " + String(col[c].targetPH, 1));
     return;
   }
   // WIFI,<ssid>,<pass>  -- set WiFi credentials (owner-only). Password is the remainder
   // after the 2nd comma, so it may contain commas/spaces (SSID may not). (Part B)
   if (k0 == "WIFI") {
-    if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+    if (!senderIsOwner()) { smsErr("AUTH", "Sorry, this number is not allowed to control the irrigation system."); return; }
     // WIFI,ON / WIFI,OFF -- master switch (mirrors the Settings > WiFi toggle). Checked before the
     // ssid/pass parse; a real SSID of literally "ON"/"OFF" with no password is not a valid pair anyway.
     // Audit fix (2026-09-08): compare against an uppercased copy, not the raw token -- tok[] is built
@@ -4611,85 +5999,360 @@ void handleSms(const String &body) {
       String t1u = tok[1]; t1u.toUpperCase();
       if (t1u == "ON" || t1u == "OFF") {
         wifiEnabled = (t1u == "ON"); saveWifiEn();
-        sendSMS(String("ACK,WIFI,") + t1u);
+        sendSMS(t1u == "ON" ? "OK: WiFi is ON.\nText NET in a minute to check the connection." : "OK: WiFi is OFF.");
         return;
       }
     }
     int p1 = b.indexOf(','), p2 = (p1 >= 0) ? b.indexOf(',', p1 + 1) : -1;
-    if (p1 < 0 || p2 < 0) { sendSMS("ERR,WIFI"); return; }
+    if (p1 < 0 || p2 < 0) { smsErr("WIFI", "NOT DONE: Use WIFI,<network name>,<password>\nor WIFI,ON / WIFI,OFF"); return; }
     String ss = b.substring(p1 + 1, p2), pw = b.substring(p2 + 1);
     xSemaphoreTake(netMux, portMAX_DELAY); wifiSsid = ss; wifiPass = pw; xSemaphoreGive(netMux);
     saveWifi(); wifiCredsChanged = true;
-    sendSMS("ACK,WIFI," + ss);
+    sendSMS("OK: WiFi set to " + ss + ". Connecting now.\nText NET in a minute to check.");
     return;
   }
   // WIFIPORTAL [,STOP] -- start/stop the SoftAP WiFi-setup portal (owner-only). Join AP_SSID from a
   // phone, browse to the AP IP, pick a network + type the password, Save. (Part B)
   if (k0 == "WIFIPORTAL") {
-    if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
+    if (!senderIsOwner()) { smsErr("AUTH", "Sorry, this number is not allowed to control the irrigation system."); return; }
     // Audit fix (2026-09-09): same case-sensitivity bug class as the WIFI,ON/OFF fix -- tok[] is
     // built from the un-uppercased body, so "WIFIPORTAL,stop" previously fell through to the
     // (re-)start branch below instead of stopping the portal, replying with the AP's default
     // password as if a stop had never been requested.
-    if (n >= 2) { String t1u = tok[1]; t1u.toUpperCase(); if (t1u == "STOP") { portalCancel = true; sendSMS("ACK,WIFIPORTAL,STOP"); return; } }
+    if (n >= 2) { String t1u = tok[1]; t1u.toUpperCase(); if (t1u == "STOP") { portalCancel = true; sendSMS("OK: WiFi setup portal closed."); return; } }
     portalRequested = true;
-    sendSMS(String("ACK,WIFIPORTAL,join ") + AP_SSID + " pw " + AP_PASS + " -> http://192.168.4.1");
+    sendSMS(String("OK: WiFi setup portal is ON (closes after 10 min unused).\nOn your phone join WiFi ") + AP_SSID +
+            ", password " + AP_PASS + ", then open http://192.168.4.1");
     return;
   }
   // TSKEY,<1|2>,<writeApiKey>  -- set a ThingSpeak channel write key (owner-only). (Part B)
   if (k0 == "TSKEY") {
-    if (!senderIsOwner()) { sendSMS("ERR,AUTH"); return; }
-    if (n < 3) { sendSMS("ERR,TSKEY"); return; }
+    if (!senderIsOwner()) { smsErr("AUTH", "Sorry, this number is not allowed to control the irrigation system."); return; }
+    if (n < 3) { smsErr("TSKEY", "NOT DONE: Use TSKEY,<channel 1-3>,<write key>"); return; }
     int ch = tok[1].toInt(); String key = tok[2];
-    if (ch < 1 || ch > 3) { sendSMS("ERR,TSCH"); return; }
+    if (ch < 1 || ch > 3) { smsErr("TSCH", "NOT DONE: The ThingSpeak channel must be 1, 2 or 3."); return; }
     // Same alnum-only check the portal's /tskey route already enforces -- this SMS path had none, so
     // a key containing '&' (e.g. "ABC&status=x") would inject extra query parameters into the
     // outbound ThingSpeak GET (tsUpload() concatenates it unescaped into the URL).
     bool badKey = (key.length() == 0);
     for (unsigned ki = 0; ki < key.length(); ki++) if (!isalnum((unsigned char)key[ki])) badKey = true;
-    if (badKey) { sendSMS("ERR,TSKEY_CHARS"); return; }
+    if (badKey) { smsErr("TSKEY_CHARS", "NOT DONE: The key must be letters and numbers only."); return; }
     xSemaphoreTake(netMux, portMAX_DELAY);
     if (ch == 1) tsKey1 = key; else if (ch == 2) tsKey2 = key; else tsKey3 = key;
     xSemaphoreGive(netMux);
     saveTsKey();
-    sendSMS("ACK,TSKEY," + String(ch));
+    sendSMS("OK: ThingSpeak key for channel " + String(ch) + " saved.");
     return;
   }
-  // THRESH,<start%>,<stop%>,<gap>  -- soil start/stop thresholds + fertigation gap (also on the LCD
-  // Settings > Thresholds editor). Clamps stop>start like the editor. (Owner-gated above.)
+  // THRESH,<start%>,<gap>  -- soil start threshold + fertigation gap (also on the LCD Settings >
+  // Thresholds editor). The old THRESH,<start%>,<stop%>,<gap> is still accepted, and its stop value
+  // ignored, so a saved phone message keeps working. (Owner-gated above.)
   if (k0 == "THRESH") {
-    if (n < 4) { sendSMS("ERR,THRESH"); return; }
-    int s  = clampi(tok[1].toInt(), 0, 100);
-    int st = clampi(tok[2].toInt(), 0, 100);
-    int g  = clampi((int)tok[3].toFloat(), 0, 500);
-    if (st <= s) st = clampi(s + 1, 0, 100);
-    soilStartPct = s; soilStopPct = st; fertGap = g;
+    if (n < 3) { smsErr("THRESH", "NOT DONE: Use THRESH,<start %>,<gap mg/kg>\nExample: THRESH,35,30"); return; }
+    int s = clampi(tok[1].toInt(), 0, 100);
+    int g = clampi((int)tok[n >= 4 ? 3 : 2].toFloat(), 0, 500);
+    soilStartPct = s; fertGap = g;
     saveThresholds();
-    sendSMS("ACK,THRESH," + String(s) + "," + String(st) + "," + String(g));
+    sendSMS("OK: Watering starts below " + String(s) + "% soil moisture.\nNutrients are added when " + String(g) +
+            " mg/kg or more below target.");
     return;
   }
-  sendSMS("ERR,CMD");
+  smsErr("CMD", "NOT DONE: Unknown command \"" + smsCut(tok[0], 20) + "\".\nText HELP for the list of commands.");
+}
+
+/* =============================================================================
+ *  SMS TEXT  (2026-11-16, owner's request: every text easy to read, one SMS = 160 characters)
+ *
+ *  Every outbound text is written for a person, not a parser, and is laid out the same way:
+ *    line 1   KIND: headline        CRITICAL: / ALERT: / WARNING: / NOTICE: (faults)
+ *                                   OK: / NOT DONE: / BUSY: / INFO: / RUN: (replies + notices)
+ *                                   or a report title (DAILY REPORT, SUMMARY, HELP ...)
+ *    middle   the detail, in words  "Col A irrigation, transfer, pulses=0"
+ *    then     what to do next       "Refill the reservoir" / "Reply NORMAL, ..."
+ *    last     (hh:mm CODE)          alerts only: the code the LCD, the website and the SD log use
+ *  Only GSM-7 characters are used, so one SMS really holds 160: no emoji or degree sign (they switch
+ *  the whole text to UCS-2 = 70 characters), and '|' '[' ']' '{' '}' '~' '^' '\' are avoided (2 each).
+ *  A text that would run over is trimmed in its detail line ("..") rather than split. Reports and
+ *  HELP are written as lines and sent as complete pages, each headed "TITLE i/N".
+ *  Inbound command syntax is unchanged (the portal replays it through handleSms too).
+ * ========================================================================== */
+// Technical detail -> words: "COL_A|NO_READING|raw=12,0" -> "Col A, no reading, raw=12,0".
+// All-capital words of 2+ letters are lower-cased, except the abbreviations in KEEP; anything with a
+// digit (ESP2, INA226) is kept as it is.
+static String smsPlain(const String &raw) {
+  String s = raw;
+  s.trim();
+  s.replace("MIXER_OC", "MIXER_OVERCURRENT");
+  s.replace("COL_", "Col ");
+  s.replace("|", ", ");
+  s.replace("_", " ");
+  static const char *const KEEP[] = { "RTC", "LCD", "NPK", "PZEM", "PCF", "GSM", "SMS", "USB", "UART", "ESP", "LED",
+                                      "AC", "DC", "EC", "SD", "OK", "IP", "ID", "UID" };
+  int n = s.length();
+  for (int i = 0; i < n; ) {
+    if (!isalnum((unsigned char)s[i])) { i++; continue; }
+    int j = i; bool caps = true;
+    while (j < n && isalnum((unsigned char)s[j])) { if (!isupper((unsigned char)s[j])) caps = false; j++; }
+    String w = s.substring(i, j);
+    bool keep = false;
+    for (size_t k = 0; k < sizeof(KEEP) / sizeof(KEEP[0]); k++) if (w == KEEP[k]) keep = true;
+    if (w == "PH") { s[i + 1] = 'H'; s[i] = 'p'; }                // pH
+    else if (caps && !keep && j - i >= 2) for (int k = i; k < j; k++) s[k] = (char)tolower((unsigned char)s[k]);
+    i = j;
+  }
+  return s;
+}
+
+// "14:05" from the RTC, or "" while the clock is not trusted.
+static String smsClock() {
+  if (!rtcOk) return String();
+  DateTime n = rtcNow();
+  char b[6]; snprintf(b, sizeof(b), "%02d:%02d", n.hour(), n.minute());
+  return String(b);
+}
+
+// 20261116 -> "2026-11-16" (0 -> "no-date file").
+static String smsDate(long stamp) {
+  if (stamp <= 0) return String("no-date file");
+  char b[12]; snprintf(b, sizeof(b), "%04ld-%02ld-%02ld", stamp / 10000, (stamp / 100) % 100, stamp % 100);
+  return String(b);
+}
+
+static String smsCol(int c) {                                   // "Col A (Lettuce)" / "Col A"
+  if (c < 0 || c >= NUM_COLUMNS) return String("Col ?");
+  String s = String("Col ") + COL_TAG[c];
+  if (strlen(col[c].name)) s += String(" (") + col[c].name + ")";
+  return s;
+}
+
+// Trim s to maxSeptets, ending in ".." when anything was cut.
+static String smsCut(const String &s, int maxSeptets) {
+  if (gsmSeptets(s.c_str()) <= maxSeptets) return s;
+  if (maxSeptets < 4) return String();
+  String o; int used = 0;
+  for (unsigned i = 0; i < s.length(); i++) {
+    int w = gsmIsExtended(s[i]) ? 2 : 1;
+    if (used + w > maxSeptets - 2) break;
+    o += s[i]; used += w;
+  }
+  o.trim();
+  while (o.length() && (o[o.length() - 1] == ',' || o[o.length() - 1] == '.')) o.remove(o.length() - 1);
+  return o + "..";
+}
+
+// head / detail / todo / foot, one per line (empty parts skipped). If it runs past one SMS the detail
+// line is trimmed first, then the todo line: the headline and the reference always survive.
+static String smsCompose(const String &head, String detail, String todo, const String &foot) {
+  auto total = [&]() -> int {
+    const String *p[4] = { &head, &detail, &todo, &foot };
+    int len = 0, parts = 0;
+    for (int i = 0; i < 4; i++) if (p[i]->length()) { len += gsmSeptets(p[i]->c_str()); parts++; }
+    return len + (parts ? parts - 1 : 0);
+  };
+  int over = total() - SMS_MAX;
+  if (over > 0 && detail.length()) { detail = smsCut(detail, gsmSeptets(detail.c_str()) - over); over = total() - SMS_MAX; }
+  if (over > 0 && todo.length())   { todo   = smsCut(todo,   gsmSeptets(todo.c_str())   - over); }
+  String m = head;
+  if (detail.length()) m += "\n" + detail;
+  if (todo.length())   m += "\n" + todo;
+  if (foot.length())   m += "\n" + foot;
+  return m;
+}
+
+/* Fault code -> headline + what to do. Codes not listed still go out, with the code itself spelled
+ * out as the headline. HIDE_LOC: the location is only an internal tag (ESP2, LINK, BATT ...) or is
+ * already said better by the todo line, so it is not printed. */
+const uint8_t SMS_HIDE_LOC = 1;
+struct SmsFaultInfo { const char *code; const char *what; const char *todo; uint8_t flags; };
+static const SmsFaultInfo SMS_FAULTS[] = {
+  // ---- held faults: the run waits for a reply (a second text lists the replies) ----
+  // web v.4: water is metered by the tank ultrasonics -- FLOW_FAIL now means "the level did not move".
+  { "FLOW_FAIL",          "Tank level not moving, pump stopped", "Check pump, valves, tank sensors",        0 },
+  { "ESP2_ERROR",         "Pump controller stopped the run",    "Check the pump controller board",          0 },
+  { "LEVEL_BLIND",        "Tank level sensor not reading",      "Check the mixing tank ultrasonic",         0 },
+  { "SERVO_FAIL",         "Pump selector failed or stuck",      "Check the servo and its switch",           0 },
+  { "BATT_SWITCH_FAIL",   "Switch to backup battery failed",    "Check the backup battery and relay",       0 },
+  { "INVERTER_FAIL",      "Inverter gave no AC power",          "Check the inverter and its wiring",        0 },
+  { "PWR_FAIL",           "Pump power fault, pump stopped",     "Check pump, wiring and AC supply",         0 },
+  { "SAFE_STOP",          "Safety stop",                        "Check the mixer and pumps",                0 },
+  { "DOSE_TIMEOUT",       "Nutrient pump ran too long",         "Prime the nutrient line",                  0 },
+  // ---- critical: everything stopped, cleared on the LCD ----
+  { "MIX_OVERFLOW",       "Mixing tank overfilling",            "Pumps stopped. Check tank, clear on LCD",  0 },
+  { "ESP2_DONE_TIMEOUT",  "Pump controller never finished",     "All stopped. Check tank, clear on LCD",    SMS_HIDE_LOC },
+  { "BATTERY_CRITICAL",   "Main battery critically low",        "All stopped. Charge it, clear on LCD",     SMS_HIDE_LOC },
+  { "ESTOP_KEPT",         "Emergency stop kept after restart",  "Clear it on the LCD to resume",            SMS_HIDE_LOC },
+  // ---- controllers and links ----
+  { "ESP2_RESTARTED",     "Pump controller restarted",          "",                                         0 },
+  { "ESP2_SILENCE",       "Pump controller not answering",      "Restarting it automatically",              SMS_HIDE_LOC },
+  { "ESP2_COMM_LOST",     "Lost link to pump controller",       "Retrying every 20 min. Check wiring",      SMS_HIDE_LOC },
+  { "ESP2_NO_READY",      "Pump controller did not start",      "Check its power and wiring",               0 },
+  { "ESP2_DEGRADED",      "Pump controller disabled a part",    "Run continues. Check it after",            0 },
+  { "PCF_FAIL",           "Relay board not responding",         "Check the relay board wiring",             0 },
+  { "COL_MISMATCH",       "Column is off on pump controller",   "Skipped today. Match column settings",     0 },
+  { "NANO_GARBAGE",       "Sensor board sending bad data",      "Check the sensor board wiring",            0 },
+  { "NANO_RESET",         "Sensor board was restarted",         "",                                         0 },
+  { "NANO_SILENCE",       "Sensor board not answering",         "Check its power and wiring",               SMS_HIDE_LOC },
+  { "SELF_RESET",         "Main controller restarting itself",  "Max once a day. Check if it repeats",      0 },
+  { "NET_STALL",          "Internet task stuck",                "Website paused. Watering not affected",    SMS_HIDE_LOC },
+  { "RTC_MISSING",        "Clock module not found",             "",                                         0 },
+  { "RTC_INVALID",        "Clock time is wrong",                "",                                         0 },
+  // ---- water, tanks, dosing ----
+  { "SERVO_MISMATCH",     "Wrong pump ran, retrying",           "Check the pump selector servo",            0 },
+  { "LEVEL_HIGH",         "Mixing tank full before target",     "Run goes on. Check tank litres cal",       0 },
+  { "RES_EMPTY",          "Water reservoir ran dry",            "Refill it. Run went on with less water",   0 },
+  { "RES_LOW",            "Water reservoir is low",             "Refill the reservoir",                     SMS_HIDE_LOC },
+  { "TANK_CHECK",         "Check the mixing tank",              "Runs wait. Then text TANKCHECK,OK",        0 },
+  { "EC_FAIL",            "Mixed batch EC out of range",        "Batch still given. Check dosing",          0 },
+  { "PH_FAIL",            "Mixed batch pH out of range",        "Batch still given. Check pH probe",        0 },
+  { "DOSE_BATCH_LOW",     "Batch too small to dose",            "Watering only. Check volume settings",     0 },
+  { "DOSE_CARRY",         "Dosed batch went to other column",   "",                                         0 },
+  { "THRESH_NO_FERT",     "Soil start % too low to fertilize",  "Only watering will run. Raise it",         0 },
+  { "RESUME_NO_REPLY",    "No answer to your resume",           "Still on hold. Check link, try again",     SMS_HIDE_LOC },
+  { "WO_OVERSIZE",        "Run command too long, not sent",     "Run skipped. Check column settings",       0 },
+  { "FORCE_ABORT",        "Manual run cancelled",               "",                                         0 },
+  { "MANUAL_REVOKED",     "Website control ended",              "The operator at the rig took over",        SMS_HIDE_LOC },
+  // ---- sensors ----
+  { "SENSOR_FAIL",        "Sensor not working",                 "Check its wiring",                         0 },
+  { "SOIL_MISSING",       "Soil moisture reading missing",      "Check that column's soil probes",          0 },
+  { "NPK_FAULT",          "NPK sensor not reading",             "Watering only. Check NPK sensor",          0 },
+  // ---- batteries ----
+  { "BATTERY_LOW",        "Main battery low",                   "Check charging and the solar panel",       SMS_HIDE_LOC },
+  { "BATT2_LOW",          "Backup battery low",                 "AC pumps blocked until it charges",        0 },
+  { "BATT2_CRIT",         "Backup battery critically low",      "Charge the backup battery",                0 },
+  { "BATT_SWITCH_RESET",  "Battery switch reset the boards",    "",                                         0 },
+  { "BATT_SWITCH_FAULT",  "Battery switching locked",           "AC pumps blocked. Clear on LCD, web or text BATTSW,CLEAR (auto in 24h)", SMS_HIDE_LOC },
+  { "MAIN_BATT_CRIT",     "Main battery critically low",        "",                                         0 },
+  { "BACKUP_EXHAUSTED",   "Backup battery used up",             "",                                         0 },
+  { "BACKUP_SWITCH_FAILED", "Switch to backup failed",          "",                                         0 },
+};
+static const SmsFaultInfo *smsFaultInfo(const char *code) {
+  for (size_t i = 0; i < sizeof(SMS_FAULTS) / sizeof(SMS_FAULTS[0]); i++)
+    if (!strcmp(SMS_FAULTS[i].code, code)) return &SMS_FAULTS[i];
+  return nullptr;
+}
+static const char *smsTierWord(char tier) {
+  return tier == 'C' ? "CRITICAL" : tier == 'M' ? "ALERT" : tier == 'W' ? "WARNING" : "NOTICE";
+}
+static String smsFaultWhat(const char *code) {
+  const SmsFaultInfo *fi = smsFaultInfo(code);
+  return fi ? String(fi->what) : smsPlain(code);
+}
+// The alert text for one fault. detail is already in words; "" = none.
+static String smsFaultText(char tier, const char *code, const String &detail) {
+  const SmsFaultInfo *fi = smsFaultInfo(code);
+  String what = fi ? String(fi->what) : smsPlain(code);
+  String todo = fi ? String(fi->todo) : String();
+  String t = smsClock();
+  String foot = "(" + (t.length() ? t + " " : String()) + code + ")";
+  return smsCompose(String(smsTierWord(tier)) + ": " + what, detail, todo, foot);
+}
+void smsFault(char tier, const char *code, const String &rawLoc) {
+  const SmsFaultInfo *fi = smsFaultInfo(code);
+  bool hide = fi && (fi->flags & SMS_HIDE_LOC);
+  String d = hide ? String() : smsPlain(rawLoc);
+  if (d.length() && d[0] >= 'a' && d[0] <= 'z') d[0] = (char)(d[0] - 'a' + 'A');   // its own line: capitalise
+  smsAlert(smsFaultText(tier, code, d));
+}
+
+// The reply menu sent (to the owner) right after a held-fault alert.
+static String smsHoldMenu(int colIdx, bool steerRelease) {
+  // A pump-selector hold (2026-11-16, user): ESP2 already re-switched it on its own and it is still wrong. The choice
+  // is to switch it again (the step restarts with the 3-swing pre-seat) or not.
+  if (lastHoldCode == "SERVO_FAIL")
+    return String("ON HOLD") + (colIdx >= 0 && colIdx < NUM_COLUMNS ? String(" (Col ") + COL_TAG[colIdx] + ")" : String()) +
+           ". Pump selector still wrong. Reply:\n"
+           "SERVO = switch it again and go on\n"
+           "CANCEL,30 = do not, end run (skip 30m)\n"
+           "STOP = stay on hold";
+  String m = String("ON HOLD") + (colIdx >= 0 && colIdx < NUM_COLUMNS ? String(" (Col ") + COL_TAG[colIdx] + ")" : String()) +
+             ". Reply:\n"
+             "NORMAL = resume run\n"
+             "IRRIGATE = water only, no dose\n";
+  m += steerRelease ? "RELEASE = deliver tank as is (best)\n" : "RELEASE = deliver tank as is\n";
+  m += "STOP = stay on hold\n"
+       "CANCEL,30 = end run, skip 30m";
+  return m;
+}
+
+// Send to the sender when one is set (a reply), else the owner; alerts also to the second number.
+static void smsDispatch(const String &msg, uint8_t retries, bool alsoAlertNumber) {
+  if (smsMute) return;                                 // suppress replies for portal-replayed config commands
+  if (replyTarget.length() || PHONE_NUMBER.length())    // no owner number yet: nowhere to send it
+    smsEnqueueSplit(msg, replyTarget.length() ? replyTarget : PHONE_NUMBER, retries);
+  if (alsoAlertNumber && !replyTarget.length() && ALERT_NUMBER2.length())
+    smsEnqueueSplit(msg, ALERT_NUMBER2, retries);
 }
 
 // Enqueue only -- non-blocking. The AT exchange is driven by gsmTxTick() so alert
 // and fault paths never stall the loop.
-void sendSMS(const String &msg) {
-  if (smsMute) return;                                 // suppress ACK/ERR for portal-replayed config commands
-  // Every SMS rejection replies "ERR,<reason>" to the sender and, until now, left no trace at all --
-  // an unrecognised command (ERR,CMD) simply vanished. Logging it HERE rather than at the ~15
-  // scattered rejection sites catches every path, including ones added later. logEvent never calls
-  // back into sendSMS, so this cannot recurse.
-  if (msg.startsWith("ERR,")) logEvent("GSM", "SMS_ERR", msg.substring(4));
-  // Reply to the inbound sender when one is set (STATUS/ACK); else the owner number. ERR,AUTH goes to
-  // strangers, so it gets no retries: a dead-end number must not hold up real alerts behind it.
-  uint8_t retries = msg.startsWith("ERR,AUTH") ? 0 : GSM_SEND_RETRIES;
-  smsEnqueueSplit(msg, replyTarget.length() ? replyTarget : PHONE_NUMBER, retries);
-  if (!replyTarget.length() && ALERT_NUMBER2.length() && msg.startsWith("ALERT,"))
-    smsEnqueueSplit(msg, ALERT_NUMBER2, retries);
+void sendSMS(const String &msg) { smsDispatch(msg, GSM_SEND_RETRIES, false); }
+void smsAlert(const String &msg) { smsDispatch(msg, GSM_SEND_RETRIES, true); }
+
+// A refused command. The log keeps the short machine code (SMS_ERR|<logCode>, the same codes the
+// old "ERR,<code>" replies carried) so the dashboard and SD log read exactly as before; the person
+// gets the explanation. AUTH goes to strangers, so it gets no retries: a dead-end number must not
+// hold up real alerts behind it.
+void smsErr(const char *logCode, const String &msg) {
+  if (smsMute) return;
+  logEvent("GSM", "SMS_ERR", logCode);
+  smsDispatch(msg, strcmp(logCode, "AUTH") ? GSM_SEND_RETRIES : 0, false);
 }
 
-// One SMS holds 160 septets, and sendDailyReport() alone runs past that with three columns. A longer
-// text goes out as "(i/N)" parts, so it arrives whole instead of cut off or refused by the modem.
+// ---- multi-page texts: each page is a whole SMS that starts with "TITLE i/N" ----
+static int smsSkipBreak(const String &s, int pos) {
+  while (pos < (int)s.length() && (s[pos] == '\n' || s[pos] == ' ')) pos++;
+  return pos;
+}
+// End (exclusive) of the page starting at from that fits room septets. A blank line marks a group
+// (one column of the daily report, one section of FULL SUMMARY): a page ends at one when it is in the
+// page's second half, so a group is not split; else at a line break; else at a space/comma.
+static int smsPageEnd(const String &s, int from, int room) {
+  const char *p = s.c_str(); int len = s.length();
+  int used = 0, i = from;
+  while (i < len) { int w = gsmIsExtended(p[i]) ? 2 : 1; if (used + w > room) break; used += w; i++; }
+  if (i >= len) return len;
+  int half = from + (i - from) / 2;
+  for (int j = i; j > half; j--) if (p[j] == '\n' && p[j - 1] == '\n') return j - 1;
+  for (int j = i; j > from; j--) if (p[j] == '\n') return j;
+  return gsmSplitEnd(p, from, len, room);
+}
+static int smsPageRoom(const String &title) {             // worst case header "TITLE 99/99\n"
+  return SMS_MAX - gsmSeptets(title.c_str()) - 7;
+}
+static int smsPageCount(const String &body, int room) {
+  int n = 0, pos = smsSkipBreak(body, 0), len = body.length();
+  while (pos < len) { pos = smsSkipBreak(body, smsPageEnd(body, pos, room)); n++; }
+  return n ? n : 1;
+}
+void smsSendPages(const String &title, const String &body) {
+  String one = title + "\n" + body;
+  if (gsmSeptets(one.c_str()) <= SMS_MAX) { sendSMS(one); return; }
+  int room = smsPageRoom(title);
+  int total = smsPageCount(body, room);
+  int pos = smsSkipBreak(body, 0);
+  for (int i = 1; i <= total && pos < (int)body.length(); i++) {
+    int end = smsPageEnd(body, pos, room);
+    sendSMS(title + " " + i + "/" + total + "\n" + body.substring(pos, end));
+    pos = smsSkipBreak(body, end);
+  }
+}
+
+static const char *smsStateWords(SystemState s, bool lockedOut) {
+  if (lockedOut && s == IDLE_STATE) return "safe mode, pumps locked out";
+  switch (s) {
+    case BOOT_STATE:     return "starting";
+    case STARTUP_SYNC:   return "starting up";
+    case IDLE_STATE:     return "idle, ready";
+    case ACTIVE_STATE:   return "running";
+    case RECOVERY_STATE: return "recovering pump controller";
+    case SAFE_MODE:      return "safe mode";
+    case TEST_MODE:      return "testing";
+    default:             return "EMERGENCY STOP";
+  }
+}
+
+// Safety net: one SMS holds 160 septets. A text that still runs over (a long carrier USSD answer) goes
+// out as "(i/N)" parts, so it arrives whole instead of cut off or refused by the modem.
 void smsEnqueueSplit(const String &msg, const String &to, uint8_t retries) {
   const char *s = msg.c_str();
   int len = msg.length();
@@ -4717,29 +6380,34 @@ void gsmTxTick() {
   lastGsmHealthMs = gsm.lastHealthMs();
 }
 
+// Daily / STATUS report, in words (sec.12.1.3). System lines first, then two lines per column; sent as
+// "DAILY REPORT <date> i/N" pages that each break at a line.
 void sendDailyReport() {
   long ds = (currentDayStamp > 0) ? currentDayStamp : 0;
-  String r = "RPT," + String(ds);
+  String r = String("State: ") + smsStateWords(sysState, actuationsDisabled);
+  r += (faultsToday[0] || faultsToday[1] || faultsToday[2])
+       ? "\nFaults: " + String(faultsToday[0]) + " critical, " + String(faultsToday[1]) + " major, " + String(faultsToday[2]) + " minor"
+       : String("\nFaults: none");
+  if (nanoResetsToday) r += "\nSensor board resets: " + String(nanoResetsToday);
+  r += "\nBattery " + (battVCalLoaded ? String(battV, 1) + "V" : String("n/a")) +
+       ", backup " + ((secInaOk && secHaveV) ? String(secV, 1) + "V" + (secLow ? " LOW" : "") : String("n/a"));
+  r += "\nSolar " + (inaUsable(powerIna[INA_SOLAR]) ? String(powerIna[INA_SOLAR].v, 1) + "V " + String(powerIna[INA_SOLAR].i, 1) + "A"
+                                                     : String("n/a"));
+#if SECONDARY_BACKUP_ENABLED
+  if (bkState != BK_IDLE) r += String("\nBackup supply: ") + bkName(bkState);
+#endif
+  // Daily energy (sec.12.1.3): integrated discharge + charge, Wh.
+  r += "\nEnergy: used " + String((int)(energyConsumedWh + 0.5)) + "Wh, charged " + String((int)(energyChargedWh + 0.5)) + "Wh";
+  // Two groups (a blank line keeps each on one page): what each column used today, then its targets.
+  String used = "\n\nUsed today:", tgt = "\n\nTargets (N P K mg/kg, pH):";
   for (int c = 0; c < NUM_COLUMNS; c++) {
     if (!COLUMN_ENABLED[c]) continue;
-    r += String(",") + COL_TAG[c] + ":" + (strlen(col[c].name) ? col[c].name : "-");
-    r += "|N" + String((int)col[c].targetN) + "P" + String((int)col[c].targetP) + "K" + String((int)col[c].targetK);
-    r += "|pH" + String(col[c].targetPH, 1);
-    r += "|W" + String(waterUsedToday[c], 1) + "|Nu" + String(nutrientUsedToday[c], 1);
+    used += String("\nCol ") + COL_TAG[c] + ": " + String(waterUsedToday[c], 1) + "L water, " + String(nutrientUsedToday[c], 0) + "mL nutrients";
+    tgt  += "\n" + smsCol(c) + ": " + String((int)col[c].targetN) + " " + String((int)col[c].targetP) + " " +
+            String((int)col[c].targetK) + ", " + String(col[c].targetPH, 1);
   }
-  r += ",FLT,C" + String(faultsToday[0]) + "M" + String(faultsToday[1]) + "m" + String(faultsToday[2]);
-  r += ",RST," + String(nanoResetsToday);
-  r += ",ST," + String(stateLabel(sysState, actuationsDisabled));
-  r += ",BAT," + (battVCalLoaded ? String(battV, 1) + "V" : String("--"));
-  r += ",BAT2," + ((secInaOk && secHaveV) ? String(secV, 1) + "V" + (secLow ? "LOW" : "") : String("--"));
-  r += ",SOL," + (inaUsable(powerIna[INA_SOLAR]) ? String(powerIna[INA_SOLAR].v, 1) + "V" + String(powerIna[INA_SOLAR].i, 1) + "A" : String("--"));
-#if SECONDARY_BACKUP_ENABLED
-  if (bkState != BK_IDLE) r += ",BKUP," + String(bkName(bkState));
-#endif
-  // Daily energy (sec.12.1.3): integrated discharge (CONS) + charge (CHG), Wh.
-  r += ",CONS," + String((int)(energyConsumedWh + 0.5)) + "Wh";
-  r += ",CHG," + String((int)(energyChargedWh + 0.5)) + "Wh";
-  sendSMS(r);
+  r += used + tgt;
+  smsSendPages("DAILY REPORT " + (ds > 0 ? smsDate(ds) : String("(clock not set)")), r);
   reportPending = false;
 }
 
@@ -4842,7 +6510,7 @@ static void summaryParseLine(const String &ln) {
     else if (detail.startsWith("MIN"))  sumFltm++;
     else return;
     { String f[4]; int nf = splitPipe(detail, f, 4); if (nf >= 2) sumAddError(f[1], hhmm); }  // dedup code
-    code = "F:" + detail;
+    code = "fault " + detail;
   } else if (type == "RESET") {
     sumRst++;
     // Was keyed on f[0] alone (just the device, e.g. "ESP2") -- every distinct reset REASON for the
@@ -4851,7 +6519,7 @@ static void summaryParseLine(const String &ln) {
     // swallowing every later, possibly-unrelated one. f[1] (the reason) is now part of the key too.
     String f[4]; int nf = splitPipe(detail, f, 4);
     if (nf >= 1) sumAddError(String("RST_") + f[0] + (nf >= 2 ? ("_" + f[1]) : ""), hhmm);
-    code = "R:" + detail;
+    code = "reset " + detail;
   }
   else if   (type == "DOSE")  {                      // NUT_A|target|measured|COL_A
     // Only ESP2's measured results count. ESP1 logs its plan under the same type (NUT_A|int=..|del=..,
@@ -4860,7 +6528,7 @@ static void summaryParseLine(const String &ln) {
     if (nf < 4 || !f[3].startsWith("COL_")) return;
     sumDose++;
     sumAddToCols(sumNutTot, f[3], f[2].toFloat());
-    code = "D:" + detail;
+    code = "dose " + detail;
   }
   else if   (type == "ACT") {                        // IRRIGATION|START|COL_A or ...|STOP|COL_A|W=3.2
     if      (detail.startsWith("FERTIGATION") && detail.indexOf("START") >= 0) sumFert++;
@@ -4872,17 +6540,20 @@ static void summaryParseLine(const String &ln) {
       String f[6]; int nf = splitPipe(detail, f, 6);
       for (int i = 0; i < nf; i++) if (f[i].startsWith("COL_")) sumAddToCols(sumWaterTot, f[i], detail.substring(wi + 2).toFloat());
     }
-    code = "A:" + detail;
+    code = detail;
   } else if (type == "STATE" && detail.indexOf("_SET") >= 0) {
-    code = "C:" + detail;                            // config change
+    code = "setting " + detail;                      // config change
   } else {
     return;
   }
 
-  code.replace("|", ":");
-  if (code.length() > 26) code = code.substring(0, 26);
+  // Stored already in words ("06:05 fault: ALERT flow fail, transfer.."), one event per '|'-separated
+  // entry; FULL SUMMARY prints one per line.
+  code = smsPlain(code);                               // also turns every '|' into ", "
+  if (code.length() > 38) code = code.substring(0, 36) + "..";
+  String at = (hhmm.length() == 4) ? hhmm.substring(0, 2) + ":" + hhmm.substring(2) : hhmm;
   uint8_t cap = (sumMode == SUM_FULL) ? FULL_MAX_EVENTS : SUMMARY_MAX_EVENTS;
-  if (sumEvtCount < cap) { sumEvents += "|" + hhmm + " " + code; sumEvtCount++; }
+  if (sumEvtCount < cap) { sumEvents += "|" + at + " " + code; sumEvtCount++; }
   else                   { sumTruncated = true; }
 }
 
@@ -4927,7 +6598,7 @@ void startSummaryJob(SumMode mode, long targetStamp) {
 }
 
 static String sumDayLabel() {
-  return (summaryTargetStamp > 0) ? String(summaryTargetStamp) : String("NODATE");
+  return smsDate(summaryTargetStamp);
 }
 
 // Clear every accumulator + hourly bucket before a fresh parse.
@@ -4950,29 +6621,33 @@ static void sumResetAccumulators() {
 }
 
 // SHORT SUMMARY = the day's averages (paper-ready), into sumReport.
+static String sumTitle() {
+  return String(sumMode == SUM_FULL ? "FULL SUMMARY " : "SUMMARY ") + sumDayLabel();
+}
+
 static void buildShortReport() {
-  String s = "SUM," + sumDayLabel();
+  String s = "Day averages:";
   for (int c = 0; c < NUM_COLUMNS; c++) {
     if (!COLUMN_ENABLED[c]) continue;
-    s += String(" ") + COL_TAG[c] + ":";
-    if (sumNPKc[c]) s += "N" + String((int)(sumNsum[c] / sumNPKc[c] + 0.5)) + "P" + String((int)(sumPsum[c] / sumNPKc[c] + 0.5)) + "K" + String((int)(sumKsum[c] / sumNPKc[c] + 0.5));
-    else            s += "N-P-K-";
-    if (sumMoistC[c]) s += "M" + String((int)(sumMoistSum[c] / sumMoistC[c] + 0.5));
-    else              s += "M-";
+    s += String("\nCol ") + COL_TAG[c] + ": ";
+    if (sumNPKc[c]) s += "N" + String((int)(sumNsum[c] / sumNPKc[c] + 0.5)) + " P" + String((int)(sumPsum[c] / sumNPKc[c] + 0.5)) + " K" + String((int)(sumKsum[c] / sumNPKc[c] + 0.5)) + " mg/kg";
+    else            s += "NPK n/a";
+    s += ", moisture " + (sumMoistC[c] ? String((int)(sumMoistSum[c] / sumMoistC[c] + 0.5)) + "%" : String("n/a"));
   }
-  if (sumBattC) s += " BAT" + String(sumBattVsum / sumBattC, 1) + "V " + String(sumBattWsum / sumBattC, 1) + "W";
-  s += " CONS" + String((int)(sumConsWh + 0.5)) + " CHG" + String((int)(sumChgWh + 0.5)) + "Wh";
+  if (sumBattC) s += "\nBattery " + String(sumBattVsum / sumBattC, 1) + "V, " + String(sumBattWsum / sumBattC, 1) + "W";
+  s += "\nEnergy used " + String((int)(sumConsWh + 0.5)) + "Wh, charged " + String((int)(sumChgWh + 0.5)) + "Wh";
   float wtot = 0, ntot = 0; for (int c = 0; c < NUM_COLUMNS; c++) { wtot += sumWaterTot[c]; ntot += sumNutTot[c]; }
-  s += " H2O" + String(wtot, 1) + "L NUT" + String(ntot, 0) + "mL";
-  s += " FLT C" + String(sumFltC) + "M" + String(sumFltM) + "m" + String(sumFltm);
-  s += " RST" + String(sumRst) + " IRR" + String(sumIrr) + " FERT" + String(sumFert) + " DOSE" + String(sumDose);
-  if (!sdOk) s += " (noSD)";
+  s += "\nWater " + String(wtot, 1) + "L, nutrients " + String(ntot, 0) + "mL";
+  s += "\nRuns: " + String(sumIrr) + " irrigation, " + String(sumFert) + " fertigation, " + String(sumDose) + " doses";
+  s += "\nFaults: " + String(sumFltC) + " critical, " + String(sumFltM) + " major, " + String(sumFltm) + " minor";
+  s += "\nResets: " + String(sumRst);
+  if (!sdOk) s += "\n(No SD card: nothing logged)";
   sumReport = s;
 }
 
 // FULL SUMMARY = hourly nutrient/moisture/power record + deduped errors + events + peaks.
 static void buildFullReport() {
-  String s = "FULL," + sumDayLabel() + " hourly";
+  String s = "Hourly: N P K mg/kg, M moisture %, battery V W";
   for (int h = 0; h < 24; h++) {
     bool any = (hrBattC[h] > 0);
     for (int c = 0; c < NUM_COLUMNS; c++) if (hrNPKc[h][c] || hrMoistC[h][c]) any = true;
@@ -4985,24 +6660,37 @@ static void buildFullReport() {
       if (hrNPKc[h][c]) s += " N" + String((int)(hrNsum[h][c] / hrNPKc[h][c] + 0.5)) + " P" + String((int)(hrPsum[h][c] / hrNPKc[h][c] + 0.5)) + " K" + String((int)(hrKsum[h][c] / hrNPKc[h][c] + 0.5));
       if (hrMoistC[h][c]) s += " M" + String((int)(hrMoistSum[h][c] / hrMoistC[h][c] + 0.5));
     }
-    if (hrBattC[h]) s += " | " + String(hrBattVsum[h] / hrBattC[h], 1) + "V " + String(hrBattWsum[h] / hrBattC[h], 1) + "W";
+    if (hrBattC[h]) s += "; " + String(hrBattVsum[h] / hrBattC[h], 1) + "V " + String(hrBattWsum[h] / hrBattC[h], 1) + "W";
   }
-  if (sumErrN) { s += "\nERR:"; for (int i = 0; i < sumErrN; i++) s += " " + sumErrTs[i] + " " + sumErrCode[i]; }
-  else         { s += "\nERR: none"; }
-  if (sumEvents.length()) { String e = sumEvents; e.replace("|", "\n"); s += "\nEVT:" + e; if (sumTruncated) s += "\n+more evt@SD"; }
+  if (sumErrN) {
+    s += "\n\nProblems (first seen):";
+    for (int i = 0; i < sumErrN; i++) {
+      String at = (sumErrTs[i].length() == 4) ? sumErrTs[i].substring(0, 2) + ":" + sumErrTs[i].substring(2) : sumErrTs[i];
+      const String &ec = sumErrCode[i];
+      s += "\n" + at + " " + (smsFaultInfo(ec.c_str()) ? smsFaultWhat(ec.c_str()) + " (" + ec + ")"
+                             : ec.startsWith("RST_") ? "restart: " + smsPlain(ec.substring(4)) : smsPlain(ec));
+    }
+  } else {
+    s += "\n\nProblems: none";
+  }
+  if (sumEvents.length()) {
+    String e = sumEvents; e.replace("|", "\n");
+    s += "\n\nEvents:" + e;
+    if (sumTruncated) s += "\n(more events on the SD card)";
+  }
   float wtot = 0, ntot = 0; for (int c = 0; c < NUM_COLUMNS; c++) { wtot += sumWaterTot[c]; ntot += sumNutTot[c]; }
-  s += "\nPEAK Tmax" + (sumMaxTemp > -999 ? String(sumMaxTemp, 1) : String("-"))
-     + " Vmin" + (sumMinBattV < 99999 ? String(sumMinBattV, 1) : String("-"))
-     + " Wpk" + String(sumPeakW, 1);
-  s += " H2O" + String(wtot, 1) + "L NUT" + String(ntot, 0) + "mL FLT" + String(sumFltC + sumFltM + sumFltm) + " RST" + String(sumRst);
-  if (!sdOk) s += "\n(noSD)";
+  s += "\n\nPeaks: max temp " + (sumMaxTemp > -999 ? String(sumMaxTemp, 1) + "C" : String("n/a"))
+     + ", min battery " + (sumMinBattV < 99999 ? String(sumMinBattV, 1) + "V" : String("n/a"))
+     + ", max power " + String(sumPeakW, 1) + "W";
+  s += "\nTotals: water " + String(wtot, 1) + "L, nutrients " + String(ntot, 0) + "mL, faults " +
+       String(sumFltC + sumFltM + sumFltm) + ", resets " + String(sumRst);
+  if (!sdOk) s += "\n(No SD card: nothing logged)";
   sumReport = s;
 }
 
 // Non-blocking FSM: open -> incremental read (bounded/tick) -> build -> stream SMS paced
 // to the queue so an uncapped FULL report never overflows the SMS queue or stalls the WDT.
 void summaryTick() {
-  const int SEG = 140;                                  // each SMS under the 160-char GSM7 limit
   switch (summaryStage) {
     case SUM_IDLE: return;
 
@@ -5011,7 +6699,7 @@ void summaryTick() {
       if (!sdOk) { summaryStage = SUM_BUILD; return; }   // no SD -> build an empty report
       char fname[16];
       if (summaryTargetStamp > 0) snprintf(fname, sizeof(fname), "/%08ld.CSV", summaryTargetStamp);
-      else                        strcpy(fname, "/NODATE.CSV");
+      else                        strlcpy(fname, "/NODATE.CSV", sizeof(fname));
       if (!sdTake(200)) return;                          // portal holds SD -> retry this stage next tick
       summaryFile = SD.open(fname, FILE_READ);
       sdGive();
@@ -5040,29 +6728,40 @@ void summaryTick() {
     case SUM_BUILD: {
       if (summaryFile) { if (!sdTake(200)) return; summaryFile.close(); sdGive(); }
       if (sumMode == SUM_FULL) buildFullReport(); else buildShortReport();
-      int len = sumReport.length();
-      sumSegTotal = (len + SEG - 1) / SEG; if (sumSegTotal < 1) sumSegTotal = 1;
+      // Pages break at line ends, each a whole SMS headed "SUMMARY <date> i/N" (see smsSendPages).
+      sumSegTotal = smsPageCount(sumReport, smsPageRoom(sumTitle()));
       uint8_t capN = (sumMode == SUM_FULL) ? FULL_SUMMARY_MAX_SMS : SUMMARY_MAX_SMS;
       if (capN > 0 && sumSegTotal > capN) sumSegTotal = capN;   // 0 = unlimited (FULL by request)
       sumSegIdx = 0;
+      sumPos = smsSkipBreak(sumReport, 0);
       summaryStage = SUM_STREAM;
       return;
     }
 
     case SUM_STREAM: {
-      if (sumSegIdx >= sumSegTotal) {                    // done
+      int len = sumReport.length();
+      if (sumSegIdx >= sumSegTotal || sumPos >= len) {   // done
         sumReport = ""; summaryPending = false; summaryStage = SUM_IDLE; return;
       }
       if (gsm.queued() >= GSM_QUEUE_SIZE - 1) return;    // queue nearly full -> wait (paced, no drops)
-      int len = sumReport.length();
-      int from = sumSegIdx * SEG;
-      String seg = sumReport.substring(from, min(len, from + SEG));
-      if (sumSegIdx == sumSegTotal - 1 && len > sumSegTotal * SEG) {   // capped, more text remains
-        if ((int)seg.length() > SEG - 9) seg = seg.substring(0, SEG - 9);
-        seg += "+more@SD";
+      String title = sumTitle();
+      int room = smsPageRoom(title);
+      int end = smsPageEnd(sumReport, sumPos, room);
+      String msg;
+      if (sumSegTotal == 1 && smsSkipBreak(sumReport, end) >= len) {
+        msg = title + "\n" + sumReport.substring(sumPos);           // the whole report fits one SMS
+      } else {
+        String page;
+        if (sumSegIdx == sumSegTotal - 1 && smsSkipBreak(sumReport, end) < len) {   // capped, more text remains
+          end = smsPageEnd(sumReport, sumPos, room - 19);
+          page = sumReport.substring(sumPos, end) + "\n(more on SD card)";
+        } else {
+          page = sumReport.substring(sumPos, end);
+        }
+        msg = title + " " + String(sumSegIdx + 1) + "/" + String(sumSegTotal) + "\n" + page;
       }
-      String pfx = (sumSegTotal > 1) ? ("(" + String(sumSegIdx + 1) + "/" + String(sumSegTotal) + ")") : String("");
-      replyTarget = summaryReplyTo; sendSMS(pfx + seg); replyTarget = "";
+      replyTarget = summaryReplyTo; sendSMS(msg); replyTarget = "";
+      sumPos = smsSkipBreak(sumReport, end);
       sumSegIdx++;
       return;
     }
@@ -5206,7 +6905,13 @@ void controlTick() {
   if (batteryCritical) return;             // battery-critical -> hold all runs (READY, not active)
 #endif
   if (!rtcOk) return;
-  if (secBattBlocksAc()) return;           // secondary battery low / unmonitored: no inverter use may start
+  {                                       // secondary battery low / unmonitored: no inverter use may start
+    // Logged once per reason (2026-11-17): a scheduled run that does not start must say why.
+    static const char *lastTag = nullptr;
+    const char *tag = secBattBlocksAc() ? secBlockTag() : nullptr;
+    if (tag != lastTag) { if (tag) logEvent("ESP1", "CTRL", String("AC_BLOCKED|") + tag); lastTag = tag; }
+    if (tag) return;
+  }
   // NOTE: ESP2 is OFF during idle (sec.18.8) -- do NOT gate on esp2Available here; a due
   // column powers ESP2 up on demand below and the work order is sent once it reports READY.
 
@@ -5232,12 +6937,18 @@ void controlTick() {
       ctrlNote(c, "SNOOZED|" + String((colSnoozeUntil[c] - millis()) / 60000 + 1) + "min");
       continue;
     }
-    if (col[c].lastServicedStamp == currentDayStamp) { ctrlNote(c, "SERVICED_TODAY"); continue; }
-    // schedule axis: AUTO uses the default window, MANUAL uses the operator-set one (sec.18.10.7.2)
-    uint16_t ws = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_START[c] : DEF_WIN_START[c];
-    uint16_t we = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_END[c]   : DEF_WIN_END[c];
-    if (!finishDosed && (mod < ws || mod > we)) {                  // outside service window
-      ctrlNote(c, "OUTSIDE_WINDOW|now=" + hhmm(mod) + "|win=" + hhmm(ws) + "-" + hhmm(we));
+    if (dayDoneToday(c)) { ctrlNote(c, "SERVICED_TODAY"); continue; }   // the whole day (a STOP reply, a lost fault)
+    // schedule axis: AUTO uses the default window, MANUAL the operator-set ones (sec.18.10.7.2) -- up to
+    // MAX_RUNS_PER_DAY of them since 2026-11-05. A column is watered at most once in each window.
+    int win = windowAt(c, mod);
+    if (!finishDosed && win < 0) {                                 // outside every service window
+      String wins;
+      for (int w = 0; w < windowCount(c); w++) wins += (w ? "," : "") + hhmm(windowStart(c, w)) + "-" + hhmm(windowEnd(c, w));
+      ctrlNote(c, "OUTSIDE_WINDOW|now=" + hhmm(mod) + "|win=" + wins);
+      continue;
+    }
+    if (!finishDosed && windowDoneToday(c, win)) {
+      ctrlNote(c, String("SERVICED_TODAY|win=") + (win + 1) + "/" + windowCount(c));
       continue;
     }
     // Whole-Nano-link staleness: sensor.soil[c]/npkValid[c] only reflect the last successfully parsed
@@ -5245,25 +6956,30 @@ void controlTick() {
     // sentinel is caught below), so a Nano outage previously let the schedule irrigate/fertigate on
     // arbitrarily old data for as long as the outage lasted. heartbeatTick's NANO_SILENCE alert is
     // informational only and nothing here gated on it. Same NANO_STALE_MS threshold npkMoistPct()
-    // already uses for the analogous per-sensor case.
+    // already uses for the analogous per-sensor case. Its value is the silence timeout (decision D5).
     if (!sensor.lastNanoMs || millis() - sensor.lastNanoMs > NANO_STALE_MS) {
       ctrlNote(c, "NANO_STALE");
       continue;
     }
+    if (tankCheckNeeded) { ctrlNote(c, "TANK_CHECK"); continue; }  // the operator must confirm the tank first
     if (!finishDosed && sensor.soil[c] < 0) { ctrlNote(c, "SOIL_INVALID"); continue; }   // invalid soil (faulted elsewhere)
     if (!finishDosed && sensor.soil[c] >= soilStartPct) {          // not dry enough
       ctrlNote(c, "NOT_DRY|soil=" + String(sensor.soil[c]) + ">=" + String(soilStartPct));
       continue;
     }
-    if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT) {        // reservoir guard (sec.14.4.1)
+    if (reservoirLow(sensor.msTank != 0, sensor.resLevel, RES_LOW_PCT)) {   // reservoir guard (sec.14.4.1)
       // A1: latch so the fault/SMS fires ONCE per low episode (cleared on recovery in powerTick-
       // style check below), not every loop while a column sits due over a low reservoir.
       ctrlNote(c, "RES_LOW|res=" + String((int)sensor.resLevel));
       if (!resLowLatched) { resLowLatched = true; raiseFault('M', "RES_LOW", "RESERVOIR"); }
       continue;
     }
-    bool fert = finishDosed || decideFertigate(c);                 // a dosed batch still needs its mix and flush
-    ctrlNote(c, finishDosed ? "DUE->FINISH_DOSED" : fert ? "DUE->FERTIGATE" : "DUE->IRRIGATE");   // column is being serviced now
+    // Nutrients at most once a day (2026-11-05): with several waterings a day every due window could otherwise
+    // dose. decideFertigate() isn't asked once they've gone in today, so its NPK checks don't log for nothing.
+    bool fedToday = col[c].fertStamp == currentDayStamp;
+    bool fert = finishDosed || (!fedToday && decideFertigate(c));  // a dosed batch still needs its mix and flush
+    ctrlNote(c, finishDosed ? "DUE->FINISH_DOSED" : fert ? "DUE->FERTIGATE"
+                : fedToday ? "DUE->IRRIGATE|FED_TODAY" : "DUE->IRRIGATE");   // column is being serviced now
 #if BATTERY_SAFETY_ENABLED
     if (batteryLow) fert = false;                                  // low battery -> irrigation only (READY, not active)
 #endif
@@ -5271,6 +6987,7 @@ void controlTick() {
     // OFF-during-idle (sec.18.8): queue the run, power ESP2 up, and let its READY dispatch the
     // work order (stateMachineTick ACTIVE_STATE is the warm-up timeout safety net).
     pendingRun.active = true; pendingRun.colIdx = c; pendingRun.fertigate = fert;
+    pendingRun.window = (int8_t)win;                               // -1 for a dosed batch finished outside a window
     runUiBegin(c, fert);                                           // pre-run receipt (shows during warm-up)
     esp2WarmupMs = millis();
     if (esp2Available && esp2Powered) dispatchPendingRun();        // already up -> send immediately
@@ -5476,7 +7193,7 @@ static bool acsReadVolts(float &v) {
 
 void readBatteryAdc() {
   // The ACS758 is read either way, so a dead ADC still shows on the Diag page while the INA226 is in use.
-  float vAdc;
+  float vAdc = 0;
   acsOk = acsReadVolts(vAdc);
   const InaMon &m = powerIna[INA_MAIN];
   battFromIna = inaUsable(m);
@@ -5640,9 +7357,10 @@ void powerInaTick() {
 static void secBattPolicy() {
   bool valid = secInaOk && secHaveV;
   if (valid) {
-    if (!secLow && secV < SEC_BATT_LOW_V) secLow = true;
-    else if (secLow && secV >= SEC_BATT_RECOVER_V) secLow = false;
-    secCrit = (secV < SEC_BATT_CRIT_V);
+    float pct = (float)secBattPct(secRestV);       // the resting charge, not the raw voltage (2026-11-17)
+    if (!secLow && pct <= SEC_BLOCK_PCT) secLow = true;
+    else if (secLow && pct >= SEC_UNBLOCK_PCT) secLow = false;
+    secCrit = (secRestV < SEC_BATT_CRIT_V);
   }
 #if SECONDARY_BATT_ENABLED
   // raiseFault sends nothing during Testing. Setting these one-shots there would lose the alert for the
@@ -5659,13 +7377,41 @@ static void secBattPolicy() {
   missAlerted = false;
   if (secLow && !lowAlerted) {
     lowAlerted = true;
-    raiseFault('M', "BATT2_LOW", (String("V=") + String(secV, 2) + "|AC_BLOCKED").c_str());
+    raiseFault('M', "BATT2_LOW", (String("V=") + String(secV, 2) + "|rest=" + String(secRestV, 2) + "|pct=" +
+                                  String(secBattPct(secRestV)) + "|AC_BLOCKED").c_str());
   } else if (!secLow && lowAlerted) {
     lowAlerted = false; logEvent("ESP1", "PWR2", "BATT2|RECOVERED|V=" + String(secV, 2));
   }
   if (secCrit && !critAlerted) { critAlerted = true; raiseFault('M', "BATT2_CRIT", (String("V=") + String(secV, 2)).c_str()); }
   else if (!secCrit) critAlerted = false;
 #endif
+}
+
+// Learn secRint at a switch to the secondary (see secRestV): the last reading on main against the second one on the
+// secondary (the first can still carry the transfer), taken within 15 s of each other, the current having risen by
+// at least 0.1 A. Smoothed (30 % of each new step); saved to NVS once back on main, never during the switch.
+static void secRintLearn(float v, float i, unsigned long now) {
+  static float mainV = 0.0f, mainI = 0.0f;
+  static unsigned long mainMs = 0;
+  static bool done = false;
+  static uint8_t secN = 0;
+  if (!esp2OnSecondary) {
+    mainV = v; mainI = i; mainMs = now; done = false; secN = 0;
+    if (secRintDirty) { secRintDirty = false; prefsCal.putFloat("secR", secRint); }
+    return;
+  }
+  if (done || ++secN < 2) return;
+  done = true;
+  if (mainMs == 0 || now - mainMs > 15000UL) return;
+  float dI = i - mainI, dV = mainV - v;
+  if (dI < 0.1f || !(dV > 0.0f)) return;
+  float r = dV / dI;
+  if (r < SEC_RINT_MIN || r > SEC_RINT_MAX) return;
+  float was = secRint;
+  secRint += 0.3f * (r - secRint);
+  secRintDirty = true;
+  logEvent("ESP1", "PWR2", "BATT2|RINT|step=" + String(r, 3) + "|was=" + String(was, 3) + "|now=" + String(secRint, 3) +
+           "|main=" + String(mainV, 2) + "V/" + String(mainI, 3) + "A|sec=" + String(v, 2) + "V/" + String(i, 3) + "A");
 }
 
 void secBattTick() {
@@ -5712,11 +7458,14 @@ void secBattTick() {
   i -= secOffsetA;
   secV = secHaveV ? secV + 0.3f * (v - secV) : v;        // light filter so a load step can't flap the latch
   secHaveV = true; secI = i; secP = secV * i;
+  secRestV = secV + secI * secRint;                       // resting voltage: the charger's lift / the load's sag out
+  secRintLearn(v, i, now);
   secBattPolicy();
   if (secLow != prevLow || lastLogMs == 0 || now - lastLogMs >= PWR_LOG_INTERVAL_MS) {
     lastLogMs = now; prevLow = secLow;
     logEvent("ESP1", "PWR2", "BATT2|V=" + String(secV, 2) + "|I=" + String(secI, 3) + "|P=" + String(secP, 1) +
-             "|LOW=" + String(secLow ? 1 : 0) + "|SRC=" + (esp2OnSecondary ? "SECONDARY" : "MAIN"));
+             "|LOW=" + String(secLow ? 1 : 0) + "|SRC=" + (esp2OnSecondary ? "SECONDARY" : "MAIN") +
+             "|REST=" + String(secRestV, 2) + "|PCT=" + String(secBattPct(secRestV)) + "|R=" + String(secRint, 3));
   }
 }
 
@@ -5724,7 +7473,10 @@ void secBattTick() {
 // A run already in progress is never aborted by this -- only new work is refused.
 #if SECONDARY_BATT_ENABLED
 static bool bswRecharging() {
-  return millis() < BSW_RECHARGE_MS || (bswLastStrikeMs && millis() - bswLastStrikeMs < BSW_RECHARGE_MS);
+  // Latched once passed: a plain millis() < X comes true again for a minute when millis() wraps at 49.7 days.
+  static bool bootWaitOver = false;
+  if (!bootWaitOver && millis() >= BSW_RECHARGE_MS) bootWaitOver = true;
+  return !bootWaitOver || (bswLastStrikeMs && millis() - bswLastStrikeMs < BSW_RECHARGE_MS);
 }
 #endif
 
@@ -5743,8 +7495,51 @@ bool secBattBlocksAc(const char **why) {
   return false;
 }
 
+// Which of secBattBlocksAc's reasons it is (2026-11-17): "BATT2 low" used to be shown for all of them -- a monitor
+// that is not answering, the battery-switch fault latch, or the minute after a restart all looked like a flat pack.
+static unsigned long secRechargeLeftMs() {
+#if SECONDARY_BATT_ENABLED
+  unsigned long now = millis(), left = 0;
+  if (now < BSW_RECHARGE_MS) left = BSW_RECHARGE_MS - now;
+  if (bswLastStrikeMs && now - bswLastStrikeMs < BSW_RECHARGE_MS) {
+    unsigned long l2 = BSW_RECHARGE_MS - (now - bswLastStrikeMs);
+    if (l2 > left) left = l2;
+  }
+  return left;
+#else
+  return 0;
+#endif
+}
+const char *secBlockLcd() {
+  static char b[21];
+  if (!secBattBlocksAc()) return "";
+#if SECONDARY_BACKUP_ENABLED
+  if (bkState != BK_IDLE) return "Main batt critical";
+#endif
+#if SECONDARY_BATT_ENABLED
+  if (!secInaOk || !secHaveV) return secNoPack ? "BATT2 not seen: wire" : "BATT2 monitor off";
+  if (secLow) { snprintf(b, sizeof(b), "BATT2 low: %d%%", secBattPct(secRestV)); return b; }
+  if (bswLatched) return "Batt switch fault";
+  if (bswRecharging()) { snprintf(b, sizeof(b), "Restarted: wait %lus", (secRechargeLeftMs() + 999UL) / 1000UL); return b; }
+#endif
+  return "AC pumps blocked";
+}
+const char *secBlockTag() {
+  if (!secBattBlocksAc()) return "";
+#if SECONDARY_BACKUP_ENABLED
+  if (bkState != BK_IDLE) return "MAIN_BATT_CRIT";
+#endif
+#if SECONDARY_BATT_ENABLED
+  if (!secInaOk || !secHaveV) return secNoPack ? "BATT2_NOT_SEEN" : "BATT2_MONITOR";
+  if (secLow) return "BATT2_LOW";
+  if (bswLatched) return "BATTSW_FAULT";
+  if (bswRecharging()) return "BATTSW_RECHARGE";
+#endif
+  return "BATT2";
+}
+
 /* ---- Battery-switch reset protection (see BSW_LATCH_STRIKES) ------------------------------- *
- * ESP2 announces every P4 switch (INFO,BATT,SWITCHING,<to>) before it moves it. ESP1 then:
+ * ESP2 announces every P0 switch (INFO,BATT,SWITCHING,<to>) before it moves it. ESP1 then:
  * flushes the SD log, journals the switch in NVS ("battsw"/"pend"), opens a short quiet window
  * (no SD write, no new WiFi request, no SMS -- less load on the hold-up, nothing half-written if
  * the rails do drop) and answers BATTSW,GO. ESP2 confirms with INFO,BATT,SECONDARY|MAIN once the
@@ -5785,6 +7580,51 @@ static void bswStrike(uint8_t dir, const char *by) {
   }
 }
 
+// Why a manual or remote reboot must wait, or NULL. An ESP1 reboot also cuts ESP2 (setup() drives GPIO4 LOW),
+// so it would lose a run or a held fault. An E-stop clears all of these, so this can never trap the operator.
+const char *rebootBusyReason() {
+  if (wo.active || pendingRun.active || fcPhase == FP_RUNNING || sysState == ACTIVE_STATE) return "a run is in progress";
+  if (pendingExercise.active) return "a pump test is running";
+  if (esp2Held) return "a fault is held";
+  return NULL;
+}
+
+/* Tank check (decision D12). Set when a run is lost in a way that can leave ESP2's saved volume too low. (web v.4 measures
+ * the mixing tank before every fill, so this now only holds back SCHEDULED runs; a forced run clears it, 2026-11-17.) No run starts until the operator has
+ * looked at the tank and confirmed by SMS TANKCHECK,OK or the LCD Settings row. Confirming does not change ESP2's
+ * saved volume, so if the tank holds unexpected water, empty it first with Testing (the booster to the column). */
+void tankCheckSet(const char *why) {
+  if (!tankCheckNeeded) {
+    tankCheckNeeded = true;
+    prefs.putBool("tankchk", true);
+  }
+  raiseFault('M', "TANK_CHECK", why);
+}
+
+void tankCheckClear(const char *by) {
+  if (!tankCheckNeeded) return;
+  tankCheckNeeded = false;
+  prefs.putBool("tankchk", false);
+  logEvent("ESP1", "STATE", String("TANK_CHECK|CONFIRMED|by=") + by);
+}
+
+void tankCheckBoot() {
+  tankCheckNeeded = prefs.getBool("tankchk", false);
+  bool wasLive = prefs.getBool("runlive", false);
+  if (wasLive) prefs.putBool("runlive", false);
+  if (runLossNeedsTankCheck(wasLive, bswBootStruck)) tankCheckSet("ESP1_RESET_DURING_RUN");
+  else if (tankCheckNeeded) logEvent("ESP1", "STATE", "TANK_CHECK|STILL_NEEDED_AT_BOOT");
+}
+
+// Written only when it changes, so about twice per run.
+void tankCheckTick() {
+  static bool saved = false;
+  bool live = wo.active && wo.stage == WO_ACKED && !esp2Held;
+  if (live == saved) return;
+  saved = live;
+  prefs.putBool("runlive", live);
+}
+
 // A deliberate cut/restart while a switch is pending is not the switch's fault -- forget it so the
 // next boot / READY does not count a strike.
 void bswForgetPending() {
@@ -5793,7 +7633,7 @@ void bswForgetPending() {
   bswSavePending(0);
 }
 
-/* A stop while the boards are on the secondary drops P4 at once, and that transfer can reset ESP1 before
+/* A stop while the boards are on the secondary drops P0 at once, and that transfer can reset ESP1 before
  * the stop has finished. Unjournaled, the rig would come back as if nothing had been asked of it: an E-stop
  * forgotten and the schedule running again, or a cancelled column re-run at once. So it is written down
  * first. Surviving BSW_CUT_SURVIVE_MS clears it (bswTick), so a later unrelated reset can't replay it.
@@ -5855,7 +7695,27 @@ void bswBoot() {
   } else if (pend != 0) bswSavePending(0);
 }
 
+void bswVerifyAnswer() {
+  if (!bswVerdict) return;
+  if (!strcmp(bswVerdict, "OK")) sendEsp2("BATTSW,OK");
+  else sendEsp2(String("BATTSW,FAIL,") + bswVerdict);
+}
+
 void bswTick() {
+  // INFO,BATT,VERIFY (2026-11-16): decide whether the switch was survived by every board.
+  if (bswVerifyStartMs && !bswVerdict) {
+    // ESP1 never saw this switch announced (it restarted since, or the announcement was lost): it cannot vouch
+    // for it, and a reset would not have been journaled -- refuse.
+    if (!bswGoMs || millis() - bswGoMs > 15000UL)               bswVerdict = "ESP1_NO_GO";
+    else if (nanoBootMs && (long)(nanoBootMs - bswGoMs) >= 0)    bswVerdict = "NANO_RESET";
+    else if (sensor.lastNanoMs && (long)(sensor.lastNanoMs - bswVerifyStartMs) > 0) bswVerdict = "OK";
+    else if (millis() - bswVerifyStartMs >= BSW_VERIFY_NANO_MS) bswVerdict = "NANO_SILENT";
+    if (bswVerdict) {
+      logEvent("ESP1", "PWR2", String("BATTSW|VERIFY|") + bswVerdict);
+      bswVerifyAnswer();
+    }
+  }
+  if (bswVerifyStartMs && millis() - bswVerifyStartMs > 10000UL) { bswVerifyStartMs = 0; bswVerdict = nullptr; }
   // A switch that was announced but neither confirmed nor followed by a reboot: ESP2 survived and
   // only the confirmation was lost. Drop the journal so a much later, unrelated READY can't count.
   if (bswPendingDir && millis() - bswPendingMs > BSW_PENDING_MAX_MS) {
@@ -5882,7 +7742,7 @@ void bswTick() {
     if (bswAutoClearDue(bswLastStrikeT, now, BSW_WINDOW_S)) {
       bool was = bswLatched;
       bswClear("AUTO_24H");
-      if (was) sendSMS("INFO,BATT_SWITCH,REARMED,24h since the last switch reset");
+      if (was) sendSMS("INFO: Battery switching re-armed.\n24 h passed since the last switch reset. AC pumps are allowed again.");
     }
   }
 }
@@ -5891,7 +7751,7 @@ void bswTick() {
  *  SECONDARY AS BACKUP  (see SECONDARY_BACKUP_ENABLED, backupNext in pure_math.h)
  * -----------------------------------------------------------------------------
  *  The decisions are in backupNext(), which is host-tested. This wires it up: debounce the main battery,
- *  send the alerts, and ask ESP2 to hold or release P4. Reset-proof by construction: no state survives
+ *  send the alerts, and ask ESP2 to hold or release P0. Reset-proof by construction: no state survives
  *  a reset except "the alert already went out" (NVS battsw/bka), so a reset lands on BK_IDLE with the
  *  boards on main, and the same steps run again -- without a second text, after the hold-up has
  *  recharged, and at most BSW_LATCH_STRIKES times, because each switch-caused reset is a strike.
@@ -5917,7 +7777,7 @@ static void bkCritAlert(const char *code, const String &loc) {
   lastFaultMsg = String(code) + " " + loc;
   lastFaultTime = tsString();
   wakeBacklight();
-  sendSMS(String("ALERT,CRIT,") + code + "," + loc);
+  smsFault('C', code, loc);
 }
 static String bkVolts() {
   return String("MAIN=") + String(battV, 2) + "|SEC=" + ((secInaOk && secHaveV) ? String(secV, 2) : String("--"));
@@ -5981,7 +7841,7 @@ void backupTick() {
         esp2SetPower(true);
         break;
       case BK_ACTIVE:
-        sendSMS(String("INFO,BACKUP,ON,") + bkVolts());
+        sendSMS(String("INFO: Now running on the BACKUP battery.\n") + smsPlain(bkVolts()));
         break;
       case BK_RETURNING:
         if (from == BK_ACTIVE && !in.mainOkHeld)
@@ -5992,7 +7852,7 @@ void backupTick() {
       case BK_IDLE:
         retryAt = 0;
         if (from != BK_ALERT && from != BK_WAIT) esp2SetPower(false);
-        sendSMS(String("INFO,BACKUP,OFF,") + bkVolts());
+        sendSMS(String("INFO: Back on the MAIN battery.\n") + smsPlain(bkVolts()));
         break;
     }
   }
@@ -6015,23 +7875,38 @@ void scheduleTick() {
   DateTime now = rtcNow();
   long ds = dayStamp(now);
   if (ds != currentDayStamp) {                 // midnight rollover -> reset daily counters
+    bool firstAfterBoot = currentDayStamp < 0;
     currentDayStamp = ds;
+    logKeepFrom = dayStamp(now - TimeSpan(LOG_KEEP_DAYS, 0, 0, 0));   // CSV logs kept in Firebase from this day on
     faultsToday[0] = faultsToday[1] = faultsToday[2] = 0;
     nanoResetsToday = 0; esp2PowerCycles = 0;
     reportSentToday = false; nanoDailyResetDone = false;
     energyConsumedWh = energyChargedWh = 0.0;  // reset daily energy totals (B2)
-    for (int c = 0; c < NUM_COLUMNS; c++) { waterUsedToday[c] = nutrientUsedToday[c] = 0; }
+    for (int c = 0; c < NUM_COLUMNS; c++) {
+      waterUsedToday[c] = nutrientUsedToday[c] = 0;
+      wateringsToday[c] = feedingsToday[c] = 0;
+    }
+    // Not a new day, only a restart: today's water, nutrients and run counts carry on (2026-11-06).
+    if (firstAfterBoot) restoreDayTotals(ds);
+    // ...and so do the once-a-day jobs (2026-11-17 log): every restart after 03:00 reset the Nano again, and one after
+    // 18:00 would send the daily report again. Their day is kept in NVS.
+    if (firstAfterBoot) {
+      nanoDailyResetDone = (prefs.getLong("nrsDay", -1) == ds);
+      reportSentToday    = (prefs.getLong("rptDay", -1) == ds);
+    }
   }
   uint16_t mod = now.hour() * 60 + now.minute();
 
   if (!reportSentToday && mod >= DAILY_REPORT_MIN) {
-    sendDailyReport(); reportSentToday = true;
+    sendDailyReport(); reportSentToday = true; prefs.putLong("rptDay", ds);
     if (now.dayOfTheWeek() == SIM_CHECK_WEEKDAY) simHealthCheck();
   }
-  if (!nanoDailyResetDone && mod >= DAILY_NANO_RESET_MIN) {     // sec.18.9.5.0.3 (exempt from HW limit)
+  // Not while a pump runs or the selector moves: the reset would blind the overflow watch mid-fill (ESP2
+  // would hold the run as LEVEL_BLIND). It simply happens on a later pass, once the pump is off.
+  if (!nanoDailyResetDone && mod >= DAILY_NANO_RESET_MIN && !levelRelayActive() && !servoReqActive) {     // sec.18.9.5.0.3 (exempt from HW limit)
     sendNanoCommand("RESET_REQ");
     logEvent("ESP1", "RESET", "NANO|RESET_REQ|DAILY");
-    nanoDailyResetDone = true;
+    nanoDailyResetDone = true; prefs.putLong("nrsDay", ds);
   }
   if (reportPending && sysState != ACTIVE_STATE) sendDailyReport();   // deferred STATUS
   // Deferred SUMMARY: operation finished -> run the (non-blocking) SD parse now (sec.12.1.3.1).
@@ -6046,7 +7921,7 @@ void scheduleTick() {
  * ========================================================================== */
 // Oldest completed daily CSV on the SD with supaLast < stamp < today (skips NODATE + today's open file).
 // 0 = nothing to send. Requires a valid clock so "today" is known -- no auto catch-up on a dead RTC.
-static long uploadNextCatchupDay() {
+static long uploadNextCatchupDay(long after, long notBefore) {
   if (!rtcOk || currentDayStamp <= 0) return 0;
   if (!sdTake(200)) return 0;                          // SD busy -> try next cycle
   long best = 0;
@@ -6059,7 +7934,7 @@ static long uploadNextCatchupDay() {
       bool digits = true; for (int i = 0; i < 8; i++) if (!isDigit(n[i])) digits = false;
       if (!digits) continue;                                     // skips NODATE.CSV and other names
       long stamp = n.substring(0, 8).toInt();
-      if (stamp > supaLast && stamp < currentDayStamp && (best == 0 || stamp < best)) best = stamp;
+      if (stamp > after && stamp >= notBefore && stamp < currentDayStamp && (best == 0 || stamp < best)) best = stamp;
     }
     root.close();
   }
@@ -6085,18 +7960,35 @@ void uploadTick() {
     }
   }
 
+  // The website's "Upload from the rig" (irrigation/logRequest, polled on core 0): first in line, today included.
+  if (webLogReqStamp != 0) {
+    long d = webLogReqStamp; webLogReqStamp = 0;
+    manualUploadStamp = d; attempts = 0;
+    logEvent("ESP1", "UPLOAD", "WEB_REQUEST|" + String(d) + ".CSV");
+  }
+
   // 1) publish a finished result (netTask -> here)
   if (uploadResult != 0) {
     long s = uploadResStamp; int r = uploadResult, code = uploadHttp;
+    bool fb = uploadWasFb;
     uploadResult = 0; lastAttemptMs = millis();
+    const char *to = fb ? "|FIREBASE" : "|SUPABASE";
     if (r == 1) {
-      logEvent("ESP1", "UPLOAD", "OK|" + String(s) + ".CSV");
-      if (s > supaLast) { supaLast = s; saveSupaLast(); }
+      logEvent("ESP1", "UPLOAD", "OK|" + String(s) + ".CSV" + to);
+      if (fb) {                                   // only a COMPLETED day moves the mark (today is still growing)
+        if (s > fbLogLast && s < currentDayStamp) { fbLogLast = s; prefs.putLong("fblogl", fbLogLast); }
+      } else if (s > supaLast) { supaLast = s; saveSupaLast(); }
+      if (manualUploadStamp == s) manualUploadStamp = 0;
+      attempts = 0;
+    } else if (code == -2) {                      // not on the SD card: nothing to retry
+      logEvent("ESP1", "UPLOAD", "MISSING|" + String(s) + ".CSV" + to);
       if (manualUploadStamp == s) manualUploadStamp = 0;
       attempts = 0;
     } else {
       attempts++;
-      logEvent("ESP1", "UPLOAD", "FAIL|" + String(s) + ".CSV|http=" + String(code) + "|try=" + String(attempts));
+      String why = String("FAIL|") + s + ".CSV|http=" + code + "|try=" + attempts + to;
+      if (fb && fbLogFailStep[0]) why += String("|step=") + fbLogFailStep + "|heap=" + fbLogFailHeap + "|blk=" + fbLogFailBlock;
+      logEvent("ESP1", "UPLOAD", why);
       if (manualUploadStamp == s && attempts >= 5) { manualUploadStamp = 0; attempts = 0; }  // give up a stuck manual send
     }
     return;
@@ -6107,14 +7999,17 @@ void uploadTick() {
   // from core-0 netTask (handleSms's SUPA command, portalHandleSupa()).
   xSemaphoreTake(netMux, portMAX_DELAY);
   bool suConfigured = supaUrl.length() > 0 && supaKey.length() > 0;
+  bool toFb = firebaseEnabled && fbUrl.length() >= 8;             // 2026-11-17: Firebase first (Supabase expired)
   xSemaphoreGive(netMux);
-  if (!suConfigured) return;    // not configured
+  if (!toFb && !suConfigured) return;    // no destination
   if (!wifiConnected) return;
   unsigned long wait = (attempts > 0) ? BACKOFF[attempts < 4 ? attempts - 1 : 3] : 5000UL;
   if (millis() - lastAttemptMs < wait) return;                   // backoff / gentle SD-scan throttle
 
-  long target = (manualUploadStamp != 0) ? manualUploadStamp : uploadNextCatchupDay();
+  long target = (manualUploadStamp != 0) ? manualUploadStamp
+              : toFb ? uploadNextCatchupDay(fbLogLast, logKeepFrom) : uploadNextCatchupDay(supaLast, 0);
   if (target == 0) return;
+  uploadReqPartial = (target == currentDayStamp);                // today's file: sent as far as it is written
   uploadReqStamp = target;                                       // hand to netTask
   lastAttemptMs = millis();
 }
@@ -6132,7 +8027,7 @@ void heartbeatTick() {
     nanoSilent = true;
     faultsToday[2]++;                                          // minor (now actually tallied)
     logEvent("ESP1", "FAULT", "MIN|NANO_SILENCE|NANO");
-    sendSMS("ALERT,MIN,NANO_SILENCE,NANO");                    // one-shot (queued, non-blocking)
+    smsFault('m', "NANO_SILENCE", "");                         // one-shot (queued, non-blocking)
   }
   // ESP2 silence: major fault + recovery. Inherently one-shot (esp2Available latches false
   // until ESP2 speaks again). RECOVERY_STATE drives the power-cycle (no longer a dead end).
@@ -6163,6 +8058,28 @@ void heartbeatTick() {
  *  link. NIGHT window wraps midnight (NIGHT_START_MIN..NIGHT_END_MIN).             */
 void nanoPaceTick() {
   NanoPace desired;
+  // FAST (2026-11-15): from ESP2's servo request until its PUMP,OFF -- the whole time water is moving
+  // through the transfer or booster pump. FAST is a lease on the Nano (15 s), so it is renewed here every
+  // NANO_FAST_RENEW_MS; the renewals are not logged.
+  bool pumpStarting = servoOkRelayMs && millis() - servoOkRelayMs < SERVO_TO_PUMP_FAST_MS;   // servo OK -> PUMP,ON
+  if (levelRelayActive() || servoReqActive || pumpStarting) {
+    // TANK gap watchdog (2026-11-16 hardening): in FAST a TANK comes every ~0.3 s. None for NANO_TANK_GAP_MS (counted
+    // from the later of the last TANK and entering FAST) = the Nano may have lost FAST (a reset it could not report,
+    // a dropped command): send FAST again now instead of at the next renewal, and log the gap once.
+    unsigned long now = millis();
+    unsigned long ref = (lastTankMs && (long)(lastTankMs - fastSinceMs) > 0) ? lastTankMs : fastSinceMs;
+    bool gap = (lastNanoPace == PACE_FAST) && ref && now - ref >= NANO_TANK_GAP_MS;
+    if (gap && !tankGapLogged) {
+      tankGapLogged = true;
+      logEvent("NANO", "LINK", "TANK_GAP|ms=" + String(now - ref) + "|lnk=" + String(tankLinkPct()) + "%|ovf=" + String(nanoRxOverflows));
+    }
+    if (lastNanoPace != PACE_FAST || now - lastFastSentMs >= (gap ? NANO_TANK_GAP_MS : NANO_FAST_RENEW_MS)) {
+      if (lastNanoPace != PACE_FAST) fastSinceMs = nzMs(now);
+      sendNanoCommand("FAST", lastNanoPace != PACE_FAST);
+      lastNanoPace = PACE_FAST; lastFastSentMs = now;
+    }
+    return;
+  }
   if (sysState == ACTIVE_STATE || wo.active || pendingRun.active) {
     desired = PACE_ACTIVE;
   } else if (!rtcOk) {
@@ -6172,11 +8089,16 @@ void nanoPaceTick() {
     bool night = (mod >= NIGHT_START_MIN) || (mod < NIGHT_END_MIN);
     desired = night ? PACE_NIGHT : PACE_DAY;
   }
-  if (desired == lastNanoPace) return;
-  lastNanoPace = desired;
-  if      (desired == PACE_ACTIVE) sendNanoCommand("ACTIVE");
-  else if (desired == PACE_DAY)    sendNanoCommand("DAY");
-  else if (desired == PACE_NIGHT)  sendNanoCommand("NIGHT");
+  static unsigned long lastPaceSentMs = 0;
+  bool changed = (desired != lastNanoPace);
+  // No TANK accepted since this boot (2026-11-17: the tanks read -1 after every restart). The pace command after a
+  // restart is what makes the Nano send a full cycle at once; it goes out once and can be lost on this line, and in
+  // the day the Nano's own cycle is 20 min. So until a TANK is in, send it again every NANO_FIRST_DATA_RETRY_MS.
+  if (lastTankMs == 0 && lastPaceSentMs != 0 && millis() - lastPaceSentMs >= NANO_FIRST_DATA_RETRY_MS) changed = true;
+  if (!changed && millis() - lastPaceSentMs < NANO_PACE_REFRESH_MS) return;   // refresh: see NANO_PACE_REFRESH_MS
+  lastNanoPace = desired; lastPaceSentMs = millis();
+  const char *paceCmd = (desired == PACE_ACTIVE) ? "ACTIVE" : (desired == PACE_DAY) ? "DAY" : "NIGHT";
+  sendNanoCommand(paceCmd, changed);                     // only a real change is logged
 }
 
 /* =============================================================================
@@ -6217,7 +8139,7 @@ void deviceHealthTick() {
   if (g_lastSelfResetDay == today) return;                      // already reset for this day stamp
 
   logEvent("ESP1", "RESET", String("SELF|DEVICE_LOST|") + DEV_NAME[lost]);
-  sendSMS(String("ALERT,MAJ,SELF_RESET,") + DEV_NAME[lost]);    // best-effort (may not flush before reboot)
+  smsFault('M', "SELF_RESET", String(DEV_NAME[lost]) + " not responding"); // best-effort (may not flush before reboot)
   logFlush(true);                                               // persist what we can
   g_lastSelfResetDay = today;
   delay(50);                                                    // let the last UART/SD bytes drain
@@ -6236,6 +8158,8 @@ void telemetryCollect() {
   strlcpy(telem.deviceTime, deviceTime.c_str(), sizeof(telem.deviceTime));
   telem.temp = sensor.temp; telem.hum = sensor.hum; telem.lux = sensor.lux;
   telem.resLevel = sensor.resLevel; telem.mixLevel = sensor.mixLevel; telem.flow = sensor.flow;
+  telem.resL = (sensor.msTank && sensor.resOk) ? sensor.resL : -1.0f;
+  telem.mixL = (sensor.msTank && sensor.mixOk) ? sensor.mixL : -1.0f;
   for (int c = 0; c < NUM_COLUMNS; c++) {
     telem.soil[c] = sensor.soil[c];
     telem.npkValid[c] = sensor.npkValid[c];
@@ -6263,8 +8187,15 @@ void telemetryCollect() {
   telem.pendExIdx = pendingExercise.idx;
   telem.rtcOk_ = rtcOk; telem.sdOk_ = sdOk; telem.acsOk_ = acsOk;
   telem.secOk_ = secInaOk && secHaveV; telem.secLow_ = secLow; telem.onSecondary_ = esp2OnSecondary;
-  telem.secV_ = secV; telem.secI_ = secI; telem.secP_ = secP;
+  telem.secV_ = secV; telem.secI_ = secI; telem.secP_ = secP; telem.secRest_ = secRestV;
   telem.bswLatched_ = bswLatched; telem.bswStrikes_ = bswStrikes;
+  telem.acVMin_ = (int16_t)acVMin; telem.acVMax_ = (int16_t)acVMax;
+  telem.acLastV_ = acLastV; telem.acLastAgeMs_ = acLastMs ? (uint32_t)(millis() - acLastMs) : 0xFFFFFFFF;
+  telem.acAMin10_ = (int16_t)acAMin10; telem.acAMax10_ = (int16_t)acAMax10;
+  telem.acLastI_ = acLastIMs ? acLastI : -1.0f;
+  telem.acLastIAgeMs_ = acLastIMs ? (uint32_t)(millis() - acLastIMs) : 0xFFFFFFFF;
+  telem.servoSide_ = servoSideNow;
+  telem.servoSideAgeMs_ = servoSideMs ? (uint32_t)(millis() - servoSideMs) : 0xFFFFFFFF;
   telem.bkState_ = (uint8_t)bkState;
   telem.simOk = simReady; telem.netReg = netRegistered;
   telem.rssi = lastRssi; telem.creg = lastCreg;
@@ -6280,6 +8211,14 @@ void telemetryCollect() {
                     ? (long)((faultAckUntilMs - millis()) / 1000) : 0;
   telem.actDisabled = actuationsDisabled;
   telem.exEnabled = exerciseEnabled; telem.exRunS = exerciseRunS;
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    telem.dayWaterL[c] = waterUsedToday[c];   telem.dayNutMl[c] = nutrientUsedToday[c];
+    telem.dayWaterings[c] = wateringsToday[c]; telem.dayFeedings[c] = feedingsToday[c];
+  }
+  for (int k = 0; k < 3; k++) {                // exerciseTick()'s own test: due once idle this long
+    unsigned long since = millis() - lastPumpUseMs[k];
+    telem.exNextMin[k] = since >= PUMP_EXERCISE_INTERVAL_MS ? 0 : (long)((PUMP_EXERCISE_INTERVAL_MS - since) / 60000UL);
+  }
   telem.wmHeld  = webManualHeld();
   telem.wmLeftS = telem.wmHeld ? (long)((webManualUntilMs - millis()) / 1000) : 0;
   strlcpy(telem.wmState, webManualState, sizeof(telem.wmState));
@@ -6301,6 +8240,7 @@ void telemetryCollect() {
   // Raw sensor mirror for the web diagnostics tab (same values the LCD Sensor Diag pages show).
   telem.rTemp = sensor.rawTemp; telem.rHum = sensor.rawHum; telem.rLux = sensor.rawLux;
   telem.rResCm = sensor.rawResCm; telem.rMixCm = sensor.rawMixCm; telem.rFlow = sensor.rawFlow;
+  telem.rResSt = sensor.resSt; telem.rMixSt = sensor.mixSt;
   for (int cc = 0; cc < NUM_COLUMNS; cc++) {
     telem.rSoil[cc][0] = sensor.rawSoil[cc][0]; telem.rSoil[cc][1] = sensor.rawSoil[cc][1];
     for (int r = 0; r < 7; r++) telem.rNpk[cc][r] = sensor.rawNpk[cc][r];
@@ -6338,6 +8278,9 @@ void telemetryCollect() {
     telem.pumpBooster  = live && (!strcmp(run.stage, "Release")        || !strcmp(run.stage, "Flush Release"));
     telem.pumpMixer    = live && !strcmp(run.stage, "Mixing");
   }
+  // Every push request raised so far happened on this core, before this point, so this snapshot already
+  // shows the events behind them (see fbPushSeq).
+  telem.pushSeq = fbPushSeq;
   telem.valid = true;
   portEXIT_CRITICAL(&telemMux);
 }
@@ -6393,23 +8336,26 @@ static void tsUpload() {
     if (t.battVCalValid && t.battIOk_) url += "&field7=" + String(t.battP, 1);   // power needs both V and I valid
     ok = tsGet(url) || ok;
   }
-  if (k3.length()) {                                  // Channel 3: chemistry (per-column EC + pH)
+  if (k3.length()) {                                  // Channel 3: pH + solar + battery current (EC dropped)
     String url = "http://" + String(TS_HOST) + "/update?api_key=" + k3;
     int fld = 1;
+    // 2026-11-15 (user): soil EC is no longer sent to ThingSpeak -- its fields carry SOLAR instead. Each
+    // enabled column still owns a field PAIR, but only the pair's second field (pH) is written here; the
+    // first (old EC) fields 1 and 3 take the solar current and today's solar energy below. Soil EC itself
+    // is still read, logged on the SD card and published to Firebase -- only this upload dropped it.
     for (int c = 0; c < NUM_COLUMNS && fld <= 8; c++) {
       if (!COLUMN_ENABLED[c]) continue;
-      if (t.npkValid[c]) {
-        url += "&field" + String(fld++) + "=" + String(t.npkEC[c], 2);
-        url += "&field" + String(fld++) + "=" + String(t.npkPH[c], 2);
-      } else fld += 2;
+      if (t.npkValid[c] && fld + 1 <= 8) url += "&field" + String(fld + 1) + "=" + String(t.npkPH[c], 2);
+      fld += 2;
     }
-    // Battery current rides Ch3 because Ch2 "System" has all 8 fields used.
-    // CONSTRAINT: the loop above consumes 2 fields per ENABLED column -- 4 today with A and B.
-    // Enabling column C would take fields 1-6 and collide with field 5. Move this constant if so.
+    // Battery current rides Ch3 because Ch2 "System" has all 8 fields used. With EC gone, column C's
+    // pair (5/6) only writes pH on 6, so enabling C no longer collides with this field 5.
     if (t.battIOk_) url += "&field" + String(TS3_CURRENT_FIELD) + "=" + String(t.battI, 3);
     if (t.solarOk_) {
-      url += "&field" + String(TS3_SOLAR_V_FIELD) + "=" + String(t.solarV_, 2);
-      url += "&field" + String(TS3_SOLAR_W_FIELD) + "=" + String(t.solarP_, 1);
+      url += "&field" + String(TS3_SOLAR_I_FIELD)  + "=" + String(t.solarI_, 3);      // was column A EC
+      url += "&field" + String(TS3_SOLAR_WH_FIELD) + "=" + String(t.chargedWh_, 1);   // was column B EC
+      url += "&field" + String(TS3_SOLAR_V_FIELD)  + "=" + String(t.solarV_, 2);
+      url += "&field" + String(TS3_SOLAR_W_FIELD)  + "=" + String(t.solarP_, 1);
     }
     ok = tsGet(url) || ok;
   }
@@ -6716,10 +8662,14 @@ static bool firebaseUploadLive() {
   // t.state, not sysState: this runs on core 0 and the snapshot is the only sanctioned view of
   // core-1 state. The enum read happened to be atomic, but mixing the two invites the next field
   // added here to be one that is not.
-  meta["refreshMs"] = (t.state == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
+  bool watched = fbViewerWatching();                 // the dashboard's live pace (2026-11-17)
+  meta["refreshMs"] = watched ? ((t.state == ACTIVE_STATE) ? FIREBASE_UPLOAD_LIVE_ACTIVE_MS : FIREBASE_UPLOAD_LIVE_IDLE_MS)
+                              : ((t.state == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS);
+  meta["live"] = watched;
 
   JsonObject system = doc.createNestedObject("system");
   system["state"] = stateLabel(t.state, t.actDisabled);
+  system["firmware"] = "web v.4 (2026-11-17)";           // the dashboard names the firmware it is talking to
   system["masterWorkOrderActive"] = t.woActive;
   // The dashboard has a Power Source tile; without this key it reads "--". The rig runs from the
   // battery bank, with the inverter raised only for AC pumps during a run.
@@ -6729,6 +8679,28 @@ static bool firebaseUploadLive() {
   system["secondaryBattSwitching"] = (bool)SECONDARY_BATT_ENABLED;
   system["battSwitchFault"]   = t.bswLatched_;
   system["battSwitchStrikes"] = t.bswStrikes_;
+  // The AC supply window ESP2's PZEM check enforces (System tab, 2026-11-14), and the last AC voltage it
+  // measured, with its age at this snapshot. No reading since ESP1 started = the two last* keys are absent.
+  system["acVoltMin"] = t.acVMin_;
+  system["acVoltMax"] = t.acVMax_;
+  if (t.acLastV_ > 0.0f) {
+    system["acVoltLast"]      = t.acLastV_;
+    system["acVoltLastAgeMs"] = t.acLastAgeMs_;
+  }
+  // The AC pump current limits (System tab, 2026-11-16) in whole tenths of an amp, as stored (5 = 0.5 A): a float
+  // here would print as 0.300000012. The last AC pump current measured, with its age, only once there is one.
+  system["acAmpMin10"] = t.acAMin10_;
+  system["acAmpMax10"] = t.acAMax10_;
+  if (t.acLastI_ >= 0.0f) {
+    system["acAmpLast"]      = t.acLastI_;
+    system["acAmpLastAgeMs"] = t.acLastIAgeMs_;
+  }
+  // The pump selector's side as the Nano last confirmed it (Manual/Test switch, 2026-11-16). Absent = never
+  // confirmed; no age = confirmed before ESP1's last restart (kept in NVS).
+  if (t.servoSide_ != SERVO_SIDE_NONE) {
+    system["servoSide"] = (t.servoSide_ == SERVO_SIDE_TRANSFER) ? "TRANSFER" : "BOOSTER";
+    if (t.servoSideAgeMs_ != 0xFFFFFFFF) system["servoSideAgeMs"] = t.servoSideAgeMs_;
+  }
   system["backupEnabled"]     = (bool)SECONDARY_BACKUP_ENABLED;
   system["backupState"]       = bkName((BkState)t.bkState_);
   // For the new Set Clock control: show the operator what ESP1 currently reads before they decide to
@@ -6739,6 +8711,9 @@ static bool firebaseUploadLive() {
 
   JsonObject sensors = doc.createNestedObject("sensors");
   if (t.tankValid)  { sensors["reservoirLevel"] = t.resLevel; sensors["mixingLevel"] = t.mixLevel; sensors["flowRate"] = t.flow; }
+  // web v.4: the litres each tank holds, from the tank calibration (absent when the reading is not usable).
+  if (t.resL >= 0.0f) sensors["reservoirLiters"] = roundf(t.resL * 100.0f) / 100.0f;
+  if (t.mixL >= 0.0f) sensors["mixingLiters"]    = roundf(t.mixL * 100.0f) / 100.0f;
   if (t.envValid)   { sensors["temperature"] = t.temp; sensors["humidity"] = t.hum; }
   if (t.lightValid) sensors["lightLevel"] = t.lux;
   // Voltage/percent only publish from the main INA226 or a REAL opto calibration -- otherwise there is
@@ -6751,7 +8726,8 @@ static bool firebaseUploadLive() {
     // scale uses its own full/empty pair. Clamped, and only published when the reading is valid --
     // a made-up 0 % would look like a flat battery rather than a missing sensor.
     float pct = (t.battV - BATT_EMPTY_V) * 100.0f / (BATT_FULL_V - BATT_EMPTY_V);
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
     sensors["batteryPercent"] = (int)(pct + 0.5f);
   }
   if (t.battIOk_) {
@@ -6770,8 +8746,10 @@ static bool firebaseUploadLive() {
     sensors["secondaryBatteryVoltage"] = t.secV_;
     sensors["secondaryBatteryCurrent"] = t.secI_;        // signed: + = discharging (SEC_INVERT_CURRENT)
     sensors["secondaryBatteryPower"]   = t.secP_;
-    float sp = (t.secV_ - SEC_BATT_EMPTY_V) * 100.0f / (SEC_BATT_FULL_V - SEC_BATT_EMPTY_V);
-    if (sp < 0) sp = 0; if (sp > 100) sp = 100;
+    // The RESTING charge (secRestV), not the raw voltage: the charger lifts it, the load pulls it down (2026-11-17).
+    float sp = (t.secRest_ - SEC_BATT_EMPTY_V) * 100.0f / (SEC_BATT_FULL_V - SEC_BATT_EMPTY_V);
+    if (sp < 0) sp = 0;
+    if (sp > 100) sp = 100;
     sensors["secondaryBatteryPercent"] = (int)(sp + 0.5f);
     sensors["secondaryBatteryLow"]     = t.secLow_;
   }
@@ -6814,6 +8792,12 @@ static bool firebaseUploadLive() {
   dts["attempted"]    = lastTsUploadMs != 0;
   dts["lastUploadOk"] = lastTsOk;
 
+  JsonObject dlu = dg.createNestedObject("logUpload");     // 2026-11-17: the CSV logs go to Firebase
+  dlu["target"]          = (firebaseEnabled && fbUrl.length() >= 8) ? "firebase" : (supaCfg ? "supabase" : "none");
+  dlu["busy"]            = uploadBusy;
+  dlu["lastUploadedDay"] = fbLogLast;
+  dlu["keepFromDay"]     = (long)logKeepFrom;
+
   JsonObject dsb = dg.createNestedObject("supabase");
   dsb["configured"]          = supaCfg;
   dsb["uploadBusy"]          = uploadBusy;
@@ -6825,7 +8809,7 @@ static bool firebaseUploadLive() {
   dsy["pendingRun"]      = t.pendRun;
   if (t.lastFault[0])   dsy["lastFault"]     = t.lastFault;
   if (t.lastFaultAt[0]) dsy["lastFaultTime"] = t.lastFaultAt;
-  // Read-only Lock Screen status (Part 2, item M) -- no write path is exposed for this on purpose.
+  // Lock Screen status (Part 2, item M). The website shows it, and since 2026-11-05 can set it with LCD_LOCK.
   dsy["lcdLocked"] = lcdLocked;
 
   JsonObject de2 = dg.createNestedObject("esp2");
@@ -6889,6 +8873,10 @@ static bool firebaseUploadLive() {
   dex["enabled"] = t.exEnabled;
   dex["seconds"] = t.exRunS;
   dex["intervalHours"] = (int)(PUMP_EXERCISE_INTERVAL_MS / 3600000UL);
+  // Minutes until each pump's exercise falls due (transfer, booster, mixer), counted from its last real run or, after
+  // a restart, from the restart: the clock is kept in RAM (2026-11-06). 0 = due now, done once the rig is idle.
+  JsonArray dnx = dex.createNestedArray("nextDueMin");
+  for (int k = 0; k < 3; k++) dnx.add(t.exNextMin[k]);
 
   // Armed forced run -- the operator's proof the rig received the request and is counting down.
   JsonObject dfc = dg.createNestedObject("forceArmed");
@@ -6919,6 +8907,9 @@ static bool firebaseUploadLive() {
   rLig["lux"] = t.rLux; rLig["ageMs"] = t.agLight;
   JsonObject rTk = draw.createNestedObject("tank");
   rTk["reservoirCm"] = t.rResCm; rTk["mixingCm"] = t.rMixCm; rTk["flowLpm"] = t.rFlow;
+  // Why a tank has no reading (2026-11-17): the dashboard says "no echo" etc. instead of just "Unavailable".
+  rTk["reservoirStatus"] = String(t.rResSt ? t.rResSt : '?');
+  rTk["mixingStatus"]    = String(t.rMixSt ? t.rMixSt : '?');
   rTk["ageMs"] = t.agTank;
   JsonObject rSo = draw.createNestedObject("soil");
   rSo["ageMs"] = t.agSoil;
@@ -6984,6 +8975,23 @@ static bool firebaseUploadLive() {
     z["schedMode"] = colSchedMode[c];
     z["winStart"]  = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_START[c] : DEF_WIN_START[c];
     z["winEnd"]    = (colSchedMode[c] == SCHED_MANUAL) ? COL_WIN_END[c]   : DEF_WIN_END[c];
+    // Several waterings a day (2026-11-05): every window in use, how many are done today, and whether nutrients
+    // already went in today. winStart/winEnd above stay window 1, for dashboards that predate this.
+    z["runs"] = windowCount(c);
+    JsonArray zw = z.createNestedArray("windows");
+    for (int w = 0; w < windowCount(c); w++) {
+      JsonArray pair = zw.createNestedArray();
+      pair.add(windowStart(c, w)); pair.add(windowEnd(c, w));
+    }
+    z["runsToday"] = runsDoneToday(c);
+    z["fedToday"]  = col[c].fertStamp == currentDayStamp;
+    // Today's tally (2026-11-06): runs that reached the column (scheduled and forced), how many added nutrients, and
+    // the litres and mL they delivered. Survives a restart; resets at midnight.
+    JsonObject zt = z.createNestedObject("today");
+    zt["waterings"] = t.dayWaterings[c];
+    zt["feedings"]  = t.dayFeedings[c];
+    zt["liters"]    = roundf(t.dayWaterL[c] * 100.0f) / 100.0f;
+    zt["ml"]        = roundf(t.dayNutMl[c] * 10.0f) / 10.0f;
     z["targetN"]   = col[c].targetN; z["targetP"] = col[c].targetP;
     z["targetK"]   = col[c].targetK; z["targetPH"] = col[c].targetPH;
     if (!COLUMN_ENABLED[c]) continue;                   // no sensor data for a disabled column
@@ -7044,15 +9052,209 @@ static bool firebaseUploadLive() {
   String payload;
   serializeJson(doc, payload);
 
-  if (!fbBegin(fbBuildUrl(base, "/irrigation/live.json"))) { fbLastOk = false; fbLastHttp = 0; fbFailures++; return false; }
+  // print=silent (2026-11-09): without it RTDB answers a PUT by echoing the whole ~6-10 KB snapshot
+  // back, and that body was never read. WiFiClientSecure::flush() is a no-op in core 2.0.17, so
+  // fbHttp.end() left it sitting on the kept-alive socket, where the NEXT request (a command poll)
+  // could read it as its own status line. With print=silent a success is a bodiless 204 (still
+  // inside the 2xx test below), and the drain covers the small error body of a rejection.
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/live.json") + "&print=silent")) { fbLastOk = false; fbLastHttp = 0; fbFailures++; return false; }
   fbHttp.addHeader("Content-Type", "application/json");
   int code = fbHttp.PUT(payload);
+  if (code > 0) fbHttp.getString();                        // drain: never leave a body on the reused socket
   fbHttp.end();                                            // setReuse(true): keeps the socket, frees the request
   fbLastHttp = code;
   fbLastOk = (code >= 200 && code < 300);
   if (!fbLastOk) fbFailures++;
   if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; }  // token rejected -> force a renew next tick
   return fbLastOk;
+}
+
+/* =============================================================================
+ *  CSV LOGS TO FIREBASE  (core 0 / netTask, 2026-11-17)  --  see LOG_CHUNK_BYTES
+ * ========================================================================== */
+static bool fbOk(int code) { return code >= 200 && code < 300; }
+static int fbLogRequest(const String &base, const String &path, const char *method, const String &body) {
+  if (!fbBegin(fbBuildUrl(base, path.c_str()) + "&print=silent")) return 0;
+  int code;
+  if (!strcmp(method, "PUT")) { fbHttp.addHeader("Content-Type", "application/json"); code = fbHttp.PUT(body); }
+  else code = fbHttp.sendRequest(method);
+  if (code > 0) fbHttp.getString();                        // drain: never leave a body on the reused socket
+  fbHttp.end();
+  if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; }
+  return code;
+}
+// A piece of the CSV as a JSON string. RTDB needs valid UTF-8 and this log is ASCII; the only other bytes in it are line
+// noise logged as GARBAGE, so those become '?'.
+static void fbJsonEscapeAppend(String &out, const uint8_t *b, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    uint8_t c = b[i];
+    if      (c == '"')  out += "\\\"";
+    else if (c == '\\') out += "\\\\";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else if (c < 0x20 || c >= 0x7F) out += '?';
+    else out += (char)c;
+  }
+}
+struct FbLogJob {
+  bool active; uint8_t phase; long stamp; char day[9]; char path[16];
+  size_t size, off; uint16_t n; bool partial; unsigned long startMs;
+  uint8_t netTries;                                         // connection failures on the current step
+};
+const uint8_t FB_LOG_NET_TRIES = 3;                         // a dropped connection: this many fresh sockets per step
+static FbLogJob fbLogJob = {};
+const unsigned long FB_LOG_JOB_MAX_MS = 900000UL;          // 15 min: a stuck upload gives up (and is retried later)
+
+static void fbLogJobFinish(bool ok, int code) {
+  if (!ok) {
+    const char *ph = fbLogJob.phase == 0 ? "start" : fbLogJob.phase == 1 ? "piece" : "done";
+    if (fbLogJob.phase == 1) snprintf(fbLogFailStep, sizeof(fbLogFailStep), "piece%u", (unsigned)fbLogJob.n);
+    else strlcpy(fbLogFailStep, ph, sizeof(fbLogFailStep));
+    fbLogFailHeap = ESP.getFreeHeap();
+    fbLogFailBlock = ESP.getMaxAllocHeap();
+  }
+  fbLogJob.active = false;
+  uploadHttp = code;
+  uploadResStamp = fbLogJob.stamp; uploadResult = ok ? 1 : 2;
+  uploadReqStamp = 0; uploadBusy = false;
+}
+static void fbLogJobBegin(long stamp, const char *path, bool partial) {
+  fbLogJob = FbLogJob();
+  fbLogJob.active = true; fbLogJob.phase = 0; fbLogJob.stamp = stamp; fbLogJob.partial = partial;
+  snprintf(fbLogJob.day, sizeof(fbLogJob.day), "%08ld", stamp);
+  strlcpy(fbLogJob.path, path, sizeof(fbLogJob.path));
+  fbLogJob.startMs = millis();
+}
+// Days older than logKeepFrom leave Firebase (their pieces and their index entry). A few per upload at most.
+static void fbLogRetention(const String &base) {
+  long keepFrom = logKeepFrom;
+  if (keepFrom <= 0) return;
+  if (!fbBegin(fbBuildUrl(base, "/logs/index.json") + "&shallow=true")) return;
+  int code = fbHttp.GET();
+  String resp = (code > 0) ? fbHttp.getString() : "";
+  fbHttp.end();
+  if (code != 200 || resp.length() == 0 || resp == "null") return;
+  StaticJsonDocument<2048> doc;
+  if (deserializeJson(doc, resp)) return;
+  long old[8]; int nOld = 0;
+  for (JsonPair kv : doc.as<JsonObject>()) {
+    const char *k = kv.key().c_str();
+    if (strlen(k) != 8) continue;
+    long d = atol(k);
+    if (d > 0 && d < keepFrom && nOld < 8) old[nOld++] = d;
+  }
+  for (int i = 0; i < nOld; i++) {
+    char p[40];
+    snprintf(p, sizeof(p), "/logs/files/%08ld.json", old[i]); fbLogRequest(base, String(p), "DELETE", "");
+    snprintf(p, sizeof(p), "/logs/index/%08ld.json", old[i]); fbLogRequest(base, String(p), "DELETE", "");
+  }
+}
+// A failed request: a dropped or refused connection (code < 0) is retried on a fresh socket, up to FB_LOG_NET_TRIES
+// times per step; anything else (or the last try) ends the upload. Returns true when the step should just be retried.
+static bool fbLogNetRetry(int code) {
+  if (code >= 0 || ++fbLogJob.netTries >= FB_LOG_NET_TRIES) return false;
+  fbResetTls();                                             // drop a half-open TLS session; the next request re-handshakes
+  return true;
+}
+// One step per netTask pass: 0 = check the file, clear an older copy, mark "uploading"; 1 = one piece; 2 = mark "done".
+static void fbLogJobStep() {
+  String base; bool en;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; en = firebaseEnabled; xSemaphoreGive(netMux);
+  if (!en || base.length() < 8) { fbLogJobFinish(false, 0); return; }
+  if (millis() - fbLogJob.startMs > FB_LOG_JOB_MAX_MS) { fbLogJobFinish(false, -5); return; }
+  if (WiFi.status() != WL_CONNECTED || !fbEnsureToken()) return;        // wait (bounded by FB_LOG_JOB_MAX_MS)
+  if (!fbLastOk) return;          // the live report goes first: start or go on only while Firebase answers (2026-11-17)
+  if (ESP.getFreeHeap() < FIREBASE_MIN_HEAP) return;
+  String idx = String("/logs/index/") + fbLogJob.day + ".json";
+  if (fbLogJob.phase == 0) {
+    if (!sdTake(2000)) return;
+    File f = SD.open(fbLogJob.path, FILE_READ);
+    bool exists = f && !f.isDirectory();
+    fbLogJob.size = exists ? f.size() : 0;
+    if (f) f.close();
+    sdGive();
+    if (!exists) {
+      fbLogRequest(base, idx, "PUT", "{\"state\":\"missing\",\"at\":{\".sv\":\"timestamp\"}}");
+      fbLogJobFinish(false, -2); return;
+    }
+    int code = fbLogRequest(base, String("/logs/files/") + fbLogJob.day + ".json", "DELETE", "");   // an older copy
+    if (!fbOk(code)) { if (!fbLogNetRetry(code)) fbLogJobFinish(false, code); return; }
+    code = fbLogRequest(base, idx, "PUT", String("{\"state\":\"uploading\",\"size\":") + fbLogJob.size +
+                                          ",\"partial\":" + (fbLogJob.partial ? "true" : "false") +
+                                          ",\"at\":{\".sv\":\"timestamp\"}}");
+    if (!fbOk(code)) { if (!fbLogNetRetry(code)) fbLogJobFinish(false, code); return; }
+    fbLogJob.phase = 1; fbLogJob.off = 0; fbLogJob.n = 0; fbLogJob.netTries = 0;
+    return;
+  }
+  if (fbLogJob.phase == 1) {
+    if (fbLogJob.off >= fbLogJob.size) { fbLogJob.phase = 2; return; }
+    size_t want = fbLogJob.size - fbLogJob.off;
+    if (want > LOG_CHUNK_BYTES) want = LOG_CHUNK_BYTES;
+    // The piece's JSON text is the only big allocation, and it is freed when this pass ends. It needs one block of
+    // about want x 1.15; without that, wait for the next pass instead of fragmenting the heap further.
+    if (ESP.getMaxAllocHeap() < want + want / 4 + 1024) return;
+    String body;
+    if (!body.reserve(want + want / 8 + 16)) return;
+    body += '"';
+    if (!sdTake(2000)) return;
+    size_t got = 0;
+    File g = SD.open(fbLogJob.path, FILE_READ);
+    if (g && g.seek(fbLogJob.off)) {
+      uint8_t blk[LOG_READ_BLOCK];                         // small and on netTask's stack: no static buffer (see LOG_CHUNK_BYTES)
+      while (got < want) {
+        size_t n = want - got; if (n > sizeof(blk)) n = sizeof(blk);
+        size_t r = g.read(blk, n);
+        if (r == 0) break;
+        fbJsonEscapeAppend(body, blk, r);
+        got += r;
+      }
+    }
+    if (g) g.close();
+    sdGive();
+    if (got == 0) { fbLogJob.size = fbLogJob.off; fbLogJob.phase = 2; return; }   // the file ended early
+    body += '"';
+    char p[40]; snprintf(p, sizeof(p), "/logs/files/%s/%04u.json", fbLogJob.day, (unsigned)fbLogJob.n);
+    int code = fbLogRequest(base, String(p), "PUT", body);
+    if (!fbOk(code)) {
+      if (fbLogNetRetry(code)) return;                     // the same piece again, on a fresh socket
+      fbLogRequest(base, idx, "PUT", "{\"state\":\"failed\",\"at\":{\".sv\":\"timestamp\"}}");
+      fbLogJobFinish(false, code); return;
+    }
+    fbLogJob.off += got; fbLogJob.n++; fbLogJob.netTries = 0;
+    return;
+  }
+  int code = fbLogRequest(base, idx, "PUT", String("{\"state\":\"done\",\"size\":") + fbLogJob.size +
+                                         ",\"chunks\":" + fbLogJob.n + ",\"partial\":" + (fbLogJob.partial ? "true" : "false") +
+                                         ",\"at\":{\".sv\":\"timestamp\"}}");
+  if (!fbOk(code) && fbLogNetRetry(code)) return;
+  if (fbOk(code)) fbLogRetention(base);
+  fbLogJobFinish(fbOk(code), code);
+}
+// irrigation/logRequest = {day, at}: the website's "Upload from the rig". Only a CHANGE of `at` counts (see the viewer poll).
+static void firebasePollLogRequest() {
+  static unsigned long lastPollMs = 0;
+  static int64_t lastAt = -1;
+  static bool primed = false;
+  if (millis() - lastPollMs < 10000UL) return;
+  lastPollMs = millis();
+  String base; bool enabled;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
+  if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
+  if (!fbEnsureToken()) return;
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/logRequest.json"))) return;
+  int code = fbHttp.GET();
+  String resp = (code > 0) ? fbHttp.getString() : "";
+  if (code != 200) resp = "";
+  fbHttp.end();
+  if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
+  if (code != 200 || resp.length() == 0 || resp == "null") { primed = true; return; }
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, resp)) return;
+  int64_t at = doc["at"] | (int64_t)-1;
+  long day = doc["day"] | 0L;
+  if (primed && at > 0 && at != lastAt && day >= 20200101L && day <= 20991231L) webLogReqStamp = day;
+  primed = true; lastAt = at;
 }
 
 /* =============================================================================
@@ -7100,7 +9302,8 @@ static void firebasePollManual() {
   if (!fbEnsureToken()) return;
   if (!fbBegin(fbBuildUrl(base, "/irrigation/manual.json"))) return;
   int code = fbHttp.GET();
-  String resp = (code == 200) ? fbHttp.getString() : "";
+  String resp = (code > 0) ? fbHttp.getString() : "";      // read error bodies too: an unread one poisons the reused socket
+  if (code != 200) resp = "";
   fbHttp.end();
   if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
   if (code != 200 || resp.length() == 0 || resp == "null") return;
@@ -7118,6 +9321,36 @@ static void firebasePollManual() {
   bool want = doc["want"] | false;
   webManualReq = want;                                 // core 1 applies it (grant/refuse/release)
   if (seq != webManualSeq) { webManualSeq = seq; webManualPing = true; }
+}
+
+// irrigation/viewer = {at, refreshAt} (server timestamps, written by the dashboard; see FB_VIEWER_HOLD_MS). Only a CHANGE
+// counts -- ESP1's clock is not Firebase's, so the values are never compared with a time. Core 0 only: it sets two
+// plain variables that the same netTask loop reads.
+static void firebasePollViewer() {
+  static unsigned long lastPollMs = 0;
+  static int64_t lastAt = -1, lastRefresh = -1;
+  static bool primed = false;
+  if (millis() - lastPollMs < FIREBASE_COMMAND_POLL_MS) return;
+  lastPollMs = millis();
+  String base; bool enabled;
+  xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
+  if (!enabled || base.length() < 8 || WiFi.status() != WL_CONNECTED) return;
+  if (!fbEnsureToken()) return;
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/viewer.json"))) return;
+  int code = fbHttp.GET();
+  String resp = (code > 0) ? fbHttp.getString() : "";      // read error bodies too: an unread one poisons the reused socket
+  if (code != 200) resp = "";
+  fbHttp.end();
+  if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
+  if (code != 200 || resp.length() == 0 || resp == "null") return;
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, resp)) return;
+  int64_t at = doc["at"] | (int64_t)-1, rf = doc["refreshAt"] | (int64_t)-1;   // int64: a JS timestamp (see PollManual)
+  if (primed) {
+    if (at > 0 && at != lastAt) fbViewerUntilMs = nzMs((millis() + FB_VIEWER_HOLD_MS));
+    if (rf > 0 && rf != lastRefresh) { fbRefreshPending = true; fbViewerUntilMs = nzMs((millis() + FB_VIEWER_HOLD_MS)); }
+  }
+  primed = true; lastAt = at; lastRefresh = rf;
 }
 
 /* Web hold-to-run (2026-09-10, Website Manual/Test tab, mousedown/mouseup) -- irrigation/testHold =
@@ -7144,7 +9377,8 @@ static void firebasePollTestHold() {
   if (!fbEnsureToken()) return;
   if (!fbBegin(fbBuildUrl(base, "/irrigation/testHold.json"))) return;
   int code = fbHttp.GET();
-  String resp = (code == 200) ? fbHttp.getString() : "";
+  String resp = (code > 0) ? fbHttp.getString() : "";      // read error bodies too: an unread one poisons the reused socket
+  if (code != 200) resp = "";
   fbHttp.end();
   if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
   if (code != 200 || resp.length() == 0 || resp == "null") return;
@@ -7187,7 +9421,8 @@ static void firebasePollCommands() {
   // higher threshold. 10 nodes is ~550 B filtered, comfortably inside the 2048 B document.
   if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json") + "&orderBy=%22%24key%22&limitToLast=10")) return;
   int code = fbHttp.GET();
-  String resp = (code == 200) ? fbHttp.getString() : "";
+  String resp = (code > 0) ? fbHttp.getString() : "";      // read error bodies too: an unread one poisons the reused socket
+  if (code != 200) resp = "";
   fbHttp.end();
   if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
   if (code != 200 || resp.length() == 0 || resp == "null") return;
@@ -7218,10 +9453,13 @@ static void firebasePollCommands() {
   pf["exerciseEnabled"] = true; pf["exerciseSeconds"] = true;
   pf["mode"] = true; pf["enabled"] = true; pf["schedMode"] = true;
   pf["winStart"] = true; pf["winEnd"] = true;
+  pf["windows"] = true;                            // SET_COLUMN: [[start,end], ...] own watering times (2026-11-05)
   pf["targetN"] = true; pf["targetP"] = true; pf["targetK"] = true; pf["targetPH"] = true;
   pf["preset"] = true;                             // SET_COLUMN: crop preset name
   pf["clkY"] = true; pf["clkMo"] = true; pf["clkD"] = true; pf["clkH"] = true; pf["clkMi"] = true;
-  pf["thStart"] = true; pf["thStop"] = true; pf["thGap"] = true;
+  pf["thStart"] = true; pf["thGap"] = true;
+  pf["vMin"] = true; pf["vMax"] = true;            // SET_AC_VOLT: the AC supply window (2026-11-14)
+  pf["aMin10"] = true; pf["aMax10"] = true;        // SET_AC_AMP: the AC pump current limits (2026-11-16)
 
   // A filter that did not fit would silently drop keys; say so loudly instead of mis-parsing.
   if (filter.overflowed()) {
@@ -7305,6 +9543,21 @@ static void firebasePollCommands() {
     c.schedMode = req["payload"]["schedMode"].isNull() ? -1 : (int8_t)(req["payload"]["schedMode"] | 0);
     c.winStart  = req["payload"]["winStart"] | -1;
     c.winEnd    = req["payload"]["winEnd"]   | -1;
+    // windows: the column's own watering times, [[start, end], ...] in minutes of the day (2026-11-05). Copied as
+    // sent and checked on core 1; more pairs than MAX_RUNS_PER_DAY are marked too many, not cut short.
+    c.winCount = -1;
+    JsonVariant jw = req["payload"]["windows"];
+    if (!jw.isNull()) {
+      c.winCount = 0;
+      if (jw.is<JsonArray>()) {
+        for (JsonVariant pair : jw.as<JsonArray>()) {
+          if (c.winCount >= MAX_RUNS_PER_DAY) { c.winCount = MAX_RUNS_PER_DAY + 1; break; }
+          c.wins[c.winCount][0] = pair[0].is<int>() ? (int16_t)pair[0].as<int>() : -1;
+          c.wins[c.winCount][1] = pair[1].is<int>() ? (int16_t)pair[1].as<int>() : -1;
+          c.winCount++;
+        }
+      }
+    }
     c.tgt[0]    = req["payload"]["targetN"]  | -1.0f;
     c.tgt[1]    = req["payload"]["targetP"]  | -1.0f;
     c.tgt[2]    = req["payload"]["targetK"]  | -1.0f;
@@ -7318,8 +9571,13 @@ static void firebasePollCommands() {
     c.clkMi = req["payload"]["clkMi"] | -1;
     // SET_THRESH: all required together.
     c.thStart = req["payload"]["thStart"] | -1;
-    c.thStop  = req["payload"]["thStop"]  | -1;
     c.thGap   = req["payload"]["thGap"]   | -1.0f;
+    // SET_AC_VOLT: both required, whole volts (a decimal reads as absent and is refused).
+    c.acVMin  = req["payload"]["vMin"] | -1;
+    c.acVMax  = req["payload"]["vMax"] | -1;
+    // SET_AC_AMP: both required, whole tenths of an amp (5 = 0.5 A); a decimal reads as absent and is refused.
+    c.acAMin10 = req["payload"]["aMin10"] | -1;
+    c.acAMax10 = req["payload"]["aMax10"] | -1;
     FirebaseCommandStatus ack = {};
     strlcpy(ack.id, c.id, sizeof(ack.id));
     // Mark it non-"queued" immediately, so the next poll cannot hand the same request to
@@ -7352,9 +9610,11 @@ static void firebaseFlushStatus() {
     body.createNestedObject("updatedAt")[".sv"] = "timestamp";
     String json; serializeJson(body, json);
     String path = String("/irrigation/commands/") + u.id + ".json";
-    if (!fbBegin(fbBuildUrl(base, path.c_str()))) return;
+    // print=silent + drain: same reason as the live PUT -- an unread echo poisons the kept-alive socket.
+    if (!fbBegin(fbBuildUrl(base, path.c_str()) + "&print=silent")) return;
     fbHttp.addHeader("Content-Type", "application/json");
     int code = fbHttp.PATCH(json);
+    if (code > 0) fbHttp.getString();
     fbHttp.end();
     if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
     if (code < 200 || code >= 300) return;                 // keep it queued and retry later
@@ -7382,7 +9642,9 @@ void firebaseCommandTick() {
         firebaseQueueStatus(c.id, "rejected", "no valid enabled column in 'columns'");
         logEvent("FIREBASE", "REJECT", "FORCE|NO_COLUMN"); continue;
       }
-      if (c.liters <= 0.0f || c.liters > FORCE_MAX_LITERS) {
+      // The run is stored in tenths of a litre (fcSeq[].dL below), so anything under 0.05 L rounded to an
+      // empty WATER,0.00 work order for ESP2. Refused instead (2026-11-05); the dashboard's own floor is 0.1 L.
+      if (c.liters <= 0.0f || c.liters > FORCE_MAX_LITERS || lroundf(c.liters * 10.0f) < 1) {
         firebaseQueueStatus(c.id, "rejected", "liters out of range");
         logEvent("FIREBASE", "REJECT", "FORCE|LITERS=" + String(c.liters, 1)); continue;
       }
@@ -7421,7 +9683,7 @@ void firebaseCommandTick() {
         firebaseQueueStatus(c.id, "rejected", why);
         logEvent("FIREBASE", "REJECT", String("FORCE|NOT_IDLE|") + why); continue;
       }
-      if (sensor.tankValid && sensor.resLevel < RES_LOW_PCT) {
+      if (reservoirLow(sensor.msTank != 0, sensor.resLevel, RES_LOW_PCT)) {
         firebaseQueueStatus(c.id, "rejected", "reservoir too low");
         logEvent("FIREBASE", "REJECT", "FORCE|RES_LOW"); continue;
       }
@@ -7477,6 +9739,12 @@ void firebaseCommandTick() {
     }
     if (!strcmp(c.type, "CANCEL_FORCE")) {
       if (fcPhase == FP_NONE) { firebaseQueueStatus(c.id, "rejected", "no forced run is armed"); continue; }
+      // Only a countdown can be cancelled (2026-11-05), the same rule as the LCD's BACK. Once forceTick()
+      // has fired (FP_RUNNING) the work order is live on ESP2, and forceAbort() would only clear the phase:
+      // this replied "armed forced run cancelled" while the pumps carried on, and a cancel takes up to 3 s
+      // to be picked up, so it was easy to hit at the end of a countdown. Stopping a live run is
+      // EMERGENCY_STOP's job, and the reply says so.
+      if (fcPhase != FP_WAIT) { firebaseQueueStatus(c.id, "rejected", "run already started; use emergency stop"); continue; }
       forceAbort("WEB");                                   // resolves the armed run's own command too
       firebaseQueueStatus(c.id, "completed", "armed forced run cancelled");
       continue;
@@ -7558,7 +9826,7 @@ void firebaseCommandTick() {
       esp2TestArmed = false; testArmPending = false; testArmTries = 0; lastTestArmMs = 0;
       esp2WarmupMs = millis();               // prime reference (TEST_PRIME_MS)
       puArmMs = millis();
-      puPhase = PU_ARM;
+      puPhase = PU_ARM; testServoDoneRow = -1; puServoFailWhy[0] = '\0';
       setState(TEST_MODE);                   // stops controlTick/exerciseTick starting a run underneath
       firebaseQueueStatus(c.id, "accepted", (String("pulse ") + c.arg + " for " + secs + "s").c_str());
       logEvent("FIREBASE", "CMD", String("PULSE|") + c.arg + "|" + secs + "s");
@@ -7631,7 +9899,30 @@ void firebaseCommandTick() {
         // and permanently disabling the column with only a routine, non-alerting OUTSIDE_WINDOW log
         // line. Reject it here rather than let it through, same reasoning as the ws==we check.
         if (ws >= we) { firebaseQueueStatus(c.id, "rejected", "window start must be before window end"); continue; }
+        // With several windows a day, window 1 must still end before window 2 starts.
+        if (colRuns[ci] > 1 && we >= COL_EXTRA_START[ci][0]) {
+          firebaseQueueStatus(c.id, "rejected", "window 1 must end before window 2 starts"); continue;
+        }
         newWs = (uint16_t)ws; newWe = (uint16_t)we; setWin = true;
+      }
+      // windows[] (2026-11-05): all of the column's own watering times at once, 1..MAX_RUNS_PER_DAY of them, in
+      // order. Each must lie in the day, start before it ends, and end before the next starts. Not together with
+      // winStart/winEnd, which is the one-window form older dashboards send.
+      uint8_t  newRuns = colRuns[ci];
+      uint16_t newWins[MAX_RUNS_PER_DAY][2] = {};
+      bool     setWins = false;
+      if (c.winCount >= 0) {
+        if (c.winStart >= 0 || c.winEnd >= 0) { firebaseQueueStatus(c.id, "rejected", "send windows or winStart/winEnd, not both"); continue; }
+        if (c.winCount < 1 || c.winCount > MAX_RUNS_PER_DAY) { firebaseQueueStatus(c.id, "rejected", "windows: 1 to 4 start/end pairs"); continue; }
+        bool bad = false;
+        for (int w = 0; w < c.winCount; w++) {
+          if (c.wins[w][0] < 0 || c.wins[w][1] < 0) { bad = true; break; }
+          newWins[w][0] = (uint16_t)c.wins[w][0]; newWins[w][1] = (uint16_t)c.wins[w][1];
+        }
+        if (bad || !windowsValid(newWins, c.winCount)) {
+          firebaseQueueStatus(c.id, "rejected", "windows: in order, apart, minutes 0-1439"); continue;
+        }
+        newRuns = (uint8_t)c.winCount; setWins = true;
       }
       // Preset (additive): resolve against the real firmware preset table BEFORE the explicit
       // per-field loop below, so an explicit targetN/P/K/PH sent in the SAME command can still
@@ -7665,7 +9956,7 @@ void firebaseCommandTick() {
         newTgt[t] = c.tgt[t]; setTgt[t] = true;
       }
       if (tgtBad) continue;
-      if (!(setMode || setEn || setSched || setWin || setTgt[0] || setTgt[1] || setTgt[2] || setTgt[3])) {
+      if (!(setMode || setEn || setSched || setWin || setWins || setTgt[0] || setTgt[1] || setTgt[2] || setTgt[3])) {
         firebaseQueueStatus(c.id, "rejected", "no recognised field to change"); continue;
       }
 
@@ -7677,6 +9968,13 @@ void firebaseCommandTick() {
       if (setEn)    { COLUMN_ENABLED[ci] = newEn; changed += String("enabled=") + (newEn ? "1 " : "0 "); touchedEn = true; }
       if (setSched) { colSchedMode[ci] = newSched; changed += String("sched=") + (newSched ? "MANUAL " : "AUTO "); touchedSched = true; }
       if (setWin)   { COL_WIN_START[ci] = newWs; COL_WIN_END[ci] = newWe; changed += "win=" + String(newWs) + "-" + String(newWe) + " "; touchedSched = true; }
+      if (setWins) {
+        COL_WIN_START[ci] = newWins[0][0]; COL_WIN_END[ci] = newWins[0][1];
+        for (int x = 0; x < newRuns - 1; x++) { COL_EXTRA_START[ci][x] = newWins[x + 1][0]; COL_EXTRA_END[ci][x] = newWins[x + 1][1]; }
+        colRuns[ci] = newRuns;
+        changed += "runs=" + String(newRuns) + " ";
+        touchedSched = true;
+      }
       for (int t = 0; t < 4; t++) {
         if (!setTgt[t]) continue;
         applyColumnTarget(ci, TGT_KEY[t], newTgt[t], err);   // already validated -- cannot fail here
@@ -7715,21 +10013,60 @@ void firebaseCommandTick() {
     // ---- SET_THRESH: same fields, same clamps, same save function as the LCD Thresholds editor
     // and the SMS THRESH command.
     if (!strcmp(c.type, "SET_THRESH")) {
-      // Audit fix (2026-09-09): thGap uses the same -1 absent-field sentinel as thStart/thStop (set
-      // at parse time), but was previously only clamped, never rejected when missing/negative -- a
-      // partial payload silently zeroed fertGap instead of being refused, turning "fertigate only
-      // past a meaningful shortfall" into "fertigate on any positive shortfall at all" with no log
-      // distinction from a deliberate 0. Now rejected exactly like thStart/thStop.
-      if (c.thStart < 0 || c.thStop < 0 || c.thGap < 0.0f) { firebaseQueueStatus(c.id, "rejected", "missing threshold fields"); continue; }
+      // Audit fix (2026-09-09): thGap uses the same -1 absent-field sentinel as thStart (set at parse
+      // time), but was previously only clamped, never rejected when missing/negative -- a partial
+      // payload silently zeroed fertGap instead of being refused, turning "fertigate only past a
+      // meaningful shortfall" into "fertigate on any positive shortfall at all" with no log distinction
+      // from a deliberate 0. Now rejected exactly like thStart. An older dashboard may still send
+      // thStop; the payload filter drops it (decision D11).
+      if (c.thStart < 0 || c.thGap < 0.0f) { firebaseQueueStatus(c.id, "rejected", "missing threshold fields"); continue; }
       int s  = clampi(c.thStart, 0, 100);
-      int st = clampi(c.thStop, 0, 100);
-      if (st <= s) st = clampi(s + 1, 0, 100);              // stop must exceed start, same bump as LCD/SMS
       float g = (c.thGap > 500.0f) ? 500.0f : c.thGap;
-      soilStartPct = s; soilStopPct = st; fertGap = g;
+      soilStartPct = s; fertGap = g;
       saveThresholds();
-      logEvent("FIREBASE", "CFG", String("THRESH|start=") + s + "|stop=" + st + "|gap=" + String(g, 1));
+      logEvent("FIREBASE", "CFG", String("THRESH|start=") + s + "|gap=" + String(g, 1));
       firebaseQueueStatus(c.id, "completed",
-        (String("thresholds: start=") + s + " stop=" + st + " gap=" + String(g, 1)).c_str());
+        (String("thresholds: start=") + s + " gap=" + String(g, 1)).c_str());
+      continue;
+    }
+
+    // ---- SET_AC_VOLT: the AC supply window ESP2's PZEM check enforces. Same check and same save as the
+    // LCD's AC Voltage editor. Who may send it is the rules' job (operators and Sub-operators only).
+    if (!strcmp(c.type, "SET_AC_VOLT")) {
+      if (c.acVMin < 0 || c.acVMax < 0) { firebaseQueueStatus(c.id, "rejected", "missing voltage fields"); continue; }
+      if (!acVoltWindowOk(c.acVMin, c.acVMax)) {
+        firebaseQueueStatus(c.id, "rejected", (String("need ") + AC_V_LIMIT_LOW + "-" + AC_V_LIMIT_HIGH +
+                            " V, low " + AC_V_MIN_GAP + " V under high").c_str());
+        continue;
+      }
+      // Someone has it open on the LCD: their Save would silently overwrite this, so refuse instead.
+      if ((uiMode == UI_EDIT || editConfirm) && editItem == SET_ACVOLT) {
+        firebaseQueueStatus(c.id, "rejected", "being edited on the LCD"); continue;
+      }
+      setAcVoltWindow(c.acVMin, c.acVMax, "FIREBASE");
+      firebaseQueueStatus(c.id, "completed", (String("AC window ") + acVMin + "-" + acVMax + " V").c_str());
+      continue;
+    }
+
+    // ---- SET_AC_AMP (2026-11-16): the AC pump current limits ESP2's PZEM check enforces -- no-current (min) and
+    // overcurrent (max), whole tenths of an amp. Same check and same save as the LCD's AC Current editor. Who may
+    // send it is the rules' job (operators and Sub-operators only, like SET_AC_VOLT).
+    if (!strcmp(c.type, "SET_AC_AMP")) {
+      if (c.acAMin10 < 0 || c.acAMax10 < 0) { firebaseQueueStatus(c.id, "rejected", "missing current fields"); continue; }
+      char msg[48];
+      if (!acAmpWindowOk(c.acAMin10, c.acAMax10)) {
+        snprintf(msg, sizeof(msg), "need %.1f-%.1f A, min %.1f A under max",
+                 AC_A_LIMIT_LOW / 10.0f, AC_A_LIMIT_HIGH / 10.0f, AC_A_MIN_GAP / 10.0f);
+        firebaseQueueStatus(c.id, "rejected", msg);
+        continue;
+      }
+      // Someone has it open on the LCD: their Save would silently overwrite this, so refuse instead.
+      if ((uiMode == UI_EDIT || editConfirm) && editItem == SET_ACAMP) {
+        firebaseQueueStatus(c.id, "rejected", "being edited on the LCD"); continue;
+      }
+      setAcAmpWindow(c.acAMin10, c.acAMax10, "FIREBASE");
+      snprintf(msg, sizeof(msg), "AC current %.1f-%.1f A", acAMin10 / 10.0f, acAMax10 / 10.0f);
+      firebaseQueueStatus(c.id, "completed", msg);
       continue;
     }
 
@@ -7751,20 +10088,42 @@ void firebaseCommandTick() {
       continue;
     }
 
+    // ---- LCD_LOCK { action: "lock" | "unlock" }: the website's lock switch (added 2026-11-05). The same flag,
+    // NVS key and log as Settings > Lock Screen and the UP+DOWN unlock, so the LCD and the website show one lock.
+    // Automation, the MODE+BACK emergency stop and the UP+DOWN unlock at the rig work exactly as before.
+    // Locking is refused while someone at the rig is in a menu, an editor, Testing, Calibration or Sensor Diag:
+    // the lock screen would take their buttons mid-edit or mid-hold, and automation waits while uiMode isn't
+    // UI_DATA. Unlocking is never refused. Privileged accounts only (RTDB rules).
+    if (!strcmp(c.type, "LCD_LOCK")) {
+      bool lock = !strcmp(c.arg, "lock");
+      if (!lock && strcmp(c.arg, "unlock")) { firebaseQueueStatus(c.id, "rejected", "action must be lock or unlock"); continue; }
+      if (lock && uiMode != UI_DATA) { firebaseQueueStatus(c.id, "rejected", "someone is using the LCD menu"); continue; }
+      if (lcdLocked != lock) {
+        lcdLocked = lock; saveLock();
+        logEvent("FIREBASE", "STATE", lock ? "LCD_LOCK|WEB" : "LCD_UNLOCK|WEB");
+      }
+      fbRequestPush();                                   // the website shows the lock from ESP1's snapshot
+      firebaseQueueStatus(c.id, "completed", lock ? "screen locked" : "screen unlocked");
+      continue;
+    }
+
     if (!strcmp(c.type, "REBOOT")) {
       if (!strcmp(c.arg, "nano")) {
+        if (levelRelayActive() || servoReqActive) {     // mid-pump: the Nano is the overflow watch and the servo
+          firebaseQueueStatus(c.id, "rejected", "a pump is running or the pump selector is moving"); continue;
+        }
         sendNanoCommand("RESET_REQ");
         nanoResetReqInFlight = true; nanoResetReqMs = millis(); nanoResetsToday++;
         logEvent("FIREBASE", "CMD", "REBOOT|NANO");
         firebaseQueueStatus(c.id, "completed", "nano soft reset requested");
       } else if (!strcmp(c.arg, "esp2")) {
-        if (wo.active) { firebaseQueueStatus(c.id, "rejected", "a work order is running"); continue; }
-        sendEsp2("RESET_SELF");                            // soft first; the ladder power-cycles if it stays dark
+        { const char *busy = rebootBusyReason(); if (busy) { firebaseQueueStatus(c.id, "rejected", busy); continue; } }
+        sendEsp2("RESET_SELF");                          // soft first; the ladder power-cycles if it stays dark
         esp2SoftResetTried = true; esp2RecoverMs = millis();
         logEvent("FIREBASE", "CMD", "REBOOT|ESP2");
         firebaseQueueStatus(c.id, "completed", "esp2 soft reset sent");
       } else if (!strcmp(c.arg, "esp1")) {
-        if (wo.active) { firebaseQueueStatus(c.id, "rejected", "a work order is running"); continue; }
+        { const char *busy = rebootBusyReason(); if (busy) { firebaseQueueStatus(c.id, "rejected", busy); continue; } }
         // BOOTLOOP GUARD. firebaseFlushStatus() is core-0 and queued, so restarting now can beat the
         // status PATCH: the node would stay "queued", the poller would see it again after boot and
         // reboot forever. Persist the id so the post-boot poll skips it even if the PATCH never
@@ -8131,7 +10490,6 @@ static String portalConfigHtml() {
   }
   o += "<h3>Thresholds</h3><form method=POST action=/thresh>"
        "<p>Start&lt;<input name=start type=number value=" + String(soilStartPct) + " style='width:56px'>% "
-       "Stop&gt;<input name=stop type=number value=" + String(soilStopPct) + " style='width:56px'>% "
        "gap<input name=gap type=number value=" + String((int)fertGap) + " style='width:56px'>mg/kg "
        "<button type=submit>Save</button></p></form>";
   return o;
@@ -8198,7 +10556,8 @@ static String portalAdminHtml(const String &msg) {            // the unlocked ad
        "<p><label><input type=checkbox name=en value=yes" + String(firebaseEnabled ? " checked" : "") + "> Enabled (live snapshot + remote commands)</label></p>"
        "<p>Last upload: " + String(fUrl.length() == 0 ? "not configured"
                                    : (fbLastUploadMs == 0 ? "none yet"
-                                      : String((millis() - fbLastUploadMs) / 1000) + " s ago, " + (fbLastOk ? "OK" : "FAILED"))) + "</p>"
+                                      : String((millis() - fbLastUploadMs) / 1000) + " s ago, " + (fbLastOk ? "OK" : "FAILED")
+                                         + (fbLastHttp ? " (HTTP " + String(fbLastHttp) + ")" : ""))) + "</p>"
        "<p><button type=submit style='width:100%;padding:10px'>Save Firebase settings</button></p></form>";
   // Device account. The password is write-only from here: it is never rendered back, and once a
   // refresh token exists it is no longer needed at all (Forget password below).
@@ -8363,6 +10722,8 @@ static void portalHandleFormat() {                            // POST /format --
 static void portalHandleReboot() {                            // POST /reboot -- software-reset ESP1
   if (!portalRequireAdmin()) return;
   if (portalServer.arg("confirm") != "yes") { portalServer.send(200, "text/html", portalAdminHtml("Cancelled (box unchecked).")); return; }
+  { const char *busy = rebootBusyReason();
+    if (busy) { portalServer.send(200, "text/html", portalAdminHtml(String("Not rebooted: ") + busy + ". Stop or cancel it first.")); return; } }
   portalServer.send(200, "text/html", portalHead("Reboot") +
                     "<h3>Rebooting the controller&hellip;</h3><p>The setup AP will drop. Reconnect to your "
                     "network (or reopen Setup AP) in ~15 s.</p></body></html>");
@@ -8493,7 +10854,6 @@ static void portalHandleColPreset() {                         // POST /colpreset
 static void portalHandleThresh() {                            // POST /thresh
   if (!portalRequireAdmin()) return;
   portalCfgReply("THRESH," + String(portalServer.arg("start").toInt()) + "," +
-                 String(portalServer.arg("stop").toInt()) + "," +
                  String(portalServer.arg("gap").toInt()), "Thresholds saved (reload to confirm).");
 }
 static void portalStart() {
@@ -8576,7 +10936,7 @@ void netTask(void *pv) {
       continue;
     }
 
-    // Battery-switch quiet window (set by core 1): start no new WiFi/TLS request while P4 moves.
+    // Battery-switch quiet window (set by core 1): start no new WiFi/TLS request while P0 moves.
     if (battQuietActive()) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
 
     char ssid[33] = "", pass[65] = "";
@@ -8624,11 +10984,32 @@ void netTask(void *pv) {
       if (fbOn) fbEnsureToken();
     }
 
-    unsigned long fbInterval = (netState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS;
+    unsigned long fbInterval = fbViewerWatching()
+        ? ((netState == ACTIVE_STATE) ? FIREBASE_UPLOAD_LIVE_ACTIVE_MS : FIREBASE_UPLOAD_LIVE_IDLE_MS)   // someone is watching
+        : ((netState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS);
     // An error should not sit unseen for up to a minute, so core 1 can force a push out of band.
     // Rate-limited: a burst of rejections must not turn into a burst of TLS uploads on a battery.
-    bool urgent = fbPushNow && (millis() - fbLastUploadMs >= FB_PUSH_MIN_GAP_MS);
-    if (urgent) fbPushNow = false;
+    // It waits for a snapshot taken after the request (fbPushSeq), at most FB_PUSH_FRESH_WAIT_MS, so
+    // a stalled core 1 cannot hold it back for good. Requests that land after that snapshot stay
+    // pending, and get their own push once the gap allows.
+    static uint32_t      pushedSeq  = 0;               // the newest request a push has already covered
+    static unsigned long pushWaitMs = 0;               // when the wait for a fresh snapshot began (0 = none)
+    bool urgent = false;
+    uint32_t wantedSeq = fbPushSeq;
+    if (wantedSeq != pushedSeq && millis() - fbLastUploadMs >= FB_PUSH_MIN_GAP_MS) {
+      uint32_t coveredSeq;
+      portENTER_CRITICAL(&telemMux); coveredSeq = telem.pushSeq; portEXIT_CRITICAL(&telemMux);
+      if (!pushWaitMs) pushWaitMs = nzMs(millis());
+      // Newer, not just different: after a timed-out wait pushedSeq can be ahead of the snapshot in hand.
+      bool fresh = (int32_t)(coveredSeq - pushedSeq) > 0;
+      if (fresh || millis() - pushWaitMs >= FB_PUSH_FRESH_WAIT_MS) {
+        urgent = true;
+        pushedSeq = fresh ? coveredSeq : wantedSeq;
+        pushWaitMs = 0;
+      }
+    }
+    // The dashboard's Refresh button: a fresh report now (the snapshot core 1 refreshes every second).
+    if (fbRefreshPending && millis() - fbLastUploadMs >= FB_REFRESH_MIN_GAP_MS) { fbRefreshPending = false; urgent = true; }
     if (urgent || millis() - fbLastUploadMs >= fbInterval) firebaseUploadLive();
     // Remote-command transport, both directions. Cheap: they ride the SAME keep-alive TLS
     // socket as the upload above, so a 3 s poll costs one small GET, not a handshake.
@@ -8636,18 +11017,28 @@ void netTask(void *pv) {
     firebasePollCommands();
     firebasePollManual();                                  // the Manual/Test tab's hold + keep-alive
     firebasePollTestHold();                                // the Manual/Test tab's hold-to-run buttons
+    firebasePollViewer();                                  // someone watching / a Refresh (2026-11-17)
 
-    // Supabase CSV push: core 1 sets uploadReqStamp; do one attempt here and publish the result.
+    // CSV log push: core 1 sets uploadReqStamp. Firebase (2026-11-17) goes one piece per pass (fbLogJobStep below);
+    // Supabase, only while Firebase is off, is one streamed attempt here.
     if (uploadReqStamp != 0 && !uploadBusy) {
       uploadBusy = true;
       long stamp = uploadReqStamp;
       char path[16], obj[13];
       snprintf(path, sizeof(path), "/%08ld.CSV", stamp);
       snprintf(obj,  sizeof(obj),  "%08ld.CSV", stamp);
-      bool ok = supaUploadFile(path, obj);
-      uploadResStamp = stamp; uploadResult = ok ? 1 : 2;
-      uploadReqStamp = 0; uploadBusy = false;
+      bool toFb;
+      xSemaphoreTake(netMux, portMAX_DELAY); toFb = firebaseEnabled && fbUrl.length() >= 8; xSemaphoreGive(netMux);
+      uploadWasFb = toFb;
+      if (toFb) fbLogJobBegin(stamp, path, uploadReqPartial);
+      else {
+        bool ok = supaUploadFile(path, obj);
+        uploadResStamp = stamp; uploadResult = ok ? 1 : 2;
+        uploadReqStamp = 0; uploadBusy = false;
+      }
     }
+    if (fbLogJob.active) fbLogJobStep();
+    firebasePollLogRequest();                              // the website's "Upload from the rig" (every 10 s)
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
@@ -8704,8 +11095,8 @@ void raiseFault(char tier, const char *code, const char *loc) {
   if (tier == 'C' || !(editConfirm || restoreConfirm || resetConfirm)) { uiMode = UI_DATA; lcdPage = PAGE_FAULT; }
   wakeBacklight();
 
-  // GSM alert for all tiers (sec.12.1.1)
-  sendSMS(String("ALERT,") + t + "," + code + "," + loc);
+  // GSM alert for all tiers (sec.12.1.1), in words (smsFault)
+  smsFault(tier, code, loc);
 
   if (tier == 'C') enterEmergencyStop(true);     // critical -> shutdown (sec.14.7.1)
 }
@@ -8758,17 +11149,22 @@ void enterFaultHold(const char *code, const char *loc) {
   logEvent("ESP1", "FAULT", detail);
   lastFaultMsg = String(code) + " " + loc + " " + colS;
   lastFaultTime = tsString();
-  // GSM alert WITH operation + column, and the reply menu (sec.12.1.1 + user req).
-  sendSMS(String("ALERT,CRIT,") + code + "," + loc + "," + op + "," + colS +
-          ",reply STOP/RELEASE/IRRIGATE/NORMAL");
   // Count consecutive identical holds; after 3 FLOW_FAILs steer to Release (flow-independent on ESP2).
   if (lastHoldCode == code) sameHoldN++; else { lastHoldCode = code; sameHoldN = 1; }
+  // SMS detail in words: "Col A fertigation, transfer, pulses=0".
+  String smsColOp = (wo.colIdx >= 0 && wo.colIdx < NUM_COLUMNS ? String("Col ") + COL_TAG[wo.colIdx] : String("Col ?")) +
+                    " " + (wo.fertigate ? "fertigation" : "irrigation");
+  String smsDetail = smsColOp + ", " + smsPlain(loc);
   // Circuit breaker. Steering only moves the cursor -- an operator who keeps picking "Resume normal"
   // against dead hardware re-holds forever, which is exactly the state that forced a physical reset
   // with the pumps still live. Give up on our own and snooze the column instead.
   if (sameHoldN >= HOLD_AUTOCANCEL_N) {
     logEvent("ESP1", "FAULT", String("CRIT|") + code + "|" + loc + "|AUTOCANCEL|after=" + String(sameHoldN));
-    sendSMS(String("ALERT,CANCEL,") + code + "," + colS + ",repeated holds - run cancelled, column snoozed 30m");
+    { String t = smsClock();
+      smsAlert(smsCompose("ALERT: Run cancelled automatically",
+                          smsColOp + ": " + smsFaultWhat(code) + ", " + String(sameHoldN) + " times in a row",
+                          "Column skipped for 30 min. Fix it before the next run",
+                          String("(") + (t.length() ? t + " " : String()) + code + ")")); }
     // Overwrite the plain fault line above with the actual outcome: esp2Held is about to go false and
     // the banner will simply disappear, so this is the only trace (besides SMS) of "the rig gave up on
     // its own" vs. a real operator-confirmed recovery -- see diagnostics.system.lastFault.
@@ -8776,7 +11172,12 @@ void enterFaultHold(const char *code, const char *loc) {
     cancelRun(1, code, true);                          // 30-min snooze; clears the hold + stops ESP2; isAuto
     return;
   }
-  steerRelease = (sameHoldN >= 3 && String(code) == "FLOW_FAIL");
+  // web v.4: a dead tank ultrasonic (LEVEL_BLIND) is the same dead-meter case -- Release runs on a timer.
+  steerRelease = (sameHoldN >= 3 && (String(code) == "FLOW_FAIL" || String(code) == "LEVEL_BLIND"));
+  // GSM alert WITH operation + column (sec.12.1.1 + user req), then the reply menu as its own text to the
+  // owner (the second alert number cannot send commands).
+  smsAlert(smsFaultText('C', code, smsDetail));
+  sendSMS(smsHoldMenu(wo.colIdx, steerRelease));
   esp2Held = true; faultRecovSel = steerRelease ? 1 : 0;   // default cursor: Release when steering, else Hold
   runUiAbort(code);                                    // close the run UI so the recovery menu is reachable
   editConfirm = false; restoreConfirm = false; resetConfirm = false; editDirty = false;   // force-dismiss any open dialog (§B.3.1)
@@ -8790,7 +11191,10 @@ void enterFaultHold(const char *code, const char *loc) {
  * the only way to stop the pumps.
  *   mode 0 = turn the column OFF (persistent)   1 = snooze 30 min   2 = snooze 10 min
  * Safe to call whether or not ESP2 is currently held. */
-void cancelRun(int mode, const char *why, bool isAuto) {
+void cancelRun(int mode, const char *whyIn, bool isAuto) {
+  // A copy: callers pass lastHoldCode.c_str(), which is cleared below (the log said "CANCEL|OFF|COL_A|", 2026-11-17).
+  const String whyS = whyIn ? whyIn : "";
+  const char *why = whyS.c_str();
   int c = (wo.colIdx >= 0) ? wo.colIdx : pendingRun.colIdx;      // whichever run we are aborting
   bswNoteCut(2, c, mode);                                        // before STOP_ALL: it may be the last thing we do
 
@@ -8824,7 +11228,14 @@ void cancelRun(int mode, const char *why, bool isAuto) {
 
   String colS = (c >= 0 && c < NUM_COLUMNS) ? String("COL_") + COL_TAG[c] : String("COL_?");
   logEvent("ESP1", "ACT", String("CANCEL|") + scope + "|" + colS + "|" + why);
-  sendSMS(String("ACK,CANCEL,") + scope + "," + colS);
+  if (!isAuto) {                                                 // an auto-cancel already sent its own alert
+    bool hasCol = (c >= 0 && c < NUM_COLUMNS);
+    const char *what = !hasCol ? "Nothing was running. All stopped."
+                     : mode < 0 ? "Stopped because pumps were disabled."
+                     : mode == 0 ? "Column turned OFF. Turn it on again on the LCD or website."
+                     : mode == 1 ? "Column skipped for 30 min." : "Column skipped for 10 min.";
+    sendSMS(String("OK: Run cancelled") + (hasCol ? ", " + smsCol(c) : String()) + "\n" + what);
+  }
 
   runUiAbort("CANCELLED");                                       // release the run screen
   esp2SetPower(false);                                           // OFF-during-idle
@@ -8836,7 +11247,7 @@ void cancelRun(int mode, const char *why, bool isAuto) {
 void issueRecovery(int sel) {
   if (!esp2Held) return;
   if (sel == 0) {                                      // Hold / acknowledge: stay held, push nothing
-    sendSMS("ACK,STOP,HELD");
+    sendSMS("OK: Still on hold, tank kept.\nReply NORMAL, IRRIGATE or RELEASE when ready, or CANCEL,30 to end the run.");
     // Visible acknowledgement. Staying held is correct behaviour, but with no feedback at all this
     // button was indistinguishable from a dead one.
     lastFaultMsg = String("HELD - waiting");
@@ -8859,7 +11270,7 @@ void issueRecovery(int sel) {
   { const char *bw;
     if (secBattBlocksAc(&bw)) {
       lastFaultMsg = String("Resume refused: ") + bw;
-      sendSMS("ERR,RESUME,BATT2");
+      smsErr("RESUME|BATT2", String("NOT DONE: Can't resume yet: ") + bw + ".\nStill on hold, tank kept.");
       logEvent("ESP1", "ACT", String("RESUME|BLOCKED|BATT2|") + mode);
       return;
     } }
@@ -8885,18 +11296,267 @@ static bool calTgtVisible(int idx) {
   if (t.kind == CK_SOIL || t.kind == CK_NPK) return COLUMN_ENABLED[t.col];  // hide disabled columns (§14.1.4.1)
   return true;
 }
+// Soil rows are one probe each: "SOIL_A1" -> probe 0, "SOIL_A2" -> probe 1 (the Nano's SOIL_PINS[col][probe]).
+static int calSoilProbe(const CalTgt &t) { return (t.id[6] == '2') ? 1 : 0; }
 static bool calIsNano(uint8_t kind) {                    // Nano-owned sensors (ESP1 applies their cal)
   return kind == CK_SOIL || kind == CK_LEVEL_RES || kind == CK_LEVEL_MIX || kind == CK_OFFSET ||
-         kind == CK_NPK || kind == CK_FLOW_RES;
+         kind == CK_NPK || kind == CK_FLOW_RES || kind == CK_VOL_MIX || kind == CK_VOL_RES;
 }
+// (FLOW_RESMIX / FLOW_MIXIRR primes went with their calibration rows in web v.4. The RESMIX / MIXIRR prime
+//  lines themselves still exist on ESP2: the "Tank Mix liters" screen runs them, see calHoldTick.)
 static const char *calPrimeLine(const char *id, int *col) {
   *col = -1;
-  if (!strcmp(id, "FLOW_MIXIRR")) { *col = 0; return "MIXIRR"; }   // prime via column A
-  if (!strcmp(id, "FLOW_RESMIX")) return "RESMIX";
   if (!strcmp(id, "FLOW_NUTA"))   return "NUTA";
   if (!strcmp(id, "FLOW_NUTB"))   return "NUTB";
   if (!strcmp(id, "FLOW_NUTC"))   return "NUTC";
+  if (!strcmp(id, "FLOW_NUTD"))   return "NUTD";      // ESP2 setupPrime(): OUT_NUT_D, DC pump, no valve
+  if (!strcmp(id, "FLOW_PHUP"))   return "PHUP";      // OUT_PH_UP
+  if (!strcmp(id, "FLOW_PHDN"))   return "PHDN";      // OUT_PH_DN
   return "";
+}
+
+// ---- Pump rate screens (CK_RATE, 2026-11-17) ----
+// t.col: 0 transfer, 1 booster (L/min), 2..4 nutrient A..C (mL/min). 0 = not measured.
+static bool rateIsWater(const CalTgt &t) { return t.col < 2; }
+static float rateCurrent(const CalTgt &t) {
+  if (t.col == 0) return calRateXfer;
+  if (t.col == 1) return calRateBoost;
+  int n = t.col - 2;
+  return pumpRateSet[n] ? PUMP_FLOWRATE_MLPM[n] : 0.0f;
+}
+// One UP (+1) / DOWN (-1) step. Below the smallest accepted rate is 0 = "not measured"; UP from there starts at it.
+static void rateNudge(const CalTgt &t, int dir, bool fast) {
+  bool w = rateIsWater(t);
+  float lo = w ? RATE_LPM_MIN : RATE_MLPM_MIN, hi = w ? RATE_LPM_MAX : RATE_MLPM_MAX;
+  float step = w ? (fast ? 0.5f : 0.05f) : (fast ? 10.0f : 1.0f);
+  float v = calVolL;
+  if (dir > 0) v = (v < lo) ? lo : v + step;
+  else { v -= step; if (v < lo - 0.001f) v = 0.0f; }
+  if (v > hi) v = hi;
+  float q = w ? 100.0f : 10.0f;
+  calVolL = roundf(v * q) / q;
+}
+// UP/DOWN held: repeat after 0.6 s, and big steps after 2.5 s (same feel as the tank-litres entry).
+static void rateHoldTick(const CalTgt &t) {
+  if (calStep != 0) { volCalHeldBtn = -1; return; }
+  bool up = (digitalRead(BTN_UP) == LOW), dn = (digitalRead(BTN_DOWN) == LOW);
+  unsigned long now = millis();
+  int b = up ? 0 : dn ? 1 : -1;
+  if (b < 0 || (up && dn)) { volCalHeldBtn = -1; return; }
+  if (b != volCalHeldBtn) { volCalHeldBtn = b; volCalHeldSinceMs = now; volCalRepeatMs = now; return; }
+  if (now - volCalHeldSinceMs < 600 || now - volCalRepeatMs < 120) return;
+  volCalRepeatMs = now;
+  rateNudge(t, b == 0 ? +1 : -1, now - volCalHeldSinceMs >= 2500);
+}
+
+// ---- Pump estimate screens (CK_PEST, 2026-11-17 user request) ----
+// "Transfer pump est" (t.col 0) / "Booster pump est" (t.col 1). Run the pump for a chosen number of seconds -- ESP2
+// times it from the inverter SWITCH-ON, the way the user measured -- while the screen shows what the pump's line says
+// that run gives. Weigh the water and type the grams (1 L = PL_G_PER_L g). From PL_MIN_TRIES tries on, the screen fits
+// the pump's line; ENTER saves it: the rate as Rate Transfer / Rate Booster, the start litres here (and, for the
+// transfer, on ESP2 as SET_CAL,PSTART -- every fill is timed by this line). Vary the seconds between tries.
+// Steps: 0 booster valve (A/B/C), 1 seconds + run, 2 running, 3 type the grams, 4 the fit, 5 saved.
+static bool pestIsXfer(const CalTgt &t) { return t.col == 0; }
+static float pestEstL(const CalTgt &t, float tS) {
+  bool x = pestIsXfer(t);
+  return plLitresAt(tS, pestRate(x), pestStart(x));
+}
+static String pestPrimeCmd(const CalTgt &t) {
+  String c = pestIsXfer(t) ? String("PRIME_START,RESMIX,") : String("PRIME_START,MIXIRR,") + COL_TAG[pestCol];
+  return c + "," + String((unsigned long)pestSecs * 1000UL);
+}
+static void pestStop(const CalTgt &t) {
+  if (!pestRunning) return;
+  sendEsp2(pestIsXfer(t) ? "PRIME_STOP,RESMIX" : "PRIME_STOP,MIXIRR");
+  pestRunning = false;
+  actRearmStart();                                     // the next run waits ACT_REARM_MS
+}
+static void pestRun(const CalTgt &t) {
+  if (actRearmWaiting())  { calMsg = "Too fast: wait 1.5s"; return; }
+  if (actuationsDisabled) { calMsg = "Actuations off"; return; }
+  if (secBattBlocksAc())  { calMsg = secBlockLcd(); return; }
+  pestRunning = true; pestStartMs = millis(); pestKeepMs = 0; pestRanMs = -1; pestReseat = false; calMsg = "";
+  pestInvOnMs = 0;                                     // the counter waits for the inverter's switch-on
+  calStep = 2;
+  logEvent("ESP1", "CAL", String("PEST_RUN|") + t.id + "|s=" + pestSecs +
+                          (pestIsXfer(t) ? String("") : String("|col=") + COL_TAG[pestCol]));
+}
+// ESP2's answer: DONE,PRIME_TIMED,<line>,<ran ms>,<re-seat 0/1>,<ms to AC, -1 = none> -- or an early end.
+void pestOnDone(const String &arg) {
+  if (!pestRunning) return;
+  pestRunning = false;
+  actRearmStart();                                     // the next run waits ACT_REARM_MS
+  if (uiMode != UI_CAL || !calOpen || CAL_TGTS[calSel].kind != CK_PEST) return;
+  const CalTgt &t = CAL_TGTS[calSel];
+  if (!arg.startsWith("PRIME_TIMED,")) { calStep = 1; calMsg = "Stopped early"; return; }
+  int p1 = arg.indexOf(','), p2 = arg.indexOf(',', p1 + 1), p3 = arg.indexOf(',', p2 + 1), p4 = arg.indexOf(',', p3 + 1);
+  if (p2 < 0 || p3 < 0) { calStep = 1; calMsg = "Bad answer"; return; }
+  pestRanMs  = arg.substring(p2 + 1, p3).toInt();
+  pestReseat = arg.substring(p3 + 1, p4 < 0 ? (int)arg.length() : p4).toInt() == 1;
+  long ac    = (p4 > 0) ? arg.substring(p4 + 1).toInt() : 0;
+  if (ac < 0) { calStep = 1; calMsg = "No AC: try again"; return; }   // the inverter never gave power: no water
+  float est = pestEstL(t, pestRanMs / 1000.0f);
+  pestGrams = (int)(roundf(est * PL_G_PER_L / 10.0f) * 10.0f);      // start from the estimate, rounded to 10 g
+  calStep = 3; calMsg = pestReseat ? "Re-seated: BACK" : "";
+  logEvent("ESP1", "CAL", String("PEST_RAN|") + t.id + "|ms=" + pestRanMs + "|ac_ms=" + ac + "|est=" + String(est, 2) +
+                          (pestReseat ? "|RESEAT" : ""));
+}
+static void pestKeep(const CalTgt &t) {
+  if (pestN >= PEST_MAX_TRIES) {                       // full: the oldest try makes room
+    for (uint8_t i = 1; i < PEST_MAX_TRIES; i++) { pestT[i - 1] = pestT[i]; pestV[i - 1] = pestV[i]; }
+    pestN = PEST_MAX_TRIES - 1;
+  }
+  pestT[pestN] = pestRanMs / 1000.0f;
+  pestV[pestN] = pestGrams / PL_G_PER_L;
+  pestN++;
+  logEvent("ESP1", "CAL", String("PEST_TRY|") + t.id + "|n=" + pestN + "|s=" + String(pestT[pestN - 1], 2) +
+                          "|g=" + pestGrams + "|L=" + String(pestV[pestN - 1], 3) +
+                          "|est=" + String(pestEstL(t, pestT[pestN - 1]), 3));
+  calMsg = "";
+  if (pestN >= PL_MIN_TRIES) { pestFit = plFit(pestT, pestV, pestN); calStep = 4; }
+  else calStep = 1;
+}
+static bool pestSave(const CalTgt &t) {
+  float q = roundf(pestFit.rateLpm * 100.0f) / 100.0f, a = roundf(pestFit.startL * 1000.0f) / 1000.0f;
+  if (!pestFit.ok || !calInRange(q, RATE_LPM_MIN, RATE_LPM_MAX)) { calMsg = "rate out of range"; return false; }
+  if (pestIsXfer(t)) {
+    calRateXfer = q; prefsCal.putFloat("rXfer", q);
+    calXferStartL = a; prefsCal.putFloat("xStartL", a);
+    pestPushOk = setCalPushBlocking("PRATE", rateWaterWire());
+    pestPushOk = setCalPushBlocking("PSTART", String(a, 3)) && pestPushOk;
+  } else {
+    calRateBoost = q; prefsCal.putFloat("rBoost", q);
+    calBoostStartL = a; prefsCal.putFloat("bStartL", a);
+    pestPushOk = setCalPushBlocking("PRATE", rateWaterWire());
+  }
+  logEvent("ESP1", "CAL", String("PEST_SAVE|") + t.id + "|rate=" + String(q, 2) + "|start=" + String(a, 3) +
+                          "|n=" + pestFit.n + (pestPushOk ? "" : "|ESP2_LATER"));
+  return true;
+}
+static void pestButton(const CalTgt &t, int i) {      // i: 0=UP 1=DOWN 2=ENTER 3=BACK
+  switch (calStep) {
+    case 0:                                            // the booster's column valve
+      if (i == 0)      pestCol = (pestCol + NUM_COLUMNS - 1) % NUM_COLUMNS;
+      else if (i == 1) pestCol = (pestCol + 1) % NUM_COLUMNS;
+      else if (i == 2) { calStep = 1; calMsg = ""; }
+      else             calCloseTarget();
+      break;
+    case 1:                                            // seconds, then run
+      if (i == 0)      { if (pestSecs < PEST_SECS_MAX) pestSecs++; calMsg = ""; }
+      else if (i == 1) { if (pestSecs > PEST_SECS_MIN) pestSecs--; calMsg = ""; }
+      else if (i == 2) pestRun(t);
+      else             calCloseTarget();
+      break;
+    case 2:                                            // running: BACK stops it
+      if (i == 3) { pestStop(t); calStep = 1; calMsg = "Stopped"; }
+      break;
+    case 3:                                            // the grams weighed
+      if (i == 0)      { pestGrams += 10; if (pestGrams > 30000) pestGrams = 30000; }
+      else if (i == 1) { pestGrams -= 10; if (pestGrams < 0) pestGrams = 0; }
+      else if (i == 2) { if (!pestReseat) pestKeep(t); }
+      else             { calStep = 1; calMsg = "Try dropped"; }
+      break;
+    case 4:                                            // the fit
+      if (i == 0)      { calStep = 1; calMsg = ""; }   // more tries
+      else if (i == 2) { if (pestFit.ok && pestSave(t)) calStep = 5; }
+      else if (i == 3) calCloseTarget();
+      break;
+    default:                                           // 5: saved
+      if (i == 2 || i == 3) calCloseTarget();
+      break;
+  }
+}
+// Keep-alive while a run is on (ESP2 times it; this only feeds its dead-man), a bound on a run that never answers,
+// and UP/DOWN held for the seconds and the grams (repeat after 0.6 s, big steps after 2.5 s).
+static void pestHoldTick(const CalTgt &t) {
+  unsigned long now = millis();
+  if (pestRunning) {
+    if (now - pestKeepMs >= 150) { bool first = (pestKeepMs == 0); pestKeepMs = now; sendEsp2KeepAlive(pestPrimeCmd(t), first); }
+    if (now - pestStartMs > (unsigned long)pestSecs * 1000UL + 100000UL) { pestStop(t); calStep = 1; calMsg = "No answer"; }
+  }
+  if (calStep != 1 && calStep != 3) { volCalHeldBtn = -1; return; }
+  bool up = (digitalRead(BTN_UP) == LOW), dn = (digitalRead(BTN_DOWN) == LOW);
+  int b = up ? 0 : dn ? 1 : -1;
+  if (b < 0 || (up && dn)) { volCalHeldBtn = -1; return; }
+  if (b != volCalHeldBtn) { volCalHeldBtn = b; volCalHeldSinceMs = now; volCalRepeatMs = now; return; }
+  if (now - volCalHeldSinceMs < 600 || now - volCalRepeatMs < 120) return;
+  volCalRepeatMs = now;
+  bool fast = (now - volCalHeldSinceMs >= 2500);
+  int dir = (b == 0) ? 1 : -1;
+  if (calStep == 1) {
+    pestSecs += dir * (fast ? 5 : 1);
+    if (pestSecs < PEST_SECS_MIN) pestSecs = PEST_SECS_MIN;
+    if (pestSecs > PEST_SECS_MAX) pestSecs = PEST_SECS_MAX;
+  } else {
+    pestGrams += dir * (fast ? 100 : 10);
+    if (pestGrams < 0) pestGrams = 0;
+    if (pestGrams > 30000) pestGrams = 30000;
+  }
+}
+static void pestRender(const CalTgt &t) {
+  char l[21];
+  bool x = pestIsXfer(t);
+  lcd.setCursor(0, 0);
+  if (x || calStep == 0) snprintf(l, 21, "%-20s", t.name);
+  else                   snprintf(l, 21, "Booster pump est  %c ", COL_TAG[pestCol]);
+  lcd.print(l);
+  const char *r1 = "", *r2 = "", *r3 = "";
+  char b1[21], b2[21];
+  switch (calStep) {
+    case 0:
+      snprintf(b1, 21, "Valve: column %c     ", COL_TAG[pestCol]); r1 = b1;
+      r2 = "UP/DN = column      "; r3 = "ENT=next  BACK=exit ";
+      break;
+    case 1:
+      snprintf(b1, 21, "Run %2d s  est %5.2fL", pestSecs, pestEstL(t, (float)pestSecs)); r1 = b1;
+      snprintf(b2, 21, "Tries %d/%d  %-8s", pestN, PL_MIN_TRIES,
+               isfinite(x ? calXferStartL : calBoostStartL) ? "saved" : "default"); r2 = b2;
+      r3 = "UP/DN s  ENT=run    ";
+      break;
+    case 2: {
+      // The counter starts at the inverter's switch-on (INFO,INV_ON), not at ENTER: the servo pre-seat and the battery
+      // switch come first. It stops at the set seconds -- ESP2 switches the inverter off then, exactly.
+      if (pestInvOnMs == 0) {
+        snprintf(b1, 21, "Starting  0.0/%2d s ", pestSecs); r1 = b1;
+        r2 = "servo + inverter... ";
+        r3 = "BACK = stop         ";
+      } else {
+        float el = (millis() - pestInvOnMs) / 1000.0f;
+        bool done = el >= (float)pestSecs;
+        if (done) el = (float)pestSecs;
+        snprintf(b1, 21, "Running %5.1f/%2d s ", el, pestSecs); r1 = b1;
+        snprintf(b2, 21, "est %5.2f L         ", pestEstL(t, el)); r2 = b2;
+        r3 = done ? "Stopped: wait...    " : "BACK = stop         ";
+      }
+      break;
+    }
+    case 3:
+      snprintf(b1, 21, "Ran %4.1fs est %5.2fL", pestRanMs / 1000.0f, pestEstL(t, pestRanMs / 1000.0f)); r1 = b1;
+      snprintf(b2, 21, "Water %5d g %5.2fL", pestGrams, pestGrams / PL_G_PER_L); r2 = b2;
+      r3 = "ENT=keep BACK=drop  ";
+      break;
+    case 4:
+      if (pestFit.ok) {
+        snprintf(b1, 21, "Fit %5.2f L/min n=%-2d", pestFit.rateLpm, pestN); r1 = b1;
+        snprintf(b2, 21, "start %+5.2f L      ", pestFit.startL); r2 = b2;
+        r3 = "ENT=save UP=more    ";
+      } else {
+        snprintf(b1, 21, "No line yet: n=%-2d  ", pestN); r1 = b1;
+        r2 = "vary the seconds    ";
+        r3 = "UP=more  BACK=exit  ";
+      }
+      break;
+    default:
+      snprintf(b1, 21, "SAVED %5.2f L/min  ", pestFit.rateLpm); r1 = b1;
+      snprintf(b2, 21, "start %+5.2f L      ", pestFit.startL); r2 = b2;
+      r3 = pestPushOk ? "ESP2 has it         " : "ESP2: at next start ";
+      break;
+  }
+  lcd.setCursor(0, 1); snprintf(l, 21, "%-20s", r1); lcd.print(l);
+  lcd.setCursor(0, 2); snprintf(l, 21, "%-20s", r2); lcd.print(l);
+  lcd.setCursor(0, 3);
+  if (calMsg.length()) snprintf(l, 21, "%-20s", calMsg.c_str()); else snprintf(l, 21, "%-20s", r3);
+  lcd.print(l);
 }
 
 void enterCal() {
@@ -8911,14 +11571,27 @@ static void calOpenTarget() {
   calOpen = true; calStep = 0; calCap[0] = calCap[1] = 0; calFlowPulses = 0; calVolL = 0.50f;
   calRunIdx = 0; calKRuns[0] = calKRuns[1] = calKRuns[2] = 0; calMsg = "";
   calRxId = ""; calRxValid = false;
+  soilCalReset();                                // a soil probe's steadiness window starts empty
+  volCalReset(); volCalPumpWasOn = false; volCalHeldBtn = -1;
   if (t.kind == CK_NPK) { for (int j = 0; j < 3; j++) calNpkEdit[j] = calNpkOff[t.col][j]; }  // seed current
+  if (t.kind == CK_RATE) { calVolL = rateCurrent(t); return; }   // typed in: nothing to stream
+  if (t.kind == CK_PEST) {                                         // no stream: the runs are timed primes
+    pestN = 0; pestRunning = false; pestRanMs = -1; pestReseat = false; pestFit.ok = false; pestFit.n = 0;
+    calStep = pestIsXfer(t) ? 1 : 0;
+    return;
+  }
   String cs = String("CAL_START,") + t.id;
   if (calIsNano(t.kind)) sendNanoCommand(cs.c_str()); else sendEsp2(cs);
 }
 
 static void calCloseTarget() {
   const CalTgt &t = CAL_TGTS[calSel];
+  if (t.kind == CK_RATE) { calOpen = false; return; }             // nothing was streaming
+  if (t.kind == CK_PEST) { pestStop(t); calOpen = false; return; } // a run must not outlive the screen
   String cs = String("CAL_STOP,") + t.id;
+  if (t.kind == CK_VOL_MIX && volCalPumpWasOn) {  // a hold-to-run pump must not outlive the screen
+    sendEsp2("PRIME_STOP,RESMIX"); sendEsp2("PRIME_STOP,MIXIRR"); volCalPumpWasOn = false;
+  }
   if (calIsNano(t.kind)) sendNanoCommand(cs.c_str());
   else {
     sendEsp2(cs);
@@ -8934,13 +11607,14 @@ static bool calCommit() {
   const CalTgt &t = CAL_TGTS[calSel];
   char buf[40];
   switch (t.kind) {
-    case CK_SOIL: {
-      int air = (int)calCap[0], wat = (int)calCap[1];
-      if (!soilCalOk(air, wat, (int)CAL_MIN_SPAN_ADC)) return false;      // too close, or dry/wet reversed
-      String k = "s" + String(t.col);
-      prefsCal.putInt((k + "a2").c_str(), air); prefsCal.putInt((k + "w2").c_str(), wat);
-      snprintf(buf, sizeof(buf), "SAVE|SOIL_%c|%d/%d", COL_TAG[t.col], air, wat);
-      calSoilAir[t.col] = air; calSoilWater[t.col] = wat;
+    case CK_SOIL: {                 // one probe: calCap[0] = WET (locked first), calCap[1] = DRY
+      int p = calSoilProbe(t);
+      int wat = (int)calCap[0], dry = (int)calCap[1];
+      if (!soilCalOk(dry, wat, (int)CAL_MIN_SPAN_ADC)) return false;      // too close, or dry/wet reversed
+      String pk = "s" + String(t.col) + "p" + String(p + 1);
+      prefsCal.putInt((pk + "d").c_str(), dry); prefsCal.putInt((pk + "w").c_str(), wat);
+      calProbeDry[t.col][p] = dry; calProbeWet[t.col][p] = wat;
+      snprintf(buf, sizeof(buf), "SAVE|%s|dry=%d|wet=%d", t.id, dry, wat);
       logEvent("ESP1", "CAL", buf);
       break;
     }
@@ -8971,8 +11645,43 @@ static bool calCommit() {
       logEvent("ESP1", "CAL", "SAVE|ACS712");
       break;
     }
-    case CK_LEVEL_RES: calResEmptyCm = calCap[0]; prefsCal.putFloat("reCm", calResEmptyCm); logEvent("ESP1","CAL","SAVE|ULTRA_RES"); break;
-    case CK_LEVEL_MIX: calMixEmptyCm = calCap[0]; prefsCal.putFloat("meCm", calMixEmptyCm); logEvent("ESP1","CAL","SAVE|ULTRA_MIX"); break;
+    // Empty capture (the tank drained). Rejected unless it sits clearly beyond the FULL distance -- an
+    // empty "captured" with water in the tank would invert the % and move the overflow stop. Both values
+    // of the pair are saved, under the bumped "2" keys loadCal() reads (see calResEmptyCm).
+    // web v.4: the captured cm is temperature-corrected like every live reading, and the tank litres
+    // geometry follows the new empty mark (its calibration points stay at their sensor distances).
+    case CK_LEVEL_RES: {
+      float cm = ultraCorrectCm(calCap[0]);
+      if (cm - calResFullCm < CAL_LEVEL_MIN_SPAN_CM) return false;
+      calResEmptyCm = cm;
+      prefsCal.putFloat("reCm2", calResEmptyCm); prefsCal.putFloat("rfCm2", calResFullCm);
+      tankVolSyncGeom();
+      snprintf(buf, sizeof(buf), "SAVE|ULTRA_RES|%s/%s", String(calResEmptyCm, 1).c_str(), String(calResFullCm, 1).c_str());
+      logEvent("ESP1", "CAL", buf); break;
+    }
+    case CK_LEVEL_MIX: {
+      float cm = ultraCorrectCm(calCap[0]);
+      if (cm - calMixFullCm < CAL_LEVEL_MIN_SPAN_CM) return false;
+      calMixEmptyCm = cm;
+      prefsCal.putFloat("meCm2", calMixEmptyCm); prefsCal.putFloat("mfCm2", calMixFullCm);
+      tankVolSyncGeom();
+      sendEsp2("SET_CAL,MIXCAP," + String(mixCapLiters(), 2));   // the fill ceiling moved with it
+      snprintf(buf, sizeof(buf), "SAVE|ULTRA_MIX|%s/%s", String(calMixEmptyCm, 1).c_str(), String(calMixFullCm, 1).c_str());
+      logEvent("ESP1", "CAL", buf); break;
+    }
+    // Tank litres point (web v.4): the locked level (volCalLockH) + the litres the operator typed (calVolL).
+    // Refused when the points would not climb with the level (tvAddPoint) -- nothing is saved then.
+    case CK_VOL_MIX: case CK_VOL_RES: {
+      bool mix = (t.kind == CK_VOL_MIX);
+      TankVolCal &tv = mix ? calMixVol : calResVol;
+      if (!tvAddPoint(tv, volCalLockH, calVolL)) return false;
+      tankVolSave(mix);
+      if (mix) sendEsp2("SET_CAL,MIXCAP," + String(mixCapLiters(), 2));
+      snprintf(buf, sizeof(buf), "SAVE|VOL_%s|%scm=%sL|n=%d", mix ? "MIX" : "RES",
+               String(volCalLockCm, 1).c_str(), String(calVolL, 1).c_str(), (int)tv.n);
+      logEvent("ESP1", "CAL", buf);
+      break;
+    }
     case CK_FLOW: {
       // 3-run result (§A.4.1.7): average if the runs agree, median if an outlier remains.
       float a = calKRuns[0], b = calKRuns[1], c = calKRuns[2];
@@ -8983,12 +11692,13 @@ static bool calCommit() {
       float kf = outlier ? med : (a + b + c) / 3.0f;
       if (kf <= 0) break;
       const char *id = t.id;
-      if      (!strcmp(id, "FLOW_RESMIX")) { calKResMix = kf; prefsCal.putFloat("kRM", kf); }
-      else if (!strcmp(id, "FLOW_MIXIRR")) { calKMixIrr = kf; prefsCal.putFloat("kMI", kf); }
-      else if (!strcmp(id, "FLOW_NUTA"))   { calKNut[0] = kf; prefsCal.putFloat("kNA", kf); }
+      if      (!strcmp(id, "FLOW_NUTA"))   { calKNut[0] = kf; prefsCal.putFloat("kNA", kf); }
       else if (!strcmp(id, "FLOW_NUTB"))   { calKNut[1] = kf; prefsCal.putFloat("kNB", kf); }
       else if (!strcmp(id, "FLOW_NUTC"))   { calKNut[2] = kf; prefsCal.putFloat("kNC", kf); }
-      setCalPushBlocking(id, String(kf, 1));
+      else if (!strcmp(id, "FLOW_NUTD"))   { calKNutD   = kf; prefsCal.putFloat("kND", kf); }   // keys loadCal() reads
+      else if (!strcmp(id, "FLOW_PHUP"))   { calKPhUp   = kf; prefsCal.putFloat("kPU", kf); }
+      else if (!strcmp(id, "FLOW_PHDN"))   { calKPhDn   = kf; prefsCal.putFloat("kPD", kf); }
+      setCalPushBlocking(id, String(kf, 1));             // ESP2 ACKs these three as a no-op (it doesn't meter them)
       snprintf(buf, sizeof(buf), "SAVE|%s|K=%d|%s", id, (int)kf, outlier ? "MED" : "AVG3");
       logEvent("ESP1", "CAL", buf);
       break;
@@ -9010,6 +11720,31 @@ static bool calCommit() {
       for (int j = 0; j < 3; j++) calNpkOff[t.col][j] = calNpkEdit[j];
       snprintf(buf, sizeof(buf), "SAVE|NPK_%c|%d/%d/%d", COL_TAG[t.col],
                (int)calNpkEdit[0], (int)calNpkEdit[1], (int)calNpkEdit[2]);
+      logEvent("ESP1", "CAL", buf);
+      break;
+    }
+    case CK_PEST: return false;   // saved by pestSave() (its own screen flow)
+    case CK_RATE: {       // a pump's measured constant rate (2026-11-17); 0 = not measured
+      float v = calVolL;
+      if (rateIsWater(t)) {
+        if (v != 0.0f && !calInRange(v, RATE_LPM_MIN, RATE_LPM_MAX)) return false;
+        const char *key = (t.col == 0) ? "rXfer" : "rBoost";
+        if (t.col == 0) calRateXfer = v; else calRateBoost = v;
+        if (v > 0.0f) prefsCal.putFloat(key, v); else if (prefsCal.isKey(key)) prefsCal.remove(key);
+        calRatePushOk = setCalPushBlocking("PRATE", rateWaterWire());
+      } else {
+        int n = t.col - 2;
+        if (v != 0.0f && !calInRange(v, RATE_MLPM_MIN, RATE_MLPM_MAX)) return false;
+        const char *key = (n == 0) ? "pumpA" : (n == 1) ? "pumpB" : "pumpC";   // the bench tools' keys
+        if (v > 0.0f) { prefsCal.putFloat(key, v); PUMP_FLOWRATE_MLPM[n] = v; pumpRateSet[n] = true; }
+        else {                                        // back to the default for the dose ceiling only
+          if (prefsCal.isKey(key)) prefsCal.remove(key);
+          PUMP_FLOWRATE_MLPM[n] = PUMP_FLOWRATE_DEFAULT_MLPM; pumpRateSet[n] = false;
+        }
+        calRatePushOk = setCalPushBlocking("NRATE", rateNutWire());
+      }
+      snprintf(buf, sizeof(buf), "SAVE|%s|%s%s", t.id, v > 0.0f ? String(v, 2).c_str() : "off",
+               calRatePushOk ? "" : "|ESP2_LATER");
       logEvent("ESP1", "CAL", buf);
       break;
     }
@@ -9036,7 +11771,54 @@ void calButton(int i) {
     return;
   }
   const CalTgt &t = CAL_TGTS[calSel];
+  if (t.kind == CK_PEST) { pestButton(t, i); return; }   // its own steps, BACK included (2026-11-17)
   if (i == 3) { calCloseTarget(); return; }        // BACK = abandon this target (no save)
+
+  // ---- Pump rate (2026-11-17): step 0 type it (UP/DOWN, held = faster; below the minimum = not measured),
+  //      ENTER saves and sends it to ESP2; step 1 = saved. ----
+  if (t.kind == CK_RATE) {
+    if (calStep == 0) {
+      if (i == 0) rateNudge(t, +1, false);
+      else if (i == 1) rateNudge(t, -1, false);
+      else if (i == 2) { if (calCommit()) { calStep = 1; calMsg = ""; } else calMsg = "out of range"; }
+    } else if (i == 2) calCloseTarget();
+    return;
+  }
+
+  // ---- Tank litres (web v.4): step 0 lock the level, 1 type the litres, 2 saved, 3 confirm "clear all" ----
+  if (t.kind == CK_VOL_MIX || t.kind == CK_VOL_RES) {
+    TankVolCal &tv = (t.kind == CK_VOL_MIX) ? calMixVol : calResVol;
+    if (calStep == 0) {                            // UP / DOWN are the hold-to-run pumps here (calHoldTick)
+      if (i != 2) return;
+      float med, lo, hi; bool steady;
+      if (!volCalStats(&med, &lo, &hi, &steady) || millis() - calRxMs >= CAL_STALE_MS) { calMsg = "no reading yet"; return; }
+      if (!steady) { calMsg = "level moving - wait"; return; }
+      float h = tvHeightCm(tv, med);
+      if (h < -TV_ANCHOR_CM || h > tvSpanCm(tv) * TV_OVER_FULL) { calMsg = "outside 0..200 %"; return; }
+      volCalLockCm = med; volCalLockH = h < 0.0f ? 0.0f : h;
+      calVolL = roundf(tvLitersAtH(tv, volCalLockH) * 10.0f) / 10.0f;   // start from the current estimate
+      calStep = 1; calMsg = "";
+      logEvent("ESP1", "CAL", String("LOCK|") + t.id + "|cm=" + String(med, 1) + "|h=" + String(volCalLockH, 1));
+    } else if (calStep == 1) {                     // litres: UP/DOWN 0.1 L (held: faster), ENTER = save
+      if (i == 0) calVolL += VOL_CAL_STEP_L;
+      else if (i == 1) { calVolL -= VOL_CAL_STEP_L; if (calVolL < 0.0f) calVolL = 0.0f; }
+      else if (i == 2) {
+        if (calCommit()) { calStep = 2; calMsg = ""; }
+        else calMsg = "must rise with level";      // e.g. fewer litres than a lower point: re-type
+      }
+    } else if (calStep == 2) {                     // saved: ENTER = add another point, DOWN = clear all
+      if (i == 2) { calStep = 0; calMsg = ""; volCalReset(); }
+      else if (i == 1 && tv.n > 0) { calStep = 3; calMsg = ""; }
+    } else {                                       // confirm clear: ENTER = yes, UP = no
+      if (i == 2) {
+        tvClearPoints(tv); tankVolSave(t.kind == CK_VOL_MIX);
+        if (t.kind == CK_VOL_MIX) sendEsp2("SET_CAL,MIXCAP," + String(mixCapLiters(), 2));
+        logEvent("ESP1", "CAL", String("CLEAR|") + (t.kind == CK_VOL_MIX ? "VOL_MIX" : "VOL_RES"));
+        calStep = 2; calMsg = "points cleared";
+      } else if (i == 0) { calStep = 2; calMsg = ""; }
+    }
+    return;
+  }
 
   if (t.kind == CK_FLOW) {
     if (calStep == 0) {                            // run step: ENTER held = pump (calHoldTick); UP = proceed
@@ -9099,6 +11881,29 @@ void calButton(int i) {
     return;
   }
 
+  if (t.kind == CK_SOIL) {
+    // One probe, two locks (2026-11-16): step 0 = SET 100% WET (probe in water) -> ENTER locks the live raw;
+    // step 1 = SET DRY 0% (dry the probe, watch the raw settle) -> ENTER locks it, checks and saves; step 2 =
+    // saved, showing the probe's live % on its new calibration. ENTER locks the mean of the steadiness window
+    // (the last few streamed readings), not one sample. UP in the dry step goes back to redo the wet lock.
+    if (calStep >= 2) { if (i == 2) calCloseTarget(); return; }        // done screen: ENTER (or BACK) leaves
+    if (i == 0 && calStep == 1) { calStep = 0; calMsg = ""; soilCalReset(); return; }
+    if (i != 2) return;
+    int mean, lo, hi; bool steady;
+    if (!soilCalStats(&mean, &lo, &hi, &steady) || millis() - calRxMs >= CAL_STALE_MS) { calMsg = "no reading yet"; return; }
+    if (mean <= SOIL_ADC_RAIL_LO || mean >= SOIL_ADC_RAIL_HI) { calMsg = "probe not connected"; return; }
+    calCap[calStep] = (float)mean;
+    if (calStep == 0) {
+      calStep = 1; calMsg = ""; soilCalReset();                       // the dry reading starts a fresh window
+      logEvent("ESP1", "CAL", String("LOCK|") + t.id + "|wet=" + mean + (steady ? "" : "|unsteady"));
+    } else if (calCommit()) {
+      calStep = 2; calMsg = "";
+    } else {
+      calMsg = "dry must be > wet+20";                                 // stay in the dry step; UP = redo wet
+    }
+    return;
+  }
+
   if (t.kind == CK_FLOW_RES) {                    // Nano reservoir flow: manual external fill, no pump
     if (calStep == 0) {                            // watch pulses climb during the fill; UP = done
       if (i == 0) {
@@ -9133,30 +11938,95 @@ void calButton(int i) {
 
 // Flow dead-man: while ENTER is physically held in the flow run step, stream PRIME_START as the
 // keep-alive (ESP2 caps locally); release -> PRIME_STOP. Mirrors testHoldTick (sec.18.10.8).
+// Tank litres screen (web v.4). Step 0 on the MIXING tank: hold UP = transfer pump in (Prime RESMIX, with ESP2's
+// overflow stop), hold DOWN = booster out through column A (Prime MIXIRR) -- the same dead-man keep-alive as
+// the flow calibration, so the level can be walked through the points without leaving the screen. Step 1:
+// UP/DOWN held for >0.6 s repeat the 0.1 L step, and after 2.5 s step a whole litre.
+static void volCalHoldTick(const CalTgt &t) {
+  static unsigned long lastHold = 0;
+  static HoldBtn upBtn = { false, 0 }, dnBtn = { false, 0 };
+  bool up = holdBtnRead(upBtn, BTN_UP), dn = holdBtnRead(dnBtn, BTN_DOWN);   // a release only after BTN_RELEASE_MS
+  unsigned long now = millis();
+  if (calStep == 1) {
+    int b = up ? 0 : dn ? 1 : -1;
+    if (b < 0 || (up && dn)) { volCalHeldBtn = -1; return; }
+    if (b != volCalHeldBtn) { volCalHeldBtn = b; volCalHeldSinceMs = now; volCalRepeatMs = now; return; }
+    if (now - volCalHeldSinceMs < 600 || now - volCalRepeatMs < 120) return;
+    volCalRepeatMs = now;
+    float step = (now - volCalHeldSinceMs >= 2500) ? 1.0f : VOL_CAL_STEP_L;
+    calVolL += (b == 0) ? step : -step;
+    if (calVolL < 0.0f) calVolL = 0.0f;
+    if (calVolL > TV_L_MAX) calVolL = TV_L_MAX;
+    return;
+  }
+  volCalHeldBtn = -1;
+  if (t.kind != CK_VOL_MIX || calStep != 0) {
+    if (volCalPumpWasOn) { sendEsp2("PRIME_STOP,RESMIX"); sendEsp2("PRIME_STOP,MIXIRR"); volCalPumpWasOn = false; }
+    return;
+  }
+  static bool volWasHeld = false, volTooSoon = false;
+  if (up != dn && !volWasHeld) {                   // press edge: too soon after the last run -> ignore this press
+    volTooSoon = actRearmWaiting();
+    if (volTooSoon) calMsg = "Too fast: wait 1.5s";
+  }
+  volWasHeld = (up != dn);
+  if (up != dn && volTooSoon) return;              // release and press again
+  if (up == dn) volTooSoon = false;
+  if (up != dn) {                                  // exactly one held
+    if (now - lastHold >= 150) {
+      lastHold = now;
+      if (actuationsDisabled)      calMsg = "Actuations off";
+      else if (secBattBlocksAc())  calMsg = secBlockLcd();
+      else {
+        sendEsp2KeepAlive(up ? "PRIME_START,RESMIX" : "PRIME_START,MIXIRR,A", !volCalPumpWasOn);
+        volCalPumpWasOn = true;
+        volCalReset();                             // the level is moving: the lock window starts again
+      }
+    }
+  } else if (volCalPumpWasOn) {
+    sendEsp2("PRIME_STOP,RESMIX"); sendEsp2("PRIME_STOP,MIXIRR");
+    volCalPumpWasOn = false;
+    actRearmStart();                               // the next press waits ACT_REARM_MS
+    volCalReset();
+  }
+}
+
 void calHoldTick() {
   if (uiMode != UI_CAL || !calOpen) { calEnterWasDown = false; return; }
   const CalTgt &t = CAL_TGTS[calSel];
+  if (t.kind == CK_VOL_MIX || t.kind == CK_VOL_RES) { calEnterWasDown = false; volCalHoldTick(t); return; }
+  if (t.kind == CK_RATE) { calEnterWasDown = false; rateHoldTick(t); return; }
+  if (t.kind == CK_PEST) { calEnterWasDown = false; pestHoldTick(t); return; }
   if (t.kind != CK_FLOW || calStep != 0) { calEnterWasDown = false; return; }
   static unsigned long lastHold = 0;
+  static bool primeTooSoon = false;
   int col; const char *ln = calPrimeLine(t.id, &col);
-  bool down = (digitalRead(BTN_ENTER) == LOW);
+  static HoldBtn primeBtn = { false, 0 };
+  static bool primeLogged = false;                           // this hold's first keep-alive went into the log
+  bool down = holdBtnRead(primeBtn, BTN_ENTER);              // a release only after BTN_RELEASE_MS up
   if (down) {
-    if (millis() - lastHold >= 150) {
+    if (!calEnterWasDown) {                        // press edge: too soon after the last prime -> ignore this press
+      primeTooSoon = actRearmWaiting();
+      if (primeTooSoon) calMsg = "Too fast: wait 1.5s";
+    }
+    if (!primeTooSoon && millis() - lastHold >= 150) {
       lastHold = millis();
       bool acLine = !strcmp(ln, "RESMIX") || !strcmp(ln, "MIXIRR");   // transfer / booster = inverter
       if (actuationsDisabled) {
         calMsg = "Actuations off";
       } else if (acLine && secBattBlocksAc()) {
-        calMsg = "BATT2 low: no prime";
+        calMsg = secBlockLcd();
       } else {
         String c = String("PRIME_START,") + ln;
         if (col >= 0) c += String(",") + COL_TAG[col];
-        sendEsp2(c);
+        sendEsp2KeepAlive(c, !primeLogged);
+        primeLogged = true;
       }
     }
     calEnterWasDown = true;
   } else if (calEnterWasDown) {
-    sendEsp2(String("PRIME_STOP,") + ln);
+    if (!primeTooSoon) { sendEsp2(String("PRIME_STOP,") + ln); actRearmStart(); }
+    primeTooSoon = false; primeLogged = false;
     calEnterWasDown = false;
   }
 }
@@ -9176,7 +12046,81 @@ void lcdRenderCal() {
   }
   const CalTgt &t = CAL_TGTS[calSel];
   bool fresh = calRxValid && (millis() - calRxMs < CAL_STALE_MS);
+  if (t.kind == CK_PEST) { pestRender(t); return; }       // its own title row (2026-11-17)
   lcd.setCursor(0, 0); snprintf(l, 21, "CAL %-16s", t.name); lcd.print(l);
+  if (t.kind == CK_RATE) {                                  // pump rate (2026-11-17)
+    bool w = rateIsWater(t);
+    const char *u = w ? "L/min" : "mL/min";
+    char v[16];
+    if (calStep == 0) {
+      lcd.setCursor(0, 1);
+      if (calVolL > 0.0f) { snprintf(v, sizeof(v), w ? "%.2f" : "%.1f", calVolL); snprintf(l, 21, "set: %8s %-6s", v, u); }
+      else snprintf(l, 21, "set: not measured   ");
+      lcd.print(l);
+      // What the last run really saw (INFO,PUMP_RATE from ESP2): the levels for water, the flow meter for a dose.
+      lcd.setCursor(0, 2);
+      float seen = rateSeen[t.col];
+      if (seen > 0.0f) { snprintf(v, sizeof(v), w ? "%.2f" : "%.1f", seen); snprintf(l, 21, "seen:%8s %-6s", v, u); }
+      else snprintf(l, 21, "seen: no run yet    ");
+      lcd.print(l);
+      lcd.setCursor(0, 3);
+      if (calMsg.length()) { snprintf(l, 21, "%-20s", calMsg.c_str()); lcd.print(l); }
+      else lcd.print("UP/DN ENT=save BACK ");
+    } else {
+      lcd.setCursor(0, 1);
+      if (calVolL > 0.0f) { snprintf(v, sizeof(v), w ? "%.2f" : "%.1f", calVolL); snprintf(l, 21, "SAVED %7s %-6s", v, u); }
+      else snprintf(l, 21, "SAVED: not measured ");
+      lcd.print(l);
+      lcd.setCursor(0, 2); lcd.print(calRatePushOk ? "ESP2 has it         " : "ESP2: at next start ");
+      lcd.setCursor(0, 3); lcd.print("ENT/BACK = done     ");
+    }
+    return;
+  }
+  if (t.kind == CK_VOL_MIX || t.kind == CK_VOL_RES) {       // tank litres (web v.4)
+    bool mix = (t.kind == CK_VOL_MIX);
+    const TankVolCal &tv = mix ? calMixVol : calResVol;
+    float med = 0, lo = 0, hi = 0; bool steady = false;
+    bool have = volCalStats(&med, &lo, &hi, &steady) && fresh;
+    float span = tvSpanCm(tv);
+    if (calStep == 0) {
+      // "41.2cm 9% ~1.5L" / "STEADY pts 2/8" -- the level now, its % and the litres the curve gives it.
+      if (have) {
+        float h = tvHeightCm(tv, med);
+        int pct = (span > 0.0f) ? (int)roundf(h * 100.0f / span) : 0;
+        snprintf(l, 21, "%5scm %3d%% ~%sL      ", String(med, 1).c_str(), pct, String(tvLitersAtH(tv, h), 1).c_str());
+      } else snprintf(l, 21, "level --  waiting    ");
+      lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "%-7s pts %d/%d      ", have ? (steady ? "STEADY" : "moving") : "", (int)tv.n, (int)TV_MAX_PTS);
+      lcd.setCursor(0, 2); lcd.print(l);
+      lcd.setCursor(0, 3);
+      if (calMsg.length()) { snprintf(l, 21, "%-20s", calMsg.c_str()); lcd.print(l); }
+      else lcd.print(mix ? "ENT=lock UP/DN=pump " : "ENT=lock  BACK=done ");
+    } else if (calStep == 1) {
+      snprintf(l, 21, "at %scm h%scm     ", String(volCalLockCm, 1).c_str(), String(volCalLockH, 1).c_str());
+      lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "litres: %-7s     ", String(calVolL, 1).c_str());
+      lcd.setCursor(0, 2); lcd.print(l);
+      lcd.setCursor(0, 3);
+      if (calMsg.length()) { snprintf(l, 21, "%-20s", calMsg.c_str()); lcd.print(l); }
+      else lcd.print("UP/DN L  ENT=save   ");
+    } else if (calStep == 2) {
+      snprintf(l, 21, "SAVED  pts %d/%d      ", (int)tv.n, (int)TV_MAX_PTS);
+      lcd.setCursor(0, 1); lcd.print(l);
+      { char t[32];                                        // "full=18.5L 90%=16.2L": 20 (it was 21, the last L cut off)
+        snprintf(t, sizeof(t), "full=%sL %d%%=%sL", String(tvLitersAtPct(tv, 100.0f), 1).c_str(),
+                 (int)MIX_HIGH_PCT, String(tvLitersAtPct(tv, MIX_HIGH_PCT), 1).c_str());
+        snprintf(l, 21, "%-20s", t); }
+      lcd.setCursor(0, 2); lcd.print(l);
+      lcd.setCursor(0, 3);
+      if (calMsg.length()) { snprintf(l, 21, "%-20s", calMsg.c_str()); lcd.print(l); }
+      else lcd.print("ENT=add DN=clr BACK ");
+    } else {
+      snprintf(l, 21, "Clear all %d points?", (int)tv.n); lcd.setCursor(0, 1); lcd.print(l);
+      lcd.setCursor(0, 2); lcd.print("(cone shape only)   ");
+      lcd.setCursor(0, 3); lcd.print("ENT=yes  UP=no      ");
+    }
+    return;
+  }
   if (t.kind == CK_FLOW) {
     if (calStep == 0) {
       lcd.setCursor(0, 1); snprintf(l, 21, "Run %d/3 hold ENTER  ", calRunIdx + 1); lcd.print(l);
@@ -9220,6 +12164,28 @@ void lcdRenderCal() {
       lcd.setCursor(0, 2); snprintf(l, 21, "N%d P%d K%d        ", (int)calNpkEdit[0], (int)calNpkEdit[1], (int)calNpkEdit[2]); lcd.print(l);
       lcd.setCursor(0, 3); lcd.print("UP/DN  ENT=next/save");
     }
+    return;
+  }
+  if (t.kind == CK_SOIL) {                          // one capacitive probe: WET lock, then DRY lock
+    int p = calSoilProbe(t);
+    int mean = 0, lo = 0, hi = 0; bool steady = false;
+    bool have = soilCalStats(&mean, &lo, &hi, &steady) && fresh;
+    if (calStep >= 2) {                             // saved: show the result and the live % on it
+      lcd.setCursor(0, 1); snprintf(l, 21, "SAVED W%4d D%4d   ", calProbeWet[t.col][p], calProbeDry[t.col][p]); lcd.print(l);
+      lcd.setCursor(0, 2);
+      if (have) { snprintf(l, 21, "raw %4d = %3d%%     ", mean, soilPctCal(mean, calProbeDry[t.col][p], calProbeWet[t.col][p])); lcd.print(l); }
+      else lcd.print("raw   --            ");
+      lcd.setCursor(0, 3); lcd.print("ENT/BACK = done     ");
+      return;
+    }
+    lcd.setCursor(0, 1); lcd.print(calStep == 0 ? "SET 100% WET: water " : "SET DRY 0%: dry it  ");
+    lcd.setCursor(0, 2);
+    if (!have) lcd.print("raw   --  waiting   ");
+    else if (calStep == 0) { snprintf(l, 21, "raw%4d %-6s +-%-3d", mean, steady ? "STEADY" : "moving", (hi - lo + 1) / 2); lcd.print(l); }
+    else { snprintf(l, 21, "raw%4d %-6s W%-4d", mean, steady ? "STEADY" : "moving", (int)calCap[0]); lcd.print(l); }
+    lcd.setCursor(0, 3);
+    if (calMsg.length()) { snprintf(l, 21, "%-20s", calMsg.c_str()); lcd.print(l); }
+    else lcd.print(calStep == 0 ? "ENT=lock WET BACK=x " : "ENT=lock DRY UP=wet ");
     return;
   }
   if (t.kind == CK_FLOW_RES) {                      // Nano reservoir flow: manual fill (no pump)
@@ -9351,6 +12317,8 @@ void diagButton(int i) {
 }
 
 // Liveness flag from freshness + validity. Short (<=4 chars) so it right-fits a 20-col line.
+// Sensor Diag tank rows: ' ' = usable for control; the Nano's status letter when it gave a reason; '!' otherwise.
+static char diagUsChar(bool ok, char st) { if (ok) return ' '; return (st == '?' || st == 'K') ? '!' : st; }
 static const char *diagNanoFlag(unsigned long ms, bool valid) {
   if (ms == 0) return "n/a";                        // never received this sensor
   if (millis() - ms > NANO_STALE_MS) return "OLD";  // link/sensor stopped updating
@@ -9375,11 +12343,25 @@ void lcdRenderDiag() {
       snprintf(l, 21, "%-6s%-9s%5s", "Humid", String(sensor.rawHum, 1).c_str(), diagNanoFlag(sensor.msEnv, sensor.envValid));   lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "%-6s%-9s%5s", "Lux", String(sensor.rawLux, 0).c_str(), diagNanoFlag(sensor.msLight, sensor.lightValid)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 1:   // Nano: ultrasonic tanks + reservoir flow (raw)
+    case 1:   // Nano: ultrasonic tanks (raw cm, litres, median spread) + reservoir flow (raw)
       snprintf(l, 21, "%-8s Nano Tank", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
-      snprintf(l, 21, "%-7scm:%-6s%4s", "Res", String(sensor.rawResCm, 0).c_str(), diagNanoFlag(sensor.msTank, sensor.tankValid)); lcd.setCursor(0, 1); lcd.print(l);
-      snprintf(l, 21, "%-7scm:%-6s%4s", "Mix", String(sensor.rawMixCm, 0).c_str(), diagNanoFlag(sensor.msTank, sensor.tankValid)); lcd.setCursor(0, 2); lcd.print(l);
-      snprintf(l, 21, "%-7sLpm:%-5s%4s", "Flow", String(sensor.rawFlow, 1).c_str(), diagNanoFlag(sensor.msTank, true));            lcd.setCursor(0, 3); lcd.print(l);
+      // "R 31.2  12.4L s0.3" -- raw cm, litres from the tank calibration, the Nano's 5-ping spread (cm);
+      // a trailing '!' = not usable for control (no echo, too noisy, or outside the tank).
+      // The last character: ' ' = usable; else the Nano's reason (E no echo, R out of range, F few pings, S echo
+      // stuck, X no pings) or '!' (ESP1 refused it: too scattered, outside the tank, no geometry).
+      snprintf(l, 21, "R%5s %5sL s%-3s%c", String(sensor.rawResCm, 1).c_str(),
+               sensor.resL >= 0 ? String(sensor.resL, 1).c_str() : "--",
+               sensor.resSpreadCm >= 0 ? String(sensor.resSpreadCm, 1).c_str() : "-", diagUsChar(sensor.resOk, sensor.resSt));
+      lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "M%5s %5sL s%-3s%c", String(sensor.rawMixCm, 1).c_str(),
+               sensor.mixL >= 0 ? String(sensor.mixL, 1).c_str() : "--",
+               sensor.mixSpreadCm >= 0 ? String(sensor.mixSpreadCm, 1).c_str() : "-", diagUsChar(sensor.mixOk, sensor.mixSt));
+      lcd.setCursor(0, 2); lcd.print(l);
+      // Flow (raw L/min), the TANK link (% of the Nano's frames that arrived lately), freshness.
+      { int q = tankLinkPct();
+        snprintf(l, 21, "Flw%5s Lk%-4s%5s", String(sensor.rawFlow, 1).c_str(), q >= 0 ? (String(q) + "%").c_str() : "--",
+                 diagNanoFlag(sensor.msTank, true)); }
+      lcd.setCursor(0, 3); lcd.print(l);
       break;
     case 2: {  // Nano: per-probe capacitive soil raw ADC (A1/A2 B1/B2 C1/C2) from the normal SOIL packet
       snprintf(l, 21, "%-8s Soil ch", hdr);                               lcd.setCursor(0, 0); lcd.print(l);
@@ -9417,7 +12399,7 @@ void lcdRenderDiag() {
       if (!COLUMN_ENABLED[c]) { lcdRow(1, "column disabled"); lcdRow(2, ""); lcdRow(3, ""); break; }
       snprintf(l, 21, "M%5.1f%%  T%5.1fC", sensor.npk[c][0], sensor.npk[c][1]);  lcdRow(1, l);
       snprintf(l, 21, "EC%-7.2f pH%4.1f", sensor.npk[c][2], sensor.npk[c][3]);   lcdRow(2, l);
-      snprintf(l, 21, "N%-4d P%-4d K%-4d%4s", (int)sensor.npk[c][4], (int)sensor.npk[c][5],
+      snprintf(l, 21, "N%-4d P%-4d K%-4d%3s", (int)sensor.npk[c][4], (int)sensor.npk[c][5],   // 20 cols (was 21)
                (int)sensor.npk[c][6], diagNanoFlag(sensor.msNpk[c], sensor.npkValid[c]));
       lcdRow(3, l);
       break;
@@ -9443,17 +12425,17 @@ void lcdRenderDiag() {
       snprintf(l, 21, "Iac:%-8s%5s", String(diagEsp2Raw[4], 2).c_str(), diagEsp2Flag(4)); lcd.setCursor(0, 2); lcd.print(l);
       snprintf(l, 21, "Pw :%-8s%5s", String(diagEsp2Raw[5], 0).c_str(), diagEsp2Flag(5)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    case 10:   // ESP2 flow (1/2): RESMIX / MIXIRR / NUT A  (pulse counts)
+    case 10:   // ESP2 dosing flow (1/2): NUT A / B / C (pulse counts). web v.4: no RESMIX / MIXIRR meters.
       snprintf(l, 21, "%-8s ESP2 Flw1", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "RESMIX", (long)diagEsp2Raw[6], diagEsp2Flag(6)); lcd.setCursor(0, 1); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "MIXIRR", (long)diagEsp2Raw[7], diagEsp2Flag(7)); lcd.setCursor(0, 2); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT A",  (long)diagEsp2Raw[8], diagEsp2Flag(8)); lcd.setCursor(0, 3); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT A", (long)diagEsp2Raw[6], diagEsp2Flag(6)); lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT B", (long)diagEsp2Raw[7], diagEsp2Flag(7)); lcd.setCursor(0, 2); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT C", (long)diagEsp2Raw[8], diagEsp2Flag(8)); lcd.setCursor(0, 3); lcd.print(l);
       break;
-    default:  // case 11: ESP2 flow (2/2): NUT B / NUT C
+    default:  // case 11: ESP2 dosing flow (2/2): NUT D / pH up / pH down
       snprintf(l, 21, "%-8s ESP2 Flw2", hdr);                             lcd.setCursor(0, 0); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT B", (long)diagEsp2Raw[9],  diagEsp2Flag(9));  lcd.setCursor(0, 1); lcd.print(l);
-      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT C", (long)diagEsp2Raw[10], diagEsp2Flag(10)); lcd.setCursor(0, 2); lcd.print(l);
-      snprintf(l, 21, "UP/DN=page BACK=out"); lcd.setCursor(0, 3); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "NUT D", (long)diagEsp2Raw[9],  diagEsp2Flag(9));  lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "PH UP", (long)diagEsp2Raw[10], diagEsp2Flag(10)); lcd.setCursor(0, 2); lcd.print(l);
+      snprintf(l, 21, "%-7s p%-7ld%4s", "PH DN", (long)diagEsp2Raw[11], diagEsp2Flag(11)); lcd.setCursor(0, 3); lcd.print(l);
       break;
   }
 }
@@ -9517,6 +12499,7 @@ void handleButtons() {
       if (!unlockLatch) {
         unlockLatch = true;
         lcdLocked = false; saveLock(); wakeBacklight();
+        fbRequestPush();                                          // the website unlocks with it (2026-11-05)
         logEvent("ESP1", "STATE", "LCD_UNLOCK");
       }
       for (int i = 0; i < 5; i++) last[i] = digitalRead(pins[i]); // don't replay edges after unlock
@@ -9714,6 +12697,19 @@ void sendEsp2(const String &body) {
   esp2Serial.print(","); esp2Serial.println(FRAME_END);
   logEvent("ESP1", "CMD", "ESP2|" + body);
 }
+// Same frame, no log row: for high-rate traffic (LEVEL, ~3 per second while a pump runs) that would
+// otherwise put hundreds of ESP1,CMD rows into the SD log and the Supabase upload per run.
+void sendEsp2Quiet(const String &body) {
+  esp2Serial.print(FRAME_START); esp2Serial.print(",");
+  esp2Serial.print(body);
+  esp2Serial.print(","); esp2Serial.println(FRAME_END);
+}
+// A hold's keep-alive (TEST,HOLD / PRIME_START every 150 ms): only the first of a hold goes into the log. The 17 Nov log
+// had 3619 TEST;HOLD and 779 PRIME_START rows -- ~6 SD writes a second while a button was held, which also slowed the
+// very loop that sends them.
+void sendEsp2KeepAlive(const String &body, bool first) {
+  if (first) sendEsp2(body); else sendEsp2Quiet(body);
+}
 
 // Derive the 3-state column mode (0=AUTO,1=IRRIGATION_ONLY,2=OFF) for the editor.
 static int colMode3(int c) { return !COLUMN_ENABLED[c] ? 2 : (col[c].mode == MODE_AUTO ? 0 : 1); }
@@ -9727,7 +12723,9 @@ static bool testRowVisible(int r) {
 static String testRowName(int r) {
   if (r < 16) return TEST_NAMES[r];
   if (r == TEST_FILL_ROW) return "Fill Res>Mix";
-  if (r >= TEST_ROWS) return "Mixer+Inverter";       // row 20: dashboard only, not on the LCD list
+  if (r >= TEST_ROWS) return "Mixer (DC)";           // row 22: dashboard only, not on the LCD list
+  if (r == TEST_SERVO_L_ROW) return "Servo>Transfer";   // selector only, inverter stays off
+  if (r == TEST_SERVO_R_ROW) return "Servo>Booster";
   return String("Push>Col ") + COL_TAG[r - (TEST_FILL_ROW + 1)];
 }
 
@@ -9778,9 +12776,14 @@ void commitEditor() {
       saveExercise();
       break;
     case SET_THRESH:
-      if (editTmp[1] <= editTmp[0]) editTmp[1] = clampi(editTmp[0] + 1, 0, 100);   // stop > start
-      soilStartPct = editTmp[0]; soilStopPct = editTmp[1]; fertGap = editTmp[2]; saveThresholds();
+      soilStartPct = editTmp[0]; fertGap = editTmp[1]; saveThresholds();
       logEvent("ESP1", "STATE", "THRESH_SET");
+      break;
+    case SET_ACVOLT:
+      setAcVoltWindow(editTmp[0], editTmp[1], "ESP1");    // saves, sends to ESP2 if on, logs old -> new
+      break;
+    case SET_ACAMP:                                       // editTmp[0] = max (overcurrent), [1] = min
+      setAcAmpWindow(editTmp[1], editTmp[0], "ESP1");     // saves, sends to ESP2 if on, logs old -> new
       break;
     case SET_FORCE:
       // Race fix: refuse to clobber an already-armed/running Force Run (web-armed or LCD-armed) --
@@ -9805,6 +12808,15 @@ void commitEditor() {
           uiMode = UI_DATA; lcdPage = PAGE_HOME; wakeBacklight();
           break;
         } }
+      // A column that is OFF (e.g. "Turn OFF column" in the cancel menu) is switched back ON (2026-11-17). The
+      // operator picked it here by name, and the editor said so before ENTER ("Col A OFF, ARM=ON"). Before, the
+      // run was armed, counted down, and was then dropped as COL_DISABLED -- and the column stayed off for the schedule.
+      { uint8_t want = fcModeColumns(fcMode);
+        for (int b = 0; b < NUM_COLUMNS; b++)
+          if ((want & (1 << b)) && !COLUMN_ENABLED[b]) {
+            COLUMN_ENABLED[b] = true; saveColEnable(b);
+            logEvent("ESP1", "ACT", String("FORCE|COL_ON|COL_") + COL_TAG[b]);
+          } }
       // ARM, don't run. forceTick() fires it after the countdown and re-checks safety THEN, because
       // conditions can change during a delay of up to 5 minutes. Return to UI_DATA so automation
       // (and the fire check, which requires uiMode == UI_DATA) is live while the clock runs.
@@ -9826,7 +12838,8 @@ void commitEditor() {
 // Restore operational config to compiled defaults (companion spec §C). Resets automation settings;
 // KEEPS calibration (separate NVS namespace), column-enable flags (physical wiring), and WiFi/TS
 // connectivity setup. Idle-only; no reboot. EC/pH safe windows are compile constants (not in NVS,
-// re-sent each work order), so there is nothing stale to ACK-push here.
+// re-sent each work order), so there is nothing stale to ACK-push here. The AC supply window (PZEM) is
+// reset too; ESP2 is off while idle and gets it from its next READY.
 void restoreDefaults() {
   for (int c = 0; c < NUM_COLUMNS; c++) {
     col[c].mode = MODE_AUTO;
@@ -9834,14 +12847,20 @@ void restoreDefaults() {
     col[c].name[0] = '\0';
     colSchedMode[c] = SCHED_AUTO;
     COL_WIN_START[c] = DEF_WIN_START[c]; COL_WIN_END[c] = DEF_WIN_END[c];
+    // One watering a day again, and the later windows back to their compiled values (2026-11-05).
+    static const uint16_t EXTRA_DEF[MAX_RUNS_PER_DAY - 1][2] = { { 12*60, 13*60 }, { 16*60, 17*60 }, { 18*60, 19*60 } };
+    colRuns[c] = 1;
+    for (int x = 0; x < MAX_RUNS_PER_DAY - 1; x++) { COL_EXTRA_START[c][x] = EXTRA_DEF[x][0]; COL_EXTRA_END[c][x] = EXTRA_DEF[x][1]; }
     saveColumn(c); saveSchedule(c);
   }
   // Audit fix (2026-09-10): restoreDefaults() is documented as "reset to compiled defaults" -- this
   // was hardcoding 20.0f while the actual compiled global default (line 134, FERTIGATE_TRIGGER_GAP)
-  // is 30.0f. soilStartPct/soilStopPct here already match their own compiled defaults; fertGap was
-  // the one silent outlier, making Restore Defaults leave a materially more aggressive fertigation
-  // trigger than the function's own contract promises.
-  soilStartPct = 35; soilStopPct = 45; fertGap = 30.0f; saveThresholds();
+  // is 30.0f. soilStartPct here already matches its own compiled default; fertGap was the one silent
+  // outlier, making Restore Defaults leave a materially more aggressive fertigation trigger than the
+  // function's own contract promises.
+  soilStartPct = 35; fertGap = 30.0f; saveThresholds();
+  setAcVoltWindow(AC_V_DEFAULT_LOW, AC_V_DEFAULT_HIGH, "ESP1");   // AC supply window back to 215-240 V
+  setAcAmpWindow(AC_A_DEFAULT_MIN, AC_A_DEFAULT_MAX, "ESP1");     // AC current limits back to 0.5 / 3.0 A
   logEvent("ESP1", "RESET", "CONFIG|DEFAULTS|kept cal+cols+wifi");
 }
 
@@ -9862,7 +12881,9 @@ void enterEditor(int item) {
       editTmp[2] = (int)col[0].targetN; editTmp[3] = (int)col[0].targetP;
       editTmp[4] = (int)col[0].targetK; editTmp[5] = (int)(col[0].targetPH * 10);
       break;
-    case SET_THRESH:   editTmp[0] = soilStartPct; editTmp[1] = soilStopPct; editTmp[2] = (int)fertGap; break;
+    case SET_THRESH:   editTmp[0] = soilStartPct; editTmp[1] = (int)fertGap; break;
+    case SET_ACVOLT:   editTmp[0] = acVMin; editTmp[1] = acVMax; break;
+    case SET_ACAMP:    editTmp[0] = acAMax10; editTmp[1] = acAMin10; break;   // overcurrent first
     case SET_EXERCISE: editTmp[0] = exerciseEnabled ? 1 : 0; editTmp[1] = exerciseRunS; break;
   }
   uiMode = UI_EDIT;
@@ -9913,6 +12934,7 @@ void settingsButton(int i) {
       }
       else if (setSel == SET_LOCK) {                            // lock the LCD (Part D)
         lcdLocked = true; saveLock();
+        fbRequestPush();                                       // the website locks with it (2026-11-05)
         logEvent("ESP1", "STATE", "LCD_LOCK");
         uiMode = UI_DATA;                                      // back to data view (automation unaffected)
       }
@@ -9937,6 +12959,11 @@ void settingsButton(int i) {
         if (sysState != IDLE_STATE || !bswLatched) return;      // idle-only; nothing to clear otherwise
         bswClear("LCD");
       }
+      else if (setSel == SET_TANKCHK) {                         // the operator has looked at the mixing tank
+        if (sysState != IDLE_STATE) return;                     // idle-only, like clearing the switch fault
+        tankCheckClear("LCD");
+        uiMode = UI_DATA; setSel = setRowAt(0);                 // this row has just disappeared
+      }
       else if (setSel == SET_WIFI) {                            // toggle STA WiFi + telemetry (persisted)
         wifiEnabled = !wifiEnabled; saveWifiEn();
         logEvent("ESP1", "CMD", wifiEnabled ? "WIFI|ON" : "WIFI|OFF");   // netTask gate acts next iteration
@@ -9957,7 +12984,8 @@ void settingsButton(int i) {
         if (sysState != IDLE_STATE) return;
         restoreConfirm = true; restoreSel = 0;                  // default cursor = NO
       }
-      else if (setSel == SET_RESET) {                            // manual ESP1 reboot: double-confirm (anytime)
+      else if (setSel == SET_RESET) {                            // manual ESP1 reboot: double-confirm
+        if (rebootBusyReason()) return;                          // the row reads [BUSY]; loop() refuses too
         resetConfirm = true; resetSel = 0;                       // default cursor = NO
       }
       else enterEditor(setSel);
@@ -10056,6 +13084,13 @@ void settingsButton(int i) {
                 editTmp[1] = s / 60; editTmp[2] = s % 60;
               }
             }
+            // Several windows a day (2026-11-05): window 1, the one edited here, stays clear of window 2, which
+            // is set on the website. Same real-time correction as above, so an overlap can never be committed.
+            if (editTmp[0] == SCHED_MANUAL && colRuns[editCol] > 1) {
+              int limit = COL_EXTRA_START[editCol][0] - 1;     // the last minute window 1 may reach
+              if (editTmp[3] * 60 + editTmp[4] > limit) { editTmp[3] = limit / 60; editTmp[4] = limit % 60; }
+              if (editTmp[1] * 60 + editTmp[2] >= limit) { int s = limit - 1; editTmp[1] = s / 60; editTmp[2] = s % 60; }
+            }
           }
         } else if (i == 2) {
           int lastField = (editTmp[0] == SCHED_MANUAL) ? 5 : 1;
@@ -10129,10 +13164,28 @@ void settingsButton(int i) {
       case SET_THRESH:
         if (delta) {
           if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, 0, 100);
-          else if (editField == 1) editTmp[1] = clampi(editTmp[1] + delta, 0, 100);
-          else if (editField == 2) editTmp[2] = clampi(editTmp[2] + delta, 0, 500);
+          else if (editField == 1) editTmp[1] = clampi(editTmp[1] + delta, 0, 500);
         } else if (i == 2) {
-          if (++editField > 2) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
+          if (++editField > 1) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
+        }
+        break;
+      case SET_ACVOLT:
+        // 1 V a press. Each limit stops AC_V_MIN_GAP short of the other, so the pair is always valid.
+        if (delta) {
+          if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, AC_V_LIMIT_LOW, editTmp[1] - AC_V_MIN_GAP);
+          else                editTmp[1] = clampi(editTmp[1] + delta, editTmp[0] + AC_V_MIN_GAP, AC_V_LIMIT_HIGH);
+        } else if (i == 2) {
+          if (++editField > 1) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
+        }
+        break;
+      case SET_ACAMP:
+        // 0.1 A a press. field 0 = overcurrent (max), field 1 = no-current (min); each stops AC_A_MIN_GAP
+        // short of the other, so the pair is always valid.
+        if (delta) {
+          if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, editTmp[1] + AC_A_MIN_GAP, AC_A_LIMIT_HIGH);
+          else                editTmp[1] = clampi(editTmp[1] + delta, AC_A_LIMIT_LOW, editTmp[0] - AC_A_MIN_GAP);
+        } else if (i == 2) {
+          if (++editField > 1) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
         break;
     }
@@ -10167,8 +13220,11 @@ static void pulseFinish(bool ok, const char *why) {
   int  row = puRow;
   bool sawFlow = puFlowSeen;
   unsigned long pulses = puFlowPulses;
+  bool sawLevel = puLevelSeen;
+  float levelL = puLevelL;
   bool wasHold = puHoldMode;
   puPhase = PU_NONE; puRow = -1; puFlowSeen = false; puFlowPulses = 0; puHoldMode = false;
+  puLevelSeen = false; puLevelL = 0.0f;
   if (wasHold) testHoldLatched = true;     // no re-arm until the page sends want:false (see its declaration)
   esp2SetPower(false);
   if (sysState == TEST_MODE) setState(IDLE_STATE);
@@ -10179,7 +13235,29 @@ static void pulseFinish(bool ok, const char *why) {
    * dosing pumps deliver ~12 mL in a 15 s test and "0.01 L" tells you nothing. */
   String detail = why;
   float k = pulseKForRow(row);
-  if (ok) {
+  bool servoRow = (row == TEST_SERVO_L_ROW || row == TEST_SERVO_R_ROW);
+  bool servoMissed = false;                // a servo move that was not confirmed answers "failed", not "completed"
+  if (ok && servoRow) {
+    // A servo row moves the pump selector only (inverter off): the answer is whether the Nano confirmed it. It
+    // replaces "pulse complete" so it fits the 47 characters of the website's reply field (2026-11-16: the old
+    // "pulse complete; SERVO OK - selector moved to the TRANSFER side" arrived cut off before the side's name).
+    if (testServoDoneRow == row) {
+      detail = String("SERVO OK: selector on the ") + (row == TEST_SERVO_L_ROW ? "TRANSFER" : "BOOSTER") + " side";
+    } else {
+      servoMissed = true;
+      detail = puServoFailWhy[0] ? String("SERVO FAIL: ") + puServoFailWhy
+                                 : String("SERVO NOT CONFIRMED: check the Nano and servo");
+    }
+  } else if (ok && row >= TEST_FILL_ROW && row <= TEST_FILL_ROW + NUM_COLUMNS) {
+    // Fill / Push combo (web v.4): the mixing-tank ultrasonic answers. Fill should raise it, Push lower it.
+    bool fill = (row == TEST_FILL_ROW);
+    if (!sawLevel || levelL <= -98.0f) detail += "; no tank level to compare";
+    else {
+      float moved = fill ? levelL : -levelL;
+      detail += (moved >= 0.3f) ? ("; LEVEL OK " + String(fill ? "+" : "-") + String(fabsf(levelL), 2) + " L")
+                                : ("; NO LEVEL CHANGE (" + String(levelL, 2) + " L)");
+    }
+  } else if (ok) {
     if (k <= 0.0f) {
       detail += "; no flow sensor on this output";
     } else if (!sawFlow) {
@@ -10193,7 +13271,7 @@ static void pulseFinish(bool ok, const char *why) {
   }
   logEvent("ESP1", "ACT", String(wasHold ? "TESTHOLD|" : "PULSE|") + (ok ? "DONE|" : "ABORT|") + detail);
   if (puCmdId[0]) {
-    firebaseQueueStatus(puCmdId, ok ? "completed" : "failed", detail.c_str());
+    firebaseQueueStatus(puCmdId, (ok && !servoMissed) ? "completed" : "failed", detail.c_str());
     puCmdId[0] = '\0';
   }
 }
@@ -10225,7 +13303,7 @@ void pulseTick() {
         esp2TestArmed = false; testArmPending = false; testArmTries = 0; lastTestArmMs = 0;
         esp2WarmupMs = millis();
         puArmMs = millis();
-        puPhase = PU_ARM;
+        puPhase = PU_ARM; testServoDoneRow = -1; puServoFailWhy[0] = '\0';
         setState(TEST_MODE);
         logEvent("FIREBASE", "CMD", String("TESTHOLD|START|") + testHoldReqBit);
       }
@@ -10253,6 +13331,11 @@ void pulseTick() {
         logEvent("ESP1", "ACT", String("TESTHOLD|RUN|") + testRowName(puRow));
       } else {
         puEndMs = millis() + (unsigned long)puSeconds * 1000UL;
+        puInvOnSeen = false;
+        // Fill/Push combos (2026-11-16): the pump only runs after the battery switch, AC dead wait, servo pre-seat and
+        // inverter confirm. PUMP,ON restarts the seconds; until then this is the budget, so a 5 s test no longer ends
+        // before its pump has started. ESP2's own combo cap still bounds it.
+        if (puRow >= 16 && puRow <= 19) puEndMs += PULSE_AC_START_MAX_MS;
         logEvent("ESP1", "ACT", String("PULSE|START|") + testRowName(puRow) + "|" + puSeconds + "s");
       }
       puLastSendMs = 0;
@@ -10271,7 +13354,7 @@ void pulseTick() {
   if (puPhase == PU_REPORT) {
     // Waiting on ESP2's TEST,FLOW answer so the result can say whether fluid actually moved --
     // the whole point of the test. Bounded, so a silent ESP2 cannot strand the command.
-    if (puFlowSeen || millis() - puReportMs > PULSE_REPORT_WAIT_MS) pulseFinish(true, "pulse complete");
+    if (puFlowSeen || puLevelSeen || millis() - puReportMs > PULSE_REPORT_WAIT_MS) pulseFinish(true, "pulse complete");
     return;
   }
 
@@ -10280,19 +13363,32 @@ void pulseTick() {
   // (button released, tab closed, network dropped), bounded by TEST_HOLD_BROWSER_TIMEOUT_MS, and in
   // any case by TEST_HOLD_MAX_MS of continuous running. Either way ESP2's OWN 400 ms dead-man is what
   // actually protects the relay if ESP1 itself vanishes.
+  // A servo row's move is over once the Nano confirmed it or ESP2 reported it failed (2026-11-16): end the pulse
+  // then rather than holding ESP2 in Testing for the rest of its seconds. The seconds stay the upper bound.
+  bool servoSettled = !puHoldMode && (puRow == TEST_SERVO_L_ROW || puRow == TEST_SERVO_R_ROW) &&
+                      (testServoDoneRow == puRow || puServoFailWhy[0]);
   bool timeUp = puHoldMode
     ? (millis() - testHoldLastFreshMs > TEST_HOLD_BROWSER_TIMEOUT_MS ||
        millis() - testHoldRunMs >= TEST_HOLD_MAX_MS)
-    : ((long)(millis() - puEndMs) >= 0);
+    : ((long)(millis() - puEndMs) >= 0 || servoSettled);
   if (timeUp) {
     sendEsp2("TEST,RELEASE");                  // ask for the meter count; ESP2 answers TEST,FLOW
     puPhase = PU_REPORT; puReportMs = millis();
     return;
   }
   if (millis() - puLastSendMs >= 150) {
+    bool first = (puLastSendMs == 0);
     puLastSendMs = millis();
-    sendEsp2(String("TEST,HOLD,") + puRow);
+    sendEsp2KeepAlive(String("TEST,HOLD,") + puRow, first);
   }
+}
+
+// The Testing header while an inverter row was refused: which reason, padded to the 20 columns (2026-11-17).
+static const char *testBlockedHdr() {
+  static char b[21];
+  const char *w = secBlockLcd();
+  snprintf(b, sizeof(b), "%-20s", *w ? w : "AC pumps blocked");
+  return b;
 }
 
 void testHoldTick() {
@@ -10311,33 +13407,50 @@ void testHoldTick() {
     sendEsp2("TEST,ENTER");                                    // sent repeatedly until ACK (or cap)
   }
 
-  static bool wasHeld = false, pressBlocked = false;
+  static bool wasHeld = false, pressBlocked = false, pressTooSoon = false;
   static unsigned long lastSendMs = 0;
-  bool held = (digitalRead(BTN_ENTER) == LOW);
+  static HoldBtn enterBtn = { false, 0 };
+  bool held = holdBtnRead(enterBtn, BTN_ENTER);              // a release only after BTN_RELEASE_MS up
 
   if (held) {
     if (!wasHeld) {                                            // press edge
       wasHeld = true; lastSendMs = 0;
+      // Too soon after the last release (ACT_REARM_MS): ignore this press entirely -- release and press again.
+      pressTooSoon = actRearmWaiting();
+      if (pressTooSoon) { actWaitMsgUntilMs = millis() + 2000; return; }
       pressBlocked = testRowUsesInverter(testSel) && secBattBlocksAc();
       if (pressBlocked) {                                      // inverter row on a low/unmonitored secondary
         testBlockedUntilMs = millis() + 3000;
-        logEvent("ESP1", "ACT", String("TEST|BLOCKED|BATT2|") + testRowName(testSel));
+        logEvent("ESP1", "ACT", String("TEST|BLOCKED|") + secBlockTag() + "|" + testRowName(testSel));
       } else {
-        testOnBit = testSel;
+        testOnBit = testSel; testServoDoneRow = -1;   // a new press: forget the last servo confirmation
         logEvent("ESP1", "ACT", String("TEST|START|") + testRowName(testSel));
       }
     }
-    if (pressBlocked) return;                                  // nothing was started, nothing to keep alive
+    if (pressBlocked || pressTooSoon) return;                  // nothing was started, nothing to keep alive
     if (millis() - lastSendMs >= 150) {                        // keep-alive stream (< ESP2 timeout)
+      bool first = (lastSendMs == 0);
       lastSendMs = millis();
-      sendEsp2(String("TEST,HOLD,") + testSel);
+      sendEsp2KeepAlive(String("TEST,HOLD,") + testSel, first);
     }
   } else if (wasHeld) {                                        // release edge
     wasHeld = false; testOnBit = -1;
+    if (pressTooSoon) { pressTooSoon = false; return; }        // it never started: no new gap
     if (pressBlocked) { pressBlocked = false; return; }
     sendEsp2("TEST,RELEASE");
+    actRearmStart();                                           // the next press waits ACT_REARM_MS
     logEvent("ESP1", "ACT", "TEST|STOP");
   }
+}
+
+// One tank's level for the home page: "62%", or why there is none (see PAGE_HOME).
+static void tankLcdText(char *b, size_t n, float pct, char st, bool usable) {
+  // "62%?" = an echo, but not one ESP2 is given (pings too spread, past the empty mark, ...): see NANO,LEVEL in the log.
+  if (pct >= 0.0f) { snprintf(b, n, usable ? "%d%%" : "%d%%?", (int)pct); return; }
+  const char *w = (lastTankMs == 0) ? "wait"
+                : st == 'E' ? "echo?" : st == 'S' ? "stuck" : st == 'R' ? "range"
+                : st == 'F' ? "noisy" : st == 'X' ? "noPng" : "--";
+  snprintf(b, n, "%s", w);
 }
 
 // Write exactly 20 columns at the start of a row: left-justify, space-pad, hard-truncate. Padding is
@@ -10506,7 +13619,13 @@ void lcdTick() {
       if (battVCalLoaded) snprintf(l, 21, "Bat:%.1fV %s", battV, batteryCritical ? "CRIT" : batteryLow ? "LOW" : "OK");
       else                snprintf(l, 21, "Bat: uncalibrated");
       lcdRow(2, l);
-      snprintf(l, 21, "Res:%d%% Mix:%d%%", (int)sensor.resLevel, (int)sensor.mixLevel); lcdRow(3, l);
+      // A tank with no reading says why instead of "-1%" (2026-11-17): wait = nothing from the Nano yet since this
+      // boot; otherwise the Nano's pinger status (E no echo, S echo line stuck, R out of range, F too few good pings,
+      // X not pinging) -- the same letters as the log's TANK st=.
+      { char rb[8], mb[8];
+        tankLcdText(rb, sizeof(rb), sensor.resLevel, sensor.resSt, sensor.resOk);
+        tankLcdText(mb, sizeof(mb), sensor.mixLevel, sensor.mixSt, sensor.mixOk);
+        snprintf(l, 21, "Res:%s Mix:%s", rb, mb); lcdRow(3, l); }
       break;
     case PAGE_SENSORS:
       snprintf(l, 21, "T:%.1fC H:%.0f%%", sensor.temp, sensor.hum); lcdRow(0, l);
@@ -10535,15 +13654,17 @@ void lcdTick() {
         snprintf(l, 21, "Main V:uncal%s", esp2OnSecondary ? "" : " *"); lcdRow(0, l);
         snprintf(l, 21, "I:%.2fA P:--", battI); lcdRow(1, l);
       }
-      if (secInaOk && secHaveV)
-        snprintf(l, 21, "B2:%.2fV %.2fA%s", secV, secI, esp2OnSecondary ? " *" : (secLow ? " L" : ""));
-      else if (secNoPack) snprintf(l, 21, "B2: no pack - wiring");
-      else snprintf(l, 21, "B2: no INA226");
-      lcdRow(2, l);                                  // '*' = the boards are on that battery now
-      if (inaUsable(powerIna[INA_SOLAR]))            // SD and RTC moved to the Columns page for this row
-        snprintf(l, 21, "Sol:%.1fV %.2fA%s", powerIna[INA_SOLAR].v, powerIna[INA_SOLAR].i, bswLatched ? " SW!" : "");
-      else
-        snprintf(l, 21, "Sol: no INA226%s", bswLatched ? " SWFLT" : "");
+      // B2 (2026-11-16, user): the secondary battery's charge % and its power only -- watts NEGATIVE while it charges
+      // (secP = V x signed I, + = discharging). No reading: dashes.
+      if (secInaOk && secHaveV) snprintf(l, 21, "B2:%4d%%  %+.1fW", secBattPct(secRestV), secP);   // resting charge
+      else                      snprintf(l, 21, "B2:  --%%   --W");
+      lcdRow(2, l);
+      // The battery-switch status sits here (it left the Settings menu): SWok, or SW!! while a fault is latched.
+      { const char *sw = SECONDARY_BATT_ENABLED ? (bswLatched ? " SW!!" : " SWok") : (bswLatched ? " SW!!" : "");
+        if (inaUsable(powerIna[INA_SOLAR]))          // SD and RTC moved to the Columns page for this row
+          snprintf(l, 21, "Sol:%.1fV %.1fA%s", powerIna[INA_SOLAR].v, powerIna[INA_SOLAR].i, sw);
+        else
+          snprintf(l, 21, "Sol: no INA226%s", sw); }
       lcdRow(3, l);
       break;
     case PAGE_GSM:   // GSM (A7670C) + WiFi/ThingSpeak link health
@@ -10592,7 +13713,9 @@ void lcdTick() {
         if (top > RECOV_N - 3) top = RECOV_N - 3;
         for (int r = 0; r < 3; r++) {
           int idx = top + r;
-          snprintf(l, 21, "%c%-19s", idx == faultRecovSel ? '>' : ' ', RECOV_NAMES[idx]); lcdRow(r + 1, l);
+          // A pump-selector hold offers "switch it again" where the others say "Resume normal" (same action).
+          const char *nm = (idx == 3 && lastHoldCode == "SERVO_FAIL") ? "Switch servo again" : RECOV_NAMES[idx];
+          snprintf(l, 21, "%c%-19s", idx == faultRecovSel ? '>' : ' ', nm); lcdRow(r + 1, l);
         }
       } else if (sysState == EMERGENCY_STOP) {
         lcdRow(0, "** EMERGENCY OFF  **");
@@ -10613,25 +13736,12 @@ void lcdTick() {
 /* =============================================================================
  *  SETTINGS / TESTING RENDERING  (20x4; cleared on uiMode change by lcdTick)
  * ========================================================================== */
-// Helper: draw a 3-row scrolling list window (rows 1..3) with a '>' cursor.
-static void drawList(int sel, int count, const char *const *names) {
-  int top = sel - 1; if (top < 0) top = 0;
-  if (top > count - 3) top = (count > 3) ? count - 3 : 0;
-  char l[21];
-  for (int r = 0; r < 3; r++) {
-    int idx = top + r;
-    lcd.setCursor(0, r + 1);
-    if (idx < count) snprintf(l, 21, "%c%-19s", idx == sel ? '>' : ' ', names[idx]);
-    else             snprintf(l, 21, "%-20s", "");
-    lcd.print(l);
-  }
-}
-
 // Settings-row label with a live [ON]/[OFF] suffix for the two WiFi toggles.
 static String setRowLabel(int i) {
   if (i == SET_WIFI)   return String("WiFi        ") + (wifiEnabled ? "[ON]" : "[OFF]");
   if (i == SET_SOFTAP) return String("Setup AP    ") + ((portalActive || portalRequested) ? "[ON]" : "[OFF]");
-  if (i == SET_BATTSW) return bswLatched ? String("BattSw FAULT>clear") : String("Batt Switch  [OK]");
+  if (i == SET_BATTSW) return String("BattSw FAULT>clear");
+  if (i == SET_RESET && rebootBusyReason()) return String("Reboot ESP1 [BUSY]");
   if (i == SET_TESTING && actuationsDisabled) return String("Testing     [OFF]");
   return SET_NAMES[i];
 }
@@ -10668,7 +13778,7 @@ void lcdRenderSettings() {
     lcd.setCursor(0, 0); lcd.print("=== SETTINGS ===    ");
     // The web can re-enable actuations while this menu is open, hiding the row under the cursor.
     if (!setRowVisible(setSel)) setSel = setRowAt(0);
-    // Like drawList, but the two WiFi rows carry a live [ON]/[OFF] suffix.
+    // A 3-row scrolling list; the two WiFi rows carry a live [ON]/[OFF] suffix.
     // Window over VISIBLE rows, not raw enum indices (SET_ENABLE is hidden unless locked out).
     int n = setRowCount();
     int top = setPosOf(setSel) - 1; if (top < 0) top = 0;
@@ -10691,7 +13801,13 @@ void lcdRenderSettings() {
     //  ARMING...   = ESP2 alive, waiting for it to confirm TEST mode (priming/retrying)
     //  NO ACK!     = ESP2 alive but not ACKing TEST,ENTER after several tries (suspect ESP1->ESP2 TX)
     //  (dead-man)  = confirmed in TEST mode, relays controllable
-    const char *hdr = ((long)(millis() - testBlockedUntilMs) < 0) ? "TEST:BATT2 LOW/NOMON"
+    const char *hdr = ((long)(millis() - actWaitMsgUntilMs) < 0) ? "TOO FAST: WAIT 1.5s "
+                    : ((long)(millis() - testBlockedUntilMs) < 0) ? testBlockedHdr()
+                    : ((long)(millis() - testUseComboUntilMs) < 0) ? "INV: USE FILL/PUSH  "
+                    : ((long)(millis() - testServoFailUntilMs) < 0)
+                        ? (testInverterNoAc    ? "INVERTER: NO AC     "
+                         : testBattSwitchFail  ? "BATT SWITCH FAILED  "
+                         : testServoFailAcLive ? "SERVO: AC STILL LIVE" : "SERVO FAIL-chk Nano ")
                     : !esp2Available     ? "TESTING: ESP2 DOWN  "
                     : esp2TestArmed       ? "TESTING (dead-man)  "
                     : (testArmTries >= TEST_ARM_NOACK_HINT) ? "TEST NO ACK-chk link"
@@ -10701,11 +13817,13 @@ void lcdRenderSettings() {
     for (int r = 0; r < 2; r++) {
       int idx = top + r;
       lcd.setCursor(0, r + 1);
+      // Fixed layout, full width (2026-11-16): name in exactly 14 columns, the mark always at 16-19, and lcdRow()
+      // pads to 20, so scrolling from a long name (Servo>Transfer) to a short one leaves no old characters behind.
       if (idx < TEST_ROWS && testRowVisible(idx))
-        snprintf(l, 21, "%c%-11s %s", idx == testSel ? '>' : ' ', testRowName(idx).c_str(),
-                 idx == testOnBit ? "[ON]" : "[ -]");
-      else snprintf(l, 21, "                    ");
-      lcd.print(l);
+        snprintf(l, 21, "%c%-14.14s %s", idx == testSel ? '>' : ' ', testRowName(idx).c_str(),
+                 idx == testServoDoneRow ? "[OK]" : idx == testOnBit ? "[ON]" : "[ -]");
+      else l[0] = 0;                          // empty row: lcdRow() pads it to 20 spaces
+      lcdRow(r + 1, l);
     }
     lcd.setCursor(0, 3); lcd.print("HOLD ENT=on BACK=ext");
     return;
@@ -10725,8 +13843,15 @@ void lcdRenderSettings() {
                editField==3?'>':' ', editTmp[3], editField==4?'>':' ', editTmp[4]);
       lcd.print(l);
       break;
-    case SET_SCHEDULE:
-      lcd.setCursor(0, 0); snprintf(l, 21, "Schedule            "); lcd.print(l);
+    case SET_SCHEDULE: {
+      // Row 0 lists the column's later windows when it has several a day (set on the website, 2026-11-05).
+      // Only window 1 is edited here, and the correction above keeps it clear of window 2.
+      String top = "Schedule";
+      if (editTmp[0] == SCHED_MANUAL && colRuns[editCol] > 1) {
+        top = colRuns[editCol] > 3 ? "+" : "Also ";
+        for (int x = 0; x < colRuns[editCol] - 1; x++) top += (x ? " " : "") + hhmm(COL_EXTRA_START[editCol][x]);
+      }
+      lcd.setCursor(0, 0); snprintf(l, 21, "%-20s", top.c_str()); lcd.print(l);
       lcd.setCursor(0, 1);
       snprintf(l, 21, "%cCol %c   %cSched:%-4s ",
                editField==0?'>':' ', COL_TAG[editCol],
@@ -10741,6 +13866,7 @@ void lcdRenderSettings() {
         snprintf(l, 21, "(AUTO uses default) ");
       lcd.print(l);
       break;
+    }
     case SET_COLMODE:
       lcd.setCursor(0, 0); lcd.print("Column Mode         ");
       lcd.setCursor(0, 1);
@@ -10754,7 +13880,7 @@ void lcdRenderSettings() {
       break;
     case SET_PRESET:
       lcd.setCursor(0, 0);
-      snprintf(l, 21, "%cPreset COL_%c %c%-6s",
+      snprintf(l, 21, "%cPreset COL_%c%c%-6s",           // 20 columns ("MANUAL" lost its L at 21)
                editField==0?'>':' ', COL_TAG[editCol],
                editField==1?'>':' ', editTmp[0]==0 ? "NAMED" : "MANUAL");
       lcd.print(l);
@@ -10789,15 +13915,36 @@ void lcdRenderSettings() {
         break;
 
     case SET_THRESH:
-      // One field per row, no title: Start and Stop on one row ran to 22 chars and the LCD cut a
-      // Stop of 80% to "8". Row 3 is the shared edit hint below.
+      // One field per row, no title. Row 3 is the shared edit hint below.
       lcd.setCursor(0, 0);
       snprintf(l, 21, "%cSoil start<%3d%%    ", editField==0?'>':' ', editTmp[0]); lcd.print(l);
       lcd.setCursor(0, 1);
-      snprintf(l, 21, "%cSoil stop >%3d%%    ", editField==1?'>':' ', editTmp[1]); lcd.print(l);
+      snprintf(l, 21, "%cFert gap %3d mg/kg  ", editField==1?'>':' ', editTmp[1]); lcd.print(l);
       lcd.setCursor(0, 2);
-      snprintf(l, 21, "%cFert gap %3d mg/kg  ", editField==2?'>':' ', editTmp[2]); lcd.print(l);
+      lcd.print(F("                    "));
       break;
+
+    case SET_ACVOLT: {
+      // Row 0 shows the last AC voltage ESP2 measured, so the limits are set against a real reading.
+      char last[6];
+      if (acLastV > 0.0f) snprintf(last, sizeof(last), "%dV", (int)(acLastV + 0.5f));
+      else                strcpy(last, "---");
+      snprintf(l, 21, "AC Voltage last %-4s", last); lcd.setCursor(0, 0); lcd.print(l);
+      snprintf(l, 21, "%cLow  limit %3d V   ", editField==0?'>':' ', editTmp[0]); lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "%cHigh limit %3d V   ", editField==1?'>':' ', editTmp[1]); lcd.setCursor(0, 2); lcd.print(l);
+      break;
+    }
+
+    case SET_ACAMP: {
+      // Row 0 = the last AC pump current ESP2 measured, so the limits are set against a real reading.
+      char last[8];
+      if (acLastI >= 0.0f) snprintf(last, sizeof(last), "%.1fA", acLastI);
+      else                 strcpy(last, "---");
+      snprintf(l, 21, "AC Current last%5s", last);                                 lcd.setCursor(0, 0); lcd.print(l);
+      snprintf(l, 21, "%cOvercurrent %4.1f A ", editField==0?'>':' ', editTmp[0] / 10.0f); lcd.setCursor(0, 1); lcd.print(l);
+      snprintf(l, 21, "%cNo-current  %4.1f A ", editField==1?'>':' ', editTmp[1] / 10.0f); lcd.setCursor(0, 2); lcd.print(l);
+      break;
+    }
 
     case SET_FORCE: {
       // Row 0 = mode. Rows 1-2 show the slot the cursor is in, so A-then-B's eleven fields fit a
@@ -10809,16 +13956,24 @@ void lcdRenderSettings() {
       // Which column this slot actually waters (A-then-B: slot0=A, slot1=B).
       const char *tag = (fcMode == 3) ? (slot == 0 ? "A" : "B")
                                       : (fcMode == 0 ? "A" : fcMode == 1 ? "B" : "AB");
-      snprintf(l, 21, "%s %c%4.1fL %cN%3u %cP%3u", tag,
+      // 20 columns exactly (2026-11-17: "AB" and the 3-space indent made 21, cutting the last digit / the "s").
+      snprintf(l, 21, "%-2s%c%4.1fL %cN%3u %cP%3u", tag,
                f==0?'>':' ', q.dL / 10.0f, f==1?'>':' ', q.ml[0], f==2?'>':' ', q.ml[1]);
       lcd.setCursor(0,1); lcd.print(l);
-      snprintf(l, 21, "   %cK%3u  %cstart %3us", f==3?'>':' ', q.ml[2], f==4?'>':' ', q.delayS);
+      snprintf(l, 21, "  %cK%3u  %cstart %3us", f==3?'>':' ', q.ml[2], f==4?'>':' ', q.delayS);
       lcd.setCursor(0,2); lcd.print(l);
       break;
     }
   }
   lcd.setCursor(0, 3);
-  lcd.print(editItem == SET_FORCE ? "UP/DN set ENT next  " : "UP/DN edit ENT next ");
+  if (editItem == SET_FORCE) {
+    uint8_t off = 0, want = fcModeColumns(fcMode);
+    for (int b = 0; b < NUM_COLUMNS; b++) if ((want & (1 << b)) && !COLUMN_ENABLED[b]) off |= (uint8_t)(1 << b);
+    char h[21];
+    if (off) snprintf(h, 21, "Col %-3s OFF, ARM=ON ", off == 0b011 ? "A+B" : off == 0b001 ? "A" : "B");
+    else     snprintf(h, 21, "%-20s", "UP/DN set ENT next");
+    lcd.print(h);
+  } else lcd.print("UP/DN edit ENT next ");
 }
 
 /* =============================================================================
@@ -10867,6 +14022,10 @@ void logEvent(const char *source, const char *type, const String &detail) {
   // (substring past the 3rd comma), but any external reader of the thesis CSV does not.
   String d = detail;
   d.replace(',', ';');
+  // Line breaks too (2026-11-16): outbound SMS are now multi-line, and the driver logs each one as
+  // TX_SUBMIT|<text>. A raw '\n' would end the CSV row mid-detail (an inbound multi-line SMS did too).
+  d.replace("\r", "");
+  d.replace("\n", " / ");
   String stamp = tsString();
 
   // Dashboard ring first: it must capture the event even if the SD path below declines or the
@@ -10882,7 +14041,7 @@ void logEvent(const char *source, const char *type, const String &detail) {
     webEvtHead = (webEvtHead + 1) % WEB_EVT_N;
     if (webEvtCount < WEB_EVT_N) webEvtCount++;
     portEXIT_CRITICAL(&evtMux);
-    if (webUrgent(type)) fbPushNow = true;
+    if (webUrgent(type)) fbRequestPush();
   }
 
   String row = stamp + "," + source + "," + type + "," + d + "\n";
@@ -10910,19 +14069,26 @@ void logFlush(bool force) {
 
   char fname[16];
   if (rtcOk && currentDayStamp > 0) snprintf(fname, sizeof(fname), "/%08ld.CSV", currentDayStamp);
-  else { strcpy(fname, "/NODATE.CSV"); }
+  else strlcpy(fname, "/NODATE.CSV", sizeof(fname));
 
   // Serialize SD access against the core-0 portal (SD admin). If the portal holds sdMux, don't block
   // the core-1 loop -- keep buffering and flush on a later tick (logBuf tolerates this like !sdOk).
   if (sdMux && xSemaphoreTake(sdMux, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
   File f = SD.open(fname, FILE_APPEND);
-  if (f) { f.print(logBuf); f.close(); logBuf = ""; logLineCount = 0; }
+  // A full card opens fine and then writes short, so the open alone proves nothing.
+  size_t want = logBuf.length(), wrote = 0;
+  if (f) { wrote = f.print(logBuf); f.close(); }
+  if (wrote == want) { logBuf = ""; logLineCount = 0; }
   else {
     // Write failed: try ONE re-init. If the card is really gone, mark it lost so
     // deviceHealthTick (Part C) sees the present->absent transition.
-    if (!SD.begin(SD_CS)) { sdOk = false; Serial.println(F("WARN: microSD lost (write failed, re-init failed)")); }
-    logBuf = ""; logLineCount = 0;            // avoid unbounded growth on write failure
+    bool cardBack = SD.begin(SD_CS);
+    if (!cardBack) { sdOk = false; Serial.println(F("WARN: microSD lost (write failed, re-init failed)")); }
+    Serial.printf("WARN: SD write failed, %u of %u log bytes lost\n", (unsigned)(want - wrote), (unsigned)want);
+    // Avoid unbounded growth, and leave a marker: otherwise the gap looks like a quiet period in the CSV.
+    logBuf = cardBack ? tsString() + ",ESP1,LOG,WRITE_FAILED|lost_bytes=" + String(want - wrote) + "\n" : String("");
+    logLineCount = cardBack ? 1 : 0;
   }
   if (sdMux) xSemaphoreGive(sdMux);
 }
