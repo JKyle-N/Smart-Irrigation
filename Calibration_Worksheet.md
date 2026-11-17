@@ -32,10 +32,11 @@ Wrong values here do not throw an error. They produce confident, precise, wrong 
 | Constant | File:line | Now | What it is | How | If wrong |
 |---|---|---|---|---|---|
 | `PUMP_FLOWRATE_MLPM[3]` | `ESP1`, CalStore `pumpA/B/C` | `{50, 50, 50}` guessed | Nutrient peristaltic pump delivery, mL per minute, per pump | 🔧 `Calibration/ESP2/Flow`: hold BOOT about 60 s into a measuring cylinder, 3×, `calc` | Sets both each dose's run time *and* its timeout ceiling. Over- or under-fertilises silently, with no alarm, because the firmware has no independent measure of what the nutrient pumps actually moved |
-| `calKResMix`, `calKMixIrr` | `ESP1`, CalStore `kRM`, `kMI` (pushed to ESP2) | `450` generic | Main flow meters, pulses per litre | 🔧 `Calibration/ESP2/Flow` (drives the paired pump under a dead-man) | Wrong delivered volume everywhere. Far too high and a stage runs to its 180 s cap — on `SEQ_FILL` that is the mixing tank overflowing |
+| Transfer and booster **pump lines** (litres = start + rate × seconds from the inverter switch-on) | `shared/pump_line.h` (`PL_XFER_READINGS`, `PL_BOOST_READINGS`); ESP1 NVS `rXfer`/`xStartL`, `rBoost`/`bStartL`; ESP2 NVS `xS` | Transfer **11.74 L/min, +0.47 L**; booster **13.20 L/min, −0.65 L** (fitted at boot from the user's 10 + 10 weighed runs of 17 Nov, 1 L = 1028 g) | How much water a run moves | ⏱️ LCD Settings → Calibration → **Transfer pump est** / **Booster pump est**: run 3–60 s, weigh, type the grams; at least 5 tries, vary the seconds | Every fill's run time is (need − start) ÷ rate: a rate 10 % high gives about 10 % less water, and the top-up only makes up a shortfall of more than 3 L. Full readings and fits: reference §5.3.2 |
+| ~~`calKResMix`, `calKMixIrr`~~ | `ESP1`, CalStore `kRM2`, `kMI2` | — | Main flow meters (ResMix, MixIrr) | **Not used since web v.4 (16 Nov 2026):** the tank ultrasonics measure the water. ESP2 accepts and ignores `SET_CAL,FLOW_RESMIX/MIXIRR` | — |
 | `calKNut[3]`, and the D / pH-up / pH-down meters | `ESP1`, CalStore `kNA`..`kNC`, `kND`, `kPU`, `kPD` (pushed to ESP2) | `450` generic | Small dosing flow meters | 🔧 `Calibration/ESP2/Flow` | As above. Small meters differ most from the generic figure, and these are the ones metering chemicals |
 | `FLOW_K_PULSES_PER_LITER` | `Nano:139` | `450.0` | Reservoir flow meter | 🔧 `Calibration/Nano/Flow` (3-run with outlier rejection) | Reservoir volume accounting drifts. Easiest: CalStore `set frS` corrects it with no Nano reflash. Otherwise it **must equal ESP1's `NANO_FLOW_K`** |
-| `WATER_BUDGET_L[3]` | `ESP1:353` **and** `ESP2:161` | `{5, 5, 5}` | Litres delivered per column per service | 🌱 Decide from pot size and crop | **Duplicated in two firmwares. Change both.** If they disagree, ESP1 plans a batch ESP2 will not deliver, and the mismatch is silent |
+| `WATER_BUDGET_L[3]` | `shared/rig_constants.h` (both ESP32s) | `{5, 5, 5}` | Litres delivered per column per service | 🌱 Decide from pot size and crop | One definition since web v.4 |
 | `calSoilAir[3]` / `calSoilWater[3]` | `ESP1:157-158` | A/B measured, C default | Capacitive probe raw ADC, bone dry and saturated | 🔧 `Calibration/Nano/Soil` | Drives every irrigation start/stop decision *and* the NPK divergence gate. Column C is still on placeholder values |
 | `SOIL_BASELINE_N/P/K` | `ESP1:336-338` | Lab values present | Soil's existing nutrient content, mg/kg | 📄 F.A.S.T. Labs report MC2812-6783 — already obtained | The dose is the *gap* between baseline and target. A wrong baseline offsets every dose by a constant amount |
 | Stock concentrations `STOCK_A/B/C_*` | `ESP1:339+` | Manufacturer figures | mg/L of each nutrient in the stock tanks | ⏱️ **Dilute at commissioning** and record the actual dilution | Doses are computed from these. Undiluted stock means every dose is far too strong |
@@ -46,16 +47,20 @@ Wrong here and the rig either stops when it should not, or fails to stop when it
 
 | Constant | File:line | Now | What it is | How | If wrong |
 |---|---|---|---|---|---|
-| `TRANSFER_LPM` | `ESP2` | `8.0` | Reservoir→mix transfer pump, L/min | 🔧 `Calibration/ESP2/Flow` `ch RESMIX` prints it | Sets the flow-blind stage timeout. Too low and stages abort mid-fill; too high and a dead pump is not caught until the 180 s hard cap |
-| `BOOSTER_LPM` | `ESP2` | `6.0` | Mix→column booster pump, L/min | 🔧 `Calibration/ESP2/Flow` `ch MIXIRR A` prints it | As above, on delivery |
-| `MIX_TARGET_PCT` / `MIX_MAX_PCT` | `ESP1:194-195` | `70` / `95` | Mixing tank fill target and overflow guard | 🌱 Decide from tank geometry, then verify against the ultrasonic reading | `MIX_MAX_PCT` is the last guard before an overflow |
-| `RES_LOW_PCT` | `ESP1:193` | `15` | Reservoir floor that blocks operations | 🌱 Decide — set above the pump intake | Too low and the transfer pump runs dry |
-| `calResEmptyCm` / `calResFullCm` | `ESP1:164` | `38` / `11` measured | Ultrasonic geometry, reservoir | 🔧 `Calibration/Nano/Ultrasonic` (`empty` and `full`) | Every tank percentage. Note `loadCal()` overrides these from NVS — editing the constant alone does not take |
-| `calMixEmptyCm` / `calMixFullCm` | `ESP1:165` | `50` / `4` | Ultrasonic geometry, mixing tank | 🔧 `Calibration/Nano/Ultrasonic` | As above |
+| `TRANSFER_LPM`, `XFER_START_L`, `XFER_MIN_RUN_S` | `ESP2` | `11.74` L/min, `0.47` L, `6` s | The transfer pump's default line (a fill is TIMED from it, web v.4) | ⏱️ the Transfer pump est screen (above), or LCD **Rate Transfer** | The fill gives the wrong litres; see the pump lines row |
+| `BOOSTER_LPM` / `BOOSTER_OPEN_LPM` | `ESP2` | `1.0` (guess, with the drip pipe) / `13.2` (open valve) | The booster's rate: sizes how long a delivery may take (stage cap, no-flow and stall windows) / caps how fast a drain is believable | ⏱️ LCD **Rate Booster**: type the `seen:` value after a real delivery through the drip pipe | Too low: a slow failure is noticed late. Too high: a healthy delivery is cut short as a stall |
+| `MIX_HIGH_PCT` (shared) / ESP1 backstop | `shared/rig_constants.h`; `ESP1` | `90` % / `97` % | The fill's overflow stop (ESP2) and ESP1's own last-line stop (web v.4; `MIX_TARGET_PCT` 70 / `MIX_MAX_PCT` 95 in ESP1 are older planning values) | 🌱 Decide from tank geometry, then verify against the ultrasonic reading | Too high and a ripple overfills; too low and big batches are capped (the planning ceiling `MIXCAP` is the litres at 90 %, 15.90 L by default) |
+| `RES_LOW_PCT` = `RES_FILTER_PCT` | `ESP1`, `shared/rig_constants.h` | `18` | Reservoir floor that blocks operations: the reservoir's filter zone, where its ultrasonic stops seeing water | 🌱 Decide — set above the pump intake | Too low and the transfer pump runs dry |
+| `calResEmptyCm` / `calResFullCm` | `ESP1` (NVS) | `42.9` / `24.0` cm, measured 15 Nov | Ultrasonic geometry, reservoir (sensor to water) | 🔧 LCD **Ultra Res empty**, then **Tank Res liters** (up to 8 level → litres points) | Every tank percentage and every litre the reservoir reports |
+| `calMixEmptyCm` / `calMixFullCm` | `ESP1` (NVS) | `42.9` / `24.0` cm, measured 15 Nov | Ultrasonic geometry, mixing tank | 🔧 LCD **Ultra Mix empty**, then **Tank Mix liters** | Every fill check and every delivery is measured on this tank (web v.4) |
+| `TANK_D_BOTTOM_CM` / `TANK_D_TOP_CM`; mixer insert | `ESP1`; `shared/tank_volume.h` | `31.0` / `39.4` cm (a cone); mixer Ø 6 × 11.4 cm | The tank shape between EMPTY and FULL, and the mixer's volume taken out of it | ⏱️ tape measure; the Tank liters points override the cone | Litres wrong by the shape error |
+| `FILL_SETTLE_MS` / `FILL_STEADY_L` / `FILL_TOPUP_MIN_L` / `FILL_TOPUP_MAX` | `ESP2` | `60` s / `0.3` L / `3` L / `2` | Settle after a timed fill, steadiness band, shortfall that earns a top-up, top-ups per fill (user rules, 17 Nov) | 🌱 Decide (the user's rules); confirm the settle on the rig | A short settle measures ripples; a big top-up threshold leaves small batches short |
+| `MIX_LOW_STOP_PCT` / `MIX_LOW_STOP_MS` | `ESP2` | `5` % / `10` s | A delivery ends this long after the mixing tank is under this level (user rule, 17 Nov) | 🌱 Decide | Too short leaves water behind; too long runs the booster dry |
+| `ULTRA_MAX_SPREAD_CM` | `ESP1` | `4` cm (2 before 17 Nov) | How far the Nano's pings may disagree for a reading to be used for control | ⏱️ watch `NANO,LEVEL,NOT_USABLE` lines and the LCD `?` during runs | Too tight: readings dropped while the transfer pours in. Too loose: a mixer echo passes as a level |
 | `MIXING_DURATION_MS` | `ESP1:136` | `30000` | Homogenise time after dosing | ⏱️ Observe when EC/pH readings settle | Too short and EC/pH are measured on an unmixed batch |
 | `PRIME_CAP_MS` | `ESP2:215` | `45000` | Hard cap for purging air from a line | ⏱️ Time an actual prime | Too short and priming never completes |
 | `BATT_LOW_V` / `BATT_CRIT_V` | `ESP1:198-199` | `11.8` / `11.2` | Fertigation cutoff and full stop | 📄 12 V lead-acid resting curve, then ⏱️ verify with a multimeter against the reading. **The INA226 also reads the sag during inverter runs.** A flag sets only after `BATT_FLAG_HOLD_MS` (60 s) below the line, which covers a start's dip but not a long run's sag, so measure that before enabling `BATTERY_SAFETY_ENABLED` | Too low and the battery is damaged; too high and the rig stops needlessly |
-| `SEC_BATT_LOW_V` / `SEC_BATT_RECOVER_V` / `SEC_BATT_CRIT_V` | `ESP1` (secondary battery block) | `13.6` / `14.0` / `12.8` | Secondary (4S Li-ion) level below which no inverter use may start, the level that releases it, and the critical alert | 📄 the pack's datasheet (3.4 / 3.5 / 3.2 V per cell), then ⏱️ check the voltage under the boards' load | Too low drains the pack; too high blocks irrigation needlessly |
+| `SEC_BLOCK_PCT` / `SEC_UNBLOCK_PCT` / `SEC_BATT_CRIT_V`; `SEC_RINT_DEFAULT` | `ESP1` (secondary battery block) | `30` % / `35` % of the **resting** charge (≈ 14.0 / 14.2 V) / `12.8` V; `0.25` Ω learned into NVS `secR` | AC pumps are blocked at or below 30 % resting charge (resting V = V + I × R, so charging does not read high) (user, 17 Nov) | 📄 4S Li-ion curve; ⏱️ check the % against a rested pack | Too high blocks runs on a healthy pack; too low lets the inverter start on a weak one |
 | `SEC_BATT_FULL_V` / `SEC_BATT_EMPTY_V` | `ESP1` | `16.8` / `12.8` | Secondary battery % scale (display only) | 📄 4.20 / 3.20 V per cell | Wrong % on the dashboard only |
 | `BATT_SWITCH_SETTLE_MS` / `BATT_RETURN_DELAY_MS` | `ESP2` | `500` / `1000` | Settle after the DPDT moves the boards to the secondary before the inverter starts; wait after the inverter stops before returning to main | ⏱️ scope the board rail through a switch once the hold-up stage is fitted | Too short and the inverter starts (or the boards return) while the transfer is still settling |
 | `BSW_RECHARGE_MS` | `ESP1` | `60000` | How long inverter use waits after a boot or a switch reset, so the hold-up can recharge | ⏱️ scope the hold-up voltage from a cold boot until it is full, then add a margin | Too short and the retry fails too, using up the second strike; too long only delays the re-run |
@@ -89,7 +94,7 @@ Nothing to measure. These are decisions to make deliberately and record in the t
 
 | Constant | File:line | Now | Notes |
 |---|---|---|---|
-| `soilStartPct` / `soilStopPct` | `ESP1:111-112` | `35` / `45` | Irrigation hysteresis band. **`NPK_MIN_MOIST_PCT` must stay below `soilStartPct`** — the host test suite asserts this |
+| `soilStartPct` | `ESP1` | `35` | Irrigation starts below this soil moisture (the stop % was removed; a run gives the column's water budget). **`NPK_MIN_MOIST_PCT` must stay below `soilStartPct`** — the host test suite asserts this |
 | `fertGap` | `ESP1:134` | `30.0` | mg/kg below target before fertigating. Directly sets how often fertigation runs |
 | `NPK_MOIST_AGREE_PCT` | `ESP1/include/pure_math.h` | `15` | How far the NPK probe may sit from the capacitive pair before exclusion. Tighten once you know the probe's real spread |
 | `NPK_MIN_MOIST_PCT` | `ESP1/include/pure_math.h` | `15` | Below this the probe's N/P/K registers are not trustworthy |
@@ -98,7 +103,7 @@ Nothing to measure. These are decisions to make deliberately and record in the t
 | `exerciseEnabled` / `exerciseRunS` | `ESP1:291-292` | `true` / `5 s` | Preventive pump exercise. Now settable from LCD and web |
 | `FORCE_MAX_LITERS` / `FORCE_MAX_DOSE_ML` | `ESP1:657-658` | `20 L` / `500 mL` | Caps on a single forced run. Deliberate safety limits |
 | `DAILY_REPORT_MIN` | `ESP1:317` | `18:00` | When the daily SMS summary goes out |
-| `PHONE_NUMBER` | `ESP1:97` | `09150424784` | 🌱 Confirm the recipient before commissioning |
+| `SECRET_OWNER_NUMBER` | `ESP1/include/secrets.h` (git-ignored; copy `secrets.example.h`) | — | 🌱 Set the owner phone before flashing, or on the Setup AP admin page. Never commit it |
 | `COLUMN_ENABLED[3]` | `ESP1:104`, `ESP2:162`, `Nano:74` | `{true, true, false}` | **Triplicated across all three firmwares — change all three.** C is currently disabled |
 
 ## Tier 5 — protocol constants, confirm once
@@ -122,7 +127,7 @@ silent, so check them as a set whenever you change one.
 
 | Value | Lives in | Consequence of drift |
 |---|---|---|
-| `WATER_BUDGET_L` | `ESP1:353`, `ESP2:161` | ESP1 plans a batch ESP2 will not deliver |
+| ~~`WATER_BUDGET_L`~~ | one definition in `shared/rig_constants.h` since web v.4 | No longer able to drift |
 | `COLUMN_ENABLED` | `ESP1:104`, `ESP2:162`, `Nano:74` | A column that one controller thinks exists and another does not |
 | Reservoir flow K | `Nano:139` (`FLOW_K_PULSES_PER_LITER`), `ESP1` (`NANO_FLOW_K`) | Reservoir volume accounting disagrees between the two |
 | `SECONDARY_BATT_ENABLED` | `ESP1`, `ESP2` | ESP2 switches the boards but ESP1 neither blocks a low secondary nor waits for the return (or the reverse: ESP1 blocks runs on a monitor ESP2 never uses) |
@@ -130,8 +135,9 @@ silent, so check them as a set whenever you change one.
 
 ## Suggested order
 
-1. **Tier 1 flow K-factors and pump rates.** Everything downstream is scaled by them. `Calibration/ESP2/Flow`
-   measures both from the same runs, with a measuring jug.
+1. **The transfer and booster pump lines** (LCD pump est screens), then the **tank litres** (Tank Mix / Res liters):
+   since web v.4 they are the water measurement. Then the dosing flow K-factors and nutrient pump rates
+   (`Calibration/ESP2/Flow` measures both from the same runs, with a measuring jug).
 2. **Soil endpoints**, including column C, which is still on defaults.
 3. **pH / EC fits**, then the tank ultrasonic geometry.
 4. **Currents and battery**, which only gate operations rather than dose.

@@ -22,7 +22,7 @@ Text the device, from the OWNER phone number only:
 
     WIFIPORTAL
 
-  then on your phone: join WiFi "Irrig-Setup" (password irrigate123),
+  then on your phone: join WiFi "Irrig-Setup" (password: SECRET_AP_PASS in ESP1/include/secrets.h),
   open 192.168.4.1, pick your network from the scanned list, enter the
   password, press Save. It reconnects and enables the radio automatically.
 
@@ -51,7 +51,7 @@ STEP 4 -- CONNECT ESP1 TO FIREBASE  (pick ONE option)
 ----------------
 OPTION A -- SoftAP portal (easiest, one form):
     1. Text: WIFIPORTAL   (skip if the portal is already open from Step 2)
-    2. Phone -> join "Irrig-Setup" (irrigate123) -> browse to
+    2. Phone -> join "Irrig-Setup" (password from secrets.h) -> browse to
        192.168.4.1/admin
     3. Enter the admin PIN (default 1234, unless changed)
     4. In the Firebase section, fill in:

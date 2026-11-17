@@ -111,10 +111,13 @@ A7670C HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, secondary-battery INA226 0
 microSD SPI GPIO23/19/18/5 · buttons GPIO0/12/13/15/2 · ESP2 power relay GPIO4.
 
 **ESP32 #2:** ESP1 link HW UART2 GPIO16/17 · PZEM-004T HW UART1 GPIO13/14 ·
-PCF8575 actuator expander I2C GPIO21/22 (0x20) · flow sensors (interrupt, stage-based) ·
-pH/EC/ACS712 analog inputs.
+PCF8575 actuator expander I2C GPIO21/22 (0x20) · dosing flow meters Nut A/B/C GPIO23/19/18 (Nut D 27, pH up 4,
+pH down 25 wired, not used by the runs; the ResMix GPIO26 / MixIrr GPIO5 meters are no longer read in web v.4) ·
+pH/EC/ACS712 analog inputs. The transfer and booster pumps share the inverter through a changeover switch moved by
+the Nano's D3 servo.
 
-**Nano:** UART to ESP32 #1 on D0/D1 · DHT22 D11 · 2× ultrasonic D4–D7 · flow D2 ·
+**Nano:** UART to ESP32 #1 on D0/D1 · DHT22 D11 · 2× ultrasonic D4–D7 · reservoir inflow meter D2 ·
+pump-selector servo D3 (LEFT = transfer, RIGHT = booster) ·
 RS485/NPK D8/D9/D10 · soil A0–A3 + A6/A7 · BH1750 I2C A4/A5.
 
 ---
@@ -123,25 +126,32 @@ RS485/NPK D8/D9/D10 · soil A0–A3 + A6/A7 · BH1750 I2C A4/A5.
 
 | Command | Action |
 |---------|--------|
+| `HELP` / `HELP,RUN` / `HELP,CROPS` / `HELP,SYSTEM` | The command list, one text per topic |
+| `STATUS` / `SUMMARY[,<day>]` / `FULL SUMMARY[,<day>]` | Report now / day averages / hour by hour, from the SD log |
 | `SET,COL_A,N,150,P,40,K,200,pH,5.8` | Set per-column nutrient targets (mg/kg) + pH |
 | `SET,COL_A,PRESET,PECHAY` | Apply a built-in crop preset (`PECHAY`, `TOMATO_S1`–`S3`) |
-| `NAME,COL_A,Lettuce` | Name a column (persisted in NVS) |
-| `MODE,COL_A,AUTO` / `MODE,COL_A,IRRIGATION_ONLY` | Per-column mode |
-| `STATUS` | Live status + daily summary report |
-| `SUMMARY` | Today's-activity digest, parsed from the SD log |
-| `SIMTEST` / `BAL` / `USSD,<code>` / `ALERTNUM,<number>` | SIM check, carrier balance, balance code, second alert phone |
-| `STOP,ALL` | Emergency stop |
-| `STOP` / `RELEASE` / `IRRIGATE` / `NORMAL` | Fault-hold recovery (only while a fault is held): acknowledge & hold / dump tank to its column / finish irrigation-only / resume the paused run |
+| `NAME,COL_A,Lettuce` / `MODE,COL_A,AUTO\|IRRIGATION_ONLY` / `THRESH,<start %>,<gap>` | Plant name / column mode / soil start % and fertigation gap |
+| `STOP` (`STOP,ALL`) | Emergency stop |
+| `NORMAL` / `IRRIGATE` / `RELEASE` / `SERVO` / `STOP` | Fault-hold replies (only while a fault is held): resume / finish water-only / deliver the tank as is / switch the pump selector again / stay on hold |
+| `CANCEL,30` / `CANCEL,10` / `CANCEL,OFF` | End the run and skip the column 30 / 10 min, or switch it off |
+| `TANKCHECK` / `TANKCHECK,OK` | Is a tank check needed (after a restart mid-run) / the tank was checked |
+| `UPLOAD[,YYYYMMDD]` | Send a day's SD log to the website (today included) |
+| `NET` / `WIFI,<ssid>,<pass>` / `WIFI,ON\|OFF` / `WIFIPORTAL[,STOP]` / `TSKEY,<ch>,<key>` | Network status and setup |
+| `FBASE,STATUS` (and `FBASE,ON\|OFF\|<url>\|SIGNOUT\|TLS,…\|APIKEY,…\|AUTH,…`) | Website sync status and setup |
+| `BATTSW[,CLEAR]` / `SIMTEST` / `BAL` / `USSD,<code>` / `ALERTNUM,<number>` | Battery switch, SIM check, balance, balance code, second alert phone |
 
-Outbound: fault/warning alerts (`ALERT,...`), scheduled-run notices (`RUN,...`),
-and compact daily/on-demand reports (`RPT,...` / `SUM,...`).
+The full list with replies: `Operator_Manual.md` §2 and the reference §12.2.5.
+
+Outbound, one plain-English text each: alerts (`CRITICAL: …` / `ALERT: …` / `WARNING: …` / `NOTICE: …`, ending
+with `(time CODE)`), run notices (`RUN: Col A …`) and paged reports (`DAILY REPORT <date> 1/N`, `SUMMARY …`).
+Fault codes: reference §23.4.
 
 ---
 
 ## Commissioning notes
 
 Hardware-dependent values are tagged in the source as `[MEASURE]`, `[TBD]`, or `[CONFIRM]`
-(soil ADC calibration, ultrasonic tank geometry, flow K-factors, NPK Modbus addresses/baud,
+(soil ADC calibration, ultrasonic tank geometry and litres, the transfer / booster pump lines, dosing flow K-factors, NPK Modbus addresses/baud,
 EC/pH safe windows, battery thresholds, INA226 shunt, ACS712 sensitivity, the GSM recipient
 number, etc.). Set these for your rig before deployment: `Calibration_Worksheet.md` ranks them
 and `Commissioning_Flash_Plan.md` stages the testing.

@@ -3,6 +3,8 @@
 This file defines the locked architecture and conventions for this project. These decisions were made deliberately and must NOT be changed without explicit instruction. The full specification lives in `Smart_Irrigation_System_Reference_FINAL.md` (the single source of truth).
 
 ## Read this at the start of every session
+**Current state (17 Nov 2026, web v.4 "pure ultrasonic"):** `Smart_Irrigation_System_Reference_FINAL.md` — the opening status block, §19.4.9.11–27 and §29.10. `SESSION_HANDOFF.md` below describes the 1 Nov state.
+
 **`SESSION_HANDOFF.md`** — current repo state, the one blocking user action, environment gotchas (PlatformIO is not on PATH; both `platformio.ini` files carry the skip-worktree bit, so git silently ignores edits to them), what is still outstanding, and the file-editing hazards that have corrupted `main.cpp` and `script.js` before. Short, and kept current. Read it before planning anything.
 
 ## Plan before editing
@@ -14,7 +16,7 @@ For any non-trivial change, explain the plan and wait for approval before editin
 Three controllers, strict role separation:
 - **Arduino Nano** — sensor hub ONLY. Reads sensors, frames packets, transmits. No decisions, no actuators, no fault classification.
 - **ESP32 #1** — master controller. Decisions, scheduling, GSM, logging, UI, fault classification. Single source of authority.
-- **ESP32 #2** — actuator executor. Drives pumps/valves, counts flow, performs local protective stops. Executes; does not decide policy.
+- **ESP32 #2** — actuator executor. Drives pumps/valves, meters the water by the tank ultrasonics (web v.4) and the doses by the small flow meters, performs local protective stops. Executes; does not decide policy.
 
 Build order: Nano → ESP32 #1 → ESP32 #2.
 Layout: PlatformIO, `src/main.cpp` per controller.
@@ -250,7 +252,7 @@ When power-cycling ESP2 (even 5×) doesn't restore comm, the fault is on **ESP1'
 - Config by SMS (owner-gated, NVS-persisted): `WIFI,<ssid>,<pass>` (password = remainder after the 2nd comma, may contain commas/spaces), `TSKEY,<1|2|3>,<writeKey>`, `NET` (status). Upload is plain HTTP (unencrypted — acceptable for this rig).
 
 ## ADDED: WiFi provisioning portal (SoftAP web form, set SSID/password from a phone)
-- On demand, ESP32 #1 hosts a temporary **WPA2 SoftAP** (`AP_SSID`=`Irrig-Setup`, `AP_PASS`=`irrigate123`) + a **captive web form** at `http://192.168.4.1`: join from a phone, pick a **scanned** nearby SSID (or type a hidden one), enter the password, **Save** → creds go to NVS and the device reconnects in STA. No SMS or button-typing needed (ideal for commissioning). Built-in `WebServer`+`DNSServer` (no new `lib_deps`).
+- On demand, ESP32 #1 hosts a temporary **WPA2 SoftAP** (`AP_SSID`=`Irrig-Setup`, `AP_PASS` = `SECRET_AP_PASS` from the git-ignored `ESP1/include/secrets.h`) + a **captive web form** at `http://192.168.4.1`: join from a phone, pick a **scanned** nearby SSID (or type a hidden one), enter the password, **Save** → creds go to NVS and the device reconnects in STA. No SMS or button-typing needed (ideal for commissioning). Built-in `WebServer`+`DNSServer` (no new `lib_deps`).
 - **Two Settings-menu toggles** (the MODE-button menu), each with a live `[ON]/[OFF]` label (`setRowLabel`): **`WiFi`** (`SET_WIFI`) = persisted STA-radio/telemetry master switch (`wifiEnabled`, NVS key `wifien`, default ON); **`Setup AP`** (`SET_SOFTAP`) = start/stop the provisioning portal. SMS parity: **`WIFI,ON`/`WIFI,OFF`** (radio switch) and **`WIFIPORTAL`** / `WIFIPORTAL,STOP` (portal), owner-gated. Portal also closes on **BACK** or a **10-min** auto-timeout.
 - **`wifiEnabled` gates `netTask`:** when OFF, the task drops the radio (`WiFi.mode(WIFI_OFF)`) and skips telemetry; `NET`/LCD show `WiFi:OFF` (distinct from `DOWN`). The **portal is checked before this gate**, so Setup AP works even with the radio switch OFF; a successful portal **Save auto-sets `wifiEnabled=true`** so it connects to the new network.
 - **Concurrency invariant:** the portal runs entirely in the **core-0 `netTask`** (`portalStart/Stop`, handlers). It must **not** write NVS from core 0 — it stages creds under `netMux` and sets `wifiPersistPending`; the **core-1 loop** calls `saveWifi()`+`saveWifiEn()`. Keeps all NVS writes single-core. Irrigation/fertigation (core 1 + ESP2) run **unaffected** while the AP is up; only telemetry pauses. The old `WIFI,<ssid>,<pass>` SMS stays as a fallback.
@@ -301,6 +303,53 @@ When power-cycling ESP2 (even 5×) doesn't restore comm, the fault is on **ESP1'
 - **Web hold-to-run** (`irrigation/testHold = {seq, bit, want}`): the page rewrites `want:true` every 1.2 s while a button is held. ESP1 (`firebasePollTestHold`, core 0) stages only plain scalars; `pulseTick` (core 1) arms/releases through the same `PU_ARM/PU_RUN/PU_REPORT` + `TEST,HOLD` stream as `TEST_PULSE`. Bounds: polled every **1 s** during a hold, released after **4 s** without a fresh refresh (`TEST_HOLD_BROWSER_TIMEOUT_MS`), and capped at **15 s** continuous (`TEST_HOLD_MAX_MS = PULSE_MAX_S`). Any end other than `want:false` sets `testHoldLatched`, so a still-held button cannot re-arm until it is released. ESP2's 400 ms `TEST,HOLD` dead-man covers ESP1 itself dying; it does **not** cover the browser, which is what these ESP1 bounds are for.
 - **RESUME is confirmed, not assumed:** `issueRecovery()` sends `RESUME,<mode>` and sets `resumeAwaitingAck`; `esp2Held` clears only on ESP2's `ACK,RESUME` (or `INVALID,NOT_HELD`). No reply within 5 s → `RESUME_NO_REPLY` warning, still held. `lastHeldClearReason` (resumed / auto_cancelled / cancelled / estop / esp2_restarted) is published so the dashboard can say why a hold ended.
 - **ESP2 PZEM coverage** extends to EXERCISE, AC prime and SEQ_MIX (`auxPowerFaultStop`), each only after `INVERTER_WARMUP_MS` (now 5 s) so a ramping inverter can't false-trip `PWR_FAIL,VOLTAGE|LOW`. An unreadable PZEM reports `SENSOR_FAIL,PZEM` (Major, debounced). EXERCISE, PRIME, CAL, TEST and work orders refuse each other (`BUSY,EXERCISE/PRIME/CAL`).
+
+## CHANGED (2026-11-16/17): web v.4 "pure ultrasonic" (reference §19.4.9, §29.10)
+
+**Metering:**
+- **Water:** the tank ultrasonics meter the water. The ResMix / MixIrr main-line flow meters are not read at all;
+  the small dosing meters still meter the doses.
+- **A fill is TIMED:** run time from the inverter switch-on, from the pump line (`shared/pump_line.h`), then a
+  ~1 min settle, a measurement on the mixing tank, and a top-up when more than 3 L short.
+- **A delivery** runs until the mixing tank is under 5 % for 10 s.
+- **The mixer** is part of the mixing tank's shape (`shared/tank_volume.h`).
+
+**Shared headers:** `shared/` (`rig_constants.h`, `tank_volume.h`, `pump_line.h`) is included by both ESP32s.
+`WATER_BUDGET_L`, `MIX_HIGH_PCT` and `RES_FILTER_PCT` have one definition there. Keep these headers pure: no
+hardware, no time, no globals (host-tested).
+
+**Pump lines:** the user's 17 Nov readings are compiled in, and ESP1 fits the default lines at boot (transfer
+11.74 L/min + 0.47 L; booster 13.20 L/min − 0.65 L). The LCD pump estimate screens replace them (NVS
+`rXfer`/`xStartL`, `rBoost`/`bStartL`; ESP2 `SET_CAL,PRATE` / `PSTART`). Reference §5.3.2.
+
+**Timestamps:** every "never zero" `millis()` stamp uses `nzMs(t)` (`t ? t : 1`). **Never `t | 1`**: it is 1 ms in
+the future for even `t`, so `now - stamp` wraps to about 49 days and a timeout fires at once. That was the
+LEVEL_BLIND-at-start bug of 17 Nov.
+
+**ESP1 heap:** no large `static` / global buffers. Static RAM comes straight out of the heap, and below
+`FIREBASE_MIN_HEAP` (60 KB) every Firebase request is skipped. A 12 KB static log buffer did exactly that on 17 Nov.
+Watch the build's `RAM:` line: 82,184 B as of 17 Nov.
+
+**Logs:** the SD CSVs go to Firebase (`logs/index`, `logs/files/<day>/<nnnn>`, 6 KB pieces, 14 days kept), one
+piece per netTask pass. Supabase is used only while Firebase is off; its project expired on 17 Nov. SMS `UPLOAD`
+goes through Firebase.
+
+**Secrets:** the owner number, the setup-AP password and the first-boot admin PIN live in
+`ESP1/include/secrets.h`, which is git-ignored (`secrets.example.h` holds the placeholders). Never commit it, and
+never write those values into docs.
+
+**Operator rules (user):**
+- Testing Fill/Push run 1 minute counted only while the inverter is on.
+- 1.5 s between button runs (`ACT_REARM_MS`, ESP2 `TEST/PRIME_REARM_MS`); a release counts after 120 ms
+  (`BTN_RELEASE_MS`).
+- Every timed AC run counts from `INFO,INV_ON`.
+- BATT2 blocks AC pumps at a resting charge of 30 % or less (back at 35 %).
+- Forced runs have no daily limit and no tank-check block; an OFF column is switched back on when an LCD forced
+  run is armed.
+
+**Board-to-board additions:** `LEVEL` (with CRC-8 and line number), `LEVEL_FEED`, `SERVO_REQ`/`SERVO`,
+`INFO,INV_ON`, `INFO,FILL_RUN`/`FILL_CHECK`, `PRIME_START,<line>,<col>,<ms>` → `DONE,PRIME_TIMED`. The full list is in
+the reference §9.7.4.
 
 ## Conventions
 - EC/pH safe-window, hysteresis %, mixing duration = editable constants, values `<TBD>` (set at commissioning). Do not invent final values.

@@ -317,6 +317,30 @@ Watch `PAGE_GSM` on the LCD and the SD log (`GSM` lines) while you go through th
 **Before `SECONDARY_BATT_ENABLED` goes to 1:** the module must be on the same switched supply as ESP1.
 The DPDT breaks both + and −, so a module left on the main battery loses its common ground with the UART.
 
+### V — web v.4 "pure ultrasonic" (from 16–17 Nov 2026)
+
+Water is measured by the tank ultrasonics now. Run these before trusting the litres. 17 Nov evening already
+passed 1–3; see the reference §19.4.9.27.
+
+1. **The tanks read.** On the LCD home page both tanks show a % without `?`, and `TANK` rows say `st=KK`. Fill and
+   empty the mixing tank once by hand with Testing (Fill / Push>Col). Watch `NANO,LEVEL,NOT_USABLE` lines: a steady
+   stream of `pings_spread` means the sensor sees the mixer or the inflow, so aim it away.
+2. **Tank litres.** Settings → Calibration → **Tank Mix liters** / **Tank Res liters**: add points with a measuring
+   jug.
+3. **A forced irrigation** on each column: `INFO,FILL_RUN` → `INFO,INV_ON` → `INFO,FILL_CHECK|…|OK` → the delivery →
+   `DONE`. No `LEVEL_BLIND`.
+4. **The pump lines.** Re-measure on **Transfer pump est** with the reservoir at its usual level, at least 5 tries
+   with different seconds (two lengths such as 10 s and 40 s). The first field fills came in 35 % and 7 % over.
+   Then a delivery through the drip pipe, and type its `seen:` rate into **Rate Booster**.
+5. **The website and logs.** After a restart the log shows `ESP1,FBASE,OK` within about a minute (needs the ESP1
+   build with the heap fix). Diagnostics → SD card logs → **Upload from the rig** for today; Download. SMS `UPLOAD`
+   answers "queued".
+6. **Power.** `SYS,BOOT,reason=POWER_ON` during or right after runs means the supply dips. Fit a 5 V supply of at least
+   2 A for ESP1 and the A7670C, and a 1000–2200 µF low-ESR capacitor at the modem, before long unattended runs.
+
+> **Abort if** a fill's `FILL_CHECK` is more than 3 L off twice in a row, any `LEVEL_BLIND` or `MIX_OVERFLOW`
+> appears, or the mixing tank's reading jumps by more than a litre while it is still.
+
 ## After stage G
 
 Unattended fertigation on all three columns is what stage G *graduates to*, not part of it. Run
@@ -342,30 +366,37 @@ Bisecting costs about six flash cycles, which is why it is the fallback rather t
 
 ## Known-good reference
 
-All three controllers build clean (confirmed 2026-11-01, after the A7670C swap and the firmware audit):
+All three controllers build clean (web v.4, confirmed 2026-11-17; 2026-11-01 figures in brackets):
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 24.6 % (80,672 B) | 41.9 % (1,319,045 B) |
-| ESP2 | 7.1 % (23,252 B) | 25.9 % (339,665 B) |
-| Nano | 52.0 % (1,064 B) | 48.2 % (14,792 B) |
+| ESP1 | 25.1 % (82,184 B) [80,672 B] | 45.3 % (1,424,393 B) [1,319,045 B] |
+| ESP2 | 7.3 % (24,028 B) [23,252 B] | 29.1 % (381,465 B) [339,665 B] |
+| Nano | 64.6 % (1,324 B) [1,064 B] | 64.6 % (19,836 B) [14,792 B] |
 
-A build that differs sharply from these has picked up something unintended.
+A build that differs sharply from these has picked up something unintended. **Watch ESP1's RAM above all:**
+static RAM comes out of the heap, and below 60 KB free at run time ESP1 skips every Firebase request (on 17 Nov a
+12 KB static buffer took ESP1 to 94,432 B and the website stopped updating).
 
 ## Still outstanding
 
 - The device account password (see `Firebase infos.txt`) has never been rotated.
+- The owner phone number and the setup-AP password were in this public repo's history before 17 Nov (they now come
+  from the git-ignored `ESP1/include/secrets.h`). Change the setup-AP password and the admin PIN on the portal.
 - `SESSION_HANDOFF.md` §5 holds the current list, including item 19: **with the shipped constants, fertigation doses nothing.** Settle it before stage G.
 
 ## Host test suite
 
-Both suites pass — 86 cases for ESP1, 13 for ESP2 — and are worth running before any flash, since
-they take seconds and cover the maths the dosing depends on and the modem driver:
+Both suites pass in GitHub Actions on every push — 152 cases for ESP1, 83 for ESP2 (web v.4, 17 Nov) — and are
+worth running before any flash, since they take seconds and cover the maths the dosing and the water measurement
+depend on, and the modem driver:
 
 ```bash
-cd ESP1 && pio test -e native     # 86 cases, including a simulated A7670C
-cd ESP2 && pio test -e native     # 13 cases
+cd ESP1 && pio test -e native     # 152 cases: pure maths, the A7670C driver, tank litres, pump lines
+cd ESP2 && pio test -e native     # 83 cases: flow maths, level guard, level meter, servo check, source low
 ```
+
+If this PC has no host compiler, push to a branch and let the **Build firmware** workflow run them.
 
 MinGW-w64 (g++ 14.2.0) is installed and on the persisted PATH, so this works from **a new terminal**.
 An already-open terminal from before the install will still say "gcc is not recognized" — open a

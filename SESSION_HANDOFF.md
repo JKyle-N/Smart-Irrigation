@@ -1,5 +1,11 @@
 # Session Handoff — start here
 
+> **Superseded on 17 Nov 2026.** This handoff describes the repository as of 1 Nov 2026. Since then the
+> firmware became web v.4 "pure ultrasonic". It was flashed and field-checked on 17 Nov; see
+> `Smart_Irrigation_System_Reference_FINAL.md` (the opening status block, §19.4.9.11–27, §29.10) and `CLAUDE.md`
+> ("CHANGED (2026-11-16/17)"). Host tests: ESP1 152, ESP2 83, all passing in GitHub Actions.
+
+
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds
 the locked architecture — do not repeat or re-derive it here).
 

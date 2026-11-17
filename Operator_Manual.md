@@ -24,41 +24,46 @@ ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS 
 2. Text **`STATUS`** to the controller's SIM — you should get a daily-report line back. That confirms
    two-way SMS works.
 3. To change a plant's nutrient target: **`SET,COL_A,N,150,P,40,K,200,pH,5.8`**.
-4. The system irrigates/fertigates **automatically** on its schedule; you don't trigger runs manually.
-   You'll get a **`RUN,…`** text when a column is serviced and an **`ALERT,…`** if anything goes wrong.
+4. The system irrigates/fertigates **automatically** on its schedule. You can also start a run yourself:
+   **Settings → Force Run** on the LCD (§6.8) or **Force Run** on the website. You get a **`RUN: …`** text
+   when a column is serviced, and an alert (`CRITICAL: …` / `ALERT: …`) if anything goes wrong.
 
 ---
 
 ## 2. Commands you SEND (SMS)
 
-| Command | Example | What it does | You get back |
+| Command | Example | What it does | The reply starts with |
 |---|---|---|---|
-| `STATUS` | `STATUS` | Live status + today's report. If a run is active, you get a quick busy-ack first, then the report when idle. | `RPT,…` (see §4) or `ACK,BUSY,…` |
-| `SUMMARY[,<day>]` | `SUMMARY` / `SUMMARY,YESTERDAY` | The day's **averages** (per-column NPK + moisture, power, water/nutrient totals, counts), parsed from the SD log. | `SUM,…` (see §4) |
-| `FULL SUMMARY[,<day>]` | `FULL SUMMARY,20260625` | The day's **hour-by-hour** record + de-duplicated errors + run/dose events + peaks. Can span several texts. | `FULL,… (i/N)` |
-| `NET` | `NET` | WiFi / ThingSpeak link status. | `NET,WiFi:…` (see §4) |
-| `BATTSW` / `BATTSW,CLEAR` | `BATTSW,CLEAR` | Battery-switch status, or clear a latched `BATT_SWITCH_FAULT` (re-arms switching to the secondary battery). | `BATTSW,ON,OK,strikes=0/2,supply=MAIN` / `ACK,BATTSW,CLEARED` |
-| `SIMTEST` | `SIMTEST` | Checks the SIM and modem. Also sent by itself every Sunday with the 18:00 report: **if a Sunday passes with no `SIMTEST` text, check the SIM's load and the modem.** | `SIMTEST,sig=22,reg=Y,stat=1,sent=5,gaveup=0,dlv=5,undlv=0,resets=0` |
-| `USSD,<code>` / `USSD,CLEAR` | `USSD,*143#` | Save your carrier's balance code, or clear it. It is also checked with the Sunday `SIMTEST`. | `USSD,*143#` |
-| `BAL` | `BAL` | Ask the carrier for the SIM's balance. `BAL,FAIL,ERROR` means the module or carrier refused the request. | `BAL,<carrier's text>` |
-| `ALERTNUM,<number>` / `ALERTNUM,CLEAR` | `ALERTNUM,09171234567` | Set or clear a second phone that also gets `ALERT` texts. It only receives: commands from it are refused. | `ALERTNUM,09171234567` |
-| `SET,COL_x,N,..,P,..,K,..,pH,..` | `SET,COL_A,N,150,P,40,K,200,pH,5.8` | Set per-column nutrient targets (mg/kg) + pH. Any subset of N/P/K/pH may be given. | `ACK,SET,COL_A` |
-| `SET,COL_x,PRESET,<CROP>` | `SET,COL_B,PRESET,LETTUCE` | Apply a built-in crop preset (see §7). | `ACK,SET,COL_B,PRESET,LETTUCE` |
-| `MODE,COL_x,AUTO` | `MODE,COL_A,AUTO` | Column decides irrigate-vs-fertigate automatically (by the nutrient gap). | `ACK,MODE,COL_A,AUTO` |
-| `MODE,COL_x,IRRIGATION_ONLY` | `MODE,COL_C,IRRIGATION_ONLY` | Water only for this column — never doses nutrients. | `ACK,MODE,COL_C,IRRIGATION_ONLY` |
-| `NAME,COL_x,<name>` | `NAME,COL_A,Lettuce` | Give a column a name (shown in reports; saved). | `ACK,NAME,COL_A,Lettuce` |
-| `THRESH,<start>,<stop>,<gap>` | `THRESH,35,45,30` | Soil start%/stop% irrigation thresholds + fertigation gap (mg/kg). Also on the LCD (Settings → Thresholds) and the portal. `stop` is bumped above `start` if needed. | `ACK,THRESH,35,45,30` |
-| `STOP,ALL` | `STOP,ALL` | **Emergency stop** — halt all actuators now. | `ACK,STOP,ALL` |
-| `WIFI,<ssid>,<pass>` | `WIFI,MyNet,my pass,word` | Set WiFi credentials (**owner-only**). Password is everything after the 2nd comma, so it may contain commas/spaces; the SSID may not. | `ACK,WIFI,MyNet` |
-| `WIFI,ON` \| `WIFI,OFF` | `WIFI,OFF` | WiFi **master switch** (**owner-only**) — same as Settings → WiFi. OFF stops WiFi + uploads; ON reconnects. Persisted. | `ACK,WIFI,OFF` |
-| `WIFIPORTAL` | `WIFIPORTAL` | Start the **Setup AP** portal (**owner-only**) — see §6.6. `WIFIPORTAL,STOP` cancels it. | `ACK,WIFIPORTAL,join Irrig-Setup …` |
-| `TSKEY,<1\|2\|3>,<key>` | `TSKEY,1,ABCD1234EFGH5678` | Set a ThingSpeak channel **write** key (**owner-only**). Ch1=Columns, Ch2=System, Ch3=Chem. | `ACK,TSKEY,1` |
+| `HELP` / `HELP,RUN` / `HELP,CROPS` / `HELP,SYSTEM` | `HELP,RUN` | The command list, one text per topic. | `HELP: text one command` |
+| `STATUS` | `STATUS` | The report now. During a run you get a busy note first, then the report when it ends. | `DAILY REPORT <date> 1/N` (or `BUSY: Irrigation running on Col A.`) |
+| `SUMMARY[,<day>]` | `SUMMARY,YESTERDAY` | The day's **averages** (per-column NPK and moisture, power, water and nutrients, counts), from the SD log. | `SUMMARY <date> 1/N` |
+| `FULL SUMMARY[,<day>]` | `FULL SUMMARY,20261117` | The day **hour by hour**, each error once, run and dose events, peaks. Several texts. | `FULL SUMMARY <date> 1/N` |
+| `STOP` (or `STOP,ALL`) | `STOP` | **Emergency stop.** While a fault is held, `STOP` instead means "stay on hold" (§5). | `OK: EMERGENCY STOP` |
+| `CANCEL,30` / `CANCEL,10` / `CANCEL,OFF` | `CANCEL,30` | End the current run, and skip its column for 30 / 10 minutes, or switch the column **off** (saved; switch it back on in Settings → Column Mode or on the website). | `OK: Run cancelled, Col A` |
+| `TANKCHECK` / `TANKCHECK,OK` | `TANKCHECK,OK` | Is a tank check needed / you have looked at the mixing tank (idle only, §5). | `TANK CHECK NEEDED …` / `OK: Tank check confirmed.` |
+| `SET,COL_x,N,..,P,..,K,..,pH,..` | `SET,COL_A,N,150,P,40,K,200,pH,5.8` | Nutrient targets (mg/kg) and pH. Any subset; nothing is saved if one value is out of range. | `OK: Col A targets saved` |
+| `SET,COL_x,PRESET,<crop>` | `SET,COL_B,PRESET,PECHAY` | A built-in crop preset (§7). | `OK: Col B uses preset PECHAY` |
+| `MODE,COL_x,AUTO` / `MODE,COL_x,IRRIGATION_ONLY` | `MODE,COL_A,AUTO` | AUTO = nutrients when needed; IRRIGATION_ONLY = water only. | `OK: Col A mode is AUTO …` |
+| `NAME,COL_x,<name>` | `NAME,COL_A,Lettuce` | The plant name (shown in reports; saved). | `OK: Col A plant name is now Lettuce` |
+| `THRESH,<start %>,<gap>` | `THRESH,35,30` | Watering starts below `start` % soil moisture; nutrients are added when `gap` mg/kg or more below target. (The old `THRESH,<start>,<stop>,<gap>` still works; the stop is ignored.) | `OK: Watering starts below 35% …` |
+| `NET` | `NET` | WiFi and ThingSpeak status. | `NETWORK` |
+| `WIFI,<ssid>,<pass>` / `WIFI,ON` / `WIFI,OFF` | `WIFI,MyNet,my pass,word` | WiFi network (the password is everything after the 2nd comma) / the WiFi switch. | `OK: WiFi set to MyNet. Connecting now.` |
+| `WIFIPORTAL` / `WIFIPORTAL,STOP` | `WIFIPORTAL` | The **Setup AP** portal (§6.6). | `OK: WiFi setup portal is ON …` |
+| `TSKEY,<1\|2\|3>,<key>` | `TSKEY,1,ABCD1234EFGH5678` | A ThingSpeak channel write key (1 Columns, 2 System, 3 Chem). | `OK: ThingSpeak key for channel 1 saved.` |
+| `FBASE,STATUS` (and `FBASE,ON` / `OFF`, `FBASE,<url>`, `FBASE,SIGNOUT`, `FBASE,TLS,ON` / `OFF`, `FBASE,APIKEY,<key>`, `FBASE,AUTH,<email>,<password>`) | `FBASE,STATUS` | Website sync: why it is or is not connecting, and its setup. Nothing secret is ever sent back. | `FIREBASE: signed in` … |
+| `UPLOAD` / `UPLOAD,YYYYMMDD` | `UPLOAD,20261117` | Send that day's SD log (default yesterday) to the website, today included as far as it is written. Download it there: Diagnostics → SD card logs. | `OK: The log for … is queued for upload.` |
+| `BATTSW` / `BATTSW,CLEAR` | `BATTSW,CLEAR` | Battery-switch status / clear a latched switch fault. | `BATTERY SWITCH` / `OK: Battery switch fault cleared.` |
+| `SIMTEST` | `SIMTEST` | The SIM and modem check. Also sent by itself every Sunday with the 18:00 report: **if a Sunday passes with no SIM check text, check the SIM's load and the modem.** | `SIM CHECK (weekly)` |
+| `USSD,<code>` / `USSD,CLEAR` / `USSD` | `USSD,*143#` | Save / clear / show your carrier's balance code. | `Balance code: *143#` |
+| `BAL` | `BAL` | Ask the carrier for the SIM balance (needs the USSD code). | the carrier's text |
+| `ALERTNUM,<number>` / `ALERTNUM,CLEAR` / `ALERTNUM` | `ALERTNUM,09171234567` | A second phone that also gets alerts. It only receives: its commands are refused. | the number |
+| `SUPA,<url>,<key>` / `SUPA,CLEAR` | | The old Supabase log upload (that project expired on 17 Nov 2026; logs go to the website now). | `OK: Supabase login saved.` |
 
 **`<day>` token** (for SUMMARY / FULL SUMMARY): *omit* = today · `YESTERDAY` · `YYYYMMDD` (e.g.
-`20260625`) · `NODATE` (the file used when the clock/RTC is dead).
+`20261117`).
 
-**Fault-recovery replies** — see §5. The words `STOP`, `RELEASE`, `IRRIGATE`, `NORMAL` mean something
-*only while a fault is being held*; the rest of the time `STOP` is treated as the emergency stop.
+**Fault-recovery replies** — see §5. The words `STOP`, `RELEASE`, `IRRIGATE`, `NORMAL` and `SERVO` mean
+something *only while a fault is being held*; the rest of the time `STOP` is the emergency stop.
 
 ---
 
@@ -66,147 +71,148 @@ ESP32 #2 *runs the pumps and valves*. You only ever talk to ESP32 #1 — by SMS 
 
 **All commands are owner-only**: the sender's number must match the configured owner number
 (compared on the last 9 digits). This includes STATUS/NET/SUMMARY, the recovery replies
-(STOP/RELEASE/IRRIGATE/NORMAL), and all config. A text from any other number is rejected with
-**`ERR,AUTH`**. Make sure `PHONE_NUMBER` is set to your handset.
+(STOP/RELEASE/IRRIGATE/NORMAL/SERVO), and all config. A text from any other number gets *"Sorry, this
+number is not allowed to control the irrigation system."*, at most once every 10 minutes, and short codes
+or promo senders get no reply at all. Set the owner number in `ESP1/include/secrets.h` before flashing, or
+later on the Setup AP admin page (§6.6). A second alert phone (`ALERTNUM`) receives alerts only.
 
 ---
 
 ## 4. Messages you RECEIVE (how to read them)
 
-### 4.1 Acknowledgements (`ACK,…`)
-A successful command echoes back as `ACK,…`:
+### 4.1 Replies
+Every reply is **one plain-English text** (at most 160 characters). Its first word tells you what happened:
+- **`OK:`** — done.
+- **`NOT DONE:`** — refused, with the reason and what to send instead.
+- **`BUSY:`** — queued or deferred.
+- **A heading** for a report: `DAILY REPORT`, `SUMMARY`, `NETWORK`, `BATTERY SWITCH`, `SIM CHECK`, `FIREBASE`.
 
-| Reply | Meaning |
-|---|---|
-| `ACK,SET,COL_A` | Targets saved for column A. |
-| `ACK,SET,COL_A,PRESET,LETTUCE` | Preset applied. |
-| `ACK,MODE,COL_A,AUTO` | Column mode changed. |
-| `ACK,NAME,COL_A,Lettuce` | Column named. |
-| `ACK,STOP,ALL` | Emergency stop accepted. |
-| `ACK,STOP,HELD` | (During a held fault) you chose to keep holding. |
-| `ACK,RESUME,NORMAL` / `…,IRRIGATE` / `…,RELEASE` | Your recovery choice was sent to the actuator controller. |
-| `ACK,WIFI,<ssid>` / `ACK,TSKEY,<ch>` | WiFi / ThingSpeak setting saved. |
-| `ACK,BUSY,FERTIGATION,COL_B` | The system is mid-run; your request (e.g. STATUS) is queued and answered when it finishes. |
+```
+OK: Col A targets saved
+N150 P40 K200 mg/kg, pH 5.8
+```
+```
+NOT DONE: Unknown column. Use COL_A, COL_B or COL_C.
+```
+```
+BUSY: Someone is editing settings on the LCD.
+Your change will be applied when they finish.
+```
 
-### 4.2 Errors (`ERR,…`)
-| Reply | Meaning / fix |
-|---|---|
-| `ERR,PARSE` | Command didn't parse — check commas/format. |
-| `ERR,COL` | Bad column — use `COL_A` / `COL_B` / `COL_C`. |
-| `ERR,MODE` | Mode must be `AUTO` or `IRRIGATION_ONLY`. |
-| `ERR,NAME` | NAME needs a column and a name. |
-| `ERR,PRESET` | Unknown preset name (see §7). |
-| `ERR,AUTH` | Owner-only command from a non-owner number. |
-| `ERR,WIFI` / `ERR,TSKEY` / `ERR,TSCH` | Bad WiFi/ThingSpeak syntax; `TSCH` = channel not 1–3. |
-| `ERR,SUMDATE` | Bad `<day>` token for SUMMARY. |
-| `ERR,CMD` | Unknown command keyword. |
-| `ERR,RESUME,BATT2` | A held run can't resume yet: the secondary battery is low or its monitor isn't answering (only while secondary-battery switching is enabled). The run stays held with the tank volume kept; Hold and Cancel still work. |
-| `BUSY,local edit; applied after` | Someone is editing the same setting on the LCD right now; your change is queued and applied when they finish. |
+### 4.2 Run notice
+One text per column service, when it starts:
+```
+RUN: Col A (Lettuce)
+Irrigation: water only
+Started 06:00
+```
 
-### 4.3 Run notice
-`RUN,COL_A,FERTIGATION` or `RUN,COL_A,IRRIGATION` — one text per column service, sent when a run
-starts. (No text per drop of telemetry — only run notices, alerts, and reports.)
+### 4.3 Alerts
+Line 1 is the kind and the headline, then the detail, then what to do, then `(time CODE)`. The code is the same
+one the LCD, the website and the SD log show.
 
-### 4.4 Alerts (`ALERT,<tier>,<CODE>,<loc>[,<op>,COL_x,reply …]`)
-Tiers: **CRIT** 🔴 (critical) · **MAJ** 🟠 (major) · **MIN** 🟡 (minor) · **WARN** (warning/info).
-A hard actuator fault adds the current operation + column and a recovery menu, e.g.
-`ALERT,CRIT,FLOW_FAIL,MAIN,FERTIGATION,COL_B,reply STOP/RELEASE/IRRIGATE/NORMAL`.
+The kind words are **`CRITICAL`** (Critical tier), **`ALERT`** (Major), **`WARNING`** and **`NOTICE`** (minor).
+Alerts also go to the second alert phone. A real one from 17 Nov:
+```
+CRITICAL: Tank level sensor not reading
+Col A irrigation; transfer; no settled level; level=blind; bad li..
+Check the mixing tank ultrasonic
+(17:40 LEVEL_BLIND)
+```
+When the run is **held**, a second text follows (owner only):
+```
+ON HOLD (Col A). Reply:
+NORMAL = resume run
+IRRIGATE = water only, no dose
+RELEASE = deliver tank as is
+STOP = stay on hold
+CANCEL,30 = end run, skip 30m
+```
 
-**Fault-code glossary:**
-
-| Code | Tier | Meaning | What to do |
+### 4.4 Fault codes
+| Code | Kind | The text says | What to do |
 |---|---|---|---|
-| `FLOW_FAIL` | CRIT | A pump ran but no/!enough flow was metered (dry line, blockage, dead pump). The run is **held**. | Reply with a recovery choice (§5) after checking the line. |
-| `PWR_FAIL` | CRIT | Power fault on an AC pump (no current / overcurrent / mains voltage out of range). Run **held**. | Check pump/inverter/mains, then recover. |
-| `SAFE_STOP` | CRIT | Local protective stop (e.g. mixer overcurrent). Run **held**. | Check the mixer/load, then recover. |
-| `DOSE_TIMEOUT` | CRIT | A nutrient pump ran past its time ceiling without reaching the target dose — the dosing line is unprimed or its flow sensor is stuck. Run **held**. | Prime that nutrient line (Testing combos / Prime), check the dosing flow sensor, then recover. |
-| `ESP2_ERROR` | CRIT | Actuator controller reported a generic execution failure. Run **held**. | Recover or `STOP,ALL`. |
-| `ESP2_DONE_TIMEOUT` | CRIT | A run didn't finish within the time budget. | Inspect; system has stopped supervising that run. |
-| ~~`BATTERY_CRITICAL`~~ | — | **Removed** — battery no longer stops the system. Battery voltage is still shown on the LCD/`NET`/ThingSpeak, but there is no battery emergency-stop. | Watch the battery voltage yourself. |
-| `EC_FAIL` / `PH_FAIL` | MAJ | EC or pH was outside the safe window during dosing (batch still delivered). | Check nutrient mix / probes. |
-| `SENSOR_FAIL` | MAJ | An EC/pH probe read railed (disconnected/shorted) — distinct from out-of-window. | Inspect/replace the probe. |
-| `PCF_FAIL` | MAJ | The actuator relay driver isn't responding (relay-bus fault). | Inspect ESP2 wiring/I²C; other safeties still apply. |
-| `ESP2_DEGRADED` | MAJ | One channel was disabled (a nutrient no-flow or mixer no-load) but the run **continued**. | Note which channel; service it later. |
-| `ESP2_SILENCE` | MAJ | The actuator controller went quiet **and did not answer 5 status probes (~10 s)**; recovery is under way. | Usually self-recovers. Only genuine no-reply raises this (fewer false alarms). While idle the controller is briefly powered up ~every 10 min (day) / 1 h (night) for a health check — you may hear its relay click — and every power-up now lasts at least 10 s so it can boot and respond. |
-| `ESP2_NO_READY` | MAJ | Actuator controller didn't come up for a run/startup. | Check ESP2 power (GPIO4 relay). |
-| `ESP2_COMM_LOST` | MAJ | Comm still dead after **5 fast power-cycles** — the link, not just ESP2's state, is broken. ESP1 stops hammering the relay, reboots **itself once** (a full reset, may reset once/day), then keeps **retrying gently every 20 min** until it recovers (you'll then get `ESP2_COMM_OK`). | Check the **ESP1↔ESP2 wiring**: ESP1 TX(25)→ESP2 RX(16), ESP1 RX(33)←ESP2 TX(17), a **shared ground**, and 9600 baud — no firmware retry fixes a crossed/loose/ungrounded wire. |
-| `NPK_FAULT` | MAJ | A column's NPK sensor read invalid; that column won't fertigate this cycle. | Check the RS485/NPK probe. |
-| `RES_LOW` | MAJ | Reservoir below the low threshold — runs blocked until refilled. | Refill the reservoir. |
-| ~~`BATTERY_LOW`~~ | — | **Removed** — battery low no longer disables fertigation or alerts. Monitoring only. | Watch the battery voltage yourself. |
-| `BATT2_LOW` | MAJ | Secondary battery below 13.6 V. While secondary-battery switching is enabled, no run, exercise, AC prime or inverter Testing row may **start** until it is back above 14.0 V (a run already going finishes). | It recharges from the main battery while idle; check the charger if it stays low. |
-| `BATT2_CRIT` | MAJ | Secondary battery below 12.8 V (3.2 V/cell). | Charge or replace it before the next run. |
-| `BATT_SWITCH_RESET` | MAJ | Moving the controllers to/from the secondary battery reset them: the hold-up didn't carry them through the switch. The text says which direction and the count (`n=1/2`). After about a minute (the hold-up recharges), the interrupted run re-runs on its own when still due. The tank volume is kept, and nutrients already in the tank are not dosed again. | Check the hold-up stage / DPDT coil supply. |
-| `BATT_SWITCH_FAULT` | MAJ | A **second** switch reset within 24 h. Switching is latched off and **every run that needs the inverter is refused** (runs, exercise, AC prime, inverter Testing rows). This stops a weak hold-up from resetting the rig over and over. | Fix the hold-up, then clear it: LCD **Settings → Batt Switch**, SMS `BATTSW,CLEAR`, or the dashboard System tab. It also clears itself 24 h after the last reset (if the clock is good). |
-| `ESTOP_KEPT` | CRIT | An emergency stop reset the controllers as it cut the power. The rig came back still stopped, so the stop was not lost. | Confirm on the LCD fault screen when it is safe to resume. |
-| `<fault>…\|BOARD_RESET` | MAJ | A fault (for example `FLOW_FAIL`) reset the controllers as it stopped the pumps, so the usual hold and reply menu are gone. The column is **skipped for today**. | Fix the cause. A forced run can retry it today; otherwise it runs tomorrow. |
-| `DOSE_CARRY` | MAJ | The tank still held a batch dosed for another column, and this column received it. No extra nutrients were added. | Note it for the crop records. It usually follows a stopped or skipped run. |
-| `MAIN_BATT_CRIT` | CRIT | *Only if the backup feature is enabled.* The main battery stayed critically low. The text says `SWITCHING_TO_BACKUP` or `BACKUP_NOT_AVAILABLE`. No run or other inverter use can start until it recovers. | Check the solar charging and the main battery. |
-| `BACKUP_EXHAUSTED` | CRIT | *Only if the backup feature is enabled.* The secondary battery ran down, or stopped being monitored, while running the controllers. They were returned to the main battery and **may shut down** if it is too weak. | Charge the batteries now. |
-| `BACKUP_SWITCH_FAILED` | CRIT | *Only if the backup feature is enabled.* The controllers could not be moved to the secondary battery. They stay on main and retry every minute. | Check ESP2, its link and the P4 relay. |
-| `ESP2_RESTARTED` | MAJ | The actuator controller rebooted in the middle of a run, test or held fault (a battery switch, a power glitch, or its watchdog). The job is released at once; the tank volume is kept and a still-due column re-runs on its own. | Look for the cause in the log just before it (`BATTSW`, `PWR_FAIL`, …). |
-| `RTC_INVALID` | MAJ | The clock cannot be trusted: its backup battery let it lose the time, or it keeps returning impossible dates. **Nothing runs on the schedule** and logs go to `NODATE.CSV`. | Set the clock (Settings → Set Clock, or the dashboard). If it happens again after a power cycle, replace the DS3231's CR2032. If it is `BAD_READS`, check the I²C wiring; it clears itself once reads are good. |
-| `RTC_MISSING` | MAJ | The clock chip did not answer at boot. Nothing runs on the schedule. | Check the DS3231 and its I²C wiring, then reboot. |
-| `SENSOR_FAIL,INA226…` | MAJ | The secondary battery's INA226 monitor isn't answering; inverter use is blocked (switching enabled) because the battery can't be checked. | Check the INA226 wiring on ESP1's I²C (address 0x40). If the text says `NO_PACK_CHECK_WIRING` (LCD `B2: no pack - wiring`), the chip is fine but sees no battery: check its VBUS lead and that the pack's negative is common with board ground. |
-| `NANO_GARBAGE` | MAJ | Sensor hub kept sending garbage after a software reset; running on last-valid data. | Check the Nano / sensor wiring. |
-| `NANO_RESET` | WARN | The sensor hub was told to self-reset (after 5 bad packets, or the daily fresh-start). | Informational. |
-| `NANO_SILENCE` | MIN | The sensor hub went quiet (its own watchdog restarts it). | Informational; check if it persists. |
+| `FLOW_FAIL` | CRITICAL, held | Tank level not moving, pump stopped | Check pump, valves, tank sensors, then reply (§5) |
+| `LEVEL_BLIND` | CRITICAL, held | Tank level sensor not reading | Check the mixing tank ultrasonic, then reply |
+| `SERVO_FAIL` | CRITICAL, held | Pump selector failed or stuck | Check the servo and its switch; reply `SERVO` to try again |
+| `PWR_FAIL` | CRITICAL, held | Pump power fault, pump stopped | Check pump, wiring and AC supply |
+| `INVERTER_FAIL` | CRITICAL, held | Inverter gave no AC power | Check the inverter and its wiring |
+| `BATT_SWITCH_FAIL` | CRITICAL, held | Switch to backup battery failed | Check the backup battery and relay |
+| `SAFE_STOP` | CRITICAL, held | Safety stop | Check the mixer and pumps |
+| `DOSE_TIMEOUT` | CRITICAL, held | Nutrient pump ran too long | Prime the nutrient line |
+| `ESP2_ERROR` | CRITICAL, held | Pump controller stopped the run | Check the pump controller board |
+| `MIX_OVERFLOW` | CRITICAL (emergency stop) | Mixing tank overfilling | Pumps stopped. Check tank, clear on LCD |
+| `ESP2_DONE_TIMEOUT` | CRITICAL | Pump controller never finished | All stopped. Check tank, clear on LCD |
+| `ESTOP_KEPT` | CRITICAL | Emergency stop kept after restart | Clear it on the LCD to resume |
+| `BATTERY_CRITICAL` | CRITICAL | Main battery critically low | All stopped. Charge it, clear on LCD |
+| `ESP2_RESTARTED` / `ESP2_SILENCE` / `ESP2_COMM_LOST` / `ESP2_NO_READY` | ALERT | Pump controller restarted / not answering / link lost / did not start | Usually recovers by itself; check its power and wiring if it repeats |
+| `ESP2_DEGRADED` | ALERT | Pump controller disabled a part | Run continues. Check it after (a weak pump, a fill short, a mixer with no load …) |
+| `PCF_FAIL` | ALERT | Relay board not responding | Check the relay board wiring |
+| `COL_MISMATCH` | ALERT | Column is off on pump controller | Skipped today. Match column settings |
+| `NANO_GARBAGE` | ALERT | Sensor board sending bad data | Check the sensor board wiring |
+| `SELF_RESET` | ALERT | Main controller restarting itself | Max once a day. Check if it repeats |
+| `RTC_MISSING` / `RTC_INVALID` | ALERT | Clock module not found / Clock time is wrong | Nothing runs on the schedule until fixed |
+| `SERVO_MISMATCH` | ALERT | Wrong pump ran, retrying | Check the pump selector servo |
+| `LEVEL_HIGH` | ALERT | Mixing tank full before target | Run goes on. Check tank litres cal |
+| `RES_EMPTY` / `RES_LOW` | ALERT | Water reservoir ran dry / is low | Refill it |
+| `TANK_CHECK` | ALERT | Check the mixing tank | Runs wait. Then text `TANKCHECK,OK` (§5) |
+| `EC_FAIL` / `PH_FAIL` | ALERT | Mixed batch EC / pH out of range | Batch still given. Check dosing / the pH probe |
+| `DOSE_BATCH_LOW` | ALERT | Batch too small to dose | Watering only. Check volume settings |
+| `DOSE_CARRY` | ALERT | Dosed batch went to other column | Note it for the crop records |
+| `WO_OVERSIZE` | ALERT | Run command too long, not sent | Run skipped. Check column settings |
+| `SENSOR_FAIL` | ALERT | Sensor not working (EC, pH, PZEM or a battery monitor) | Check its wiring |
+| `SOIL_MISSING` / `NPK_FAULT` | ALERT | Soil moisture reading missing / NPK sensor not reading | Check that column's probes; watering only |
+| `BATTERY_LOW` | ALERT | Main battery low | Check charging and the solar panel |
+| `BATT2_LOW` / `BATT2_CRIT` | ALERT | Backup battery low / critically low | AC pumps are blocked while its resting charge is 30 % or less (until 35 %) |
+| `BATT_SWITCH_RESET` / `BATT_SWITCH_FAULT` | ALERT | Battery switch reset the boards / Battery switching locked | Locked: clear on the LCD, the website or `BATTSW,CLEAR` (auto in 24 h) |
+| `MAIN_BATT_CRIT` / `BACKUP_EXHAUSTED` / `BACKUP_SWITCH_FAILED` | CRITICAL | (backup feature only) | Check the batteries |
+| `NANO_SILENCE` / `FORCE_ABORT` / `MANUAL_REVOKED` | NOTICE | Sensor board not answering / Manual run cancelled (and why) / Website control ended | Informational |
+| `NANO_RESET` / `NET_STALL` / `THRESH_NO_FERT` / `RESUME_NO_REPLY` | WARNING | Sensor board was restarted / Internet task stuck / Soil start % too low to fertilize / No answer to your resume | Informational, or raise the start % / resend the reply |
 
-### 4.5 Daily report — `RPT,<date>,…`
-Sent automatically once a day (and in reply to `STATUS`). Example:
+**Why a forced run was cancelled** (`FORCE_ABORT`, after its countdown):
+- **The rig was busy or locked:** `NOT_IDLE`, `IN_MENU` (someone in a menu), `BUSY`, `HELD`, `WEB_MANUAL`, `ACTUATIONS_OFF`.
+- **Battery:** `BATT2_LOW`, `BATT2_MONITOR` / `BATT2_NOT_SEEN` (its monitor is not answering), `BATTSW_FAULT`,
+  `BATTSW_RECHARGE` (pumps wait 1 minute after every restart: arm again after a minute), `MAIN_BATT_CRIT`.
+- **Water or column:** `RES_LOW`, `COL_DISABLED` (the column was switched off).
 
+### 4.5 Daily report — `DAILY REPORT <date> i/N`
+Sent automatically once a day (18:00) and in reply to `STATUS`, in several pages. For example:
 ```
-RPT,20260625,A:Lettuce|N150P40K200|pH5.8|W12.5|Nu30.0,B:-|N0P0K0|pH6.0|W5.0|Nu0.0,
-FLT,C0M1m0,RST,1,ST,IDLE_STATE,BAT,12.6V,CONS,180Wh,CHG,240Wh
+DAILY REPORT 2026-11-17 1/4
+State: idle, ready
+Faults: 0 critical, 2 major, 1 minor
+Sensor board resets: 1
+Battery 12.6V, backup 15.9V
 ```
+The pages that follow give solar and energy (used / charged), the water and nutrients each column got today,
+and each column's targets. `LOW` after a battery means it is under its low mark; `--` means its monitor isn't
+answering.
 
-| Field | Meaning |
-|---|---|
-| `20260625` | Date (YYYYMMDD); `0` if the clock is unset. |
-| `A:Lettuce` | Column letter : name (`-` if unnamed). Only **enabled** columns appear. |
-| `\|N150P40K200` | Target N-P-K (mg/kg). |
-| `\|pH5.8` | Target pH. |
-| `\|W12.5` | Water delivered to that column today (litres). |
-| `\|Nu30.0` | Nutrient dosed today (mL). |
-| `FLT,C0M1m0` | Faults today: **C**ritical / **M**ajor / **m**inor counts. |
-| `RST,1` | Sensor-hub resets today. |
-| `ST,IDLE_STATE` | Current system state. |
-| `BAT,12.6V` | Battery voltage. |
-| `BAT2,15.9V` | Secondary battery voltage (`LOW` appended when below its low threshold; `--` if its monitor isn't answering). |
-| `SOL,14.2V3.1A` | Solar voltage and current (`--` if its monitor isn't answering; `0.0V` at night is normal). |
-| `CONS,180Wh` / `CHG,240Wh` | Energy drawn from the main battery / measured from solar today. |
+### 4.6 Summary — `SUMMARY <date> i/N`
+The day's averages from the SD log: each column's N, P, K and soil moisture, the battery and power, total water
+and nutrients, fault counts, and the numbers of irrigations, fertigations and doses. If the SD card couldn't be
+read, the text says so.
 
-### 4.6 Summary — `SUM,<day> …` (averages)
-Example: `SUM,2026-06-25 A:N148P39K198M42 B:N-P-K-M51 BAT12.5V 3.2W CONS180 CHG240Wh H2O17.5L NUT30mL FLT C0M1m0 RST1 IRR2 FERT1 DOSE3`
+### 4.7 Full summary — `FULL SUMMARY <date> i/N`
+Hour by hour (each column's NPK and moisture, battery and power), then each distinct error once with its first
+time, the day's run and dose events, and the peaks and totals. Long reports go over several texts. When there is
+more than fits, the text says the rest is on the SD card.
 
-| Token | Meaning |
-|---|---|
-| `A:N148P39K198M42` | Column A day-average N, P, K, and **M**oisture %. `-` = no samples. |
-| `BAT12.5V 3.2W` | Average battery volts / watts. |
-| `CONS180 CHG240Wh` | Energy consumed / charged (Wh). |
-| `H2O17.5L NUT30mL` | Total water / nutrient delivered. |
-| `FLT C#M#m#` | Fault counts by tier. |
-| `RST# IRR# FERT# DOSE#` | Counts of resets, irrigations, fertigations, dose events. |
-| `(noSD)` | Appended if the SD card wasn't readable. |
-
-### 4.7 Full summary — `FULL,<day> hourly …`
-Multi-line / multi-text. Each populated hour: `02h A N148 P39 K198 M42 B … | 12.5V 3.1W`. Then:
-- `ERR:` — each distinct error code **once**, with the time it first occurred (or `ERR: none`).
-- `EVT:` — run/dose events of the day.
-- `PEAK Tmax… Vmin… Wpk… H2O…L NUT…mL FLT… RST…` — daily peaks and totals.
-- Long reports are paced over several texts tagged `(i/N)`; `+more@SD` / `+more evt@SD` means the rest
-  is on the SD card.
-
-### 4.8 Network status — `NET,WiFi:…`
-Example: `NET,WiFi:OK,RSSI-58,IP192.168.1.42,TS:ok,age12s,SSID:MyNet`
-- `WiFi:OK/DOWN/OFF`, `RSSI` (dBm), `IP`, `TS:ok/--` (last ThingSpeak upload), `age…s` since that upload,
-  `SSID`. `WiFi:OFF` = the master switch is off (§6.6); `DOWN` = on but not yet connected. While the
-  Setup AP portal is up it reads `WiFi:PORTAL,AP:Irrig-Setup,IP192.168.4.1` (see §6.6).
+### 4.8 Network status — `NETWORK`
+```
+NETWORK
+WiFi: connected to MyNet
+Signal -67 dBm, IP 192.168.1.42
+ThingSpeak: last upload OK, 12 s ago
+```
+While the setup portal is up it says so, with the network to join. `turned OFF` = the WiFi switch is off (§6.6).
 
 ---
 
 ## 5. Faults & recovery (the held-fault flow)
 
-When the actuator controller hits a **hard fault during a run** (FLOW_FAIL / PWR_FAIL / SAFE_STOP), it
+When the actuator controller hits a **hard fault during a run** (FLOW_FAIL, LEVEL_BLIND, SERVO_FAIL, PWR_FAIL,
+SAFE_STOP, DOSE_TIMEOUT …), it
 **stops safely and holds**: it cuts power to the actuator bank but **stays alive remembering how much
 liquid is already in the mixing tank** (so it can't overfill later). You get a CRIT alert naming the
 operation and column, and the system **waits for your reply**. Reply with **one word**:
@@ -217,12 +223,24 @@ operation and column, and the system **waits for your reply**. Reply with **one 
 | **`RELEASE`** | Dump whatever is currently in the mixing tank to that column **as-is** (no top-up, no dosing). |
 | **`IRRIGATE`** | Finish as **irrigation only** — top the tank up to the column's water amount with plain water and deliver; skip remaining nutrients. |
 | **`NORMAL`** | **Resume** the paused job from where it stopped (fill only the remaining litres, no re-dose), then deliver and flush. |
+| **`SERVO`** | (pump-selector faults) Switch the pump selector again, then resume — the same as `NORMAL`. |
+| **`CANCEL,30`** / **`CANCEL,10`** / **`CANCEL,OFF`** | End the run; skip the column for 30 / 10 minutes or switch it off. Whatever is in the mixing tank stays there and goes to the next run's column. |
+
+After **three identical holds in a row**, a `FLOW_FAIL` or `LEVEL_BLIND` menu marks RELEASE as *(best)*: the hardware is
+not recovering. On the **fourth**, the system cancels the run by itself and skips the column for 30 minutes.
 
 You can also choose these on the LCD fault screen (UP/DOWN to pick, ENTER to confirm).
 
-> **Why no "just cancel"?** The mixing tank's only outlet is the booster pump into a column (there's no
-> drain). So held liquid is eventually delivered to a column via RELEASE / IRRIGATE / NORMAL.
-> A held fault occupies the actuator engine, so **other columns won't run until you resolve it**.
+> **Mind the tank.** The mixing tank's only outlet is the booster pump into a column (there's no drain), so held
+> liquid is eventually delivered to a column. A held fault occupies the actuator engine: **other columns won't run
+> until you resolve it**.
+
+**Tank check after a restart.** If the master controller restarts in the middle of a run (a power dip), it no
+longer knows what is in the mixing tank. It raises **`TANK_CHECK`**, and **scheduled runs wait**. To clear it:
+1. Look at the mixing tank. If it holds water, empty it with Testing (Push>Col).
+2. Text **`TANKCHECK,OK`**, or use **Settings → TankCheck >confirm**.
+
+A forced run is never blocked by the check; starting one confirms it.
 
 **`STOP,ALL`** (any time) is the hard emergency stop: it halts everything immediately. Recovery from a
 full emergency stop is done at the LCD fault screen.
@@ -242,15 +260,24 @@ MODE → menu; UP/DOWN to move, ENTER to open, BACK to leave.
 
 | Item | What it does |
 |---|---|
+| **Enable Actuations** | Only shown while actuations are disabled (from the website or SMS): switches them back on. |
 | **Set Clock** | Set RTC date/time. |
 | **Schedule** | Per-column service window (AUTO default window, or MANUAL start/end H:M). |
 | **Column Mode** | Per column: AUTO / IRRIGATION_ONLY / OFF (OFF disables the column). |
 | **Preset** | Per column: pick a named crop preset or enter N/P/K/pH manually. |
-| **Thresholds** | Soil start/stop % and the fertigate trigger gap. |
-| **Calibration** | Calibrate sensors (see §6.3). Idle-only. |
-| **Testing** | Manually pulse each relay (dead-man, see §6.4). Idle-only. |
-| **Restore Defaults** | Reset operational settings to factory (see §6.5). Idle-only. |
-| **Lock Screen** | Lock the buttons (see §6.6). |
+| **Thresholds** | Soil start % and the fertigation gap. |
+| **AC Voltage** / **AC Current** | The inverter's accepted AC window (default 215–240 V, 0.5–3.0 A). |
+| **Pump Exercise** | The every-2-days preventive pump run: on/off and its length. |
+| **Force Run** | Start a run now (§6.8). Idle only. |
+| **Calibration** | Calibrate sensors and pumps (see §6.3). Idle only. |
+| **Sensor Diag** | Raw sensor values (read only). |
+| **Testing** | Manually run each relay (dead-man, see §6.4). Idle only. |
+| **WiFi [ON/OFF]** / **Setup AP [ON/OFF]** | The WiFi switch / the setup portal (§6.6). |
+| **Restore Defaults** | Reset operational settings to factory (see §6.5). Idle only. |
+| **Lock Screen** | Lock the buttons (see §6.7). |
+| **Reboot ESP1** | Restart the master controller (NO/YES confirm; refused during a run). |
+| **Batt Switch** | Only shown while a battery-switch fault is latched: clears it. |
+| **TankCheck >confirm** | Only shown while a tank check is needed: confirms you have looked at the mixing tank (§5). |
 | **Exit** | Back to the data pages. |
 
 ### 6.2 Unsaved-changes dialog
@@ -270,9 +297,19 @@ value. Targets and how to capture them:
 - **Temp / Hum / Lux offset**: capture raw → ENTER, then dial in the **true reference reading** → ENTER.
 - **NPK trim A/B/C** (guarded): a warning appears (trimming biases your data — not needed normally);
   ENTER to edit N/P/K offsets, or **DOWN to reset them to 0**.
-- **Flow ResMix / MixIrr / Nut A/B/C** (3 runs): **hold ENTER to run the pump** (live pulse count
-  shown), UP when done, enter the measured **volume**, ENTER. Repeat 3×; the system checks the three
-  K-factors for an **outlier** and lets you redo the worst run or saves the median/average.
+- **Tank Mix liters / Tank Res liters** (since 16 Nov): up to 8 "level → litres" points per tank, so the
+  ultrasonics read litres correctly. The water itself is measured by the tanks now; the ResMix / MixIrr flow
+  meters are no longer used.
+- **Rate Transfer / Rate Booster / Rate Nut A–C**: a pump's measured rate (L/min or mL/min). `not measured` = the
+  built-in default. The screen also shows the rate the last run actually saw (`seen:`).
+- **Transfer pump est / Booster pump est** (since 17 Nov): set the seconds (3–60) and ENTER to run the pump; the
+  time counts from the inverter switch-on. Weigh the water and enter the grams. From the 5th try the screen shows
+  the fitted line (L/min and start litres); ENTER saves it. Until a pump is re-measured, the system uses the
+  readings taken on 17 Nov: transfer 11.74 L/min + 0.47 L, booster 13.20 L/min − 0.65 L (reference §5.3.2).
+- **Flow Reservoir**: the reservoir's inflow meter (on the sensor board).
+- **Flow Nut A/B/C** (3 runs): **hold ENTER to run the pump** (live pulse count shown), UP when done, enter the
+  measured **volume**, ENTER. Repeat 3×; the system checks the three K-factors for an **outlier** and lets you
+  redo the worst run or saves the median/average.
 - **Prime Lines** are run the same dead-man way (hold ENTER opens the line's valve + runs its pump to
   purge air) before flow calibration.
 
@@ -281,7 +318,9 @@ actuator controller and confirms it. **No reflashing needed.**
 
 ### 6.4 Testing (Settings → Testing; idle only)
 Manually exercise the actuators. **Hold ENTER** to energize the selected item (dead-man — it drops the
-instant you release, with a **~30 s** hard cap for single relays and combos); UP/DOWN to choose. The
+instant you release; a single relay stops after **30 s**, and the Fill / Push combos may run **1 minute**,
+counted only while the inverter is on). UP/DOWN to choose. After you release, the next press waits **1.5 s**
+(the header says `TOO FAST: WAIT 1.5s`): pressing again and again switched the relay board too fast. The
 **Master Cutoff** entry is reversed here (holding it drops bank power) so you can test it without killing
 the others.
 
@@ -289,31 +328,39 @@ the others.
 a fault while you're testing (they're logged only). You are the safety here: the dead-man and 30 s cap
 bound relay-on time, and **MODE + BACK** still force-stops everything if you need it.
 
+The single-relay rows, in order: Batt->2nd, Nut A, Inverter, Col A Vlv, Col B Vlv, Spare P5, Col C Vlv,
+Nut B, Mixer, Spare P11, Spare P12, Nut C, Nut D, pH Up, pH Down, Mast Cutoff.
+
 The list has the 16 single relays, then **priming combos** that run a valve + pump together so water
-actually moves through the pipes (hard cap ~30 s; re-hold to keep going):
+actually moves through the pipes (1 minute of inverter time; re-hold to keep going):
 
 | Combo row | Energizes | Use |
 |---|---|---|
 | **Fill Res>Mix** | Inverter + Transfer pump (draws straight from the reservoir) | Prime/fill reservoir → mixing tank. |
 | **Push>Col A / B / C** | Inverter + that Column's valve + Booster pump | Prime mixing tank → the chosen column. **All** columns (A/B/C) are shown here regardless of the run config, so you can bench-test any column's wiring — scroll (UP/DOWN) to the one you want. |
 
-Hold ENTER to run a combo; release (or the 30 s cap) stops the pump and closes the valves immediately.
-This replaces the idea of a separate "Prime Lines" menu.
+| **Servo>Transfer / Servo>Booster** | The pump selector only (inverter stays off) | Check the selector moves; `[OK]` when confirmed. |
 
-Two single-relay rows changed meaning with the secondary-battery feature:
-- **Spare P0** — formerly the reservoir valve, now an unused relay. Holding it only clicks the relay.
-- **Batt->2nd** — formerly the mix valve. Holding it energizes the DPDT and moves the controllers onto
-  the secondary battery. **Until the hold-up stage is fitted, this resets all three controllers** — use
-  it only to verify the wiring on the bench.
+Hold ENTER to run a combo; release (or the cap) stops the pump and closes the valves immediately. When the
+Fill or Push combo ends, the header shows how far the mixing tank moved. This replaces the idea of a separate
+"Prime Lines" menu.
 
-When the secondary-battery switching is enabled, any row that raises the inverter (**Inverter**, **Fill**,
-**Push>Col**) is refused while the secondary battery is low or its monitor is not answering. The header
-shows `TEST:BATT2 LOW/NOMON` for 3 s.
+**Batt->2nd** (P0) energizes the DPDT and moves the controllers onto the secondary battery. **Until the
+hold-up stage is fitted, this resets all three controllers** — use it only to verify the wiring on the bench.
+
+Any row that raises the inverter (**Inverter**, **Fill**, **Push>Col**) is refused when the backup battery
+blocks the AC pumps:
+- its resting charge is **30 % or less** (allowed again from 35 %);
+- its monitor is not answering;
+- a switch fault is latched;
+- or the system restarted less than a minute ago.
+
+The header names the reason, for example `BATT2 low: 28%` or `Restarted: wait 40s`.
 
 ### 6.4.1 Batt Switch (Settings → Batt Switch; idle only)
-The row only appears when secondary-battery switching is compiled in (or a fault is latched). It shows
-`Batt Switch [OK]`, or `BattSw FAULT>clear` after two switch resets in 24 h. **ENTER** on the FAULT row
-clears the latch and re-arms switching. The LCD **Power** page shows `SWFLT` on its last line while
+Since 16 Nov the row appears **only while a switch fault is latched** (after two switch resets in 24 h); the
+switch's normal status is on the LCD **Power** page. **ENTER** on the row clears the latch and re-arms switching
+(also: the website, or SMS `BATTSW,CLEAR`; it clears by itself after 24 h). The LCD **Power** page shows `SWFLT` on its last line while
 the fault is latched.
 
 ### 6.5 Restore Defaults (Settings → Restore Defaults; idle only)
@@ -339,7 +386,7 @@ no SMS or button-typing:
 
 1. Start it: **Settings → Setup AP** (toggle to `[ON]`), or text **`WIFIPORTAL`** (owner-only). The LCD
    shows a **WiFi Setup Mode** banner with the AP name and address. (Works even if `WiFi` is `[OFF]`.)
-2. On your phone's WiFi list, join **`Irrig-Setup`** (password **`irrigate123`**).
+2. On your phone's WiFi list, join **`Irrig-Setup`** (its password is set before flashing as `SECRET_AP_PASS` in `ESP1/include/secrets.h`; ask whoever set up the unit).
 3. Open a browser to **`http://192.168.4.1`** (most phones pop this up automatically). You'll see a
    form listing **nearby networks** with signal strength.
 4. Pick your network (or type a hidden SSID), enter its **password**, tap **Save & Connect**.
@@ -348,10 +395,10 @@ no SMS or button-typing:
 
 Cancel any time with the **BACK** button, by texting **`WIFIPORTAL,STOP`**, or just wait — it closes
 itself after **10 minutes** if unused. Irrigation keeps running normally the whole time. *(The AP name
-and password are fixed in firmware; change them there if needed.)*
+is fixed in firmware; its password comes from `secrets.h`.)*
 
 **Admin area (on the same portal page).** Below the WiFi form is an **Admin** box. Enter the admin **PIN**
-(default **`1234`** — change it at commissioning) and tap **Unlock admin**. Then you can:
+(the first-boot PIN is `SECRET_ADMIN_PIN` in `secrets.h` — change it here at commissioning) and tap **Unlock admin**. Then you can:
 
 - **Owner number** — see the current SMS owner number and change it. The new number is what all SMS
   commands are gated to (and where alerts/reports go). Saved to memory, survives reboot.
@@ -382,6 +429,30 @@ and don't leave the portal running unattended.
   even when locked). The fault screen then offers `> Return to normal` / `Stay stopped` (UP/DOWN +
   ENTER).
 
+### 6.8 Force Run (Settings → Force Run; idle only)
+Start a run now, outside the schedule.
+
+**Set it up:**
+- **Mode:** Col A, Col B, A+B together, or A then B (two batches).
+- **For each batch:** litres (0.5 L steps, up to 20 L), nutrient A / B / C in mL (25 mL steps, up to 500 mL; 0 =
+  water only), and the start delay (20–300 s).
+- **Arm it:** ENTER after the last field. During the countdown, BACK cancels it.
+
+**Before it starts:**
+- **A column that is OFF:** arming switches it back on; the bottom line warns first, `Col A   OFF, ARM=ON`.
+- **When the countdown ends**, the system checks again that it is idle, the batteries allow AC pumps, and the
+  reservoir is not low. If not, the run is cancelled with a `Manual run cancelled` notice that says why (§4.4).
+- **No limits otherwise:** forced runs have no daily limit, and the tank check does not block them.
+
+### 6.9 How the water is measured (since 16–17 Nov)
+- **The tanks are the meters:** the ultrasonic sensors measure the water; the two main-line flow meters are no
+  longer used.
+- **A fill is timed:** the transfer pump runs for the time the litres need, counted from the inverter switch-on.
+  The tank then settles for about a minute and is measured, with a top-up run if more than 3 L is missing.
+- **A delivery:** the booster runs until the mixing tank is under 5 %, then 10 s more.
+- **On the LCD:** the home page shows each tank's % and litres. A `?` after it (`Mix:40%?`) means the reading was
+  too noisy to be used for control (the pings disagreed, often the inflow or the mixer).
+
 ---
 
 ## 7. Reference
@@ -389,9 +460,10 @@ and don't leave the portal running unattended.
 ### Crop presets (for `SET,COL_x,PRESET,<CROP>`)
 | Name | N | P | K | pH |
 |---|---|---|---|---|
-| `LETTUCE` | 150 | 40 | 200 | 5.8 |
-| `CARROT` | 120 | 50 | 250 | 6.2 |
-| `TOMATO` | 180 | 45 | 300 | 6.0 |
+| `PECHAY` | 180 | 60 | 120 | 6.0 |
+| `TOMATO_S1` | 200 | 80 | 160 | 6.0 |
+| `TOMATO_S2` | 240 | 100 | 200 | 6.0 |
+| `TOMATO_S3` | 150 | 80 | 300 | 6.0 |
 
 ### Columns
 A / B / C. A column set to **OFF** (or physically unwired) is hidden from menus/reports and never
@@ -462,6 +534,17 @@ account with the right access level) — you just won't be able to press anythin
 connection is confirmed current again, at which point a **"Direct hardware control"** banner reappears
 as a reminder before you touch anything.
 
+### 8.4.1 Live updates, Refresh and the SD card logs (17 Nov)
+- **Live updates:** while a dashboard page is open and visible, the controller sends its status every **2 s during a run**
+  and every **4 s** otherwise (every 20 / 60 s when nobody is watching). **Refresh** asks for a new status at
+  once, and the page says how long the answer took.
+- **Diagnostics → SD card logs:** the last 14 days of the controller's CSV log. **Download** any day.
+  **Upload from the rig** asks for any day on the card, today included as far as it is written.
+- **Manual/Test → SD card log (CSV):** **Update today's log**, then **Download today's log**. The button works
+  only while the controller is reporting and idle, with nothing running; otherwise it says why. A day's log takes
+  about 2–3 minutes per megabyte to arrive.
+- **By SMS:** `UPLOAD` / `UPLOAD,YYYYMMDD` sends a day the same way.
+
 ### 8.5 Pop-up notifications
 Since 2026-09, most actions (command results, account-management outcomes) also show as a small pop-up
 in the corner of the screen — bottom-right on a computer, top of the screen on a phone — fading out on
@@ -472,5 +555,7 @@ text elsewhere on the page, which stays there for you to read back later.
 ---
 
 *This manual reflects the firmware in this repository (ESP32 #1 `handleSms` / reports / alerts +
-the LCD menu) and the website as of 2026-09-11. If a command, message, or dashboard control looks
+the LCD menu) and the website as of 2026-11-17 (web v.4 "pure ultrasonic"). The full technical detail is in
+`Smart_Irrigation_System_Reference_FINAL.md`: SMS §12.2.5, fault codes §23.4, LCD §18.10.7.5, website §29.11,
+calibration defaults §5.3. If a command, message, or dashboard control looks
 different on your unit, the firmware or website version may have moved on since this was written.*

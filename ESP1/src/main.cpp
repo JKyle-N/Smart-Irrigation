@@ -5712,6 +5712,8 @@ void handleSms(const String &body) {
     return;
   }
   // UPLOAD             -> queue yesterday's CSV.  UPLOAD,YYYYMMDD -> queue that specific day.
+  // 2026-11-17: through Firebase when website sync is on (the Supabase project expired) -- today included, sent as far as
+  // it is written, like the website's "Upload from the rig". Supabase only while Firebase is off, completed days only.
   if (U.startsWith("UPLOAD")) {
     long stamp = 0;
     int c1 = b.indexOf(',');
@@ -5720,10 +5722,12 @@ void handleSms(const String &body) {
       DateTime y = rtcNow() - TimeSpan(1, 0, 0, 0);
       stamp = dayStamp(y);
     }
-    xSemaphoreTake(netMux, portMAX_DELAY); bool suHave = supaUrl.length() > 0; xSemaphoreGive(netMux);
-    if (!suHave) { smsErr("UPLOAD|NOCREDS", "NOT DONE: Log upload is not set up.\nSend SUPA,<project url>,<service key> first."); return; }
+    xSemaphoreTake(netMux, portMAX_DELAY);
+    bool suHave = supaUrl.length() > 0, fbHave = firebaseEnabled && fbUrl.length() >= 8;
+    xSemaphoreGive(netMux);
+    if (!suHave && !fbHave) { smsErr("UPLOAD|NOCREDS", "NOT DONE: Log upload is not set up.\nTurn on website sync (FBASE,ON) first."); return; }
     if (stamp <= 0) { smsErr("UPLOAD|DAY", "NOT DONE: Unknown day.\nUse UPLOAD (= yesterday) or UPLOAD,YYYYMMDD e.g. UPLOAD,20261115"); return; }
-    if (rtcOk && stamp == currentDayStamp) {             // never the open file
+    if (rtcOk && stamp == currentDayStamp && !fbHave) {  // Supabase: never the open file
       smsErr("UPLOAD|TODAY", "NOT DONE: Today's log is still being written.\nOnly past days can be uploaded."); return;
     }
     char path[16]; snprintf(path, sizeof(path), "/%08ld.CSV", stamp);
@@ -5731,7 +5735,8 @@ void handleSms(const String &body) {
     { bool got = sdTake(200); exists = got && SD.exists(path); if (got) sdGive(); }
     if (!exists) { smsErr((String("UPLOAD|NOFILE|") + stamp).c_str(), "NOT DONE: There is no log for " + smsDate(stamp) + " on the SD card."); return; }
     manualUploadStamp = stamp;                           // uploadTick prioritizes this
-    sendSMS("OK: The log for " + smsDate(stamp) + " is queued for upload.");
+    sendSMS("OK: The log for " + smsDate(stamp) + " is queued for upload." +
+            (fbHave ? String("\nDownload it on the website: Diagnostics > SD card logs.") : String()));
     return;
   }
   // STATUS

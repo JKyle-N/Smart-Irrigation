@@ -95,7 +95,7 @@
          INFO,FILL_REPLAN|done=..|left=.. / INFO,DRAIN_REPLAN|done=..|left=.. (back on after a SERVO_MISMATCH re-seat:
                  the stage is measured on from the level now -- the wrong pump's water neither counts against it
                  nor goes uncounted);
- *         INFO,MIX_LOW_STOP,<MAIN|FLUSH>|mix=..%|delivered=..|left=.. (the 5 % / 5 s delivery low stop: done);
+ *         INFO,MIX_LOW_STOP,<MAIN|FLUSH>|mix=..%|delivered=..|left=.. (the 5 % / 10 s delivery low stop: done);
  *         RES_EMPTY,TRANSFER|..|by=<STALL|RES_EMPTY_WINDOW> (the reservoir ran dry: the fill ends, run goes on);
  *         LEVEL_HIGH,MIX|pct=..|metered=..|target=..  (overflow limit reached: fill stopped early, the
  *                 run carries on); DEGRADED,LEVEL_BLIND (draining with no level reading: the rest of the
@@ -117,9 +117,11 @@
  *
  *  PLUMBING MODEL (documented assumption -- spec delegates HOW to ESP2 and does
  *  not step-specify the hydraulics; confirm against the real rig):
- *    Transfer pump (AC): reservoir -> mixing tank   (metered by the reservoir ultrasonic falling, the mixing-tank
- *                                                     ultrasonic rising as the witness, and the measured rate x time)
- *    Booster pump  (AC): mixing tank -> columns      (metered by the mixing-tank ultrasonic falling + rate x time)
+ *    Transfer pump (AC): reservoir -> mixing tank   (2026-11-17: TIMED -- its run time from the inverter switch-on,
+ *                                                     from the pump line -- then measured on the mixing tank after a
+ *                                                     ~1 min settle, with a top-up when more than 3 L short)
+ *    Booster pump  (AC): mixing tank -> columns      (metered by the mixing-tank ultrasonic falling; runs until the
+ *                                                     tank is under 5 % for 10 s)
  *    Both sit BELOW the tanks (flooded suction): always primed, water moves the moment the inverter is on.
  *    (web v.4: the GPIO26 / GPIO5 ResMix / MixIrr flow meters are not read at all any more.)
  *    Both are fed from the inverter (P2) through a changeover switch flipped by the Nano's D3 servo
