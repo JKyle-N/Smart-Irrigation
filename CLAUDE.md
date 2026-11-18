@@ -3,7 +3,7 @@
 This file defines the locked architecture and conventions for this project. These decisions were made deliberately and must NOT be changed without explicit instruction. The full specification lives in `Smart_Irrigation_System_Reference_FINAL.md` (the single source of truth).
 
 ## Read this at the start of every session
-**Current state (17 Nov 2026, web v.4 "pure ultrasonic"):** `Smart_Irrigation_System_Reference_FINAL.md` — the opening status block, §19.4.9.11–27 and §29.10. `SESSION_HANDOFF.md` below describes the 1 Nov state.
+**Current state (18 Nov 2026, web v.4 "pure ultrasonic"; ESP1 `2026-11-18h` and ESP2 two-step fill, both flashed):** `Smart_Irrigation_System_Reference_FINAL.md` — the opening status block, §5.0 (the system in brief), §19.4.9.11–34, §20.5 (inverter noise; main-battery and solar sensors NOT fitted) and §29.10–29.12. `SESSION_HANDOFF.md` below describes the 1 Nov state.
 
 **`SESSION_HANDOFF.md`** — current repo state, the one blocking user action, environment gotchas (PlatformIO is not on PATH; both `platformio.ini` files carry the skip-worktree bit, so git silently ignores edits to them), what is still outstanding, and the file-editing hazards that have corrupted `main.cpp` and `script.js` before. Short, and kept current. Read it before planning anything.
 
@@ -60,28 +60,31 @@ Daily fresh-start `RESET_REQ` once/day.
 
 ## LOCKED: P17 master actuator-power cutoff + tank-aware fault hold (sec.19.4.8)
 - **P17 (PCF8575 bit 15)** drives a master relay gating power to the entire P0–P16 actuator bank. Fail-safe wiring: loss of P17 = all actuators OFF (loads on normally-open contacts). ESP2 energizes P17 at the start of any actuation, de-energizes on fault/completion/idle.
-- **On a hard fault (FLOW_FAIL / PWR_FAIL / SAFE_STOP):** ESP2 drops P17, **PAUSES** the sequence, and **STAYS ALIVE** holding the **mixing-tank volume** (metered from ESP2's OWN flow sensors — the Nano ultrasonic is display-only, NOT trusted for control — and persisted to NVS so a reboot can't overfill). ESP1 keeps ESP2 **powered** (does NOT cut GPIO4) and must NOT power it down at fault, or the tank volume is forgotten and the next fill overfills. The mixing tank's only outlet is the booster → a column (no drain).
+- **On a hard fault (FLOW_FAIL / PWR_FAIL / SAFE_STOP):** ESP2 drops P17, **PAUSES** the sequence, and **STAYS ALIVE** holding the **mixing-tank volume** (measured by the mixing-tank ultrasonic since web v.4, reference §19.4.8.1 / §19.4.9; before that by ESP2's own flow sensors, with the ultrasonic display-only) and persisted to NVS so a reboot can't overfill. ESP1 keeps ESP2 **powered** (does NOT cut GPIO4) and must NOT power it down at fault, or the tank volume is forgotten and the next fill overfills. The mixing tank's only outlet is the booster → a column (no drain).
 - **Recovery is user-gated over GSM (or the LCD fault screen):** `STOP` (acknowledge & keep holding), `RELEASE` (dump tank to its column as-is), `IRRIGATE` (top up plain water to budget, deliver, no dosing), `NORMAL` (resume the paused sequence). ESP1 → ESP2 as `RESUME,<NORMAL|IRRIGATE|RELEASE>`. The fault SMS carries the operation (irrigation/fertigation) + column. A `STOP` reply skips the column for the rest of the day.
 - GPIO4 power-cut is retained ONLY as the backstop for a **frozen** ESP2 and the manual **MODE+BACK** emergency stop (cutting GPIO4 de-energizes the PCF8575 → P17 drops → bank dead).
-- **Known gap (narrowed 2026-11-01, not closed):** `mixTankL` is persisted at stage-end (`endMeteredStage()`), and now also when `STOP_ALL`/`RESET_SELF` interrupt a running stage (`creditRunningStage()`). `enterEmergencyStop()` and `cancelRun()` flush `STOP_ALL` and wait 40 ms before the GPIO4 cut so ESP2 can record it. Still open: an ESP2 that is frozen or genuinely silent (including `ESP2_DONE_TIMEOUT`, or a brown-out) cannot record anything, so a mid-`SEQ_FILL`/`SEQ_DOSE` cut can still under-report the true level and overfill on the *next* run, with no independent physical sensor to catch it (the Nano ultrasonic reading is display-only, per above). Actuator-energized safety is unaffected — the GPIO4 cut is independently fail-safe regardless of `mixTankL`'s accuracy. Closing it needs a design decision (how/when to persist more often, or gate automatic resume behind an operator tank check) — see `SESSION_HANDOFF.md`.
+- **Known gap (narrowed 2026-11-01, not closed):** `mixTankL` is persisted at stage-end (`endMeteredStage()`), and now also when `STOP_ALL`/`RESET_SELF` interrupt a running stage (`creditRunningStage()`). `enterEmergencyStop()` and `cancelRun()` flush `STOP_ALL` and wait 40 ms before the GPIO4 cut so ESP2 can record it. Still open: an ESP2 that is frozen or genuinely silent (including `ESP2_DONE_TIMEOUT`, or a brown-out) cannot record anything, so a mid-`SEQ_FILL`/`SEQ_DOSE` cut can still under-report the true level and overfill on the *next* run, with no independent physical sensor to catch it (the Nano ultrasonic reading is display-only, per above). Actuator-energized safety is unaffected — the GPIO4 cut is independently fail-safe regardless of `mixTankL`'s accuracy. Closing it needs a design decision (how/when to persist more often, or gate automatic resume behind an operator tank check) — see `SESSION_HANDOFF.md`. **web v.4 narrows it further:** every fill plans from a settled ultrasonic reading of the tank, not from `mixTankL` alone, and a restart mid-run asks for a tank check (reference §19.4.9.2, §19.4.9.21).
 
-## ADDED: Secondary battery isolation via P4 DPDT (reference §19.4.7.1) — compiled OFF until hold-up hardware exists
+## ADDED: Secondary battery isolation via P0 DPDT (reference §19.4.7.1) — ON since 2026-11-16 (hold-up fitted)
+> **Relay map since the 2026-11-15 remap:** the DPDT is on **P0** (`OUT_BATT_SEL`, the old transfer-pump relay; the
+> pumps lost their relays when the servo selector came in). P4 is column B's valve, and P5 is the spare
+> (`OUT_RES_VALVE` if a reservoir valve is fitted). Older lines below that say "P4" for the switch mean P0. This is
+> the main defence against the inverter's noise (reference §20.5).
 - **Relay map change:**
-  - **P4** (the condemned mixing-tank valve) now drives a **DPDT** that moves ESP1, ESP2, the Nano, the sensors and the relay coils off the main solar battery onto a **secondary 4S Li-ion battery** (16.8 V full) while the inverter runs. It breaks **both + and −**, so nothing links the controllers to the inverter's battery (clean sensor readings).
+  - **P0** drives a **DPDT** that moves ESP1, ESP2, the Nano, the sensors and the relay coils off the main solar battery onto a **secondary 4S Li-ion battery** (16.8 V full) while the inverter runs. It breaks **both + and −**, so nothing links the controllers to the inverter's battery (clean sensor readings).
   - De-energized = main = fail-safe. Fault, E-stop, ESP2 reboot and the GPIO4 cut all return to main.
   - The mixing tank feeds the booster directly; the mix valve is gone from every sequence, prime and combo.
-  - **P0** (reservoir valve) is a **spare** (`OUT_SPARE_P0`). `RES_VALVE_FITTED 1` (ESP2) makes every fill path open it again.
-  - Testing rows are now named `Spare P0` and `Batt->2nd`.
+  - **P5** is a **spare** (the reservoir valve's output if `RES_VALVE_FITTED 1`, ESP2, makes every fill path open it again).
 - **ESP2 owns the switch:**
   - **Rule:** inverter ON implies secondary. `pcfOn/pcfOff(OUT_INVERTER)` route through `inverterRequest()`. P4 switches first; `battPathTick()` starts the inverter after `BATT_SWITCH_SETTLE_MS` (500 ms); `AC_WARMUP_MS` = `INVERTER_WARMUP_MS` + settle. On inverter off, P4 returns after `BATT_RETURN_DELAY_MS` (1000 ms).
   - **Normal ends** (`finishOk`, exercise end, `stopPrime`, `TEST,EXIT`, combo release) use `stopAllGraceful` / `cutoffDeenergizeGraceful` / `stopKeepBank`. These keep P4 + P17 up until that return. **Faults / STOP_ALL / RESET_SELF still `stopAll()` at once.**
   - ESP2 reports `INFO,BATT,SECONDARY|MAIN`. ESP1 tracks it (`esp2OnSecondary`) and holds a graceful GPIO4 off for the return (≤ `ESP2_BATT_RETURN_WAIT_MS`, 4 s).
 - **ESP1 owns the monitor + policy:**
   - **Monitor:** INA226 (R010) at **0x40** on ESP1's I²C (`secBattTick`, raw registers, calibrated with `Calibration/ESP1/INA226`). It is not a device-loss reboot trigger.
-  - **Block:** `secBattBlocksAc()` refuses to **start** any inverter use — scheduled/forced runs, exercise, AC prime, inverter Testing rows / pulses / holds, recovery RESUME — when the secondary is **low** (< 13.6 V, released at 14.0 V) **or the INA226 is not answering**. A run in progress is never aborted.
+  - **Block:** `secBattBlocksAc()` refuses to **start** any inverter use — scheduled/forced runs, exercise, AC prime, inverter Testing rows / pulses / holds, recovery RESUME — when the secondary is **low** (resting charge ≤ 30 %, released at 35 %, user 2026-11-17; it was 13.6 / 14.0 V raw) **or the INA226 is not answering**. A run in progress is never aborted.
   - **Alerts:** `BATT2_LOW`, `BATT2_CRIT` (< 12.8 V), `SENSOR_FAIL,INA226…` (Major).
   - **Published to:** SD `PWR2`, Firebase `sensors.secondaryBattery*` + `system.boardSupply`, the LCD Power page `B2:` line, `STATUS` `BAT2`, and the website tiles.
-- **`#define SECONDARY_BATT_ENABLED 0` in BOTH ESP1 and ESP2 — set both together.** At 0: P4 is never driven automatically, the inverter switches exactly as before, nothing is blocked or alerted; the INA226 is still read and published. **Do not enable** until a hold-up stage keeps all three controllers, the P4 relay module and the DPDT coil powered through the ~10–20 ms transfer — without it every switch resets the controllers and the relay falls back to main. The user reports the hold-up fitted (2026-11-02); it has not been proven on the rig, so `Commissioning_Flash_Plan.md` stage H still comes first.
+- **`#define SECONDARY_BATT_ENABLED 1` in BOTH ESP1 and ESP2 since 2026-11-16 — set both together.** The user fitted the hold-up stage that keeps all three controllers, the P0 relay module and the DPDT coil powered through the ~10–20 ms transfer, and the switching has run on the rig since: on 18 Nov the log shows 16 verified switches (`PWR2,BATTSW|VERIFY|OK`) and the boards on the pack during runs (`SRC=SECONDARY`). At 0, P0 would never be driven automatically and nothing would be blocked or alerted; the INA226 is read either way.
 - **LOCKED: switch-reset protection (loop-proof).** Each P4 switch runs this sequence:
   1. **Announce:** ESP2 sends `INFO,BATT,SWITCHING,<SECONDARY|MAIN>`.
   2. **ESP1 prepares:** flushes the SD log, journals the switch in NVS (`battsw/pend`) and opens a ≤3 s quiet window (no SD write, no new WiFi/TLS request, no SMS start). Then it answers `BATTSW,GO`; ESP2 waits for GO or `BATT_HANDSHAKE_MS` = 800 ms.
@@ -195,6 +198,14 @@ These were added after the original spec; treat them as locked.
 - **LCD Lock:** a "Lock Screen" item in the Settings menu sets `lcdLocked` (persisted to NVS; **manual only, never automatic**). While locked, all buttons are ignored **except** UP+DOWN (unlock) and the MODE+BACK emergency combo; the lock screen shows the unlock hint. Lock is independent of `uiMode`, so **automation keeps running** while locked (irrigation/fertigation/logging/telemetry unaffected).
 
 ## CHANGED (2026-11-02): solar + main battery INA226 behind an ISO1540
+> **Not fitted on the rig (user, 18 Nov 2026; reference §20.5).** Both modules have to sit on the noisy 12 V side.
+> Once connected, the isolated board made ESP1's I²C bus fail (the LCD and the RTC dropped off;
+> `ISO1540_I2C_Diagnosis_2026-11-16`), and a board that stays clean with the inverter on could not be built in the
+> time available. The firmware support below stays and finds the modules if they are ever fitted. Until then the main
+> battery's V/%/I and the solar values are unpublished, the daily Wh stay 0, and the log's `PWR` lines read the opto
+> fallback at ~0 V. **Do not describe solar or main-battery readings as available**, and do not build anything that
+> depends on them.
+
 Supersedes the "INA226 removed" decision below for the main battery. It was removed because an INA226 must share a ground with what it measures, which put inverter noise on the boards' I²C. The ISO1540 removes that link.
 - **Hardware (ESP1's I²C):**
   - **Solar:** 0x41 (A1 GND, A0 VCC), R010 on the module, CAL 2048, 0.25 mA/bit, clips at 8.19 A.
@@ -214,13 +225,13 @@ Supersedes the "INA226 removed" decision below for the main battery. It was remo
 - **`calib` wins.** `loadCal()` applies it over ESP1's source constants, and ESP1 pushes flow K, pH, EC and the mixer zero to ESP2 at startup and in every work order. **Editing ESP2's `K_*`, `PH_CAL_*`, `EC_CAL_*` or `ACS712_ZERO_V` does nothing.** Do not write a tool or a doc that says otherwise.
 - **`Calibration/ESP1/CalStore`** sets and clears these keys from the `set` lines the other tools print. Its key table must stay in step with `loadCal()` and `loadPowerCal()`. `pumpA/B/C` (`PUMP_FLOWRATE_MLPM`) and `acsDiv/acsZero/acsSens` are NVS-backed too; a value out of range is ignored, because the pump rate is a divisor.
 - **Still source-only:** ESP2's `TRANSFER_LPM`, `BOOSTER_LPM`, `ACS712_SENS_V_PER_A`.
-- **Calibration tools never drive P4.** It is the battery DPDT, not a valve. AC loads wait `INVERTER_WARMUP_MS`, as ESP2's stages do.
+- **Calibration tools never drive the battery DPDT.** AC loads wait `INVERTER_WARMUP_MS`, as ESP2's stages do. **Open issue (found 19 Nov 2026):** the ESP2 tools (`Calibration/ESP2/Flow`, `FlowPinFinder`, `ACS712`) still carry the relay map from before the 2026-11-15 remap: they mask P4 as the DPDT, which is now on P0, and their valve, pump and inverter bits point at the old relays. Bring them in line with ESP2's `OUT_*` map before using them on the rig.
 - **Tools use `Calibration/common.ini`** for the pinned platform and COM ports, and `Calibration/cal.ps1` to flash and monitor. CI builds them all.
 
 ## ADDED (2026-11-02): smaller fixes
 - **`batteryLow`/`batteryCritical` need `BATT_FLAG_HOLD_MS` (60 s) below the line** (`battFlagHeld`), so an inverter start's dip cannot flicker them. A long run's sag can still pass 60 s, so `BATTERY_SAFETY_ENABLED` still needs a decision before it is turned on.
 - **LCD force run refuses a dose on too small a batch when arming**, not when the countdown ends (`forceBatchOk`, shared with the web path and `sendForceWorkOrder`).
-- **The dashboard's mixer pulse uses TEST row 20** (`COMBO_MIXER`: inverter + mixer), since the mixer's bare relay has no AC power without the inverter. Row 20 is not on the LCD list.
+- **The dashboard's mixer pulse uses TEST row 22:** the 12 V DC mixer relay (P10) alone, no inverter. The mixer has been a 12 V DC motor since 2026-11-15; before that, row 20 ran it with the inverter (`pulseRowForTarget`, `pure_math.h`).
 - **OneDrive conflict copies break the build.** PlatformIO compiles every file in `src/` and `test/`, so `main-<PC>.cpp` stops the link with `multiple definition`. Any that appear go in `_OneDrive_conflicts/` (gitignored) once checked against git.
 
 ## CHANGED: battery read from calibrated opto ADC + ACS758; INA226 removed; safety scaffolded-off
@@ -309,8 +320,16 @@ When power-cycling ESP2 (even 5×) doesn't restore comm, the fault is on **ESP1'
 **Metering:**
 - **Water:** the tank ultrasonics meter the water. The ResMix / MixIrr main-line flow meters are not read at all;
   the small dosing meters still meter the doses.
-- **A fill is TIMED:** run time from the inverter switch-on, from the pump line (`shared/pump_line.h`), then a
-  ~1 min settle, a measurement on the mixing tank, and a top-up when more than 3 L short.
+- **A fill is TIMED, in two steps (2026-11-18, reference §19.4.9.32):**
+  - The first run is 70 % of the need (`FILL_FIRST_FRAC`), timed from the inverter switch-on with the pump line
+    (`shared/pump_line.h`). It is cut early once the live level has risen 75 % (`FILL_FIRST_CUT_FRAC`).
+  - Then a ~1 min settle and a measurement on the mixing tank.
+  - A top-up runs when more than 0.8 L is short (`FILL_TOPUP_MIN_L`, was 3 L), at most 2. It is timed with the rate
+    the run really gave (`fillSeenLpm`) and cut at max(goal − 0.8, measured + 0.4).
+  - An early cut needs 3 readings in a row and a believable pace (`INFO,FILL_CUT`).
+  - `DEGRADED,FILL_SHORT` still fires at 3 L (`FILL_SHORT_ALERT_L`).
+  - **Never let a fill aim at 100 % in one run:** the pump's rate changes from run to run (11 to 19 L/min on 18 Nov),
+    and an overfill cannot be taken back.
 - **A delivery** runs until the mixing tank is under 5 % for 10 s.
 - **The mixer** is part of the mixing tank's shape (`shared/tank_volume.h`).
 
@@ -326,13 +345,37 @@ hardware, no time, no globals (host-tested).
 the future for even `t`, so `now - stamp` wraps to about 49 days and a timeout fires at once. That was the
 LEVEL_BLIND-at-start bug of 17 Nov.
 
-**ESP1 heap:** no large `static` / global buffers. Static RAM comes straight out of the heap, and below
-`FIREBASE_MIN_HEAP` (60 KB) every Firebase request is skipped. A 12 KB static log buffer did exactly that on 17 Nov.
-Watch the build's `RAM:` line: 82,184 B as of 17 Nov.
+**ESP1 heap (18 Nov 2026 h):** no large `static` / global buffers; static RAM comes straight out of the heap.
+- **Judge memory with `heap8Free()` / `heap8Block()`** (`MALLOC_CAP_8BIT`), never `ESP.getFreeHeap()` /
+  `getMaxAllocHeap()`. Those count ~40 KB of IRAM that no String, JSON text or TLS buffer can use: "68 KB free" was
+  really ~27 KB.
+- **The floors:** a new TLS session needs `FB_TLS_MIN_BLOCK` (17 KB) and `FB_TLS_MIN_FREE` (24 KB); a report needs
+  `FB_REPORT_MIN_BLOCK` (6 KB).
+- **Send bodies by pointer** (`POST((uint8_t *)s.c_str(), s.length())`). `HTTPClient::PUT/POST/PATCH(String)` copy
+  the body, and when that copy failed the request went out empty: HTTP 400 "No data supplied." (18 Nov 18g).
+- **Sizes:** netTask stack 24 KB, report document 12 KB.
 
 **Logs:** the SD CSVs go to Firebase (`logs/index`, `logs/files/<day>/<nnnn>`, 6 KB pieces, 14 days kept), one
-piece per netTask pass. Supabase is used only while Firebase is off; its project expired on 17 Nov. SMS `UPLOAD`
-goes through Firebase.
+piece per netTask pass, **only for a day someone asks for** (since 18 Nov g; the automatic catch-up never finished on
+this link). Supabase is used only while Firebase is off; its project expired on 17 Nov. SMS `UPLOAD` goes through
+Firebase.
+
+**Website link (owner, 18 Nov e–g; reference §19.4.9.34):**
+- One report a minute in every mode, plus one on the website's Refresh (at most every 10 s idle, 30 s busy).
+- No "watched" pace. While **busy** (a run, its warm-up, a pump exercise, an armed forced run, a dosed tank waiting,
+  or a watering window open or within 10 min) there is no log upload and no quick retry, but commands and stops are
+  still read every 3 s.
+- The pace lives in one table (`FB_PACE_*`, `linkModeNow()`), and the website reads it from `meta.refreshMs` /
+  `meta.linkMode`. Keep it that way.
+- The rig comes first. Do not bring back a realtime pace without the owner asking: on −84 to −89 dBm the extra traffic
+  failed 97 % of reports.
+
+**Runs on several columns (18 Nov, §19.4.9.33):** one batch, both valves open, `waterL` is the TOTAL. The LCD, the
+receipts (`COL_AB`) and `rn.zone` ("A+B") name every column. The split per column is not measurable; daily totals
+book it evenly (`SPLIT=EST/2`).
+
+**Tank readings near 20 cm (≈120 %) are false echoes**, at the waterproof sensors' dead zone (§19.4.9.8). The owner
+wants the reading left uncapped and unfiltered: don't add a cap without asking.
 
 **Secrets:** the owner number, the setup-AP password and the first-boot admin PIN live in
 `ESP1/include/secrets.h`, which is git-ignored (`secrets.example.h` holds the placeholders). Never commit it, and
@@ -348,7 +391,7 @@ never write those values into docs.
   run is armed.
 
 **Board-to-board additions:** `LEVEL` (with CRC-8 and line number), `LEVEL_FEED`, `SERVO_REQ`/`SERVO`,
-`INFO,INV_ON`, `INFO,FILL_RUN`/`FILL_CHECK`, `PRIME_START,<line>,<col>,<ms>` → `DONE,PRIME_TIMED`. The full list is in
+`INFO,INV_ON`, `INFO,FILL_RUN`/`FILL_CHECK`/`FILL_CUT`, `PRIME_START,<line>,<col>,<ms>` → `DONE,PRIME_TIMED`. The full list is in
 the reference §9.7.4.
 
 ## Conventions

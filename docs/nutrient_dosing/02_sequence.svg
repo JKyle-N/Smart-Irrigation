@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="356" viewBox="0 0 900 356" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<title>Fertigation sequence</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker><marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#15803d"/></marker><marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
+<rect width="900" height="356" fill="#ffffff"/>
+<text x="450" y="28" font-size="17" fill="#1f2937" text-anchor="middle" font-weight="bold">A fertigation run on ESP32 #2 (budget B per column)</text>
+<rect x="20" y="60" width="114" height="150" rx="8" fill="#bfdbfe" stroke="#374151" stroke-width="1.4"/>
+<text x="77.0" y="84" font-size="14" fill="#1f2937" text-anchor="middle" font-weight="bold">1 Fill</text>
+<text x="77.0" y="108" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">water batch</text>
+<text x="77.0" y="124" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">B × 0.8</text>
+<text x="77.0" y="140" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">(timed, then</text>
+<text x="77.0" y="156" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">measured)</text>
+<line x1="134" y1="135" x2="144" y2="135" stroke="#374151" stroke-width="1.6" marker-end="url(#ar)"/>
+<rect x="144" y="60" width="114" height="150" rx="8" fill="#ede9fe" stroke="#374151" stroke-width="1.4"/>
+<text x="201.0" y="84" font-size="14" fill="#1f2937" text-anchor="middle" font-weight="bold">2 Dose</text>
+<text x="201.0" y="108" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">A, then B, then C</text>
+<text x="201.0" y="124" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">each stops at its</text>
+<text x="201.0" y="140" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">target mL on its</text>
+<text x="201.0" y="156" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">flow meter</text>
+<line x1="258" y1="135" x2="268" y2="135" stroke="#374151" stroke-width="1.6" marker-end="url(#ar)"/>
+<rect x="268" y="60" width="114" height="150" rx="8" fill="#fef3c7" stroke="#374151" stroke-width="1.4"/>
+<text x="325.0" y="84" font-size="14" fill="#1f2937" text-anchor="middle" font-weight="bold">3 Mix</text>
+<text x="325.0" y="108" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">mixer 30 s</text>
+<text x="325.0" y="124" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">(current</text>
+<text x="325.0" y="140" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">checked)</text>
+<line x1="382" y1="135" x2="392" y2="135" stroke="#374151" stroke-width="1.6" marker-end="url(#ar)"/>
+<rect x="392" y="60" width="114" height="150" rx="8" fill="#fee2e2" stroke="#374151" stroke-width="1.4"/>
+<text x="449.0" y="84" font-size="14" fill="#1f2937" text-anchor="middle" font-weight="bold">4 EC / pH</text>
+<text x="449.0" y="108" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">measured once</text>
+<text x="449.0" y="124" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">outside window:</text>
+<text x="449.0" y="140" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">alert, still</text>
+<text x="449.0" y="156" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">delivered</text>
+<line x1="506" y1="135" x2="516" y2="135" stroke="#374151" stroke-width="1.6" marker-end="url(#ar)"/>
+<rect x="516" y="60" width="114" height="150" rx="8" fill="#ffedd5" stroke="#374151" stroke-width="1.4"/>
+<text x="573.0" y="84" font-size="14" fill="#1f2937" text-anchor="middle" font-weight="bold">5 Deliver</text>
+<text x="573.0" y="108" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">booster to</text>
+<text x="573.0" y="124" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">under 5 % + 10 s</text>
+<line x1="630" y1="135" x2="640" y2="135" stroke="#374151" stroke-width="1.6" marker-end="url(#ar)"/>
+<rect x="640" y="60" width="114" height="150" rx="8" fill="#bfdbfe" stroke="#374151" stroke-width="1.4"/>
+<text x="697.0" y="84" font-size="14" fill="#1f2937" text-anchor="middle" font-weight="bold">6 Flush fill</text>
+<text x="697.0" y="108" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">plain water</text>
+<text x="697.0" y="124" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">B × 0.2</text>
+<line x1="754" y1="135" x2="764" y2="135" stroke="#374151" stroke-width="1.6" marker-end="url(#ar)"/>
+<rect x="764" y="60" width="114" height="150" rx="8" fill="#ffedd5" stroke="#374151" stroke-width="1.4"/>
+<text x="821.0" y="84" font-size="14" fill="#1f2937" text-anchor="middle" font-weight="bold">7 Flush out</text>
+<text x="821.0" y="108" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">rinses the line</text>
+<text x="821.0" y="124" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">into the same</text>
+<text x="821.0" y="140" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">column</text>
+<rect x="20" y="232" width="860" height="110" rx="8" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.4"/>
+<text x="36" y="256" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">The dose is fixed by ESP32 #1 before the run, for the PLANNED batch B × 0.8: if the fill comes in 10 % over,</text>
+<text x="36" y="277" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">the batch is about 10 % weaker. The doses are metered (pulses ÷ K); a pump past twice its expected time stops</text>
+<text x="36" y="298" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">and holds the run as DOSE_TIMEOUT. pH is only checked: the pH up / down pumps are never run by a fertigation.</text>
+<text x="36" y="319" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">The column receives the whole batch, then the flush of plain water pushes the rest of it out of the pipe.</text>
+</svg>

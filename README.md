@@ -40,8 +40,10 @@ Three microcontrollers with strict role separation:
 - **Non-blocking everywhere** — no `delay()` in normal loop flow (one 40 ms hand-off before an emergency power cut excepted); task watchdogs on both ESP32s, internal WDT on the Nano.
 - **ESP2 powered off during idle** (power saving); ESP32 #1 powers it up on demand for each run and powers it back off.
 - **GSM (A7670C)** alerts for all fault tiers, scheduled-run notices and on-demand reports, with send retries, delivery reports, a modem watchdog, a weekly `SIMTEST` text and an optional second alert number.
-- **Pure ultrasonic water metering (web v.4)** — the two tank ultrasonics measure every litre the transfer and booster pumps move (the main-line flow meters are no longer used). A fill is a timed transfer run counted from the inverter switch-on, then a 1-minute settle, a measurement and a top-up; a delivery runs the booster until the mixing tank is under 5 % for 10 s. Pump lines come from bench measurements and can be re-measured on the LCD (Settings → Calibration → Transfer / Booster pump est).
-- **Web dashboard + cloud** — Firebase RTDB live status (every 2–4 s while the website is open, with a Refresh button), remote commands, ThingSpeak graphs, and the SD card's daily CSV logs uploaded to Firebase and downloaded on the website (Supabase only while Firebase is off), all from a core-0 task. SMS and the LCD remain the authoritative stop paths.
+- **Pure ultrasonic water metering (web v.4)** — the two tank ultrasonics measure every litre the transfer and booster pumps move (the main-line flow meters are no longer used). A fill runs in two steps (since 18 Nov 2026): a timed transfer run for about 70 % of the litres needed, counted from the inverter switch-on; a 1-minute settle and a measurement; then a top-up timed with the rate that run really gave, when more than 0.8 L is missing. Any run ends early once the tank's live level shows enough. A delivery runs the booster until the mixing tank is under 5 % for 10 s. Pump lines come from bench measurements and can be re-measured on the LCD (Settings → Calibration → Transfer / Booster pump est).
+- **Several columns in one run** — a forced run on A+B is one batch through both valves; the litres asked are the total. The LCD, the receipts and the website name every column, and the LCD's bar follows the fill and the delivery.
+- **Web dashboard + cloud** — Firebase RTDB status once a minute, plus one report at once on the website's Refresh; the link goes quiet while a run is due or under way. Remote commands, ThingSpeak graphs, and the SD card's daily CSV logs sent to Firebase for a day someone asks for and downloaded on the website (Supabase only while Firebase is off), all from a core-0 task. SMS and the LCD remain the authoritative stop paths.
+- **Kept away from the inverter's noise** — for every inverter use the boards move to a second battery (P0 DPDT, both + and − broken); a servo, not relays, chooses the AC pump; the inverter sits away from the sensor cables. The main-battery and solar sensors are not fitted: on the noisy 12 V side they disturbed the logic, and a clean board could not be built in time (reference §20.5).
 - **SD logging** — RTC-timestamped CSV, one file per day (`YYYYMMDD.CSV`), buffered/batched writes.
 - **Nano recovery ladder (2 layers)** — Nano internal WDT → ESP32 #1 `RESET_REQ` (after 5 consecutive garbage packets). The old hardware-reset layer was removed when PCF8575 **P17** became the master actuator-power cutoff.
 - **P17 master cutoff + tank-aware fault hold** — on a hard ESP2 fault, ESP2 drops the P17 master power relay (bank goes dead, fail-safe), pauses, and *stays alive* holding the metered mixing-tank volume (persisted to NVS). ESP1 keeps ESP2 powered and alerts over GSM with the operation + column; recovery is user-gated: reply `STOP` / `RELEASE` / `IRRIGATE` / `NORMAL`.
@@ -58,8 +60,12 @@ Nano/          Arduino Nano sensor hub      (Arduino IDE .ino, or PlatformIO)
 shared/        Headers used by more than one board: rig constants, tank shape -> litres, pump lines
 Calibration/   Bench calibration tools per board (each its own PlatformIO project)
 Website/       The dashboard (static site + Firebase rules); published separately on GitHub Pages
+delete-user-api/  The website's account-deletion function (Vercel); its credentials are environment variables
 Test Code/     Bench sketches & per-sensor test programs (Arduino IDE + PlatformIO)
-Smart_Irrigation_System_Reference_FINAL.md   Full specification (source of truth)
+docs/          Diagrams for the two guides below
+Smart_Irrigation_System_Reference_FINAL.md   Full specification (source of truth); §5.0 explains the system in brief
+Accurate_Water_Delivery_Guide.md             The manual work and formulas for accurate litres
+Nutrient_Dosing_Guide.md                     How a dose is decided, and the open questions on it
 CLAUDE.md      Locked architecture & conventions
 ```
 
@@ -107,7 +113,7 @@ flasher app or a web flasher). No compiler needed on the device.
 ## Pin / bus map (summary — see spec §17–19 for the authoritative version)
 
 **ESP32 #1:** Nano link EspSoftwareSerial GPIO16/17 · ESP2 link HW UART1 GPIO25/33 ·
-A7670C HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, secondary-battery INA226 0x40, ADS1115 0x48, DS3231 0x68; behind an ISO1540: solar INA226 0x41, main-battery INA226 0x44) ·
+A7670C HW UART2 GPIO27/26 · I2C GPIO21/22 (LCD 0x27, secondary-battery INA226 0x40, ADS1115 0x48, DS3231 0x68; behind an ISO1540: solar INA226 0x41, main-battery INA226 0x44, supported but not fitted on the rig) ·
 microSD SPI GPIO23/19/18/5 · buttons GPIO0/12/13/15/2 · ESP2 power relay GPIO4.
 
 **ESP32 #2:** ESP1 link HW UART2 GPIO16/17 · PZEM-004T HW UART1 GPIO13/14 ·
@@ -160,13 +166,24 @@ and `Commissioning_Flash_Plan.md` stages the testing.
 
 ## Status
 
-**web v.4 "pure ultrasonic", 17 Nov 2026.** All three controllers compile cleanly (PlatformIO `esp32dev` /
+**web v.4 "pure ultrasonic", 18 Nov 2026.** All three controllers compile cleanly (PlatformIO `esp32dev` /
 `nanoatmega328`), and the host tests run in GitHub Actions on every push (`pio test -e native` on ESP1 and ESP2).
-The firmware was flashed and checked on the rig on 17 Nov: forced irrigation runs on columns A and B completed
-(timed fill, settle and check, delivery to under 5 %). What is still open, and the change history, is in
-[`Smart_Irrigation_System_Reference_FINAL.md`](Smart_Irrigation_System_Reference_FINAL.md) §19.4.9.11–§19.4.9.27
-and §29.10. Most important: ESP32 #1 restarts when its supply dips (give it and the A7670C a 2 A supply and a
-large capacitor at the modem). This is active thesis work; values marked for commissioning are not yet final.
+
+**On the rig:** ESP32 #1 runs `web v.4 (2026-11-18h)` and ESP32 #2 the two-step fill, both flashed on the evening of
+18 Nov. The Nano runs its 17 Nov build. The first forced run with the two-step fill (A+B, 5.0 L) delivered 5.92 L;
+single-run fills earlier that day had come in 27 % short to 53 % over.
+
+**Where to read more:** the reference
+[`Smart_Irrigation_System_Reference_FINAL.md`](Smart_Irrigation_System_Reference_FINAL.md):
+- §5.0 explains the whole system in brief;
+- §19.4.9.28–34 and §29.12 cover the 18 Nov changes;
+- §20.5 covers the inverter noise.
+
+**Most important open items:**
+- ESP32 #1 restarts when its supply dips: give it and the A7670C a 2 A supply and a large capacitor at the modem.
+- The Wi-Fi at ESP32 #1 is weak (about −80 to −90 dBm).
+
+This is active thesis work; values marked for commissioning are not yet final.
 
 ---
 

@@ -186,7 +186,8 @@ Battery 12.6V, backup 15.9V
 ```
 The pages that follow give solar and energy (used / charged), the water and nutrients each column got today,
 and each column's targets. `LOW` after a battery means it is under its low mark; `--` means its monitor isn't
-answering.
+answering. **On this rig the main-battery and solar sensors are not fitted** (reference §20.5), so their values show
+`--` or stay at 0; only the backup (secondary) battery is measured.
 
 ### 4.6 Summary — `SUMMARY <date> i/N`
 The day's averages from the SD log: each column's N, P, K and soil moisture, the battery and power, total water
@@ -252,7 +253,7 @@ full emergency stop is done at the LCD fault screen.
 **Buttons:** UP, DOWN, ENTER, BACK, MODE.
 
 - **MODE** toggles between the live data pages and the **Settings** menu (and exits Testing/Calibration).
-- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (main battery V/I, where a minus current means it is charging; a `B2:` line for the secondary battery, with `*` marking the battery the controllers are running from; and a `Sol:` line for solar. SD card and clock status are on the Columns page's last line),
+- **Data pages** (UP/DOWN to cycle): **Home**, **Sensors**, **Columns**, **Power** (main battery V/I, where a minus current means it is charging; a `B2:` line for the secondary battery, with `*` marking the battery the controllers are running from; and a `Sol:` line for solar. The main-battery and solar sensors are not fitted on this rig, so only the `B2:` line carries real readings. SD card and clock status are on the Columns page's last line),
   **GSM + WiFi** health, **Fault** (last fault / recovery prompts).
 
 ### 6.1 Settings menu
@@ -444,14 +445,29 @@ Start a run now, outside the schedule.
   reservoir is not low. If not, the run is cancelled with a `Manual run cancelled` notice that says why (§4.4).
 - **No limits otherwise:** forced runs have no daily limit, and the tank check does not block them.
 
+**A+B together or A then B?** "A+B together" is **one batch**: both valves open and the litres you set are the
+**total** (10 L gives about 5 L per column; how it splits depends on each line and is not measured). "A then B" runs
+**two batches**, each with its own litres, measured separately. A forced run from the website on both columns is the
+"together" kind.
+
+**On the screen during the run:** the top line names every column (`IRRIGATE A+B`). The bottom line follows the
+water: `Fill 3.5L [####---]` while the mixing tank fills (all its runs and settles), then the litres out to the
+column(s) against the target. The result screen and the receipt name every column too (`RESULT A+B OK`,
+`RECEIPT … COL_AB`).
+
 ### 6.9 How the water is measured (since 16–17 Nov)
 - **The tanks are the meters:** the ultrasonic sensors measure the water; the two main-line flow meters are no
   longer used.
-- **A fill is timed:** the transfer pump runs for the time the litres need, counted from the inverter switch-on.
-  The tank then settles for about a minute and is measured, with a top-up run if more than 3 L is missing.
+- **A fill comes in two steps (since 18 Nov):** the transfer pump first runs for about 70 % of the litres needed,
+  counted from the inverter switch-on. The tank settles for about a minute and is measured. If more than 0.8 L is
+  missing, a short top-up runs, timed with the pump's speed just seen (at most 2 top-ups). Either run can stop
+  early when the tank shows enough. Expect the result within about 1 L of what you asked for.
 - **A delivery:** the booster runs until the mixing tank is under 5 %, then 10 s more.
 - **On the LCD:** the home page shows each tank's % and litres. A `?` after it (`Mix:40%?`) means the reading was
   too noisy to be used for control (the pings disagreed, often the inflow or the mixer).
+- **A tank at about 120 %:** the sensors can't see anything closer than about 20 cm, and a reading there (about
+  120 %) is a false echo, often water drops on the sensor face after a refill. Wipe the sensor face dry and check
+  the raw cm on Sensor Diag (reference §19.4.9.8).
 
 ---
 
@@ -534,12 +550,14 @@ account with the right access level) — you just won't be able to press anythin
 connection is confirmed current again, at which point a **"Direct hardware control"** banner reappears
 as a reminder before you touch anything.
 
-### 8.4.1 Live updates, Refresh and the SD card logs (17 Nov)
-- **Live updates:** while a dashboard page is open and visible, the controller sends its status every **2 s during a run**
-  and every **4 s** otherwise (every 20 / 60 s when nobody is watching). **Refresh** asks for a new status at
-  once, and the page says how long the answer took.
-- **Diagnostics → SD card logs:** the last 14 days of the controller's CSV log. **Download** any day.
-  **Upload from the rig** asks for any day on the card, today included as far as it is written.
+### 8.4.1 Updates, Refresh and the SD card logs (18 Nov)
+- **Updates:** the controller sends its status **once a minute**. The page also asks for a fresh one when it opens,
+  when it comes back to the front, when the last one is overdue, and when you press **Refresh**. The controller
+  answers at most every 10 s, or every 30 s while it is busy with a run (or one is about to start): **the rig comes
+  first.** Commands and stops still get through within about 3 s.
+- **Diagnostics → SD card logs:** the last 14 days of the controller's CSV log that were sent. **Download** any day.
+  **Upload from the rig** asks for any day on the card, today included as far as it is written. Days are no longer
+  sent by themselves: ask for the ones you need.
 - **Manual/Test → SD card log (CSV):** **Update today's log**, then **Download today's log**. The button works
   only while the controller is reporting and idle, with nothing running; otherwise it says why. A day's log takes
   about 2–3 minutes per megabyte to arrive.

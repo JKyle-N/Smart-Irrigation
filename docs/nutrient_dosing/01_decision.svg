@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="610" viewBox="0 0 900 610" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<title>Fertigation decision</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker><marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#15803d"/></marker><marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
+<rect width="900" height="610" fill="#ffffff"/>
+<text x="450" y="28" font-size="17" fill="#1f2937" text-anchor="middle" font-weight="bold">Water only, or water with nutrients?</text>
+<polygon points="330,39.0 480.0,70 330,101.0 180.0,70" fill="#fff7ed" stroke="#c2410c" stroke-width="1.4"/>
+<text x="330" y="68" font-size="13" fill="#1f2937" text-anchor="middle" font-weight="bold">Column due for watering?</text>
+<text x="330" y="85" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">in its window, soil under 35 %</text>
+<line x1="480" y1="70" x2="560" y2="70" stroke="#c2410c" stroke-width="1.6" marker-end="url(#ara)"/>
+<text x="566" y="74" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">no → no watering at all</text>
+<line x1="330" y1="101" x2="330" y2="123" stroke="#15803d" stroke-width="1.6" marker-end="url(#arg)"/>
+<text x="338" y="117" font-size="11" fill="#15803d" text-anchor="start" font-weight="normal">yes</text>
+<polygon points="330,123.0 480.0,154 330,185.0 180.0,154" fill="#fff7ed" stroke="#c2410c" stroke-width="1.4"/>
+<text x="330" y="152" font-size="13" fill="#1f2937" text-anchor="middle" font-weight="bold">Column mode AUTO?</text>
+<text x="330" y="169" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">IRRIGATION ONLY never doses</text>
+<line x1="480" y1="154" x2="560" y2="154" stroke="#c2410c" stroke-width="1.6" marker-end="url(#ara)"/>
+<text x="566" y="158" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">no → water only</text>
+<line x1="330" y1="185" x2="330" y2="207" stroke="#15803d" stroke-width="1.6" marker-end="url(#arg)"/>
+<text x="338" y="201" font-size="11" fill="#15803d" text-anchor="start" font-weight="normal">yes</text>
+<polygon points="330,207.0 480.0,238 330,269.0 180.0,238" fill="#fff7ed" stroke="#c2410c" stroke-width="1.4"/>
+<text x="330" y="236" font-size="13" fill="#1f2937" text-anchor="middle" font-weight="bold">NPK probe reading valid?</text>
+<text x="330" y="253" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">fresh, all 7 values present</text>
+<line x1="480" y1="238" x2="560" y2="238" stroke="#c2410c" stroke-width="1.6" marker-end="url(#ara)"/>
+<text x="566" y="242" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">no → water only</text>
+<line x1="330" y1="269" x2="330" y2="291" stroke="#15803d" stroke-width="1.6" marker-end="url(#arg)"/>
+<text x="338" y="285" font-size="11" fill="#15803d" text-anchor="start" font-weight="normal">yes</text>
+<polygon points="330,291.0 480.0,322 330,353.0 180.0,322" fill="#fff7ed" stroke="#c2410c" stroke-width="1.4"/>
+<text x="330" y="320" font-size="13" fill="#1f2937" text-anchor="middle" font-weight="bold">Probe's own moisture ≥ 15 %?</text>
+<text x="330" y="337" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">dry soil gives false NPK</text>
+<line x1="480" y1="322" x2="560" y2="322" stroke="#c2410c" stroke-width="1.6" marker-end="url(#ara)"/>
+<text x="566" y="326" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">no → water only</text>
+<line x1="330" y1="353" x2="330" y2="375" stroke="#15803d" stroke-width="1.6" marker-end="url(#arg)"/>
+<text x="338" y="369" font-size="11" fill="#15803d" text-anchor="start" font-weight="normal">yes</text>
+<polygon points="330,375.0 480.0,406 330,437.0 180.0,406" fill="#fff7ed" stroke="#c2410c" stroke-width="1.4"/>
+<text x="330" y="404" font-size="13" fill="#1f2937" text-anchor="middle" font-weight="bold">Not fed yet today?</text>
+<text x="330" y="421" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">nutrients at most once a day</text>
+<line x1="480" y1="406" x2="560" y2="406" stroke="#c2410c" stroke-width="1.6" marker-end="url(#ara)"/>
+<text x="566" y="410" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">no → water only</text>
+<line x1="330" y1="437" x2="330" y2="459" stroke="#15803d" stroke-width="1.6" marker-end="url(#arg)"/>
+<text x="338" y="453" font-size="11" fill="#15803d" text-anchor="start" font-weight="normal">yes</text>
+<polygon points="330,459.0 480.0,490 330,521.0 180.0,490" fill="#fff7ed" stroke="#c2410c" stroke-width="1.4"/>
+<text x="330" y="488" font-size="13" fill="#1f2937" text-anchor="middle" font-weight="bold">Any gap ≥ 30 mg/kg?</text>
+<text x="330" y="505" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">gap = target − probe reading</text>
+<line x1="480" y1="490" x2="560" y2="490" stroke="#c2410c" stroke-width="1.6" marker-end="url(#ara)"/>
+<text x="566" y="494" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">no → water only</text>
+<line x1="330" y1="521" x2="330" y2="543" stroke="#15803d" stroke-width="1.6" marker-end="url(#arg)"/>
+<text x="338" y="537" font-size="11" fill="#15803d" text-anchor="start" font-weight="normal">yes</text>
+<rect x="180" y="546" width="300" height="50" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="330" y="567" font-size="14" fill="#7c3aed" text-anchor="middle" font-weight="bold">FERTIGATE</text>
+<text x="330" y="585" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">dose sized by calcDose (next pictures)</text>
+<rect x="20" y="60" width="150" height="140" rx="8" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.4"/>
+<text x="30" y="82" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">The probe decides</text>
+<text x="30" y="99" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">WHETHER to dose.</text>
+<text x="30" y="116" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal"></text>
+<text x="30" y="133" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">The AMOUNT comes</text>
+<text x="30" y="150" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">from the lab soil</text>
+<text x="30" y="167" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">baseline, not the</text>
+<text x="30" y="184" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">probe (§3).</text>
+</svg>

@@ -1,6 +1,8 @@
 # Isolated Power Monitoring Guide (Current + Voltage + Charging)
 
 > **Superseded 2026-11-02.** Solar and the main battery are now measured by two INA226 behind an ISO1540 isolator; see `Smart_Irrigation_System_Reference_FINAL.md` §21.0. The isolation problem described here is what that solves. This guide is kept for the opto voltage fallback and as history.
+>
+> **Update 18 Nov 2026: no main-battery or solar monitoring is fitted on the rig.** Both sensors have to sit on the noisy 12 V side next to the inverter. The ISO1540 board disturbed ESP1's I²C bus (the LCD and the clock dropped off), and a board that keeps them from affecting the system while the inverter runs could not be built in the project's time. The opto fallback is not connected either. See the reference §20.5 for what was done about the inverter's noise instead (a second battery for the boards, the inverter moved away from the sensor cables, a servo instead of pump relays).
 
 ## Smart Irrigation System — ESP32 #1 Battery Energy Monitoring
 

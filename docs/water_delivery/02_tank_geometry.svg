@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="648" viewBox="0 0 900 648" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<title>Mixing tank geometry</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker><marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
+<rect width="900" height="648" fill="#ffffff"/>
+<text x="450" y="28" font-size="17" fill="#1f2937" text-anchor="middle" font-weight="bold">The mixing tank as measured (18 Nov), with the firmware's marks</text>
+<rect x="127.2" y="64.0" width="345.6" height="160.0" fill="#fee2e2"/>
+<text x="260" y="198.0" font-size="12" fill="#c2410c" text-anchor="middle" font-weight="bold">sensor blind zone:</text>
+<text x="260" y="214.0" font-size="12" fill="#c2410c" text-anchor="middle" font-weight="normal">water closer than ~20 cm</text>
+<polygon points="161.6,444.0 438.4,444.0 440.6,407.2 159.4,407.2" fill="#93c5fd" stroke="none"/>
+<polygon points="159.4,407.2 440.6,407.2 445.3,331.6 154.7,331.6" fill="#bfdbfe" stroke="none"/>
+<line x1="154.7" y1="331.6" x2="445.3" y2="331.6" stroke="#2563eb" stroke-width="2"/>
+<polyline points="161.6,444.0 144.1,157.6 133.2,76.0" fill="none" stroke="#374151" stroke-width="2.4"/>
+<polyline points="438.4,444.0 455.9,157.6 466.8,76.0" fill="none" stroke="#374151" stroke-width="2.4"/>
+<line x1="161.6" y1="444.0" x2="438.4" y2="444.0" stroke="#374151" stroke-width="2.4"/>
+<rect x="276.0" y="352.8" width="48.0" height="91.2" fill="#9ca3af" stroke="#374151"/>
+<text x="270.0" y="379.2" font-size="11" fill="#1f2937" text-anchor="end" font-weight="normal">mixer</text>
+<text x="270.0" y="393.2" font-size="11" fill="#1f2937" text-anchor="end" font-weight="normal">Ø 6 × 11.4 cm</text>
+<text x="330.0" y="429.6" font-size="11" fill="#1f2937" text-anchor="start" font-weight="normal">4.3 L under 0 %</text>
+<rect x="338" y="46" width="44" height="18" rx="3" fill="#e5e7eb" stroke="#374151"/>
+<text x="360" y="59" font-size="10" fill="#1f2937" text-anchor="middle" font-weight="normal">sensor</text>
+<line x1="360" y1="64" x2="360" y2="331.6" stroke="#c2410c" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ara)"/>
+<text x="366" y="306.0" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">d = measured</text>
+<text x="366" y="321.0" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">distance</text>
+<line x1="105.2" y1="64.0" x2="105.2" y2="444.0" stroke="#374151" stroke-width="1.2" marker-start="url(#ar)" marker-end="url(#ar)"/>
+<text x="99.19999999999999" y="254.0" font-size="12" fill="#1f2937" text-anchor="end" font-weight="bold">47.5 cm</text>
+<text x="99.19999999999999" y="269.0" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">sensor to</text>
+<text x="99.19999999999999" y="283.0" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">floor (tape)</text>
+<line x1="132.1" y1="157.6" x2="490.8" y2="157.6" stroke="#6b7280" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="496.8" y="153.60000000000002" font-size="12" fill="#6b7280" text-anchor="start" font-weight="normal">35.8 cm: top of the straight body (Ø 38.96 cm)</text>
+<line x1="138.1" y1="256.0" x2="490.8" y2="256.0" stroke="#1f2937" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="496.8" y="252.0" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">FULL 100 %: d = 24.0 cm (23.5 cm of water), 19.39 L</text>
+<line x1="139.1" y1="271.1" x2="490.8" y2="271.1" stroke="#c2410c" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="496.8" y="283.12" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">90 %: overflow stop, MIXCAP = 17.32 L</text>
+<line x1="146.9" y1="399.6" x2="490.8" y2="399.6" stroke="#c2410c" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="496.8" y="395.64" font-size="12" fill="#c2410c" text-anchor="start" font-weight="normal">5 %: delivery low stop = 0.89 L</text>
+<line x1="147.4" y1="407.2" x2="490.8" y2="407.2" stroke="#1f2937" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="496.8" y="420.2" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">EMPTY 0 %: d = 42.9 cm (4.6 cm of water)</text>
+<line x1="149.6" y1="444.0" x2="490.8" y2="444.0" stroke="#6b7280" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="496.8" y="457.0" font-size="12" fill="#6b7280" text-anchor="start" font-weight="normal">floor: d = 47.5 cm (the sensor reads it right)</text>
+<line x1="138.7" y1="407.2" x2="138.7" y2="331.6" stroke="#2563eb" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="132.74921999999998" y="373.4" font-size="13" fill="#2563eb" text-anchor="end" font-weight="bold">h</text>
+<text x="300" y="462.0" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">Ø 34.60 cm at the floor (108.7 cm around)</text>
+<rect x="20" y="480" width="860" height="154" rx="8" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.4"/>
+<text x="36" y="506" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">h = d_empty − d        (cm above the 0 % mark)</text>
+<text x="36" y="532" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">% = h ÷ 18.9 × 100</text>
+<text x="36" y="558" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">Ø(d) = 34.60 + 0.1219 × (47.5 − d)        (cm)</text>
+<text x="36" y="584" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">r(h) = 17.58 + 1.15 × h ÷ 18.9        (cm)</text>
+<text x="36" y="610" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">cone(h) = π × h × (r0² + r0 × r + r²) ÷ 3 ÷ 1000   (L)</text>
+<text x="470" y="506" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">mixer(h) = π × 3² × min(h, 6.8) ÷ 1000   (L)</text>
+<text x="470" y="532" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">litres(h) = cone(h) − mixer(h)</text>
+<text x="470" y="558" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">then stretched through your Tank Mix liters points (§4)</text>
+<text x="470" y="584" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">≈ 0.94 L per cm at 0 %, ≈ 1.10 L per cm at 100 %</text>
+</svg>

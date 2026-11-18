@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="342" viewBox="0 0 900 342" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<title>Pulse quantization</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker><marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#15803d"/></marker><marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
+<rect width="900" height="342" fill="#ffffff"/>
+<text x="450" y="28" font-size="16" fill="#1f2937" text-anchor="middle" font-weight="bold">Doses are whole meter pulses (K = 450 pulses/L → 2.22 mL per pulse)</text>
+<line x1="60" y1="140" x2="860" y2="140" stroke="#374151" stroke-width="1.6" marker-end="url(#ar)"/>
+<line x1="60.0" y1="132" x2="60.0" y2="148" stroke="#374151"/>
+<text x="60.0" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">0</text>
+<line x1="148.9" y1="132" x2="148.9" y2="148" stroke="#374151"/>
+<text x="148.8888888888889" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">1</text>
+<line x1="237.8" y1="132" x2="237.8" y2="148" stroke="#374151"/>
+<text x="237.7777777777778" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">2</text>
+<line x1="326.7" y1="132" x2="326.7" y2="148" stroke="#374151"/>
+<text x="326.6666666666667" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">3</text>
+<line x1="415.6" y1="132" x2="415.6" y2="148" stroke="#374151"/>
+<text x="415.5555555555556" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">4</text>
+<line x1="504.4" y1="132" x2="504.4" y2="148" stroke="#374151"/>
+<text x="504.44444444444446" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">5</text>
+<line x1="593.3" y1="132" x2="593.3" y2="148" stroke="#374151"/>
+<text x="593.3333333333334" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">6</text>
+<line x1="682.2" y1="132" x2="682.2" y2="148" stroke="#374151"/>
+<text x="682.2222222222223" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">7</text>
+<line x1="771.1" y1="132" x2="771.1" y2="148" stroke="#374151"/>
+<text x="771.1111111111112" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">8</text>
+<line x1="860.0" y1="132" x2="860.0" y2="148" stroke="#374151"/>
+<text x="860.0" y="164" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">9</text>
+<text x="860" y="184" font-size="12" fill="#6b7280" text-anchor="end" font-weight="normal">pulses (each 2.22 mL)</text>
+<text x="60.0" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">0 mL</text>
+<text x="260.0" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">5 mL</text>
+<text x="460.0" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">10 mL</text>
+<text x="660.0" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">15 mL</text>
+<text x="860.0" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">20 mL</text>
+<rect x="60.0" y="134" width="266.7" height="12" fill="#c2410c" opacity="0.25"/>
+<text x="193.33333333333334" y="106" font-size="12" fill="#c2410c" text-anchor="middle" font-weight="bold">skipped: fewer than 3 pulses</text>
+<line x1="420.0" y1="90" x2="415.6" y2="134" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="420.0" y="84" font-size="12" fill="#7c3aed" text-anchor="middle" font-weight="normal">9 mL wanted → 4 pulses = 8.9 mL</text>
+<line x1="620.0" y1="90" x2="593.3" y2="134" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="620.0" y="84" font-size="12" fill="#7c3aed" text-anchor="middle" font-weight="normal">14 mL wanted → 6 pulses = 13.3 mL</text>
+<rect x="20" y="200" width="860" height="128" rx="8" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.4"/>
+<text x="36" y="224" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">pulses = round(mL × K ÷ 1000)</text>
+<text x="36" y="250" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">delivered mL = pulses × 1000 ÷ K;  error at most half a pulse (± 1.1 mL here)</text>
+<text x="36" y="276" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">fewer than 3 pulses → not dosed, logged as DOSE,SUBRES (the intended mL is recorded)</text>
+<text x="36" y="302" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">time limit: ceiling s = mL ÷ (pump mL/min) × 60 × 2;  past it: DOSE_TIMEOUT, the run is held</text>
+</svg>

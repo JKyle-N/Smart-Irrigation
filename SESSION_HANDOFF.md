@@ -1,9 +1,14 @@
 # Session Handoff — start here
 
 > **Superseded on 17 Nov 2026.** This handoff describes the repository as of 1 Nov 2026. Since then the
-> firmware became web v.4 "pure ultrasonic". It was flashed and field-checked on 17 Nov; see
-> `Smart_Irrigation_System_Reference_FINAL.md` (the opening status block, §19.4.9.11–27, §29.10) and `CLAUDE.md`
-> ("CHANGED (2026-11-16/17)"). Host tests: ESP1 152, ESP2 83, all passing in GitHub Actions.
+> firmware became web v.4 "pure ultrasonic". It was flashed and field-checked on 17 Nov, and again on 18 Nov with the
+> two-step fill, the A+B run screens and the website link changes. See `Smart_Irrigation_System_Reference_FINAL.md`:
+> - the opening status block, and §5.0 for the system in brief;
+> - §19.4.9.11–34 and §29.10–29.12 for the changes;
+> - §20.5 for the inverter noise. The main-battery and solar sensors are not fitted, and the secondary-battery
+>   switching is on since 16 Nov.
+>
+> Also see `CLAUDE.md` ("CHANGED (2026-11-16/17)"). Host tests run in GitHub Actions on every push.
 
 
 Read this first in a new Claude Code session, **after** `CLAUDE.md` (which is auto-loaded and holds

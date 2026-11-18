@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="450" viewBox="0 0 900 450" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<title>Pump lines and readings</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker><marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
+<rect width="900" height="450" fill="#ffffff"/>
+<text x="450" y="28" font-size="17" fill="#1f2937" text-anchor="middle" font-weight="bold">Pump lines: litres against seconds from the inverter switch-on</text>
+<line x1="80.0" y1="400" x2="80.0" y2="70" stroke="#e5e7eb"/>
+<text x="80.0" y="418" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">0</text>
+<line x1="192.0" y1="400" x2="192.0" y2="70" stroke="#e5e7eb"/>
+<text x="192.0" y="418" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">5</text>
+<line x1="304.0" y1="400" x2="304.0" y2="70" stroke="#e5e7eb"/>
+<text x="304.0" y="418" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">10</text>
+<line x1="416.0" y1="400" x2="416.0" y2="70" stroke="#e5e7eb"/>
+<text x="416.0" y="418" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">15</text>
+<line x1="528.0" y1="400" x2="528.0" y2="70" stroke="#e5e7eb"/>
+<text x="528.0" y="418" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">20</text>
+<line x1="640.0" y1="400" x2="640.0" y2="70" stroke="#e5e7eb"/>
+<text x="640.0" y="418" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">25</text>
+<line x1="80" y1="400.0" x2="640" y2="400.0" stroke="#e5e7eb"/>
+<text x="72" y="404.0" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">0</text>
+<line x1="80" y1="352.9" x2="640" y2="352.9" stroke="#e5e7eb"/>
+<text x="72" y="356.8571428571429" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">1</text>
+<line x1="80" y1="305.7" x2="640" y2="305.7" stroke="#e5e7eb"/>
+<text x="72" y="309.7142857142857" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">2</text>
+<line x1="80" y1="258.6" x2="640" y2="258.6" stroke="#e5e7eb"/>
+<text x="72" y="262.57142857142856" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">3</text>
+<line x1="80" y1="211.4" x2="640" y2="211.4" stroke="#e5e7eb"/>
+<text x="72" y="215.42857142857144" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">4</text>
+<line x1="80" y1="164.3" x2="640" y2="164.3" stroke="#e5e7eb"/>
+<text x="72" y="168.28571428571428" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">5</text>
+<line x1="80" y1="117.1" x2="640" y2="117.1" stroke="#e5e7eb"/>
+<text x="72" y="121.14285714285717" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">6</text>
+<line x1="80" y1="70.0" x2="640" y2="70.0" stroke="#e5e7eb"/>
+<text x="72" y="74.0" font-size="11" fill="#6b7280" text-anchor="end" font-weight="normal">7</text>
+<text x="360.0" y="438" font-size="12" fill="#6b7280" text-anchor="middle" font-weight="normal">seconds from INV_ON</text>
+<text x="24" y="235.0" font-size="12" fill="#6b7280" text-anchor="middle" font-weight="normal">litres</text>
+<line x1="80.0" y1="400.0" x2="214.4" y2="322.4" stroke="#2563eb" stroke-width="2" stroke-dasharray="5 4"/>
+<line x1="214.4" y1="322.4" x2="640.0" y2="147.2" stroke="#2563eb" stroke-width="2.4"/>
+<line x1="80.0" y1="400.0" x2="214.4" y2="368.5" stroke="#c2410c" stroke-width="2" stroke-dasharray="5 4"/>
+<line x1="214.4" y1="368.5" x2="640.0" y2="171.5" stroke="#c2410c" stroke-width="2.4"/>
+<circle cx="217.8" cy="312.5" r="4" fill="#2563eb"/>
+<circle cx="218.2" cy="312.0" r="4" fill="#2563eb"/>
+<circle cx="214.4" cy="314.1" r="4" fill="#2563eb"/>
+<circle cx="233.2" cy="320.6" r="4" fill="#2563eb"/>
+<circle cx="234.8" cy="321.1" r="4" fill="#2563eb"/>
+<circle cx="217.8" cy="334.3" r="4" fill="#2563eb"/>
+<circle cx="239.5" cy="318.0" r="4" fill="#2563eb"/>
+<circle cx="274.4" cy="292.2" r="4" fill="#2563eb"/>
+<circle cx="261.4" cy="301.9" r="4" fill="#2563eb"/>
+<circle cx="256.7" cy="304.7" r="4" fill="#2563eb"/>
+<circle cx="259.6" cy="338.6" r="4" fill="#ffffff" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="242.4" cy="345.6" r="4" fill="#ffffff" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="253.8" cy="355.8" r="4" fill="#ffffff" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="235.2" cy="363.3" r="4" fill="#ffffff" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="241.1" cy="359.9" r="4" fill="#ffffff" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="264.1" cy="345.9" r="4" fill="#c2410c" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="245.3" cy="354.1" r="4" fill="#c2410c" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="267.3" cy="344.6" r="4" fill="#c2410c" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="262.8" cy="348.2" r="4" fill="#c2410c" stroke="#c2410c" stroke-width="1.6"/>
+<circle cx="272.9" cy="343.4" r="4" fill="#c2410c" stroke="#c2410c" stroke-width="1.6"/>
+<rect x="404.3" y="139.0" width="10" height="10" fill="#15803d"/>
+<text x="399.28" y="134.01428571428573" font-size="11" fill="#15803d" text-anchor="end" font-weight="normal">17 Nov fill: 14.7 s → 5.43 L</text>
+<rect x="583.5" y="80.1" width="10" height="10" fill="#15803d"/>
+<text x="578.48" y="75.08571428571429" font-size="11" fill="#15803d" text-anchor="end" font-weight="normal">17 Nov fill: 22.7 s → 6.68 L</text>
+<rect x="660" y="70" width="225" height="330" rx="8" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.4"/>
+<circle cx="678" cy="92" r="4" fill="#2563eb"/><text x="690" y="96" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">transfer: 10 weighed runs</text>
+<circle cx="678" cy="114" r="4" fill="#ffffff" stroke="#c2410c" stroke-width="1.6"/><text x="690" y="118" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">booster, column A</text>
+<circle cx="678" cy="136" r="4" fill="#c2410c"/><text x="690" y="140" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">booster, column B</text>
+<rect x="673" y="153" width="10" height="10" fill="#15803d"/><text x="690" y="162" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">field fills (tank rise, taped shape)</text>
+<text x="674" y="196" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">transfer: V = +0.47 + 11.74·t/60</text>
+<text x="674" y="213" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">booster:  V = -0.65 + 13.20·t/60</text>
+<text x="674" y="230" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">(t in s, V in L)</text>
+<text x="674" y="247" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal"></text>
+<text x="674" y="264" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">dashed: under 6 s the line</text>
+<text x="674" y="281" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">is not trusted (ramp from 0)</text>
+<text x="674" y="298" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal"></text>
+<text x="674" y="315" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">The field fills sit above the</text>
+<text x="674" y="332" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">transfer line: re-measure it with</text>
+<text x="674" y="349" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">the reservoir at its usual level</text>
+<text x="674" y="366" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">and longer runs (10–45 s).</text>
+</svg>

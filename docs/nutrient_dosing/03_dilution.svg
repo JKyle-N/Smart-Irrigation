@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="376" viewBox="0 0 900 376" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<title>Dilution rule</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker><marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#15803d"/></marker><marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
+<rect width="900" height="376" fill="#ffffff"/>
+<text x="450" y="28" font-size="17" fill="#1f2937" text-anchor="middle" font-weight="bold">How much stock goes into the batch: the dilution rule</text>
+<rect x="80" y="90" width="90" height="150" rx="10" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.6"/>
+<rect x="105" y="68" width="40" height="24" rx="4" fill="#ddd6fe" stroke="#7c3aed"/>
+<text x="125" y="150" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">Stock C</text>
+<text x="125" y="167" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">KNO₃</text>
+<text x="125" y="184" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">3383 mg K/L</text>
+<text x="125" y="262" font-size="13" fill="#7c3aed" text-anchor="middle" font-weight="bold">C_stock</text>
+<line x1="180" y1="165" x2="330" y2="165" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="255" y="152" font-size="13" fill="#7c3aed" text-anchor="middle" font-weight="bold">V_stock (mL)</text>
+<polygon points="340,90 520,90 505,250 355,250" fill="#ffffff" stroke="#374151" stroke-width="2"/>
+<polygon points="347,140 513,140 505,250 355,250" fill="#e0e7ff" stroke="none"/>
+<text x="430" y="185" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">batch</text>
+<text x="430" y="202" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">V_batch = B × 0.8</text>
+<text x="430" y="219" font-size="12" fill="#1f2937" text-anchor="middle" font-weight="normal">= 4.0 L</text>
+<text x="430" y="272" font-size="13" fill="#2563eb" text-anchor="middle" font-weight="bold">C_batch (mg K per L of water)</text>
+<rect x="570" y="70" width="310" height="200" rx="8" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.4"/>
+<text x="586" y="96" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">Mass of K in = mass of K in the batch:</text>
+<text x="586" y="118" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal"></text>
+<text x="586" y="140" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">C_stock × V_stock = C_batch × V_batch</text>
+<text x="586" y="162" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal"></text>
+<text x="586" y="184" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">V_stock (mL) = C_batch × V_batch ÷ C_stock × 1000</text>
+<text x="586" y="206" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal"></text>
+<text x="586" y="228" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">Example: 100 mg/L in 4.0 L from 3383 mg/L</text>
+<text x="586" y="250" font-size="13" fill="#1f2937" text-anchor="start" font-weight="normal">= 100 × 4.0 ÷ 3383 × 1000 = 118 mL</text>
+<rect x="20" y="300" width="860" height="62" rx="8" fill="#fff7ed" stroke="#c2410c" stroke-width="1.4"/>
+<text x="36" y="324" font-size="13" fill="#c2410c" text-anchor="start" font-weight="normal">Today's code computes gap × V_batch ÷ C_stock = 100 × 4.0 ÷ 3383 = 0.118 and treats it as mL.</text>
+<text x="36" y="346" font-size="13" fill="#c2410c" text-anchor="start" font-weight="normal">By this rule that number is in LITRES (0.118 L = 118 mL): the doses come out 1000 times too small (§3).</text>
+</svg>

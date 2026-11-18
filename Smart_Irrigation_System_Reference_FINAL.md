@@ -7,18 +7,35 @@
 > **§19.4.9**; wherever an older paragraph below still talks about the ResMix / MixIrr meters or about the
 > ultrasonic being "display-only", §19.4.9 is what the firmware does.
 >
-> **State on 17 Nov 2026 (flashed; forced runs checked on the rig, §19.4.9.27).**
-> - **Water:** a fill is a timed transfer run counted from the inverter switch-on, then a 1-minute settle, a
->   measurement, and a top-up when more than 3 L short. A delivery runs the booster until the mixing tank is under
->   5 % for 10 s (§19.4.9.13).
+> **State on 18 Nov 2026, night (all flashed; an A+B forced run checked on the rig at 21:32).** ESP32 #1 runs
+> `web v.4 (2026-11-18h)`, ESP32 #2 the two-step fill, the Nano its 17 Nov build. **§5.0 explains the whole system in
+> brief**; §29.12 lists what is new since 17 Nov.
+> - **Water:** a fill runs the transfer pump in two steps: about 70 % of the litres needed, a 1-minute settle and a
+>   measurement, then a top-up timed with the rate the pump really gave (when more than 0.8 L short, at most twice).
+>   A run also ends early once the tank's live level shows enough. A delivery runs the booster until the mixing tank
+>   is under 5 % for 10 s (§19.4.9.13, §19.4.9.32).
+> - **Several columns in one run:** a forced run on A+B is one batch through both valves, and the litres asked are the
+>   total. The LCD names "A+B" and its bar moves through the fill and the delivery (§19.4.9.33).
+> - **Website link:** a report once a minute plus Refresh, quieter while the rig works, and the memory fix behind the
+>   HTTP 400 "No data supplied." errors (§19.4.9.34).
+> - **Electrical noise:** the boards run from a second battery whenever the inverter is on, the inverter sits away
+>   from the sensor cables, and a servo, not relays, switches the pumps. The main-battery and solar sensors are **not
+>   fitted** (§20.5).
+> - **Tank readings near 120 %:** a distance near 20 cm is the sensor's dead zone, not water (§19.4.9.8).
 > - **Pumps:** pump lines come from the user's own measurements, re-measured on the LCD pump-estimate screens (§19.4.9.15).
 > - **Testing:** 1 minute of inverter time for Fill/Push, 1.5 s between button runs, and a 120 ms release filter
 >   (§19.4.9.14, §19.4.9.16–18).
 > - **Forced runs:** no daily limit and no tank-check block; a switched-off column is switched back on (§19.4.9.21,
 >   §19.4.9.26).
 > - **BATT2:** blocks AC pumps at a resting charge of 30 % or less (§19.4.7.1).
-> - **Website:** live updates every 2–4 s while someone watches, a Refresh button, and SD card logs through Firebase,
->   since the Supabase project expired (§19.4.9.22–23).
+> - **Operation:** each column is Automatic or Manual (readings only, no scheduled run; forced runs still work), with a
+>   day plan of single-day overrides set from the website (§19.4.9.28).
+> - **Website parity:** tank check confirmable from the website (`TANK_CHECK_OK`), restart reason/count, thresholds,
+>   calibration (read-only) and column rest/skip published (§19.4.9.29).
+> - **Tank shape:** taped by the user: 34.60 cm across at the floor, +0.1219 cm per cm, sensor 47.5 cm above the floor.
+>   The 0 % / 100 % marks stay; the litres change (MIXCAP 15.90 → 17.32 L) (§19.4.9.31).
+> - **SD card logs** reach the website through Firebase for a day someone asks for, since the Supabase project
+>   expired (§19.4.9.23, §19.4.9.34).
 >
 > - **As-built lists (17 Nov):** calibration defaults incl. the pump readings §5.3.2–5.3.3, Nano packets §9.7.1,
 >   ESP32 #1 ↔ #2 messages §9.7.4, SMS commands §12.2.5, crop presets §12.2.2, LCD menus §18.10.7.5, fault codes
@@ -73,6 +90,81 @@ The system uses a **distributed architecture**:
 | ESP32 #1     | Master Controller (decision-making)      |
 | ESP32 #2     | Actuator Controller (execution & safety) |
 
+## 5.0. 🔹 How the system works, in brief (as built, 18 Nov 2026)
+
+**In one paragraph.** Solar panels charge a 12 V main battery. An inverter turns it into 220 V AC, but only while
+one of the two AC pumps runs: the **transfer pump** (reservoir → mixing tank) or the **booster pump** (mixing tank →
+a column's drip line). A servo turned by the Nano chooses which pump the inverter feeds. Water moves in **batches**:
+the transfer pump fills the mixing tank, nutrients are dosed and mixed in it when a column needs feeding, and the
+booster empties the tank into the column. An ultrasonic sensor above each tank measures the water, so the change in
+level is the litres moved. Three controllers share the work, and the operator follows it on the LCD, by SMS and on
+the website.
+
+**Who does what**
+
+| Board | Does | Never |
+| --- | --- | --- |
+| **Arduino Nano** (sensor hub) | Reads the soil probes, the NPK probe (RS485), DHT22, BH1750, the reservoir inflow meter and both tank ultrasonics (raw cm); turns the pump-selector servo; sends checksummed packets to ESP32 #1 | decides anything or switches a load |
+| **ESP32 #1** (master) | Turns readings into %, litres and decisions; runs the schedule; LCD and buttons, SD log, clock, SMS (A7670C), the website (Firebase) and ThingSpeak; watches the second battery; switches ESP32 #2's power | drives a pump or valve |
+| **ESP32 #2** (actuators) | Runs one whole work order (fill, dose, mix, deliver, flush) through the PCF8575 relay bank; measures each stage on the tank levels; counts the dosing meters; reads EC/pH, the mixer current and the inverter output (PZEM-004T); stops on its own on a fault | chooses when to run |
+
+**When a column is watered (ESP32 #1)**
+1. **Due:** inside one of its watering windows, a column whose soil moisture is under its **Soil start** line is
+   due, once per window. Only Automatic columns; a Manual column or day waits for a forced run (§19.4.9.28).
+2. **Water or feed:** fertigate when the soil's N, P or K is below the column's preset by the trigger gap (nutrients
+   at most once a day); otherwise plain water (§14.2.0).
+3. **Gates:** nothing starts during a held fault, an emergency stop or a lockout; with the reservoir under its pause
+   level (18 %); when the second battery can't carry the boards (§19.4.7.1); or until the operator confirms the tank
+   after a restart stopped a run.
+4. **Order:** ESP32 #1 shows a receipt, powers ESP32 #2 up (it is off while idle) and sends one work order.
+
+**One run (ESP32 #2)**
+1. **Power:** P17 powers the relay bank. Before each pump start the boards move to the second battery (P0 DPDT),
+   then the servo selects the pump, then the inverter starts (§19.4.7.1–2).
+2. **Fill:** the transfer pump runs about 70 % of the litres needed, timed from its measured rate. After a 1-minute
+   settle the mixing tank is measured, and a top-up timed with the rate the pump really gave adds what is missing
+   (§19.4.9.32).
+3. **Feed (fertigation only):** the nutrient pumps dose by flow meter, the mixer (12 V DC) stirs, and EC/pH are
+   checked.
+4. **Deliver:** the booster empties the mixing tank into the column(s) until it reads under 5 % for 10 s. The tank's
+   fall is the litres delivered.
+5. **Flush (fertigation only):** a plain-water share of the budget rinses the line.
+6. **End:** inverter off, the boards back on the main battery, P17 off. ESP32 #1 writes a receipt: litres asked
+   against litres delivered.
+
+**How the litres are measured.** The Nano pings each tank and reports the distance and how far the pings disagree.
+ESP32 #1 turns the distance into % (0 % = 42.9 cm, 100 % = 24.0 cm from the sensor) and litres (the taped tank shape,
+§19.4.9.31). A level controls a run only when its pings agree within 4 cm. Run times only plan; the tank levels
+measure. The sensors can't see closer than about 20 cm, so a reading near 20 cm (about 120 %) is a false echo
+(§19.4.9.8).
+
+**What keeps it safe**
+- **ESP32 #2 stops a pump itself** when the levels say something is wrong (no rise or fall, the 90 % overflow stop,
+  the 97 % backstop, an empty reservoir) or the AC is outside its window. A hard fault turns every output off,
+  drops P17, keeps the tank's litres in NVS and waits for the operator: STOP, RELEASE, IRRIGATE or NORMAL (§19.4.8).
+  Nothing resumes on its own.
+- **ESP32 #1 is the backstop:** it cuts ESP32 #2's power (GPIO4) if ESP32 #2 freezes, and drops any Nano packet that
+  fails its checksum.
+- **Watchdogs** on both ESP32s. A restart during a run stops the run and asks for a tank check.
+- **Emergency stop** from the LCD (MODE+BACK), by SMS or from the website.
+- **Fail-safe wiring:** every load sits on a normally-open contact behind P17, so a reset or a lost signal leaves
+  everything off.
+
+**How the operator reaches it.** At the rig, the LCD and buttons: status pages, forced runs, settings, calibration
+and testing. By SMS: alerts, STATUS and commands (§12). On the website: a report once a minute plus Refresh, remote
+commands, and the SD logs on request (§29.11). The SD card keeps every event, one CSV per day, and ThingSpeak draws
+the graphs.
+
+**Design rules**
+- **One job per board:** ESP32 #1 decides, ESP32 #2 acts and protects, the Nano reads (§5.4).
+- **Measure, don't assume:** the tank level is the meter; a pump's run time only plans.
+- **Never overfill:** water can't be taken back out of the mixing tank, so a fill aims under its goal and tops up
+  (§19.4.9.32).
+- **Fail safe, operator decides:** a reset, a lost link or a fault ends with the pumps off, and the operator chooses
+  what happens after a fault.
+- **The rig first:** the website link goes quiet while a run is due or under way (§19.4.9.34).
+- **Keep the noise out:** the logic boards are kept off the inverter's noisy 12 V side (§20.5).
+
 ---
 
 ## 5.1. 🔹 System Resilience Architecture
@@ -107,6 +199,14 @@ This multi-layer approach ensures:
   back from control (§19.4.9.24), so a fill relies on its run time and on the measurement after it settles
 - ESP32 #1 restarts when its supply dips (`SYS,BOOT,reason=POWER_ON`). A restart during a run stops the run and asks
   for a tank check (§19.4.9.21, §19.4.9.27)
+- The tank sensors see nothing closer than about 20 cm, just above the 100 % mark (24.0 cm). A reading near 20 cm
+  (about 120 %) is a false echo, not water (§19.4.9.8)
+- In a run on several columns the litres are one total; how they split between the columns is not measured (one
+  tank, one outlet) (§19.4.9.33)
+- The main-battery and solar sensors are not fitted, so the main battery's voltage, %, current and the solar figures
+  are unavailable and the daily Wh totals stay at 0 (§20.5)
+- The Wi-Fi at ESP32 #1 is weak (about −80 to −90 dBm), so some website reports fail. The rig works on without the
+  website, and SMS stays the dependable path for alerts and stops (§19.4.9.34)
 
 ---
 
@@ -117,6 +217,10 @@ This multi-layer approach ensures:
   liters", §19.4.9.4): the water metering rests on it
 - pH and EC sensors require periodic calibration
 - Sensor drift should be considered in long-term use
+- **The ESP2 bench tools are out of date (found 19 Nov 2026).** `Calibration/ESP2/Flow`, `FlowPinFinder` and `ACS712`
+  still carry the relay map from before the 15 Nov rewiring: they treat P4 as the battery switch (it is P0 now, and
+  P4 is column B's valve). On today's wiring they would switch the wrong relays, so update them before use. The LCD's
+  own calibration screens are current.
 
 ### 5.3.1. Capacitive Soil-Probe Calibration (measured)
 
@@ -232,10 +336,16 @@ defaults above (`TRANSFER_LPM`, `BOOSTER_LPM`). Saving a pump estimate (§19.4.9
 - **Short runs:** the runs are 6.0–8.7 s long, so the slope is uncertain for long fills. Re-measure with two run
   lengths (for example 10 s and 40 s) on the Transfer pump est screen.
 - **An outlier:** transfer run 6 (6.15 s, 1.39 L) is about 0.47 L below runs 1–2 of the same length.
-- **First field fills (17 Nov evening, §19.4.9.27):** they came in 35 % and 7 % over plan, which suggests more flow
-  with a fuller reservoir.
+- **First field fills (17 Nov evening, §19.4.9.27):** they came in 35 % and 7 % over plan on the old tank cone; with
+  the shape taped on 18 Nov the rises were 5.43 L and 6.68 L for 3.35 L and 4.92 L planned, **62 % and 36 % over**
+  (§19.4.9.31). The pump moves more in the field than in the short weighed tries.
 - **The booster line** mixes two columns that behave differently, and was measured without the drip pipe. Type the
   LCD `seen:` value after a real delivery into **Rate Booster** (§19.4.9.11).
+
+**Step by step, with every formula and diagrams:** `Nutrient_Dosing_Guide.md` for the nutrients (how the dose is
+decided, why nothing is dosed with today's settings, the dose basis to choose) and `Accurate_Water_Delivery_Guide.md` (the manual work for accurate
+litres: tank geometry, tank litres points, the pump lines, the booster through the drip pipe, and the water budget
+from the soil).
 
 ### 5.3.3. Other calibration defaults (as built, 17 Nov 2026)
 
@@ -245,12 +355,15 @@ it lives in ESP1's NVS once saved; ESP1 pushes ESP2's share at every ESP2 start 
 | Value | Default | Constant / NVS | Set with |
 | --- | --- | --- | --- |
 | Tank ultrasonic, sensor to water at EMPTY / FULL (both tanks, measured 15 Nov) | 42.9 cm / 24.0 cm | `calResEmptyCm`/`calResFullCm`, `calMixEmptyCm`/`calMixFullCm` | Ultra Res empty / Ultra Mix empty |
-| Tank inner diameter at EMPTY / FULL (a cone between) | 31.0 cm / 39.4 cm | `TANK_D_BOTTOM_CM`, `TANK_D_TOP_CM` | Tank Mix liters / Tank Res liters (up to 8 level → litres points each override the cone) |
+| Tank shape (both tanks; taped 18 Nov) | Ø 34.60 cm at the floor, +0.1219 cm per cm of height; sensor head 47.5 cm above the floor (so Ø 35.16 cm at EMPTY, 37.46 cm at FULL) | `TANK_D_FLOOR_CM`, `TANK_TAPER_CM`, `TANK_SENSOR_H_CM` (ESP1) | firmware; Tank Mix liters / Tank Res liters points (up to 8 each) override the cone |
 | Mixer inside the mixing tank | Ø 6 cm × 11.4 cm (322.3 cm³) | `shared/tank_volume.h` (`insDiamCm`, `insHCm`) | firmware only |
-| Mixing tank planning ceiling at the 90 % overflow stop | 15.90 L (from the geometry) | `MIXCAP`, `MIX_HIGH_PCT` 90 | follows the tank calibration |
+| Mixing tank planning ceiling at the 90 % overflow stop | 17.32 L (from the geometry; 15.90 L before 18 Nov) | `MIXCAP`, `MIX_HIGH_PCT` 90 | follows the tank calibration |
 | Speed-of-sound reference temperature | 30 °C | `ULTRA_TEMP_REF_C` | firmware only |
 | Ping agreement for a control reading | 4 cm | `ULTRA_MAX_SPREAD_CM` | firmware only |
 | Reservoir filter zone (its sensor stops seeing below it) | 18 % | `RES_FILTER_PCT` | firmware only |
+| Reservoir pause: no new run while the reservoir is under it (18 Nov 2026 b) | 18 % (adjustable 18–50, never lower) | `resPausePct` (NVS `rpause`), `resPauseLevel()`, `RES_PAUSE_MAX_PCT` 50 | LCD Thresholds, website System tab (`SET_THRESH thRes`) |
+| Too wet line (a warning only; per column own value or this default) (18 Nov 2026 b) | 90 % | `soilWetPct` (NVS `swet`), `colSoilWet[]` (NVS `c<n>sw`), `wetEffPct()` keeps it ≥ Soil start + 5 | LCD Thresholds, website System tab / Zone profiles |
+| Soil start per column (18 Nov 2026 b) | the global Soil start unless set | `colSoilStart[]` (NVS `c<n>ss`, -1 = default), `colStartPct(c)` | website Zone profiles (`SET_COLUMN soilStart`) |
 | Water density | 1028 g/L | `PL_G_PER_L` | firmware only |
 | Dosing flow meters, Nut A/B/C (and the unmetered D / pH up / pH down) | 450 pulses/L | `calKNut[]` (`kNA`/`kNB`/`kNC`) | Flow Nut A/B/C (3 runs, outlier check) |
 | pH probe slope / offset | 0.0036621 pH per ADC count / 0 | `calPhM`, `calPhB` (`phM`/`phB`) | pH (7 then 4) |
@@ -3523,7 +3636,7 @@ MODE opens Settings. UP / DOWN move, ENTER opens, BACK leaves. Rows in order (th
 | Schedule | Per column: the service window (AUTO, or MANUAL start / end) |
 | Column Mode | Per column: AUTO / IRRIGATION ONLY / OFF |
 | Preset | Per column: a crop preset or manual N / P / K / pH |
-| Thresholds | Soil start % and the fertigation gap |
+| Thresholds | Soil start % and the fertigation gap; since 18 Nov 2026 (b) also, on the third row, `Wet>` (the default Too wet %, kept 5 above Soil start) and `Res<` (the reservoir pause, 18–50 %) |
 | AC Voltage / AC Current | The inverter's accepted AC window (default 215–240 V, 0.5–3.0 A) |
 | Pump Exercise | The 2-day preventive run: on / off and its length |
 | Force Run | The forced-run editor (below). Idle only |
@@ -3739,7 +3852,7 @@ Current map (the relay board was rewired on 2026-11-14; the pump relays were ret
 
 | Output | Device            |
 | ------ | ----------------- |
-| P0     | DPDT board-supply select: de-energized = main battery, energized = secondary battery (was the transfer pump relay; the battery select was on P6 until 2026-11-15. §19.4.7.1 still says "P4" from before the remaps) |
+| P0     | DPDT board-supply select: de-energized = main battery, energized = secondary battery (was the transfer pump relay; the battery select was on P6 until 2026-11-15) |
 | P1     | Nutrient A Pump (moved off P11 on 2026-11-16: the P11/P12 relays never ran A/B; was the booster pump relay before that) |
 | P2     | Inverter Relay — the only AC switching relay; it powers whichever pump the servo has selected |
 | P3     | Column A Valve    |
@@ -3761,6 +3874,12 @@ Note: P17 is no longer the Nano hardware-reset line. It is now a master cutoff t
 **Why the pump relays (P0/P1) were retired (2026-11-15).** The AC pump load was wired through these relays' contacts. The AC induced a voltage into the relay coil circuit, and that coupled onto the shared low-voltage wiring and disturbed **every** flow-sensor input, giving false or missed pulses and therefore wrong litres on every metered stage. The pumps now have no relay of their own. A changeover switch, flipped by the Nano's D3 servo, routes the inverter's output to one pump (§19.4.7.2). P0 has since become the battery select; nothing drives the spares (P5, and P11/P12 since 2026-11-16) except a raw Testing hold.
 
 ### 19.4.7.2. 🔹 Pump Selection by the Nano D3 Servo (2026-11-15)
+
+**Why a servo and not relays (user).** The two AC pumps used to have their own relays (P0 transfer, P1 booster).
+With the pump current switched through those contacts, the AC induced voltage into the relay-coil circuit. That
+coupled onto the shared low-voltage wiring and disturbed every flow-sensor input: false or missed pulses, so wrong
+litres on every metered stage. Now the Nano's servo turns a changeover switch mechanically, and the inverter relay
+(P2) is the only relay that switches AC. More on the noise in §20.5.
 
 **Rule:** the servo only ever moves with the inverter OFF and its output dead. The changeover contacts therefore never make or break load current and cannot weld. ESP32 #2 asks for the servo position again before **every** inverter start; it never trusts an "already there".
 
@@ -3785,7 +3904,7 @@ If no OK arrives within 10 s, the run **holds** with `SERVO_FAIL`. The inverter 
   - **Fill** (`FILL` / `FLUSH_FILL`): the litres that came in are kept, Major `RES_EMPTY,TRANSFER|metered=<L>|target=<L>` is raised (SMS), and the run **carries on** with the smaller batch (user decision). A fertigation batch can then be stronger than planned.
   - A trickle under `FLOW_DRY_MIN_L` that stops is still `FLOW_FAIL` after `FLOW_STALL_MS` (10 s), and no flow at all is `FLOW_FAIL` after `FLOW_TIMEOUT_MS` (10 s). Flow-blind (timed) recovery stages do not use this rule.
 - **Backstop:** ESP32 #1 checks for itself. If the mixing tank reads 97 % or more on 3 readings and the transfer pump is still on 3 s later, it raises Critical `MIX_OVERFLOW`. That E-stops the rig: STOP_ALL, then ESP32 #2's power is cut.
-- **Commissioning / tank geometry:** the percentages use ESP32 #1's tank geometry, measured on 2026-11-15 as **empty 42.9 cm, full 24.0 cm for both tanks** (sensor-to-water). That is an 18.9 cm span, so 1 cm is about 5.3 %. On the mixing tank the 90 % fill stop is at about 25.9 cm and ESP32 #1's 97 % backstop at about 24.6 cm. ESP32 #1 reads them from NVS keys `reCm2` / `rfCm2` / `meCm2` / `mfCm2`, which were renamed from `reCm`… so that older saved values no longer override the measured defaults. Calibration "Ultra … empty" re-captures EMPTY only; it is refused unless it is at least 2 cm farther than FULL. FULL has no calibration step. The Nano only sends raw cm. An uncalibrated sensor still gives a percentage; it does not read as blind.
+- **Commissioning / tank geometry:** the percentages use ESP32 #1's tank geometry, measured on 2026-11-15 as **empty 42.9 cm, full 24.0 cm for both tanks** (sensor-to-water; by tape on 18 Nov that is 4.6 cm and 23.5 cm of water, §19.4.9.31). That is an 18.9 cm span, so 1 cm is about 5.3 %. On the mixing tank the 90 % fill stop is at about 25.9 cm and ESP32 #1's 97 % backstop at about 24.6 cm. ESP32 #1 reads them from NVS keys `reCm2` / `rfCm2` / `meCm2` / `mfCm2`, which were renamed from `reCm`… so that older saved values no longer override the measured defaults. Calibration "Ultra … empty" re-captures EMPTY only; it is refused unless it is at least 2 cm farther than FULL. FULL has no calibration step. The Nano only sends raw cm. An uncalibrated sensor still gives a percentage; it does not read as blind.
 
 **Stuck-servo check (2026-11-15; web v.4 replaces the sensors with the tank levels — see §19.4.9.3).** While the inverter powers a pump, ESP32 #2 also counts the OTHER pump's flow sensor:
 - Transfer selected → it watches the irrigate sensor (FLOW_MIX_IRR, GPIO5).
@@ -3886,7 +4005,7 @@ Testing Fill / Push combos report `TEST,LEVEL,<row>,<ΔL>` (mixing-tank change s
 
 #### 19.4.9.4. Tank litres calibration (LCD → Settings → Calibration)
 
-Each tank is modelled as a truncated cone: **31.0 cm across at the 0 % (EMPTY) level, 39.4 cm at 100 % (FULL)** (`TANK_D_BOTTOM_CM` / `TANK_D_TOP_CM` in ESP1, [MEASURE]). With empty 42.9 cm / full 24.0 cm that is **≈ 18.5 L at 100 %, ≈ 16.2 L at the 90 % stop**, ≈ 0.79 L/cm at the bottom and ≈ 1.18 L/cm at the top. The operator's own points correct it:
+Each tank is modelled as a truncated cone, taped by the user on 18 Nov (§19.4.9.31): **34.60 cm across at the floor, 0.1219 cm wider per cm of height, sensor head 47.5 cm above the floor** (`TANK_D_FLOOR_CM` / `TANK_TAPER_CM` / `TANK_SENSOR_H_CM` in ESP1). At the marks (empty 42.9 cm = 4.6 cm of water, full 24.0 cm = 23.5 cm) that is 35.16 cm and 37.46 cm across: **≈ 19.4 L at 100 % (mixing tank) / 19.6 L (reservoir), 17.32 L at the 90 % stop**, ≈ 0.94 L/cm at 0 % and ≈ 1.10 L/cm at 100 %. (Before 18 Nov: a guessed 31.0 / 39.4 cm, 18.5 L and 15.90 L.) The operator's own points correct it:
 
 1. Open **"Tank Mix liters"** (or **"Tank Res liters"**). Line 1 shows the live level: `41.2cm 9% ~1.5L` (cm, %, litres on the current curve).
 2. Bring the water to a level. On the mixing tank, **hold UP** = transfer pump in (with the 90 % overflow stop), **hold DOWN** = booster out through column A; or fill / empty by hand.
@@ -3904,7 +4023,7 @@ LCD Sensor Diag page 2 (`R 31.2  12.4L s0.3`: cm, litres, spread; `!` = not usab
 
 #### 19.4.9.6. Values to confirm at commissioning
 
-`TANK_D_BOTTOM_CM`, `TANK_D_TOP_CM`, `ULTRA_TEMP_REF_C`, `ULTRA_MAX_SPREAD_CM` (ESP1); `RES_FILTER_PCT` (shared); `FILL_RES_WEIGHT`, `FILL_MIX_OVER_L`, `RES_EMPTY_WIN_MS`, `RES_EMPTY_RISE_L`, `MIX_LOW_STOP_PCT`, `MIX_LOW_STOP_MS`, `SERVO_JUDGE_MS`, `SERVO_CONFIRM_MS`, `MIX_SETTLE_MS`, `FILL_LEAD_L`, `MIX_EMPTY_MARGIN_L`, `LVL_MOVED_MIN_L`, `LVL_STALL_STEP_L`, `LVL_NOFLOW_MS`, `LVL_STALL_MS`, `LVL_SETTLE_MS`, `LVL_JUMP_L`, `CROSS_LEVEL_MIN_L`, `TRANSFER_LPM` / `BOOSTER_LPM` (defaults until the LCD rates are set), `RATE_WEIGHT`, `RATE_XCHECK_FRAC`, `RATE_DOSE_FRAC`, `RATE_WEAK_FRAC` (ESP2, §19.4.9.11); `US_PING_GAP_MS`, `US_MIN_CM`, `US_MAX_CM`, `ULTRASONIC_TIMEOUT_US` (Nano). The full mark (24.0 cm) sits near the dead zone of a waterproof JSN-SR04T-type sensor (~20–25 cm): if readings get erratic near full, raise the sensor mount.
+`TANK_D_FLOOR_CM`, `TANK_TAPER_CM`, `TANK_SENSOR_H_CM`, `ULTRA_TEMP_REF_C`, `ULTRA_MAX_SPREAD_CM` (ESP1); `RES_FILTER_PCT` (shared); `FILL_RES_WEIGHT`, `FILL_MIX_OVER_L`, `RES_EMPTY_WIN_MS`, `RES_EMPTY_RISE_L`, `MIX_LOW_STOP_PCT`, `MIX_LOW_STOP_MS`, `SERVO_JUDGE_MS`, `SERVO_CONFIRM_MS`, `MIX_SETTLE_MS`, `FILL_LEAD_L`, `MIX_EMPTY_MARGIN_L`, `LVL_MOVED_MIN_L`, `LVL_STALL_STEP_L`, `LVL_NOFLOW_MS`, `LVL_STALL_MS`, `LVL_SETTLE_MS`, `LVL_JUMP_L`, `CROSS_LEVEL_MIN_L`, `TRANSFER_LPM` / `BOOSTER_LPM` (defaults until the LCD rates are set), `RATE_WEIGHT`, `RATE_XCHECK_FRAC`, `RATE_DOSE_FRAC`, `RATE_WEAK_FRAC` (ESP2, §19.4.9.11); `US_PING_GAP_MS`, `US_MIN_CM`, `US_MAX_CM`, `ULTRASONIC_TIMEOUT_US` (Nano). The full mark (24.0 cm) sits near the dead zone of a waterproof JSN-SR04T-type sensor (~20–25 cm; no reading under 19.8 cm all day on 17 Nov): if readings get erratic near full, raise the sensor mount.
 
 **Flash all three boards together** — the Nano's 8-field `TANK`, ESP1's checksummed and numbered `LEVEL` and ESP2's `LEVEL_FEED` belong together; an older ESP1 rejects the new `TANK`.
 
@@ -3924,7 +4043,15 @@ While the transfer pump runs, the water falls onto the mixing tank's surface: wa
 
 #### 19.4.9.8. Levels past 100 %, reservoir empty, delivery low stop (2026-11-16)
 
-**Past 100 %.** 0 % (EMPTY) and 100 % (FULL) stay the calibrated distances (42.9 cm / 24.0 cm). Water **closer** than FULL now reads **past 100 %** instead of stopping at 100: each % is 0.189 cm, so **120 % = 3.78 cm above the full mark (20.2 cm from the sensor)**. A deep echo is still 0 %. The ceiling is 200 % (`LEVEL_PCT_MAX`, nonsense guard). The litres keep counting above FULL on the same cone taper (≈ 23.3 L at 120 % with the default shape), and calibration points may be taken up there (up to 200 %; was 115 %). The LCD, the website (`sensors.reservoirLevel` / `mixingLevel`), ThingSpeak and the logs show the real figure, e.g. `Res:120%`. The 90 % fill stop and the 97 % backstop are unchanged.
+**Past 100 %.** 0 % (EMPTY) and 100 % (FULL) stay the calibrated distances (42.9 cm / 24.0 cm). Water **closer** than FULL now reads **past 100 %** instead of stopping at 100: each % is 0.189 cm, so **120 % = 3.78 cm above the full mark (20.2 cm from the sensor)**. A deep echo is still 0 %. The ceiling is 200 % (`LEVEL_PCT_MAX`, nonsense guard). The litres keep counting above FULL on the same cone taper (≈ 23.6 L at 120 % with the 18 Nov tank shape), and calibration points may be taken up there (up to 200 %; was 115 %). The LCD, the website (`sensors.reservoirLevel` / `mixingLevel`), ThingSpeak and the logs show the real figure, e.g. `Res:120%`. The 90 % fill stop and the 97 % backstop are unchanged.
+
+**A reading near 20 cm is not water (checked 18 Nov 2026, night; firmware unchanged).** On 18 Nov the reservoir read about 120 % for hours while it was visibly under 80 %.
+- **What the log shows:** the reservoir's distance stuck at 20.0–20.4 cm, with no spread between pings and status OK: 01:00–12:00, 16:27–16:45, and from 21:35, right after a transfer. Between those times it read a believable 22.8–31 cm.
+- **Why it says 120 %:** the arithmetic is right: (42.9 − 20.2) ÷ (42.9 − 24.0) = 120 %. But 20 cm is the closest these waterproof sensors can measure (their dead zone, §19.4.9.31), and water under 80 % would be at least 27.8 cm away.
+- **So something within 20 cm of the sensor returned the echo.** Most likely water drops or condensation on the sensor face after the inflow splashed during a transfer, or a pipe, a float or the tank's flared top in the beam.
+- **The effect:** while stuck there, ESP2 takes the reservoir as full, so its empty-reservoir window never opens. A reservoir that really ran dry would end as a no-level-change fault (`FLOW_FAIL`), not `RES_EMPTY`.
+- **Left as it is (user, 18 Nov):** the reading is not capped at 100 % and not filtered.
+- **To check at the rig:** read the raw cm on Sensor Diag, wipe the sensor face dry and read again. A tape from the sensor head to the water should match the raw cm.
 
 **Reservoir empty — judged on the mixing tank (user rule).** The reservoir has a filter at the bottom, and its ultrasonic stops at ~15 %: it cannot see whether any water is left below that. So on a transfer, 3 reservoir readings in a row at or under **18 %** (`RES_FILTER_PCT`, shared/rig_constants.h) open a **10 s window** (`RES_EMPTY_WIN_MS`); 3 above it close it. If the **mixing tank** has not risen by 0.3 L (`RES_EMPTY_RISE_L`) across the window, the reservoir is empty: the transfer stops, `RES_EMPTY,TRANSFER|…|by=RES_EMPTY_WINDOW` (Major + SMS "refill it"), and the run carries on with what came in. If it rose, the next 10 s window opens from there. ESP32 #1's reservoir-low guard (`RES_LOW_PCT`) is now the same 18 % (it was 15 %, which an empty reservoir sitting on its filter reads, so it never tripped): no new run starts below it, with the `RES_LOW` alert. This replaces web v.3's 15 % / 10 s rule.
 
@@ -3999,6 +4126,9 @@ Not firmware: the many bad Nano frames point at the wiring. Route the Nano's ser
 
 #### 19.4.9.13. Transfer by run time, settle and top-up; delivery to under 5 % + 10 s; the mixer in the tank (2026-11-17 user rule)
 
+> **Since 18 Nov 2026** a fill runs in two steps and tops up from 0.8 L short, not 3 L (§19.4.9.32). The rest of this
+> section still applies.
+
 **The rule (user, 17 Nov).** The transfer pump sits below the reservoir and is always primed, so it is accurate and critical: the water a fill needs is turned into a **run time**, counted from the moment the inverter is **switched on** (its start-up included, the way the pump was measured). When the time is up the inverter stops, the water settles for about **1 minute** while the mixing tank's ultrasonic is watched until it is steady, and the ultrasonic then measures the tank. More than **3 L** short: the transfer runs again for what is missing. 3 L or less: carry on. The **reservoir is no measure** of the water used, because it is refilled while the transfer runs. The booster is less critical: it empties the mixing tank to **under 5 %**, then runs **10 s more**. Its rate only says how fast the tank should drain, and it is lower once the drip pipe is connected.
 
 **Measurements (user, 17 Nov; 1 L = 1028 g; grams minus the container; time from the inverter switch-on):**
@@ -4013,7 +4143,7 @@ Every reading and the fitted default lines: §5.3.2.
 
 **A fill (FILL / FLUSH_FILL, ESP2 `fillStep`):**
 
-1. Plan from a settled level (rule 1): need = the batch minus what the booster can already reach, capped at the 90 % limit (about 15.9 L with the mixer).
+1. Plan from a settled level (rule 1): need = the batch minus what the booster can already reach, capped at the 90 % limit (about 17.3 L with the mixer and the 18 Nov tank shape).
 2. Run time = (need − `XFER_START_L` 0.47 L) ÷ Q, with Q = the LCD **Rate Transfer** (default **11.74 L/min** = `TRANSFER_LPM`), never under `XFER_MIN_RUN_S` (6 s, the shortest run measured). It is timed from the inverter relay switching on (`apRelayOnMs`). 5 L → 23.2 s, 10 L → 48.7 s, 15 L → 74.3 s.
 3. During the run the mixing tank's own rise still guards it: the 90 % overflow stop, no level change in 20 s (FLOW_FAIL), a stall, the empty-reservoir window (18 % + 10 s), the 10 s pump verdict and blind. A weak pump (under half the run time's litres at 25 s) raises `DEGRADED,PUMP_WEAK|TRANSFER`. A selector re-seat measures the tank and times the rest from the new switch-on (`INFO,FILL_REPLAN`).
 4. Time up → inverter off → **settle**: at least `FILL_SETTLE_MS` (60 s), and the reading must have held within `FILL_STEADY_L` (0.3 L) for `FILL_STEADY_WIN_MS` (10 s). Never steady by 150 s: measured anyway (`DEGRADED,FILL_NOT_STEADY`). No reading at all: the run time's figure is kept, marked EST (`DEGRADED,FILL_SETTLE_BLIND`).
@@ -4021,7 +4151,7 @@ Every reading and the fitted default lines: §5.3.2.
 
 **A delivery (DELIVER / FLUSH_DELIVER):** the mixing tank's fall is the measure of the litres sent to the column. It ends `MIX_LOW_STOP_MS` (**10 s**, was 5 s) after the tank is under 5 % (three readings in a row; a reading back at 5 % or over cancels the count). A tank its booster cannot get that low ends the same way, 10 s after reaching the learned floor (`mixDeadL`). The booster's rate is no measure of the litres. The no-level-change and stall windows and the stage cap allow a tank draining at half the LCD **Rate Booster** (`DRAIN_SLOW_X`). The default `BOOSTER_LPM` is a cautious **1.0 L/min** (the drip pipe is not measured yet), so the windows are 72 s and 45 s and the cap is 15 min for 5 L. The open-valve 13.2 L/min (`BOOSTER_OPEN_LPM`) is only the fastest a tank may drain (the impossible-pace check of §19.4.9.12). There is no weak-pump alert for the booster.
 
-**The mixer in the mixing tank:** a cylinder 6 cm across and 11.4 cm tall (322.3 cm³) stands on the bottom. `shared/tank_volume.h` now takes the part of it under water out of the tank's shape: 0.0283 L per cm of water, 0.322 L once it is covered. The calibration points still hold exactly, and between them the curve bends like the real tank. With the 31 / 39.4 cm cone over 18.9 cm: 5 % = 0.70 L, 50 % = 7.88 L, 90 % = 15.90 L, 100 % = 18.16 L. Assumption: the mixer stands on the 0 % level (the empty mark at 42.9 cm).
+**The mixer in the mixing tank:** a cylinder 6 cm across and 11.4 cm tall (322.3 cm³) stands on the bottom. `shared/tank_volume.h` now takes the part of it under water out of the tank's shape: 0.0283 L per cm of water, 0.322 L once it is covered. The calibration points still hold exactly, and between them the curve bends like the real tank. With the shape taped on 18 Nov (§19.4.9.31): 5 % = 0.89 L, 50 % = 9.29 L, 90 % = 17.32 L, 100 % = 19.39 L (it was 0.70 / 7.88 / 15.90 / 18.16 L on the guessed 31 / 39.4 cm cone). The mixer stands on the floor, 4.6 cm below the 0 % mark, so 6.8 cm of it is above the mark (0.192 L).
 
 **Simulation** (`fillsim.py`: the user's 0.18 L run-to-run scatter, a 0.15 L reading noise, 2000 fills each):
 
@@ -4098,8 +4228,11 @@ ESP2 sends `INFO,INV_ON,<pump>` the moment it switches the inverter relay on. Un
 
 #### 19.4.9.22. Live website and Refresh (17 Nov)
 
-- **The viewer signal:** while a dashboard page is open and visible, it writes `irrigation/viewer/at` (a server timestamp) every 15 s. ESP1 polls that node with its commands (every 3 s). While it keeps changing, ESP1 uploads `irrigation/live` every 2 s during a run and every 4 s otherwise (`FIREBASE_UPLOAD_LIVE_*_MS`), instead of every 20 / 60 s. It returns to the slow pace 45 s after the last touch (`FB_VIEWER_HOLD_MS`).
-- **The Refresh button** writes `irrigation/viewer/refreshAt`. ESP1 uploads at once (at most every 1.5 s), and the page says how long the answer took.
+> **Replaced on 18 Nov 2026 (g):** there is no "watched" pace any more. ESP1 reports once a minute and answers a
+> Refresh (§19.4.9.34). Below is the 17 Nov design, kept for the record.
+
+- **The viewer signal:** while a dashboard page is open and visible, it writes `irrigation/viewer/at` (a server timestamp) every 15 s. ESP1 polls that node with its commands (every 3 s). While it keeps changing, ESP1 uploads `irrigation/live` every second (`FIREBASE_UPLOAD_LIVE_*_MS` = 1000 since 18 Nov 2026 b; it was 2 s during a run and 4 s otherwise), instead of every 20 / 60 s. While watched, netTask loops every 100 ms (`FB_LOOP_LIVE_MS`) so the 1 s pace holds; every poll keeps its own timer and the SD log upload stays at one piece per 500 ms (`FB_LOG_STEP_MIN_MS`). It returns to the slow pace 45 s after the last touch (`FB_VIEWER_HOLD_MS`).
+- **The Refresh button** writes `irrigation/viewer/refreshAt`. ESP1 uploads at once (at most every 1 s since 18 Nov 2026 b; 1.5 s before), and the page says how long the answer took.
 - **What the snapshot carries:** `meta.refreshMs` / `meta.live` (the pace), `system.firmware`, and the tanks' pinger status (`sensorsRaw.tank.reservoirStatus` / `mixingStatus`). A tank with no reading says why on the page.
 - **Rules:** approved accounts and the operators may write only `at` and `refreshAt`, each within the last minute, and `refreshAt` at most every 2 s. ESP1's device account reads the node. Deployed 17 Nov.
 
@@ -4107,7 +4240,7 @@ ESP2 sends `INFO,INV_ON,<pump>` the moment it switches the inverter relay on. Un
 
 - **What goes up:** each day's CSV goes to the Realtime Database that serves the website, as text pieces `logs/files/<yyyymmdd>/<nnnn>` of 6 KB (`LOG_CHUNK_BYTES`; 12 KB until the evening of 17 Nov), plus `logs/index/<yyyymmdd>` = `{state: uploading/done/missing/failed, size, chunks, partial, at}`.
 - **How it is sent:** non-ASCII and control bytes (line noise) become `?`; everything else is unchanged. ESP1 sends one piece per network-task pass, so commands and the live report keep flowing. A 1 MB day is 171 pieces, about 2–3 minutes.
-- **Which days:** finished days go up by themselves, oldest first after `fbLogLast` (NVS `fblogl`). The website's **Upload from the rig** (`irrigation/logRequest = {day, at}`, polled every 10 s) asks for any day on the card, today included as far as it is written (`partial`). Firebase keeps `LOG_KEEP_DAYS` (14). Older days are deleted there and stay on the SD card only.
+- **Which days:** since 18 Nov 2026 (g), only a day someone asks for. Finished days no longer go up by themselves (oldest first after `fbLogLast`, NVS `fblogl`): at about 1.2 MB a day that catch-up never finished on this link (§19.4.9.34). The website's **Upload from the rig** (`irrigation/logRequest = {day, at}`, polled every 30 s; 10 s until 18 Nov g) asks for any day on the card, today included as far as it is written (`partial`). Firebase keeps `LOG_KEEP_DAYS` (14). Older days are deleted there and stay on the SD card only.
 - **Supabase** remains the target only while Firebase is off.
 - **Who can see them:** operators and the privileged tier can read the logs (they hold SMS texts and phone numbers). Only ESP1's device account writes them. On the website: Diagnostics → SD card logs (list, Download, Upload from the rig).
 - **Manual/Test → SD card log (CSV)** (user, 17 Nov: logs at any time of the morning). **Update today's log** asks for today's log so far, through the same `irrigation/logRequest`. It works only while ESP1 is reporting, idle (`IDLE_STATE` or `SAFE_MODE`), with no run, pump test, pump or mixer on; otherwise the button is off and says why. **Download today's log** works once it is sent. The badge follows `logs/index/<today>`: NOT SENT → ASKED → SENDING → SENT (SO FAR), or FAILED / NOT ON CARD.
@@ -4154,22 +4287,310 @@ With the LEVEL_BLIND fixes of §19.4.9.24–25 flashed (not yet those of §19.4.
 - **Water left after a restart goes to the next run's column.** The 18:19 run asked for 2.0 L on Col A and delivered the 5.79 L the interrupted run had left, because a delivery empties the tank. It was Col A's own water this time. It would matter if the next run were another column or a fertigation, which is what the tank check is for.
 - **Firebase was down from the 17:58 flash on**: the log upload's static buffer (§19.4.9.23). Fixed that evening; ESP1 needs flashing again.
 
-### 19.4.7.1. 🔹 Secondary Battery Isolation (P4 DPDT) — additional feature
+#### 19.4.9.28. Operation: Automatic or Manual, and the day plan (user, 18 Nov; ESP1 only)
 
-**Purpose.** While the inverter runs the AC motors (transfer, booster, mixer), the controllers are momentarily moved off the main solar battery onto a **secondary battery**, so they share no electrical connection with the battery the inverter is loading. A **DPDT** breaks **both** the positive and the negative conductor, so no ground path remains either, and the sensor readings taken during a run stay clean.
+**The rule (user, 18 Nov):** each column can be **Manual**: ESP1 only reads it (moisture, nutrients, everything else as
+usual) and starts **no scheduled run** for it; the operator irrigates and fertigates it by hand with forced runs
+("Water a column now" on the website, Force Run on the LCD). **Automatic** is the behaviour of every earlier build. On
+top of each column's default there is a **day plan**: single dates set to Manual or Automatic, e.g. 20 Nov Manual,
+27 Nov Automatic, 28 Nov Manual; every other day follows the default.
+
+- **Where:** `ESP1/include/run_plan.h` (pure, host-tested: `test/test_run_plan`, 10 tests) and `main.cpp`. ESP2 and the
+  Nano are unchanged. Backup of the code before the change: `Firmware_Backup_before_manual_plan_2026-11-18`.
+- **State:** `colOpManual[c]` (the default, NVS `c<n>op`) and `colPlan[c]` (a `RunPlan`: a start day plus 62 marks,
+  `-` default / `M` / `A`; NVS blob `c<n>pl`). The plan covers today and the next 61 days (`RUN_PLAN_DAYS`). Absent
+  keys = Automatic and no plan, so older NVS behaves exactly as before.
+- **The decision:** `controlTick()` skips a column whose day is Manual (`colManualToday()`: today's mark, else the
+  default), logged `CTRL,COL_A|MANUAL|plan` or `|MANUAL|default`. It is checked right after the column's enable flag,
+  so a Manual column also doesn't finish a dosed batch left by a restart (like a snoozed column; the tank check
+  covers that tank). A run that already started finishes. A dead clock (no date) uses the default alone.
+- **Set from the website:** `SET_COLUMN {col, operation: "AUTOMATIC"|"MANUAL", plan: "<up to 62 of - M A>",
+  planFrom: yyyymmdd}`. The plan replaces the whole plan; `""` clears it. `planFrom` is the date of the plan's first
+  character (the website sends ESP1's own date from the snapshot); more than one day off ESP1's date is refused
+  ("plan date is not ESP1's date: check clock"), and so is a plan while the RTC isn't set. Characters for days
+  already past, or past the 62-day reach, are dropped. Reply: `COL_A: ops=MANUAL plan=3d ...`.
+- **Published** in `irrigation/live` → `sensors.zones.<id>`: `operation` (the default), `operationToday`, `plan`
+  (62 characters from today) and `planFrom` (ESP1's date, absent while it is unknown). Copied into the telemetry
+  snapshot on core 1 under `telemMux`, so the uploader never reads a half-written plan.
+- **LCD:** the column page shows `MAN` for a column that is Manual today (in place of AUTO / IRR).
+- **Restore Defaults** sets every column back to Automatic with no plan.
+- **Size:** static RAM 82,592 B (+408 B over the 17 Nov evening build); built and unit-tested 18 Nov, **not yet
+  flashed** at the time. Flashed the evening of 18 Nov in the `2026-11-18h` build (§19.4.9.34).
+
+#### 19.4.9.29. Website parity (18 Nov; ESP1 only)
+
+A scan of ESP1 against the website (all 21 command types and 209 of 212 published values already matched) left a few
+things the firmware knew but never told the website. ESP1 now publishes, and accepts:
+- **`TANK_CHECK_OK`** (new command): the website's "I've checked the tank". Same rule and effect as SMS `TANKCHECK,OK`:
+  only while idle, `tankCheckClear("WEB")`. `diagnostics.tankCheck = {needed, why}`; `why` is the reason
+  `tankCheckSet()` was given (`tankCheckWhy`), or `CARRIED_OVER_RESTART` when the check was restored from NVS.
+- **`system.bootReason`** (this start's `esp_reset_reason()`: POWER_ON, BROWNOUT, SOFTWARE, PANIC, …),
+  **`bootsToday`** (NVS `bootDay`/`bootN`, counted at the first `scheduleTick()` with a date; one NVS write a start)
+  and **`uptimeS`**. On 17 Nov ESP1 started about 40 times, mostly POWER_ON; the website now warns from 3 a day.
+- **`system.soilStartPct`, `system.fertGap`**: the thresholds, which the website could only ask for before.
+- **18 Nov 2026 (b):** `system.soilWetPct` (default Too wet), `system.resPausePct` (the reservoir pause), and per zone
+  `soilStartPct` / `soilWetPct` (the lines as they apply) with `soilStartOwn` / `soilWetOwn` when the column has its own.
+  `system.firmware` reads "web v.4 (2026-11-18b)".
+- **`diagnostics.calibration`** (read-only): `rates` {transferLpm, boosterLpm, transferStartL, boosterStartL,
+  nutMlpm[3], nutMeasured[3]}, `flowK` {nutA, nutB, nutC, nutD, phUp, phDn, reservoirScale}, `tanks` {res/mix
+  Empty/FullCm}, `probes` {phM, phB, ecM, ecB, acs712Zero, tempOff, humOff, luxOff}. NaN / inf values are left out
+  (a bare NaN would make Firebase refuse the whole report); a rate of 0 means "not measured, the built-in line".
+- **`sensors.zones.<id>.restMin`** (minutes left of a rest after repeated faults, `colSnoozeUntil`) and
+  **`skippedToday`** (`dayDoneToday()`: the day closed by a STOP reply or a lost fault).
+- `system.firmware` now reads **"web v.4 (2026-11-18)"**, so the website shows when this build is on the rig.
+
+The website side needs no firmware for: the Nutrient D test (`nutD` was already accepted by `pulseRowForTarget()`),
+plain words for all 52 alert codes (copied from `SMS_FAULTS`), and switching an off column on from its forced-run form.
+Static RAM 82,648 B (+56 B). Backup before the change: `Firmware_Backup_before_web_parity_2026-11-18`. Built and
+host-tested 18 Nov; flashed the evening of 18 Nov in the `2026-11-18h` build (§19.4.9.34).
+
+#### 19.4.9.30. Realtime link to the website (user, 18 Nov; ESP1 + website)
+
+The owner: the website "didn't connect … too slow, sometimes late, and then disconnect again"; wanted a very realtime
+connection. The 17 Nov log (`20261117.CSV`) showed why, all on ESP1's side of Firebase:
+- ESP1's Wi-Fi at −69 to −90 dBm (median about −81). Overnight 1 upload in about 590 failed; 08:39–09:42, 14 of 47
+  failed with nothing running. The firmware cannot fix that: the signal at ESP1 needs to be −67 dBm or better.
+- At the slow pace (60 s idle, 20 s running; that firmware had no live pace), one failed upload left the website without
+  a report for over 2 minutes, and it says ESP1 has stopped reporting at 90 s.
+- A token renewal that hit a network error climbed the auth backoff (30 s → 2 m → 8 m → 30 m) with no reports at all
+  in between (09:43–09:47, 14:53–14:59).
+- `FIREBASE_MIN_HEAP` (60 KB) was checked with the TLS session already open, so ESP1 skipped every live report once that
+  left under 60 KB free, while the command polls on the same session went on (17:43–18:30: not one upload).
+- `FBASE,OK/FAIL` was one attempt behind: `firebaseLogTick()` keyed on `fbLastUploadMs`, which is stamped when a call
+  starts, so the `FAIL|http=0` after every restart was a request still on the wire, not a failure.
+
+ESP1, `system.firmware` **"web v.4 (2026-11-18c)"**:
+- `fbEnsureToken()`: a renewal that got no answer from Google (`fbAuthHttp <= 0` for every request it tried) retries after
+  `FB_AUTH_NET_RETRY_MS` (10 s) and does not climb the ladder; the ladder stays for refusals (any HTTP status, or a 200
+  that will not parse). The old token keeps working until `fbTokenUsableMs` (1 min before it really expires; renewal
+  starts 5 min before), so a failed renewal no longer stops anything. The password sign-in is tried only when Google
+  refused the refresh token (or there is none, or a forced sign-in), not after a network error.
+- `FIREBASE_MIN_HEAP` only before a NEW session; with the session open, `FIREBASE_MIN_HEAP_OPEN` (32 KB), enough for the
+  report itself. The SD log upload step uses the same pair (its piece's own block is still checked).
+- A live report that failed (a real attempt) goes again after `FB_UPLOAD_RETRY_MS` (3 s), up to `FB_UPLOAD_RETRIES` (3)
+  in a row, instead of at the next 20 / 60 s tick. A call that sent nothing (no Wi-Fi, no token, memory) is not retried
+  early.
+- ThingSpeak: every `TS_UPLOAD_WATCHED_MS` (5 min) while the website is watched; `TS_TIMEOUT_MS` 4 s (was 6 s); once a
+  channel gets no answer, the others are skipped that round. A ThingSpeak outage now holds netTask for about 8 s at most
+  instead of up to 36 s.
+- The report is serialized into one block reserved with `measureJson()`, and `fbBuildUrl()` reserves its URL, so the live
+  pace no longer reallocates Strings hundreds of times a second. `http=-101` = no free block for the report's text.
+- `fbUploadDone` counts finished calls (`firebaseUploadLive()` now wraps `firebaseUploadLiveOnce()`); `firebaseLogTick()`
+  keys on it, writes at most one line per `FB_LOG_TRANSITION_MIN_MS` (10 s; `n=` / `fail=` still count everything), and
+  adds `skip=off|wifi|no-snapshot|memory|login` when nothing was sent.
+- `diagnostics.firebase` adds `failures`, `handshakes` (new TLS sessions since this start), `freeHeap` and `maxAllocHeap`.
+
+Website (Jmhatake123/Website commit `099a0b3`, published 18 Nov): an amber **Delayed** state between on time and "not
+reporting" (`deviceDelayMs()`: one interval plus at least 5 s late), a quicker reconnect when this browser is offline
+(`nudgeFirebaseReconnect()`), and on Diagnostics the signal's meaning plus the four link-health values above.
+
+Static RAM 82,688 B (+24 B), flash 1,436,177 B. Backup before the change: `Backup_before_realtime_link_2026-11-18`.
+Built 18 Nov with no warnings (clean build); the host tests do not cover `main.cpp` and cannot run on this PC (no g++).
+Flashed the evening of 18 Nov in the `2026-11-18h` build. Its pace was changed again the same day (§19.4.9.34).
+
+#### 19.4.9.31. Tank shape by tape (user, 18 Nov; ESP1 only)
+
+The user measured the tank by tape (inside, wall already deducted; heights above the inside floor) and asked for the
+firmware to follow it, suspecting the sensor reads with an offset because the 0 % and 100 % marks were set from the
+sensor only:
+
+| Height | Circumference | Diameter |
+| --- | --- | --- |
+| 0 cm (floor) | 108.7 cm | 34.60 cm |
+| 22.6 cm | 117.4 cm | 37.37 cm |
+| 35.8 cm (the user's "100 % level", top of the straight body) | 122.4 cm | 38.96 cm |
+| 46.0 cm (rim; 46.3 cm outside) | 131.0 cm | 41.70 cm |
+| Sensor head | | 47.5 cm above the floor |
+
+**Findings** (with the 17 Nov log):
+- **A straight cone up to 35.8 cm:** the middle point is 0.1 mm off the line through the other two; 0.1219 cm wider
+  per cm. Above 35.8 cm it flares to the rim.
+- **No sensor offset.** The reservoir, pumped dry on 17 Nov (15:25), read 47.1–47.6 cm; the tape says 47.5 cm.
+- **0 % (42.9 cm) is 4.6 cm of water, about 4.3 L** (4.27 L in the mixing tank with the mixer, 4.40 L in the
+  reservoir). It is where deliveries leave the mixing tank (42.8–43.2 cm after every delivery on 17 Nov). The water
+  under it is never delivered; for fertigation it dilutes the next batch.
+- **100 % (24.0 cm) is 23.5 cm of water, not 35.8 cm.** The waterproof sensors gave no reading under 19.8 cm all
+  day (dead zone about 20 cm). With 100 % at 35.8 cm (11.7 cm from the sensor), the 90 % stop (15.3 cm) and the 97 %
+  backstop (12.8 cm) would sit in the blind zone and an overfill would go unseen. To use the whole body (about 38 L)
+  the sensors must first be raised at least 12 cm.
+- **The guessed cone was wrong:** 31.0 / 39.4 cm at the marks gave about 20 % too few litres near 0 %, 3 % too few at
+  100 %.
+- **The 17 Nov fills, worked out again:** 18:14 rose 5.43 L (planned 3.35 L, 14.7 s), 18:26 rose 6.68 L (planned
+  4.92 L, 22.7 s): 62 % and 36 % over, implied 20.2 and 16.4 L/min against the weighed 11.74 L/min. A 5 L run gave
+  about 7.3 L. Unless the 2-minute check below shows the sensor scale is off, the transfer line must be re-measured
+  (`Accurate_Water_Delivery_Guide.md` §5).
+
+**Changed (ESP1 only):**
+- `TANK_D_BOTTOM_CM` / `TANK_D_TOP_CM` (31.0 / 39.4) are replaced by the measured shape: `TANK_SENSOR_H_CM` 47.5,
+  `TANK_D_FLOOR_CM` 34.60, `TANK_TAPER_CM` 0.1219. `tankDiamAtCm(d)` gives the diameter at a sensor distance;
+  `tankVolSyncGeom()` sets both tanks' diameters at their current marks, and the mixer's height above the 0 % mark
+  (`mixerHAboveEmpty`: 11.4 − 4.6 = 6.8 cm). A re-captured EMPTY keeps the litres right.
+- **Not changed:** EMPTY 42.9 cm and FULL 24.0 cm, so every %, the 5 % low stop, the 90 % stop and the 97 % backstop
+  sit where they were. The litres they mean change:
+
+| Level | Mixing tank before → now | Reservoir before → now |
+| --- | --- | --- |
+| 5 % (low stop) | 0.70 → 0.89 L | 0.72 → 0.92 L |
+| 50 % | 7.88 → 9.29 L | 8.14 → 9.48 L |
+| 90 % (`MIXCAP`) | 15.90 → 17.32 L | 16.22 → 17.51 L |
+| 100 % | 18.16 → 19.39 L | 18.48 → 19.58 L |
+
+- ESP2's learned heel (`mixHeel`) was learned in the old litres; it is re-learned by the first delivery after the
+  flash (it updates when it differs by more than 0.05 L).
+- Host test `test_measured_tank_shape` (ESP1 `test_tank_volume`) pins these litres. `rig_constants.h` comment only
+  (ESP2 binary unchanged). Firmware string `web v.4 (2026-11-18d)`.
+
+**To check by hand (2 min):** with water in the tank, the LCD distance plus the water depth measured with a ruler
+should be 47.5 cm (within about 0.5 cm), at two levels. That confirms the sensor scale, and with it the fill rises above.
+
+Static RAM 82,688 B, flash 1,436,277 B. Backup before the change: `Firmware_Backup_before_tank_shape_2026-11-18`.
+Built 18 Nov with no warnings. Flashed the evening of 18 Nov in the `2026-11-18h` build (§19.4.9.34).
+
+#### 19.4.9.32. Two-step fill (user, 18 Nov; ESP2)
+
+**Why.** The transfer pump's rate changes from run to run. On 18 Nov it gave about 11 L/min at 15:33, and about
+18–19 L/min at 17:34 and 18:36 (`PUMP_RATE;TRANSFER|seen=18.90` / `19.09`), against the saved 11.74 L/min. One run
+timed with the saved rate therefore missed in both directions, and an overfill can't be taken back: the mixing tank
+has no drain.
+
+| Forced run, 18 Nov | Asked | Fill check | Delivered |
+| --- | --- | --- | --- |
+| 15:33, column A | 5.0 L | 1.09 L short: under the 3 L top-up limit, so nothing corrected it | 3.10 L |
+| 17:34, columns A+B | 10.0 L | 4.90 L over | 14.90 L |
+| 18:36, columns A+B | 10.0 L | 5.32 L over | 15.32 L |
+
+**How a fill runs now** (ESP2 `fillStep`; helpers in `ESP2/include/level_meter.h`):
+1. **First run:** 70 % of the litres needed (`FILL_FIRST_FRAC`), timed with the saved rate from the inverter
+   switch-on. When the other 30 % would be under 0.8 L, it goes for all of it. It ends early once the live level has
+   risen 75 % of the need (`FILL_FIRST_CUT_FRAC`): the pump is much faster than its saved rate.
+2. **Settle and measure:** 1 minute, as before. The rate the run really gave is worked out from the rise:
+   (rise − 0.47 L start) ÷ run time (`fillSeenLpm`). It counts only for a run of 10 s or more, and only within
+   0.4–2.5 × the saved rate.
+3. **Top-up:** when more than 0.8 L is still missing (`FILL_TOPUP_MIN_L`; 3 L before), at most twice. It is timed
+   with the rate just seen and ends early once the live level is within 0.8 L of the goal (`FILL_CUT_LAG_L`, the
+   water still running in after the stop). The cut is never set less than 0.4 L above where the top-up started.
+4. **Alert:** still more than 3 L short with the top-ups used up gives `DEGRADED,FILL_SHORT`, as before.
+
+An early end needs 3 readings in a row at the cut level (`FILL_CUT_SAMPLES`) and a believable pace (`levelPaceOk`),
+so one noisy echo can't end a run. It is a normal end (`INFO,FILL_CUT`), never a fault. A fill recovering from a
+level-blind hold keeps the single timed run, since it couldn't measure a first one.
+
+**Log lines:** `INFO,FILL_RUN|need|run_s|q|start_l|base[|cut][|topup=n]`,
+`INFO,FILL_CHECK|goal|measured|missing|settle_s|OK or TOPUP[|seen]` and `INFO,FILL_CUT|level|cut|t|run_s|by_time`.
+ESP2 reports progress over the whole fill (every run and settle), which the LCD shows as `Fill x.xL` (§19.4.9.33).
+
+**Simulated before flashing** (pump rates 8–22 L/min): every fill landed within about 1 L of its goal.
+
+**First run on the rig (18 Nov 21:32; forced from the website, A+B, 5.0 L):**
+
+| Step | Log | Meaning |
+| --- | --- | --- |
+| First run | `FILL_RUN need=3.50 run_s=15.5 q=11.74 base=0.17 cut=3.92` | 70 % of 5.0 L; ran its full 15.5 s |
+| Check 1 | `FILL_CHECK goal=5.17 measured=4.12 missing=1.05 TOPUP seen=13.49` | The pump gave 13.49 L/min; 1.05 L to go |
+| Top-up | `FILL_RUN need=1.05 run_s=6.0 q=13.49 base=4.12 cut=4.52 topup=1` | The shortest run allowed, 6 s |
+| Early end | `FILL_CUT level=5.30 cut=4.52 t=5.5` | Stopped at 5.5 s |
+| Check 2 | `FILL_CHECK measured=6.19 missing=-1.02 OK` | 1.02 L over |
+| Receipt | `RECEIPT POST\|COL_AB\|IRRIGATION\|OK\|WATER=5.92of5.0` | 5.92 L delivered (+18 %), against +49 % and +53 % earlier the same day |
+
+**Known limit:** the shortest transfer run is 6 s (`XFER_MIN_RUN_S`), which moves about 1.6–2.3 L. A top-up for
+little more than 0.8 L can therefore overshoot by about 1 L, as it did here. Not changed yet.
+
+**Files:**
+- `ESP2/src/main.cpp`: the fill block, the early stop in `stagePoll`, and whole-fill progress in `progTick`.
+- `ESP2/include/level_meter.h`: `fillFirstL`, `fillSeenLpm`, `fillCutLevel`.
+- Three new host tests in `ESP2/test/test_level_meter`. They were syntax-checked here and run in CI, because this
+  PC has no host compiler.
+
+Static RAM 24,060 B, flash 384,065 B. Backup before the change: `Firmware_Backup_before_two_step_fill_2026-11-18`.
+Flashed the evening of 18 Nov.
+
+#### 19.4.9.33. One batch for several columns: LCD, receipts and website (user, 18 Nov; ESP1)
+
+**The user's report:** on an A+B forced run the LCD showed only column A and the progress bar never left zero. Also,
+10 L for A+B gave about 15 L in all, where 5 L per column was expected.
+
+**How such a run works (unchanged).** The mixing tank has one outlet, so a run on A+B is **one batch**: ESP2 opens
+both column valves together, and the booster empties the tank through both.
+- **The litres asked are the total** for the run (`WorkOrder.waterL`), so 10 L on A+B is about 5 L per column.
+- **The split is not measured:** how the water divides depends on each line's flow. ESP1 books half to each column
+  in its daily totals (`SPLIT=EST/2`).
+- **The extra 5 L came from the fill:** the pump ran at about 19 L/min against the saved 11.74 L/min. The two-step
+  fill now prevents that (§19.4.9.32).
+- **For measured litres per column**, use the LCD Force Run's **"A then B"** mode: two batches, each with its own
+  litres, filled and delivered one after the other. "A+B together" and the website's forced run on both columns are
+  one shared batch.
+
+**Changed (ESP1):**
+- **LCD:** the receipt, live and result screens name every column, e.g. `RECEIPT  A+B`, `IRRIGATE A+B` and
+  `RESULT A+B OK` (`runCols`, `runMulti`). Before, they named only the first.
+- **The progress bar moves:**
+  - During the transfer, the bottom row shows the whole fill over all its runs and settles, e.g. `Fill 3.5L [####---]`.
+  - During the delivery it shows the water out so far against the target, counting the stage still under way
+    (`runWaterNow`).
+  - The bar used to sit at zero because ESP2 adds a delivery's litres only when the stage ends.
+- **Receipts:** `RECEIPT,PRE|COL_AB|…` and `POST|COL_AB|…`, the same naming the `ACT` lines already used.
+- **Website:** the run's `zone` reads "A+B" (`telem.runMask`).
+
+This is part of the ESP1 build flashed the evening of 18 Nov (`2026-11-18h`), first seen on the rig at 21:32
+(`RECEIPT,PRE|COL_AB`). Backup before the change: `Firmware_Backup_before_two_step_fill_2026-11-18` (`ESP1_main.cpp`).
+
+#### 19.4.9.34. Website link: the rig first, a report a minute, and the memory fix (owner, 18 Nov; ESP1 18e–18h)
+
+**Why.** ESP1's Wi-Fi is weak (−84 to −89 dBm). Its SD card shows reports failing 1–8 % a day from 10 to 17 Nov,
+and 97 % on 18 Nov, once the extra realtime traffic of §19.4.9.22 and §19.4.9.30 was added. The owner asked twice:
+- **First, for the operation to come first:** "During an operation, or when a fertigation/irrigation is coming up,
+  focus on the operation, not Firebase."
+- **Then, for the link to go back to its pre-17 Nov weight:** "no longer high realtime … still it automatically
+  refreshes … and a refresh button. To lessen the load of ESP1."
+
+**How the link works now (`2026-11-18h`):**
+- **A report a minute** in every mode. The website can ask for one more at once (Refresh, the page opening or coming
+  to the front, or a report overdue), answered at most every 10 s idle and every 30 s busy.
+- **Busy** means a run, its warm-up, a pump exercise, an armed forced run, a dosed tank waiting, or a watering window
+  that is open and not yet served or opens within 10 minutes. While busy:
+  - no SD log upload and no quick retry;
+  - commands and every stop are still read every 3 s;
+  - a fault is still pushed at once.
+- **Polls:** commands every 3 s, refresh requests every 6 s, log requests every 30 s. SD logs go up only for a day
+  someone asks for (§19.4.9.23).
+- **Recovery:** after 3 failed reports in a row the TLS session is renewed; after 10, Wi-Fi is rejoined. A reply may
+  take 12 s.
+- **Website:** reads the pace and the mode from `meta.refreshMs` / `meta.linkMode`, so a pace change needs no website
+  change (`Website/README.md`, "Link lite").
+
+**How it got there (18 Nov):**
+
+| Build | Change |
+| --- | --- |
+| 18e "link pace" | Busy and idle modes as above. Recovery after 2 / 8 failures. ThingSpeak once a minute in every mode. |
+| 18f | Firebase had stored a report that ESP1 gave up on after 6 s, so the reply wait went to 12 s. Wi-Fi kept awake (`WiFi.setSleep(false)`). |
+| 18g "link lite" | A report a minute in every mode, with no "watched" pace (the page no longer writes `viewer/at`). Slower polls, no automatic upload of old SD logs, recovery after 3 / 10. Wi-Fi back to its default modem sleep: staying awake cost about 80–100 mA with no measurable gain. Noise bytes in a report's text are replaced before sending (`textFixes`), and Firebase's refusal reason is logged (`FBASE,REPLY`). The Firebase session is dropped before the Wi-Fi setup portal opens: on 18 Nov evening, opening the portal (about 40 times) had been followed by 7 PANIC / watchdog restarts. |
+| 18h "heap fix" | Fixes the HTTP 400 "No data supplied." seen with 18g at 20:59. `HTTPClient` copied each 5–7 KB body, and when the copy failed the request went out empty; bodies now go by pointer. Memory is judged on byte-addressable heap (`heap8Free`, `heap8Block`), because the old figure counted about 40 KB of IRAM that no text can use. A new TLS session is tried only with a 17 KB block and 24 KB free. The netTask stack (28 → 24 KB) and the report buffer (16 → 12 KB) give memory back to the heap. |
+
+**On the rig:**
+- With 18g at 20:59: `FBASE,REPLY|http=400|… "No data supplied."`.
+- With 18h from 21:24: `FBASE,OK|http=204|heap=34000|…`, firmware string `web v.4 (2026-11-18h)`.
+
+The real limit is still the signal at ESP1: it needs about −67 dBm or better (§19.4.9.30). Backups before each step:
+`Firmware_Backup_before_link_pace_2026-11-18`, `Firmware_Backup_before_wifi_awake_2026-11-18`,
+`Firmware_Backup_before_link_lite_2026-11-18` and `Firmware_Backup_before_heap_fix_2026-11-18`.
+
+### 19.4.7.1. 🔹 Secondary Battery Isolation (P0 DPDT) — additional feature
+
+**Purpose.** While the inverter runs an AC pump (transfer or booster; the mixer is 12 V DC), the controllers are momentarily moved off the main solar battery onto a **secondary battery**, so they share no electrical connection with the battery the inverter is loading. A **DPDT** breaks **both** the positive and the negative conductor, so no ground path remains either, and the sensor readings taken during a run stay clean. It is the main defence against the inverter's noise (§20.5). **In service since 16 Nov 2026.**
 
 **Hardware.**
 - **Secondary battery:** 4S Li-ion, 16.8 V full (14.8 V nominal). It is charged from the main battery while the DPDT is in the main position (idle).
 - **What moves to it:** ESP1, ESP2, the Nano, the sensors and the relay coils.
-- **Switch:** P4, the relay of the condemned mixing-tank valve, drives the DPDT. De-energized = main battery, which is the fail-safe position. A fault, an E-stop, an ESP2 reboot, or ESP1 cutting ESP2's power (GPIO4) all return the boards to main.
+- **Switch:** P0 (`OUT_BATT_SEL`, the old transfer-pump relay) drives the DPDT. De-energized = main battery, which is the fail-safe position. A fault, an E-stop, an ESP2 reboot, or ESP1 cutting ESP2's power (GPIO4) all return the boards to main.
 - **Monitor:** an **INA226 with an R010 shunt** on **ESP1's I²C at 0x40** measures the secondary's voltage and current. It is calibrated with `Calibration/ESP1/INA226` (module `sec`).
-- **Plumbing:** the mixing tank feeds the booster directly and the column valves select the column. The reservoir valve is no longer fitted, so P0 is a spare.
+- **Plumbing:** the mixing tank feeds the booster directly and the column valves select the column. The reservoir valve is no longer fitted (`RES_VALVE_FITTED 0`); its output would be P5, now a spare.
 
-**Sequencing (ESP2).** The rule is that inverter ON implies the secondary battery, for every inverter use (run stages, mixing, exercise, AC prime, and Testing / Timed Pulse / hold-to-run):
-1. P4 switches the boards to the secondary.
+**Sequencing (ESP2).** The rule is that inverter ON implies the secondary battery, for every inverter use (run stages, pump exercise, AC prime, and Testing / Timed Pulse / hold-to-run):
+1. P0 switches the boards to the secondary, at the very start of a pump run and before the servo moves. ESP2 checks that nothing restarted (the PCF8575 still holds; ESP1 and the Nano confirm), and the boards stay on the secondary for the whole pump run.
 2. After `BATT_SWITCH_SETTLE_MS` (500 ms), the inverter starts.
 3. The existing `INVERTER_WARMUP_MS` follows, extended by the settle time (`AC_WARMUP_MS`).
-4. When the inverter stops, P4 returns the boards to main after `BATT_RETURN_DELAY_MS` (1000 ms). On a normal end, P17 stays up until that return; faults cut everything at once.
+4. When the inverter stops, P0 returns the boards to main after `BATT_RETURN_DELAY_MS` (1000 ms). On a normal end, P17 stays up until that return; faults cut everything at once.
 
 ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 logs them, publishes them, and holds off cutting ESP2's power until the return (`ESP2_BATT_RETURN_WAIT_MS`, 4 s bound).
 
@@ -4183,12 +4604,12 @@ ESP2 reports `INFO,BATT,SECONDARY` and `INFO,BATT,MAIN` on each switch. ESP1 log
 - **Alerts (Major):** `BATT2_LOW`, `BATT2_CRIT` (below 12.8 V) and `SENSOR_FAIL,INA226`.
 - **Readings:** published to the Firebase live snapshot (`sensors.secondaryBattery*`, `system.boardSupply`), the LCD power page (`B2:` line), the SMS `STATUS` report (`BAT2`) and the SD log (`PWR2`).
 
-**Prerequisite — not yet fitted.** A DPDT transfer leaves the boards unpowered for about 10–20 ms. A hold-up stage after the DPDT (e.g. a supercapacitor or UPS module) must keep all three controllers, the P4 relay module's coil and the DPDT coil powered through the transfer. Without it, every switch resets the controllers and the relay falls back to main. For that reason the switching is compiled **off** in both firmwares (`SECONDARY_BATT_ENABLED 0`, ESP1 and ESP2 — set both together). Monitoring works regardless.
+**Prerequisite — the hold-up, fitted 16 Nov 2026.** A DPDT transfer leaves the boards unpowered for about 10–20 ms. A hold-up stage after the DPDT (e.g. a supercapacitor or UPS module) must keep all three controllers, the P0 relay module's coil and the DPDT coil powered through the transfer. Without it, every switch resets the controllers and the relay falls back to main. The user fitted it on 16 Nov, and the switching has been compiled **on** in both firmwares since (`SECONDARY_BATT_ENABLED 1`, ESP1 and ESP2 — set both together). On 18 Nov the log shows 16 switches verified (`PWR2,BATTSW|VERIFY|OK`) and the boards on the pack during runs (`PWR2,BATT2|…|SRC=SECONDARY`). Monitoring works either way.
 
 **When the hold-up fails anyway (reset-proofing).** Every switch is handled as a moment at which the controllers may reset:
 1. **Announce:** ESP2 sends `INFO,BATT,SWITCHING,<to>`.
 2. **ESP1 prepares:** it flushes its SD log, writes a switch journal to NVS, and stops SD writes, new WiFi/TLS requests and SMS sends for up to 3 s. That keeps the load on the hold-up low and leaves nothing half-written. Then it replies `BATTSW,GO`.
-3. **ESP2 prepares:** it saves the mixing-tank volume and its own journal to NVS, and only then moves P4.
+3. **ESP2 prepares:** it saves the mixing-tank volume and its own journal to NVS, and only then moves P0.
 4. **Confirm:** once the boards have survived the 500 ms settle, both journals are cleared (`INFO,BATT,SECONDARY|MAIN`).
 
 **Counting resets.** A boot that finds a journal still set knows the switch reset it. ESP2 reports `INFO,BATT,RESET,<to>` until ESP1 acknowledges. A `READY` from ESP2 while a switch is pending counts the same way. Each such event is one **strike**:
@@ -4202,9 +4623,9 @@ Independently of the battery switch, any `READY` from ESP2 during a live run, he
 - **Recharge wait:** no inverter use for `BSW_RECHARGE_MS` (60 s, [MEASURE]) after a boot or strike, because the hold-up is flat.
 - **No double dose:** ESP2 keeps what the tank already holds in NVS, and a re-run doses only what is still owed. A dose started but not finished counts as delivered, so the error is always towards under-dosing. No dose starts until a switch back to main has finished.
 - **The batch reaches its column:** the column the tank was dosed for runs first, regardless of its window or soil reading, except at night or if the operator snoozed, disabled or skipped it. A batch stopped on purpose is not restarted automatically, but its doses still count when the column next runs. An order for a different column adds no dose and raises `DOSE_CARRY`.
-- **Faults, stops and commands:** a fault is written to NVS before its own P4 drop and reported after the reset, and its column is skipped for the day. An E-stop or cancel is written down before its cut and restored after the reset. A dashboard command in flight is marked failed.
+- **Faults, stops and commands:** a fault is written to NVS before its own P0 drop and reported after the reset, and its column is skipped for the day. An E-stop or cancel is written down before its cut and restored after the reset. A dashboard command in flight is marked failed.
 
-**Backup for a critical main battery — ready, not active** (`SECONDARY_BACKUP_ENABLED 0`, ESP1 and ESP2). When main stays below `BATT_CRIT_V` for 60 s with nothing running, ESP1 texts `ALERT,CRIT,MAIN_BATT_CRIT`, waits for the text to leave the modem, and has ESP2 hold the boards on the secondary (`BATTBK,ON`). ESP2 stays powered and holds P4 and P17; all inverter use is blocked from the alert onward, because the inverter would load the flat main battery. The boards return when main holds `BACKUP_MAIN_RECOVER_V` (12.6 V, [CONFIRM]) for 5 minutes, or when the pack reaches `SEC_BATT_CRIT_V` or stops being monitored (`ALERT,CRIT,BACKUP_EXHAUSTED`). Needs `SECONDARY_BATT_ENABLED` and a calibrated main voltage. **Limits:** the pack does not charge while it powers the boards; if the boards return to a main too weak to run them, the rig stays dark until main recovers; and the charger needs its own low-voltage cutoff so it does not drain a critical main.
+**Backup for a critical main battery — ready, not active** (`SECONDARY_BACKUP_ENABLED 0`, ESP1 and ESP2). When main stays below `BATT_CRIT_V` for 60 s with nothing running, ESP1 texts `ALERT,CRIT,MAIN_BATT_CRIT`, waits for the text to leave the modem, and has ESP2 hold the boards on the secondary (`BATTBK,ON`). ESP2 stays powered and holds P0 and P17; all inverter use is blocked from the alert onward, because the inverter would load the flat main battery. The boards return when main holds `BACKUP_MAIN_RECOVER_V` (12.6 V, [CONFIRM]) for 5 minutes, or when the pack reaches `SEC_BATT_CRIT_V` or stops being monitored (`ALERT,CRIT,BACKUP_EXHAUSTED`). Needs `SECONDARY_BATT_ENABLED` and a calibrated main voltage. **Limits:** the pack does not charge while it powers the boards; if the boards return to a main too weak to run them, the rig stays dark until main recovers; and the charger needs its own low-voltage cutoff so it does not drain a critical main.
 
 ### 19.4.8. 🔹 P17 Master Actuator-Power Cutoff & Fault Hold
 
@@ -4322,12 +4743,15 @@ Upon reset or power-up:
 
 ## 20.2. Load Power
 
-* Pumps and valves → 12V
+* Transfer and booster pumps → 220 V AC from the inverter (relay P2), one at a time through the servo changeover
+  (§19.4.7.2)
+* Valves, dosing pumps and the mixer → 12 V DC through the relay bank (P17)
 * Relay modules → 5V
 
 ## 20.3. Important Rules
 
-* All grounds must be COMMON
+* All grounds must be COMMON on the boards' side (ESP32s, Nano, sensors, relay coils). While the inverter runs, that
+  side is cut off from the main battery, both + and − (§19.4.7.1, §20.5)
 * Do NOT power loads from ESP32
 * Use flyback diodes for pumps and valves
 
@@ -4339,11 +4763,77 @@ Upon reset or power-up:
 - MUST NOT be powered from the ESP32 5V pin
 - Must follow the same battery-switched rail as ESP32 #1 once SECONDARY_BATT_ENABLED is on: the DPDT breaks both + and −, and the UART needs that common ground
 
+## 20.5. ⚡ Electrical noise from the inverter and DC switching (as built, 18 Nov 2026)
+
+**The problem.** The inverter makes 220 V AC by switching the 12 V battery current very fast, and the relays and
+motors switch heavy currents on and off. Both put fast spikes on the 12 V wiring and the AC output cables, and the
+spikes couple into any wire laid next to them. Sensor wires carry a few volts over long runs, so they suffer most. On
+this rig the effect was severe on everything close to the inverter's output and the 12 V cables, and worst while the
+inverter ran. What it did:
+- **Flow sensors:** while the pumps had their own relays switching the AC load, the induced voltage reached every
+  flow-sensor input through the relay-coil wiring, giving false or missed pulses and wrong litres (§19.4.7.2).
+- **I²C bus:** with the solar / main-battery sensor board connected (an ISO1540 isolator and two INA226 on the
+  battery side), ESP32 #1's LCD and clock dropped off the bus. The diagnosis ranked noise and supply dips from the
+  battery side as the likeliest cause (`ISO1540_I2C_Diagnosis_2026-11-16\FINDINGS.md`).
+- **Buttons:** a relay coil or the inverter switching could end a hold-to-run press (§19.4.9.18).
+
+**What was done (hardware, by the user):**
+1. **A second battery for the boards (§19.4.7.1).** For every inverter use, the P0 DPDT moves ESP32 #1, ESP32 #2,
+   the Nano, the sensors and the relay coils off the main battery onto a 4S Li-ion pack, breaking both + and −.
+   - While the inverter runs, the boards share no wire with the battery it loads. That removes both the conducted
+     noise and the supply dip of a motor start.
+   - A hold-up stage carries the boards through the 10–20 ms changeover.
+   - In service since 16 Nov; on 18 Nov the log shows 16 verified switches.
+2. **The inverter moved away from the sensor cables.** Distance is the simplest filter: the noise a wire picks up
+   falls quickly as it moves away from the noisy cable.
+3. **A servo, not relays, chooses the pump (§19.4.7.2).** The inverter's output reaches the transfer or the booster
+   pump through changeover contacts that the Nano's servo turns.
+   - The servo moves only with the inverter off and its output dead, so no contact ever breaks motor current.
+   - The inverter relay (P2) is the only relay that switches AC.
+   - Switching the motors with relays had leaked noise into the boards and upset the other sensors.
+
+**What the firmware does about what still gets through:**
+- Nano packets carry a checksum. A corrupted line is dropped and counted (`NANO,GARBAGE`), and repeated garbage
+  resets the Nano (§18.9.5).
+- A tank level is used for control only when its pings agree within 4 cm. A fill's early stop needs 3 readings in a
+  row and a believable pace (§19.4.9.24, §19.4.9.32).
+- An I²C device must miss 3 answers in a row to count as lost. An INA226 that restarts after a supply blip gets its
+  calibration back (§21.0).
+- Hold-to-run buttons ignore a release shorter than 120 ms (§19.4.9.18).
+- Noise bytes are replaced before a report's text goes to the website (§19.4.9.34).
+
+**Not done in the time available: the main-battery and solar sensors.**
+- **Why they are hard:** an INA226 must share a ground with what it measures, so both modules sit on the main
+  battery's 12 V side. That is close to the inverter and its cables, the noisiest part of the rig.
+  - The isolated board of §21.0 (ISO1540) was meant to keep that side apart from the logic. Once connected, it made
+    ESP32 #1's I²C bus fail, taking the LCD and the clock with it.
+  - A board that keeps these sensors from disturbing the whole system's logic while the inverter runs could not be
+    designed and proven within the project's time. It would need its own supply and isolation on the battery side,
+    and testing with the inverter on.
+- **So they are not fitted.** ESP32 #1 still looks for them (0x41 solar, 0x44 main) and uses them if they answer.
+- **What that means:** the main battery's voltage, %, current and the solar figures are not published, so the
+  website shows them as unavailable, and the daily Wh totals stay at 0. The opto fallback reads nothing either: all
+  1,255 `PWR,BATT` lines of 18 Nov read `VRAW` 0.000–0.008 with `SRC=OPTO`.
+- **Nothing depends on them:** the battery protections are compiled out (`BATTERY_SAFETY_ENABLED 0`, §21.1.1).
+  - The second battery's own monitor (INA226 at 0x40) works, because that pack shares the boards' ground.
+  - It is the one that can block inverter use (§19.4.7.1).
+
+**Not tried yet, if the work continues:**
+- **A small microcontroller on the battery side** that reads the two INA226 and sends the values over an
+  opto-isolated serial line, so no I²C crosses the barrier.
+- **Sensor cables in twisted pairs,** kept apart from the power cables and crossing them at right angles.
+- **Ferrite cores** on the inverter's input and output cables.
+- **RC snubbers or TVS diodes** across the relay contacts that switch inductive loads.
+
 ---
 
 # 21. 🔌 Power Monitoring System
 
 ## 21.0. Solar + Main Battery Monitoring (two INA226 behind an ISO1540)
+
+> **Not fitted on the rig (18 Nov 2026).** Once connected, this board made ESP32 #1's I²C bus fail (LCD and clock
+> lost). A board that stays clean with the inverter on could not be built in the time available (§20.5). The firmware
+> below is kept, and ESP32 #1 uses both modules if they answer.
 
 An INA226 must share a ground with what it measures, while the boards must not share one with the main battery. Two modules therefore sit on the main-battery side of an **ISO1540** I²C isolator and stay readable through every inverter run and battery switch. Nothing but the isolator crosses over. (The part number matters: an ISO1450 is an RS-485 transceiver and passes no I²C.)
 
@@ -5074,8 +5564,8 @@ Storage bucket**; the developer generates time-limited signed URLs from the dash
 
 ## 29.10. 17 Nov 2026 additions (web v.4)
 
-All of these are described in §19.4.9.11–§19.4.9.27 and §19.4.7.1. Flashed and checked on the rig the same evening,
-except the heap fix of §19.4.9.23 and the SMS `UPLOAD` change (§12.2.5), both built but not yet flashed.
+All of these are described in §19.4.9.11–§19.4.9.27 and §19.4.7.1. Flashed and checked on the rig the same evening.
+The heap fix of §19.4.9.23 and the SMS `UPLOAD` change (§12.2.5) went in with the 18 Nov flash.
 
 | Feature | Board(s) | Section |
 | --- | --- | --- |
@@ -5098,11 +5588,11 @@ The database nodes ESP32 #1 uses. The account levels and the rules are in `Websi
 
 | Node | Direction | What |
 | --- | --- | --- |
-| `irrigation/live` | ESP1 writes | The snapshot: every 20 s during a run and 60 s idle, or 2 s / 4 s while someone watches (§19.4.9.22) |
+| `irrigation/live` | ESP1 writes | The snapshot: once a minute, plus one at once on a Refresh (at most every 10 s idle, 30 s busy), since 18 Nov g (§19.4.9.34; the 17 Nov pace is in §19.4.9.22) |
 | `irrigation/commands/<id>` | website writes `{type, payload, status: "queued", source: "dashboard", byName}`; ESP1 polls every 3 s and answers `status` = accepted / completed / rejected / failed with a `detail` | Remote commands (below) |
 | `irrigation/manual`, `irrigation/testHold` | website writes, ESP1 polls | The Manual/Test tab's direct control and its hold-to-run buttons (dead-man keep-alive) |
-| `irrigation/viewer` `{at, refreshAt}` | website writes | Someone is watching / Refresh (§19.4.9.22) |
-| `irrigation/logRequest` `{day, at}` | website writes, ESP1 polls every 10 s | Send that day's SD log (§19.4.9.23) |
+| `irrigation/viewer` `{at, refreshAt}` | website writes | Refresh (`refreshAt`, polled every 6 s); `at` is unused since 18 Nov g (§19.4.9.34) |
+| `irrigation/logRequest` `{day, at}` | website writes, ESP1 polls every 30 s (10 s until 18 Nov g) | Send that day's SD log (§19.4.9.23) |
 | `logs/index/<day>`, `logs/files/<day>/<nnnn>` | ESP1 writes | The SD logs, 6 KB pieces, kept 14 days (§19.4.9.23) |
 
 **Remote command types** (`type`, with the payload fields used):
@@ -5116,8 +5606,8 @@ The database nodes ESP32 #1 uses. The account levels and the rules are in `Websi
 | `RECOVER` | `action` = hold / release / irrigate / normal | A reply to a held fault |
 | `ACK_FAULT` | — | Website-only snooze of the fault prompt; changes nothing on the rig |
 | `ENABLE_ACTUATIONS` / `DISABLE_ACTUATIONS` | — | The actuation lockout. Enable is never refused (the escape hatch); while disabled, monitoring continues and nothing is energized |
-| `SET_COLUMN` | `col`, any of `mode`, `enabled`, `schedMode`, `winStart`, `winEnd`, `windows`, `preset`, `targetN/P/K/PH` | Column configuration (allowed while held or locked out: it actuates nothing) |
-| `SET_THRESH` | `thStart`, `thGap` | As the LCD Thresholds editor and SMS `THRESH` |
+| `SET_COLUMN` | `col`, any of `mode`, `enabled`, `schedMode`, `winStart`, `winEnd`, `windows`, `preset`, `targetN/P/K/PH`, `operation`, `plan`, `planFrom`, and (18 Nov 2026 b) `soilStart`, `soilWet` (-1 = the default, else 0–100; the pair must keep Too wet ≥ Soil start + 5) | Column configuration (allowed while held or locked out: it actuates nothing) |
+| `SET_THRESH` | `thStart`, `thGap`; optional (18 Nov 2026 b) `thWet` (≥ start + 5, ≤ 100) and `thRes` (18–50) | As the LCD Thresholds editor and SMS `THRESH` (SMS keeps start + gap only). A refused field changes none of them |
 | `SET_EXERCISE` | `exerciseEnabled`, `exerciseSeconds` | The 2-day pump exercise |
 | `SET_AC_VOLT` / `SET_AC_AMP` | `vMin`, `vMax` / `aMin10`, `aMax10` | The AC supply window (saved, sent to ESP2) |
 | `SET_CLOCK` | `clkY`, `clkMo`, `clkD`, `clkH`, `clkMi` | Sets the RTC (dates checked for the month and leap years) |
@@ -5128,3 +5618,21 @@ The database nodes ESP32 #1 uses. The account levels and the rules are in `Websi
 | `RESTORE_DEFAULTS` | — | As the LCD's Restore Defaults (idle only) |
 | `CLEAR_BATT_SWITCH` | — | Clears a latched battery-switch fault |
 | `LCD_LOCK` | `action` = lock / unlock | Locking is refused while someone is in a menu at the rig; unlocking never is |
+
+## 29.12. 18 Nov 2026 additions (web v.4)
+
+All flashed by the evening of 18 Nov: ESP1 `web v.4 (2026-11-18h)` and ESP2 with the two-step fill. The Nano is
+unchanged since 17 Nov.
+
+| Feature | Board(s) | Section |
+| --- | --- | --- |
+| Thresholds: Too wet line, reservoir pause 18–50 %, per-column Soil start / Too wet | ESP1, website | §5.3.3 |
+| Operation Automatic / Manual and the day plan | ESP1, website | §19.4.9.28 |
+| Website parity: `TANK_CHECK_OK`, restart reason and count, thresholds, calibration (read-only) | ESP1, website | §19.4.9.29 |
+| Realtime-link fixes: token renewal, memory floors, retries, log lines | ESP1, website | §19.4.9.30 |
+| Tank shape by tape | ESP1 | §19.4.9.31 |
+| Two-step fill: 70 % first run, settle, top-up from 0.8 L at the rate seen, early cut on the live level | ESP2 | §19.4.9.32 |
+| A+B run screens, a progress bar that moves, `COL_AB` receipts | ESP1 | §19.4.9.33 |
+| Website link: busy / idle, a report a minute plus Refresh, the memory fix for HTTP 400 | ESP1, website | §19.4.9.34 |
+| A reservoir reading near 20 cm (about 120 %) explained: the sensor's dead zone; no change | — | §19.4.9.8 |
+| Noise measures (second battery, inverter placement, servo pump switch); main-battery and solar sensors not fitted | hardware | §20.5 |

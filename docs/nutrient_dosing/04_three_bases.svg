@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="380" viewBox="0 0 900 380" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<title>Dose by basis</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker><marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#15803d"/></marker><marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
+<rect width="900" height="380" fill="#ffffff"/>
+<text x="450" y="28" font-size="16" fill="#1f2937" text-anchor="middle" font-weight="bold">One K gap of 100, three ways to size the dose (4 L batch, stock C 3383 mg/L)</text>
+<line x1="260.0" y1="70" x2="260.0" y2="330" stroke="#e5e7eb"/>
+<text x="260.0" y="348" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">0.1 mL</text>
+<line x1="372.0" y1="70" x2="372.0" y2="330" stroke="#e5e7eb"/>
+<text x="372.0" y="348" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">1 mL</text>
+<line x1="484.0" y1="70" x2="484.0" y2="330" stroke="#e5e7eb"/>
+<text x="484.0" y="348" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">10 mL</text>
+<line x1="596.0" y1="70" x2="596.0" y2="330" stroke="#e5e7eb"/>
+<text x="596.0" y="348" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">100 mL</text>
+<line x1="708.0" y1="70" x2="708.0" y2="330" stroke="#e5e7eb"/>
+<text x="708.0" y="348" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">1000 mL</text>
+<line x1="820.0" y1="70" x2="820.0" y2="330" stroke="#e5e7eb"/>
+<text x="820.0" y="348" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="normal">10000 mL</text>
+<line x1="464.3" y1="66" x2="464.3" y2="330" stroke="#c2410c" stroke-width="1.6" stroke-dasharray="5 4"/>
+<text x="470.2777789857637" y="78" font-size="11" fill="#c2410c" text-anchor="start" font-weight="normal">floor: 3 pulses = 6.7 mL</text>
+<text x="248" y="122" font-size="13" fill="#1f2937" text-anchor="end" font-weight="bold">Code today (literal formula)</text>
+<rect x="260.0" y="100" width="8.1" height="34" fill="#9ca3af" rx="3"/>
+<text x="276.05078481828605" y="122" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">0.12 → under the floor: skipped</text>
+<text x="248" y="197" font-size="13" fill="#1f2937" text-anchor="end" font-weight="bold">Concentration: 100 mg/L in the water</text>
+<rect x="260.0" y="175" width="344.1" height="34" fill="#2563eb" rx="3"/>
+<text x="612.1331573730665" y="197" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">118 mL per run</text>
+<text x="248" y="272" font-size="13" fill="#1f2937" text-anchor="end" font-weight="bold">Soil mass: +100 mg/kg in 97.5 kg soil</text>
+<rect x="260.0" y="250" width="499.5" height="34" fill="#7c3aed" rx="3"/>
+<text x="767.4857253655327" y="272" font-size="12" fill="#1f2937" text-anchor="start" font-weight="normal">2882 mL total</text>
+<text x="268.0" y="302" font-size="12" fill="#7c3aed" text-anchor="start" font-weight="normal">too much for one 4 L batch: split over runs, e.g. 10 runs × 288 mL</text>
+</svg>

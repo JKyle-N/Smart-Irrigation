@@ -162,7 +162,13 @@ column. **Weigh or measure what actually comes out** and compare with what the f
 
 ### H — Secondary battery isolation  *(only after a hold-up stage is fitted)*
 
-The firmware ships with `SECONDARY_BATT_ENABLED 0` in both ESP1 and ESP2. At that setting the INA226
+> **Status, 18 Nov 2026: in service.** The user fitted the hold-up, and the switching has been compiled on in both
+> firmwares since 16 Nov (`SECONDARY_BATT_ENABLED 1`). The 18 Nov runs switched cleanly: 16 verified switches
+> (`PWR2,BATTSW|VERIFY|OK`), and the boards ran on the pack during runs (`SRC=SECONDARY`). It is the rig's main
+> defence against the inverter's noise (reference §20.5). The deliberate proofs below (loop protection, blackout)
+> are not recorded as done.
+
+Before 16 Nov the firmware shipped with `SECONDARY_BATT_ENABLED 0` in both ESP1 and ESP2. At that setting the INA226
 readings must already appear: the LCD Power page `B2:` line, the dashboard tiles, `BAT2` in `STATUS`,
 and `PWR2` in the log. Do this stage only once the controllers ride through the DPDT transfer.
 
@@ -218,6 +224,12 @@ reading (stage I), or `calBattV` must be calibrated. Set `SECONDARY_BACKUP_ENABL
 > third switch reset happens after `BATT_SWITCH_FAULT` latched.
 
 ### I — Solar + main battery INA226 behind the ISO1540  *(no flag; the firmware finds them by itself)*
+
+> **Status, 18 Nov 2026: skipped, not fitted.** Both modules sit on the noisy 12 V side. When the isolated board was
+> connected, ESP1's I²C bus failed (the LCD and RTC dropped off; `ISO1540_I2C_Diagnosis_2026-11-16`). A board that
+> stays clean with the inverter on could not be built in the time available (reference §20.5). The steps below stay
+> for whoever fits a working board. Nothing else in this plan depends on them, and the backup for a critical main
+> (stage H, optional) cannot be used without them.
 
 Wiring is in reference §21.0. Do these before any main firmware, with `Calibration/ESP1/INA226` flashed to ESP1 (`.\cal.ps1 ina226` in `Calibration/`):
 
@@ -327,19 +339,24 @@ passed 1–3; see the reference §19.4.9.27.
    stream of `pings_spread` means the sensor sees the mixer or the inflow, so aim it away.
 2. **Tank litres.** Settings → Calibration → **Tank Mix liters** / **Tank Res liters**: add points with a measuring
    jug.
-3. **A forced irrigation** on each column: `INFO,FILL_RUN` → `INFO,INV_ON` → `INFO,FILL_CHECK|…|OK` → the delivery →
-   `DONE`. No `LEVEL_BLIND`.
+3. **A forced irrigation** on each column, with the two-step fill (18 Nov): `INFO,FILL_RUN|…|cut=…` (70 % of the
+   need) → `INFO,INV_ON` → `INFO,FILL_CHECK|…|TOPUP|seen=…` → `INFO,FILL_RUN|…|topup=1` (maybe `INFO,FILL_CUT`) →
+   `INFO,FILL_CHECK|…|OK` → the delivery → `DONE`. The last `FILL_CHECK` should be within about 1 L. No `LEVEL_BLIND`.
+   Passed on 18 Nov 21:32 (A+B, 5.0 L asked, 5.92 L delivered; reference §19.4.9.32).
 4. **The pump lines.** Re-measure on **Transfer pump est** with the reservoir at its usual level, at least 5 tries
-   with different seconds (two lengths such as 10 s and 40 s). The first field fills came in 35 % and 7 % over.
-   Then a delivery through the drip pipe, and type its `seen:` rate into **Rate Booster**.
-5. **The website and logs.** After a restart the log shows `ESP1,FBASE,OK` within about a minute (needs the ESP1
-   build with the heap fix). Diagnostics → SD card logs → **Upload from the rig** for today; Download. SMS `UPLOAD`
-   answers "queued".
+   with different seconds (two lengths such as 10 s and 40 s). The first field fills came in 35 % and 7 % over, and
+   on 18 Nov the rate ranged from about 11 to 19 L/min between runs. The two-step fill absorbs that; a better line only
+   saves top-ups. Then a delivery through the drip pipe, and type its `seen:` rate into **Rate Booster**.
+5. **The website and logs.** After a restart the log shows `ESP1,FBASE,OK|http=204` within about a minute (the
+   `2026-11-18h` build; `FBASE,REPLY|http=400 … No data supplied.` means an older build). Diagnostics → SD card logs →
+   **Upload from the rig** for today; Download. SMS `UPLOAD` answers "queued".
 6. **Power.** `SYS,BOOT,reason=POWER_ON` during or right after runs means the supply dips. Fit a 5 V supply of at least
    2 A for ESP1 and the A7670C, and a 1000–2200 µF low-ESR capacitor at the modem, before long unattended runs.
 
-> **Abort if** a fill's `FILL_CHECK` is more than 3 L off twice in a row, any `LEVEL_BLIND` or `MIX_OVERFLOW`
-> appears, or the mixing tank's reading jumps by more than a litre while it is still.
+> **Abort if** a fill's last `FILL_CHECK` is more than 3 L off twice in a row (with the two-step fill it should be
+> within about 1 L), any `LEVEL_BLIND` or `MIX_OVERFLOW` appears, or the mixing tank's reading jumps by more than a
+> litre while it is still. A tank stuck near 20 cm (about 120 %) is a false echo at the sensor's dead zone: wipe the
+> sensor face and check before trusting it (reference §19.4.9.8).
 
 ## After stage G
 
@@ -366,17 +383,21 @@ Bisecting costs about six flash cycles, which is why it is the fallback rather t
 
 ## Known-good reference
 
-All three controllers build clean (web v.4, confirmed 2026-11-17; 2026-11-01 figures in brackets):
+All three controllers build clean (web v.4 as flashed on 18 Nov: ESP1 `2026-11-18h`, ESP2 two-step fill; 17 Nov
+figures in brackets):
 
 | | RAM | Flash |
 |---|---|---|
-| ESP1 | 25.1 % (82,184 B) [80,672 B] | 45.3 % (1,424,393 B) [1,319,045 B] |
-| ESP2 | 7.3 % (24,028 B) [23,252 B] | 29.1 % (381,465 B) [339,665 B] |
-| Nano | 64.6 % (1,324 B) [1,064 B] | 64.6 % (19,836 B) [14,792 B] |
+| ESP1 | 24.1 % (78,816 B) [82,184 B] | 45.7 % (1,438,369 B) [1,424,393 B] |
+| ESP2 | 7.3 % (24,060 B) [24,028 B] | 29.3 % (384,065 B) [381,465 B] |
+| Nano | 64.6 % (1,324 B) [unchanged] | 64.6 % (19,836 B) [unchanged] |
+
+ESP1's RAM fell on 18 Nov because the memory fix (18h) gave 4 KB of the report buffer back to the heap.
 
 A build that differs sharply from these has picked up something unintended. **Watch ESP1's RAM above all:**
-static RAM comes out of the heap, and below 60 KB free at run time ESP1 skips every Firebase request (on 17 Nov a
-12 KB static buffer took ESP1 to 94,432 B and the website stopped updating).
+static RAM comes out of the heap, and the website link needs a 17 KB block and 24 KB free (byte-addressable) to open
+a new connection (`2026-11-18h`, reference §19.4.9.34). On 17 Nov a 12 KB static buffer took ESP1 to 94,432 B and
+the website stopped updating.
 
 ## Still outstanding
 

@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="390" viewBox="0 0 900 390" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<title>Mixing tank litres during one run (two-step fill)</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker></defs>
+<rect width="900" height="390" fill="#ffffff"/>
+<text x="450" y="28" font-size="17" fill="#1f2937" text-anchor="middle" font-weight="bold">One irrigation run: mixing-tank litres over time (two-step fill, since 18 Nov 2026)</text>
+<line x1="70" y1="320" x2="860" y2="320" stroke="#374151" marker-end="url(#ar)"/>
+<line x1="70" y1="320" x2="70" y2="70" stroke="#374151" marker-end="url(#ar)"/>
+<text x="860" y="338" font-size="12" fill="#6b7280" text-anchor="end" font-weight="normal">time</text>
+<text x="62" y="66" font-size="12" fill="#6b7280" text-anchor="start" font-weight="normal">litres in the mixing tank</text>
+<rect x="70" y="80" width="50" height="240" fill="#e5e7eb" opacity="0.35"/>
+<text x="95" y="96" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">selector</text>
+<text x="95" y="110" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">+ battery</text>
+<text x="95" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">(not timed)</text>
+<rect x="120" y="80" width="75" height="240" fill="#dbeafe" opacity="0.35"/>
+<text x="157.5" y="96" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">1st run:</text>
+<text x="157.5" y="110" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">70 % of need</text>
+<text x="157.5" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">cut at 75 %</text>
+<rect x="195" y="80" width="120" height="240" fill="#fef3c7" opacity="0.35"/>
+<text x="255" y="96" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">settle ≥ 60 s</text>
+<text x="255" y="110" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">FILL_CHECK:</text>
+<text x="255" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">&gt; 0.8 L short</text>
+<rect x="315" y="80" width="60" height="240" fill="#dbeafe" opacity="0.35"/>
+<text x="345" y="96" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">top-up</text>
+<text x="345" y="110" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">at the rate</text>
+<text x="345" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">just seen</text>
+<rect x="375" y="80" width="120" height="240" fill="#dcfce7" opacity="0.35"/>
+<text x="435" y="96" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">settle ≥ 60 s</text>
+<text x="435" y="110" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">FILL_CHECK:</text>
+<text x="435" y="124" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">OK → deliver</text>
+<rect x="495" y="80" width="150" height="240" fill="#ffedd5" opacity="0.35"/>
+<text x="570" y="96" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">booster</text>
+<text x="570" y="110" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">tank falls</text>
+<rect x="645" y="80" width="60" height="240" fill="#fecaca" opacity="0.35"/>
+<text x="675" y="96" font-size="11" fill="#1f2937" text-anchor="middle" font-weight="normal">+10 s</text>
+<line x1="120" y1="150" x2="495" y2="150" stroke="#16a34a" stroke-dasharray="2 4"/>
+<text x="200" y="144" font-size="11" fill="#16a34a" text-anchor="start" font-weight="normal">goal = base + need</text>
+<line x1="120" y1="190" x2="315" y2="190" stroke="#6b7280" stroke-dasharray="2 4"/>
+<text x="200" y="204" font-size="11" fill="#6b7280" text-anchor="start" font-weight="normal">≈ 70–75 % of need</text>
+<polyline points="70,308 120,308 195,197 207,190 315,190 375,155 385,151 495,151 645,293.3 705,306.5 860,306.5" fill="none" stroke="#2563eb" stroke-width="2.6"/>
+<line x1="495" y1="293.3" x2="860" y2="293.3" stroke="#c2410c" stroke-dasharray="4 3"/>
+<text x="718" y="287.3" font-size="11" fill="#c2410c" text-anchor="start" font-weight="normal">5 % = 0.89 L: low stop</text>
+<text x="74" y="300" font-size="11" fill="#1f2937" text-anchor="start" font-weight="normal">base (floor)</text>
+<text x="718" y="218" font-size="12" fill="#c2410c" text-anchor="start" font-weight="bold">delivered =</text>
+<text x="718" y="230" font-size="12" fill="#c2410c" text-anchor="start" font-weight="bold">start − end</text>
+<text x="718" y="242" font-size="11" fill="#c2410c" text-anchor="start" font-weight="normal">(the column's litres)</text>
+<text x="70" y="358" font-size="11" fill="#6b7280" text-anchor="start" font-weight="normal">Any run may end early on the tank's live level (INFO,FILL_CUT: 3 readings in a row at a believable pace). The top-up ends</text>
+<text x="70" y="374" font-size="11" fill="#6b7280" text-anchor="start" font-weight="normal">within 0.8 L of the goal; at most 2 top-ups. 0.8 L short or less: deliver as it is. An overfill cannot be taken back.</text>
+</svg>
