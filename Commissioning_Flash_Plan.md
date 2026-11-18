@@ -408,13 +408,13 @@ the website stopped updating.
 
 ## Host test suite
 
-Both suites pass in GitHub Actions on every push — 152 cases for ESP1, 83 for ESP2 (web v.4, 17 Nov) — and are
-worth running before any flash, since they take seconds and cover the maths the dosing and the water measurement
-depend on, and the modem driver:
+Both suites pass in GitHub Actions on every push — 166 cases for ESP1, 86 for ESP2 (web v.4, 18 Nov; 152 / 83 on
+17 Nov) — and are worth running before any flash, since they take seconds and cover the maths the dosing and the water
+measurement depend on, and the modem driver:
 
 ```bash
-cd ESP1 && pio test -e native     # 152 cases: pure maths, the A7670C driver, tank litres, pump lines
-cd ESP2 && pio test -e native     # 83 cases: flow maths, level guard, level meter, servo check, source low
+cd ESP1 && pio test -e native     # 166 cases: pure maths, the A7670C driver, tank litres, pump lines, the day plan
+cd ESP2 && pio test -e native     # 86 cases: flow maths, level guard, level meter (incl. the two-step fill), servo check, source low
 ```
 
 If this PC has no host compiler, push to a branch and let the **Build firmware** workflow run them.
