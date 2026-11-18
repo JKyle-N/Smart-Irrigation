@@ -1,12 +1,16 @@
-const admin = require("firebase-admin");
+// Modular imports (firebase-admin >= 10). firebase-admin 14 removed the old namespaced API
+// (admin.apps / admin.credential / admin.auth() / admin.database()), so this form is required to upgrade.
+const { initializeApp, getApps, cert } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+const { getDatabase } = require("firebase-admin/database");
 
 // Reads the service-account key and database URL from Vercel's own environment-variable secret
 // store -- set these in the Vercel project dashboard, never in a file. FIREBASE_PRIVATE_KEY comes
 // out of the downloaded service-account JSON with literal "\n" sequences that env vars store as
 // text, not real newlines -- the replace() below restores them before handing it to the SDK.
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
+if (!getApps().length) {
+  initializeApp({
+    credential: cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
       privateKey: (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
@@ -44,7 +48,7 @@ module.exports = async (req, res) => {
   try {
     // New-F11 (audit): checkRevoked=true so a token captured before an operator's tokens were
     // revoked (e.g. after a compromise) stops working here immediately, not just at its own expiry.
-    decoded = await admin.auth().verifyIdToken(idToken, true);
+    decoded = await getAuth().verifyIdToken(idToken, true);
   } catch (error) {
     // Audit fix (2026-09-08): this branch is reachable by ANY caller, not just an authenticated
     // non-operator -- verifyIdToken() can throw before the operator check below ever runs, so a
@@ -70,7 +74,7 @@ module.exports = async (req, res) => {
   // Reached only by a verified operator (checked above), so a detailed error here is not an
   // unauthenticated-facing information leak the way the token-verification branch above was.
   try {
-    await admin.auth().deleteUser(targetUid);
+    await getAuth().deleteUser(targetUid);
     // Deep-scan finding (2026-09-10): this used to remove only /users/{uid} -- /presence/{uid} and
     // /activity/{uid} (added this session) are SEPARATE top-level nodes, not children of /users, so
     // they were silently left behind forever after a delete. Harmless as dead data (neither is ever
@@ -86,9 +90,9 @@ module.exports = async (req, res) => {
     // still reports success for the part that actually matters (the Auth account is gone), while
     // surfacing which cleanup path failed for a manual follow-up instead of silently orphaning it.
     const cleanup = await Promise.allSettled([
-      admin.database().ref(`users/${targetUid}`).remove(),
-      admin.database().ref(`presence/${targetUid}`).remove(),
-      admin.database().ref(`activity/${targetUid}`).remove()
+      getDatabase().ref(`users/${targetUid}`).remove(),
+      getDatabase().ref(`presence/${targetUid}`).remove(),
+      getDatabase().ref(`activity/${targetUid}`).remove()
     ]);
     const failedPaths = ["users", "presence", "activity"].filter((_, i) => cleanup[i].status === "rejected");
     if (failedPaths.length) console.error(`Cleanup failed for: ${failedPaths.join(", ")}`, cleanup);

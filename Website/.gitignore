@@ -1,3 +1,10 @@
 # Firebase Web configuration is intentionally versioned: Firebase identifies
 # web projects with this public configuration. Database access is protected by
 # Firebase Authentication and Realtime Database Rules, never by hiding it.
+
+# AI-agent skill packs and editor tooling are not part of the site (removed 18 Nov 2026; copy kept in
+# _Archive_Website_2026-11-18\Live_repo_non_site_files). GitHub Pages publishes the whole repo, so keep them out.
+.agents/
+.claude/
+skills-lock.json
+node_modules/
