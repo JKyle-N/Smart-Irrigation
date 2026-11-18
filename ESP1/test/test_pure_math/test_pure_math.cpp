@@ -595,6 +595,34 @@ void test_reservoir_low_uses_the_reservoir_reading_only(void) {
   TEST_ASSERT_FALSE(reservoirLow(false, 0.0f, 15.0f));      // before the first TANK packet
 }
 
+// 18 Nov 2026: the reservoir pause can be raised from the filter zone (18 %) to 50 %, never lowered under it.
+void test_reservoir_pause_only_goes_up_from_the_filter_zone(void) {
+  TEST_ASSERT_TRUE(resPauseOk(18, 18));                      // the filter zone itself (the old fixed value)
+  TEST_ASSERT_TRUE(resPauseOk(30, 18));
+  TEST_ASSERT_TRUE(resPauseOk(RES_PAUSE_MAX_PCT, 18));
+  TEST_ASSERT_FALSE(resPauseOk(17, 18));                     // under the filter: the pumps could run dry
+  TEST_ASSERT_FALSE(resPauseOk(0, 18));
+  TEST_ASSERT_FALSE(resPauseOk(RES_PAUSE_MAX_PCT + 1, 18));
+  TEST_ASSERT_FALSE(reservoirLow(true, 30.0f, 30.0f));       // at a raised pause: still allowed
+  TEST_ASSERT_TRUE(reservoirLow(true, 29.0f, 30.0f));        // under it: new runs wait
+}
+
+// 18 Nov 2026: a column's own Soil start / Too wet, -1 = the default; Too wet stays at least 5 above soil start.
+void test_column_thresholds_follow_the_default_or_their_own(void) {
+  TEST_ASSERT_EQUAL_INT(35, effPct(-1, 35));                 // no own value: the default
+  TEST_ASSERT_EQUAL_INT(40, effPct(40, 35));
+  TEST_ASSERT_EQUAL_INT(0, effPct(0, 35));                   // 0 is a real (if odd) own value, not "absent"
+  TEST_ASSERT_TRUE(wetAboveStart(35, 90));
+  TEST_ASSERT_TRUE(wetAboveStart(35, 40));                   // exactly the gap
+  TEST_ASSERT_FALSE(wetAboveStart(35, 39));
+  TEST_ASSERT_FALSE(wetAboveStart(35, 35));
+  TEST_ASSERT_FALSE(wetAboveStart(35, 101));
+  TEST_ASSERT_EQUAL_INT(90, wetEffPct(90, 35));
+  TEST_ASSERT_EQUAL_INT(65, wetEffPct(60, 60));              // a default start raised past it: pushed up, not crossed
+  TEST_ASSERT_EQUAL_INT(100, wetEffPct(90, 98));             // never over 100
+  TEST_ASSERT_TRUE(SOIL_WET_DEFAULT_PCT >= 35 + THRESH_MIN_GAP_PCT);   // the defaults agree with each other
+}
+
 void test_tank_check_needs_a_live_run_and_no_switch_reset(void) {
   TEST_ASSERT_TRUE(runLossNeedsTankCheck(true, false));
   TEST_ASSERT_FALSE(runLossNeedsTankCheck(true, true));     // a switch reset re-runs on its own (locked behaviour)
@@ -674,6 +702,19 @@ void test_level_pct_with_the_measured_tank_geometry(void) {
   TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f,   levelPct(48.0f, E, F));
 }
 
+// LINK PACE (18 Nov 2026 e): busy while a window is open, and from preMin before it opens; not after it, nor
+// for tomorrow's window late at night.
+static void test_window_open_or_soon() {
+  TEST_ASSERT_TRUE(windowOpenOrSoon(360, 360, 480, 10));    // 06:00, window 06:00-08:00: open (inclusive start)
+  TEST_ASSERT_TRUE(windowOpenOrSoon(480, 360, 480, 10));    // 08:00: still open (inclusive end)
+  TEST_ASSERT_FALSE(windowOpenOrSoon(481, 360, 480, 10));   // 08:01: over
+  TEST_ASSERT_TRUE(windowOpenOrSoon(350, 360, 480, 10));    // 05:50: opens in 10 min
+  TEST_ASSERT_FALSE(windowOpenOrSoon(349, 360, 480, 10));   // 05:49: 11 min away
+  TEST_ASSERT_FALSE(windowOpenOrSoon(1435, 0, 60, 10));     // 23:55, tomorrow's 00:00 window: not counted
+  TEST_ASSERT_FALSE(windowOpenOrSoon(600, 360, 480, 0));    // preMin 0: only while open
+  TEST_ASSERT_TRUE(windowOpenOrSoon(360, 360, 480, 0));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_imap_matches_arduino_map);
@@ -746,6 +787,8 @@ int main(int, char **) {
   RUN_TEST(test_is_leap_year);
   RUN_TEST(test_npk_min_moisture_stays_below_irrigation_start);
   RUN_TEST(test_reservoir_low_uses_the_reservoir_reading_only);
+  RUN_TEST(test_reservoir_pause_only_goes_up_from_the_filter_zone);
+  RUN_TEST(test_column_thresholds_follow_the_default_or_their_own);
   RUN_TEST(test_tank_check_needs_a_live_run_and_no_switch_reset);
   RUN_TEST(test_crc8_matches_vectors_worked_out_separately);
   RUN_TEST(test_frame_check_accepts_a_good_frame_and_gives_the_body);
@@ -753,5 +796,6 @@ int main(int, char **) {
   RUN_TEST(test_crc_field_round_trips_through_the_frame_check);
   RUN_TEST(test_servo_side_for_each_pump);
   RUN_TEST(test_level_pct_with_the_measured_tank_geometry);
+  RUN_TEST(test_window_open_or_soon);
   return UNITY_END();
 }

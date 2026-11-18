@@ -374,6 +374,29 @@ static inline bool reservoirLow(bool seen, float levelPct, float lowPct) {
   return seen && levelPct >= 0.0f && levelPct < lowPct;
 }
 
+/* Watering thresholds per column, and the reservoir pause (18 Nov 2026, the owner: Soil start per zone, an Overwatered
+ * setting, and "adjust the Watering pauses if it falls below 18 %, so the pumps never run dry"). Soil start and Too
+ * wet each have a default (LCD Settings > Thresholds, the website's System tab) and an optional own value per column,
+ * -1 = follow the default. Too wet only warns: it never starts or stops a run. It always sits THRESH_MIN_GAP_PCT
+ * above the soil start it is paired with, so a column can't be "dry enough to water" and "too wet" at once. The
+ * reservoir pause can be raised from the filter zone (floorPct: RES_FILTER_PCT, where the reservoir's ultrasonic
+ * stops seeing water) up to RES_PAUSE_MAX_PCT, never lowered below it. */
+const int SOIL_WET_DEFAULT_PCT = 90;
+const int THRESH_MIN_GAP_PCT   = 5;
+const int RES_PAUSE_MAX_PCT    = 50;
+static inline int effPct(int ownPct, int defaultPct) { return ownPct >= 0 ? ownPct : defaultPct; }
+static inline bool wetAboveStart(int startPct, int wetPct) {
+  return wetPct <= 100 && wetPct >= startPct + THRESH_MIN_GAP_PCT;
+}
+// The Too wet % that applies: never closer than the gap above soil start (a default changed later can't make a
+// column's pair contradict itself), never over 100.
+static inline int wetEffPct(int wetPct, int startPct) {
+  int lo = startPct + THRESH_MIN_GAP_PCT;
+  int w = wetPct < lo ? lo : wetPct;
+  return w > 100 ? 100 : w;
+}
+static inline bool resPauseOk(int pct, int floorPct) { return pct >= floorPct && pct <= RES_PAUSE_MAX_PCT; }
+
 /* Does a lost run need the operator to check the mixing tank first? ESP2's saved tank volume can read low after
  * a frozen ESP2 is cut or a reset lands mid-fill, and the next fill would then overfill. A battery-switch reset is
  * exempt: that run re-runs on its own by design, and ESP2's journals keep its bookkeeping right. */
@@ -417,6 +440,14 @@ static inline void crcFieldFor(const char *payload, size_t n, char out[5]) {
   static const char HEX_DIGITS[] = "0123456789ABCDEF";
   uint8_t c = crc8Text(payload, n);
   out[0] = ','; out[1] = '*'; out[2] = HEX_DIGITS[c >> 4]; out[3] = HEX_DIGITS[c & 0x0F]; out[4] = 0;
+}
+
+/* LINK PACE (18 Nov 2026 e): a watering window [s, e] (minutes of the day, inclusive at both ends, as windowAt())
+ * is open at minute `mod`, or opens within `preMin` minutes later today. ESP1 keeps Firebase in the background
+ * ("busy") from then until the window is served or over. */
+static inline bool windowOpenOrSoon(uint16_t mod, uint16_t s, uint16_t e, uint16_t preMin) {
+  if (mod >= s && mod <= e) return true;
+  return s > mod && (uint16_t)(s - mod) <= preMin;
 }
 
 #endif // PURE_MATH_H

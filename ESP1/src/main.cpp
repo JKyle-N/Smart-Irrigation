@@ -45,6 +45,7 @@
 #include <DNSServer.h>           // captive-portal DNS for the provisioning AP
 #include "pure_math.h"           // soil/level/pulse maths -- host-testable, see ESP1/test/
 #include "gsm_modem.h"           // A7670C SMS driver -- host-tested against a simulated modem
+#include "run_plan.h"            // a column's Operation (Automatic / Manual) and its day plan (2026-11-18)
 #include "../../shared/rig_constants.h"   // WATER_BUDGET_L, MIXING_TANK_MAX_L, MIX_HIGH_PCT: shared with ESP2
 // A millis() stamp that is never 0 (0 = "not set") and never in the future (2026-11-17). The old `t | 1` made every even
 // stamp 1 ms ahead of the clock, so `now - stamp` taken in the same millisecond wrapped to ~49 days and a timeout fired
@@ -137,6 +138,14 @@ const char COL_TAG[NUM_COLUMNS] = { 'A', 'B', 'C' };
  * volume and then ends, so there is no stop threshold (decision D11).          */
 // Editable at commissioning AND on-device via Settings menu (persisted to NVS).
 int soilStartPct = 35;   // start irrigation below this %   [TBD]
+// 18 Nov 2026 (the owner): an Overwatered line, and both lines per column. soilWetPct is the default "Too wet" line,
+// a warning only (pure_math.h: wetEffPct keeps it above soil start). A column's own value, -1 = follow the default;
+// set from the website's Edit settings (SET_COLUMN soilStart / soilWet), kept in NVS c<n>ss / c<n>sw.
+int    soilWetPct = SOIL_WET_DEFAULT_PCT;
+int8_t colSoilStart[NUM_COLUMNS] = { -1, -1, -1 };
+int8_t colSoilWet[NUM_COLUMNS]   = { -1, -1, -1 };
+static int colStartPct(int c) { return effPct(colSoilStart[c], soilStartPct); }
+static int colWetPct(int c)   { return wetEffPct(effPct(colSoilWet[c], soilWetPct), colStartPct(c)); }
 /* ---- NPK 7-in-1 trust thresholds ----------------------------------------- *
  * The probe reads moisture and N/P/K unreliably in unsaturated soil, so neither is trusted blindly:
  *  AGREE  how far its moisture may sit from the capacitive pair before it is dropped from the
@@ -246,6 +255,12 @@ bool soilCalStats(int *mean, int *lo, int *hi, bool *steady) {
 // loadCal() reads the `calib` NVS keys reCm2/rfCm2/meCm2/mfCm2 over these. The keys were BUMPED from
 // reCm/rfCm/meCm/mfCm (same reason as the soil "a2"/"w2" keys): an older on-device value no longer
 // overrides these measured defaults after flashing. Calibration > "Ultra ... empty" writes the new keys.
+// Tape check (user, 2026-11-18): the sensor head is 47.5 cm above the inside floor, so 42.9 cm is 4.6 cm of water
+// (~4.3 L) above the floor and 24.0 cm is 23.5 cm of water. That is NOT a sensor offset: on 17 Nov the reservoir,
+// pumped dry, read 47.1-47.6 cm. 0 % is where deliveries leave the mixing tank (it read 42.8-43.2 cm after every
+// delivery), so the marks stay. 100 % cannot move up to the tank's 35.8 cm body line: water there is 11.7 cm from
+// the sensor, inside the waterproof sensor's ~20 cm dead zone (no reading under 19.8 cm all day on 17 Nov), and the
+// 90 % stop / 97 % backstop would go blind. Raise the sensors >= 12 cm first if 100 % must be the body line.
 float calResEmptyCm = 42.9f, calResFullCm = 24.0f;     // ultrasonic geometry (moved from Nano) [MEASURED]
 float calMixEmptyCm = 42.9f, calMixFullCm = 24.0f;     //                                        [MEASURED]
 const float CAL_LEVEL_MIN_SPAN_CM = 2.0f;               // empty must sit this far beyond full, or it is ignored
@@ -253,16 +268,32 @@ const float CAL_LEVEL_MIN_SPAN_CM = 2.0f;               // empty must sit this f
 /* ---- Tank litres (web v.4 "pure ultrasonic", shared/tank_volume.h) ------------------------------------ *
  * The ResMix / MixIrr flow meters are gone: ESP2 meters every transfer and delivery on the mixing-tank level
  * in LITRES, which this board works out from the raw cm and sends with each LEVEL line. Each tank is a
- * truncated cone -- ~31.0 cm across at the 0 % level, ~39.4 cm at 100 % (user, 2026-11-16) -- corrected by the
- * operator's own "level -> litres" points (Calibration > "Tank Mix liters" / "Tank Res liters", up to 8 each,
- * NVS blobs "tvM" / "tvR"). The diameters are the same for both tanks; change them here if a tank differs.  */
-const float TANK_D_BOTTOM_CM = 31.0f;                  // inner diameter at the 0 % (EMPTY) level   [MEASURE]
-const float TANK_D_TOP_CM    = 39.4f;                  // inner diameter at the 100 % (FULL) level  [MEASURE]
+ * truncated cone, corrected by the operator's own "level -> litres" points (Calibration > "Tank Mix liters" /
+ * "Tank Res liters", up to 8 each, NVS blobs "tvM" / "tvR"). The shape is the same for both tanks.
+ * SHAPE (tape, user, 2026-11-18; inner circumference, wall already deducted): 108.7 cm at the floor, 117.4 cm at
+ * 22.6 cm, 122.4 cm at 35.8 cm -> 34.60 / 37.37 / 38.96 cm across, a straight taper of 0.1219 cm per cm (the middle
+ * point sits 0.1 mm off the line). Above 35.8 cm it flares to 41.7 cm at the rim (46.0 cm deep inside); no water
+ * goes there. tankVolSyncGeom() turns this into the diameters at the 0 % and 100 % marks, so a re-captured EMPTY
+ * keeps the litres right. (Was a guessed 31.0 / 39.4 cm at the marks: ~20 % too few litres near 0 %.)       */
+const float TANK_SENSOR_H_CM = 47.5f;                  // sensor head above the inside floor            [MEASURED]
+const float TANK_D_FLOOR_CM  = 34.60f;                 // inner diameter at the floor (108.7 cm around)  [MEASURED]
+const float TANK_TAPER_CM    = 0.1219f;                // inner diameter gained per cm of height          [MEASURED]
 // The mixer standing on the mixing tank's bottom (user, 2026-11-17): 6 cm across, 11.4 cm tall = 322.3 cm^3 the water
 // cannot fill. tank_volume.h takes it out of the shape; the ultrasonic is not in its way.
 const float MIXER_DIAM_CM = 6.0f, MIXER_H_CM = 11.4f;   //                                            [MEASURED]
-TankVolCal calMixVol = { 42.9f, 24.0f, TANK_D_BOTTOM_CM, TANK_D_TOP_CM, 0, {0}, {0}, MIXER_DIAM_CM, MIXER_H_CM };
-TankVolCal calResVol = { 42.9f, 24.0f, TANK_D_BOTTOM_CM, TANK_D_TOP_CM, 0, {0}, {0} };
+// Inner diameter at the water level a sensor distance means (the floor diameter for a distance past the floor).
+static float tankDiamAtCm(float distCm) {
+  float h = TANK_SENSOR_H_CM - distCm;
+  return TANK_D_FLOOR_CM + TANK_TAPER_CM * (h > 0.0f ? h : 0.0f);
+}
+// tank_volume.h stands the insert on the 0 % mark; the part of the mixer below that mark holds no counted water.
+static float mixerHAboveEmpty(float emptyCm) {
+  float h = MIXER_H_CM - (TANK_SENSOR_H_CM - emptyCm);
+  return h > 0.0f ? h : 0.0f;
+}
+TankVolCal calMixVol = { 42.9f, 24.0f, tankDiamAtCm(42.9f), tankDiamAtCm(24.0f), 0, {0}, {0}, MIXER_DIAM_CM,
+                         mixerHAboveEmpty(42.9f) };
+TankVolCal calResVol = { 42.9f, 24.0f, tankDiamAtCm(42.9f), tankDiamAtCm(24.0f), 0, {0}, {0} };
 // Hardening of the reading itself (the Nano sends the MEDIAN of its last 5 pings and their spread):
 // a median whose pings spread more than this is a splash / ripple / multipath, not a level -- it is shown but
 // NOT used for control (sent to ESP2 as -1, which ESP2 treats as "no reading").                      [MEASURE]
@@ -286,6 +317,10 @@ static void tankVolSyncGeom() {
   for (uint8_t i = 0; i < calResVol.n && i < TV_MAX_PTS; i++) calResVol.hCm[i] += dR;
   calMixVol.emptyCm = calMixEmptyCm; calMixVol.fullCm = calMixFullCm;
   calResVol.emptyCm = calResEmptyCm; calResVol.fullCm = calResFullCm;
+  // The measured shape, at wherever the marks now are (2026-11-18).
+  calMixVol.dBottomCm = tankDiamAtCm(calMixEmptyCm); calMixVol.dTopCm = tankDiamAtCm(calMixFullCm);
+  calResVol.dBottomCm = tankDiamAtCm(calResEmptyCm); calResVol.dTopCm = tankDiamAtCm(calResFullCm);
+  calMixVol.insHCm = mixerHAboveEmpty(calMixEmptyCm);
 }
 // Litres the mixing tank holds at ESP2's overflow stop: the most a fill may plan to put in it (MIXCAP).
 static float mixCapLiters() {
@@ -324,6 +359,13 @@ static int soilCombine(int col, int v1, int v2, int npkPct, SoilBlend *why) {
 // shared/rig_constants.h) -- its ultrasonic stops at ~15 % and cannot see the water left below. Was 15 %, which an
 // empty reservoir sitting on its filter reads, so it never tripped.                                   [TBD]
 const float RES_LOW_PCT      = RES_FILTER_PCT;
+// The reservoir pause (18 Nov 2026, the owner: "adjust the Watering pauses if it falls below 18 %, so the pumps never
+// run dry"): new runs and forced runs wait while the reservoir reads under it. RES_LOW_PCT is now its floor: it can be
+// raised to RES_PAUSE_MAX_PCT (LCD Settings > Thresholds, website System tab: SET_THRESH thRes; NVS "rpause"), never
+// set lower, because the ultrasonic can't see the water under the filter. ESP2's own empty check during a fill
+// (RES_EMPTY, at RES_FILTER_PCT) is unchanged.
+int resPausePct = (int)RES_LOW_PCT;
+static float resPauseLevel() { return (float)clampi(resPausePct, (int)RES_LOW_PCT, RES_PAUSE_MAX_PCT); }
 const float MIX_TARGET_PCT   = 70.0f;   // mixing tank fill target          [TBD]
 const float MIX_MAX_PCT      = 95.0f;   // mixing tank overflow guard       [TBD]
 
@@ -670,6 +712,12 @@ struct ColumnConfig {
   long    fertStamp;             // yyyymmdd nutrients last went in (at most once a day)
 };
 ColumnConfig col[NUM_COLUMNS];
+// Operation (2026-11-18, website request): Automatic = waters on its watering times (as before); Manual = readings
+// only, ESP1 starts no scheduled run for the column, the operator uses forced runs. colOpManual is the column's
+// default; colPlan marks single days that override it (run_plan.h). Both persist in NVS ("c<n>op", "c<n>pl"), set by
+// SET_COLUMN {operation, plan, planFrom} from the website, cleared by Restore Defaults.
+uint8_t colOpManual[NUM_COLUMNS] = { 0, 0, 0 };
+RunPlan colPlan[NUM_COLUMNS];
 
 /* ---- Latest Nano sensor snapshot ----------------------------------------- */
 struct SensorData {
@@ -923,10 +971,11 @@ String   replyTarget = "";
  * hum, lux, reservoir%, mixing%, battV, battW, flow. Channel 3 "Chem" = solar I,
  * pH A, solar Wh today, pH B, battery A, pH C, solar V, solar W (EC dropped 2026-11-15). */
 const char *TS_HOST = "api.thingspeak.com";
-const unsigned long TS_UPLOAD_IDLE_MS   = 60000;   // upload cadence when idle
-const unsigned long TS_UPLOAD_ACTIVE_MS = 20000;   // faster during ACTIVE_STATE
+const unsigned long TS_UPLOAD_IDLE_MS   = 60000;   // upload cadence, every mode (20 s during a run before 18 Nov 2026 e:
+                                                   // the rig now comes first while busy -- see LINK PACE below)
 const unsigned long WIFI_RETRY_MS       = 15000;   // reconnect backoff
 const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
+const uint16_t      TS_TIMEOUT_MS       = 4000;    // connect / answer budget per ThingSpeak send (6 s before 18 Nov 2026 c)
 
 /* ---- Firebase Realtime Database bridge (live dashboard snapshot) ---------- *
  * Phase 1 of Web_Dashboard_Firebase_Plan.md: ESP32 #1 PUTs the latest verified
@@ -949,25 +998,70 @@ const unsigned long WIFI_CONNECT_MS     = 12000;   // per-attempt connect budget
  *     tracked source, same rule as the Supabase creds. The password is used ONCE at
  *     provisioning; steady state refreshes with the stored refresh token, so the
  *     password can be wiped afterwards (FBASE,SIGNOUT or the portal's Forget button). */
-const unsigned long FIREBASE_UPLOAD_IDLE_MS   = 60000;  // ~1 min dashboard refresh when idle
-const unsigned long FIREBASE_UPLOAD_ACTIVE_MS = 20000;  // faster during ACTIVE_STATE
+/* ---- LINK PACE (18 Nov 2026 e; "link lite" 18 Nov 2026 g, the owner) --------------------------------------------- *
+ * e: "Don't show realtime; a Refresh button for live data; still refresh every 20-30 s or longer, only while idle.
+ *    During an operation, or when a fertigation/irrigation is coming up, focus on the operation, not Firebase."
+ * g: "Make the website communication back to before, no longer high realtime ... still it automatically refreshes to
+ *    request data from the system, and a refresh button. To lessen the load of ESP1." So the link is back to its pre-17 Nov
+ *    weight: one report a minute, no "watched" pace (the page no longer touches irrigation/viewer/at), no automatic
+ *    upload of old SD logs (the 17 Nov catch-up of up to 14 days at ~1.2 MB each, never finished on this link), and the
+ *    two polls added on 17 Nov slowed down. The SD card's own record (D:\, 10-18 Nov) shows why: at -84..-89 dBm ESP1's
+ *    reports failed 1-8 % a day from 10 to 17 Nov, and 97 % on 18 Nov with the extra traffic.
+ *
+ * ESP1 is in one of two link modes (linkModeNow(), core 0):
+ *   BUSY    a run, its warm-up, a pump exercise, an armed forced run, a dosed tank waiting, or a watering window that
+ *           is open (and not yet served) or opens within LINK_PRE_RUN_MIN -- see linkBusyFlag, set on core 1.
+ *           A Refresh at most every FB_REFRESH_GAP_BUSY_MS, no SD log upload, no quick retries. Commands (and every
+ *           stop) are still read every FIREBASE_COMMAND_POLL_MS, and a fault still pushes at once.
+ *   IDLE    everything else.
+ * The website reads the pace from meta.refreshMs and the mode from meta.linkMode, and works out "late" and "lost" from
+ * them, so these numbers can change here without a website change. Keep it that way: one table, here. */
+const unsigned long FB_PACE_IDLE_MS          = 60000;   // one report a minute (the pace before 17 Nov)
+const unsigned long FB_PACE_BUSY_MS          = 60000;   // a run or one coming up: the rig comes first (20 s before 17 Nov)
+const unsigned long FB_REFRESH_GAP_IDLE_MS   = 10000;   // the Refresh button / page open, idle
+const unsigned long FB_REFRESH_GAP_BUSY_MS   = 30000;   // the Refresh button / page open, busy
+const unsigned long FB_VIEWER_POLL_MS        = 6000;    // irrigation/viewer (Refresh requests); 3 s on 17-18 Nov f
+const unsigned long FB_LOGREQ_POLL_MS        = 30000;   // irrigation/logRequest ("Upload from the rig"); 10 s on 17-18 Nov f
+const uint16_t      LINK_PRE_RUN_MIN         = 10;      // BUSY this many minutes before a watering window opens
+// Recovery (18 Nov 2026 e; g: 3 / 10, was 2 / 8): the reports that failed in a row with a network error (code -1..-99).
+// After every FB_RESET_AFTER_FAILS of them the TLS session is dropped and the next request opens a fresh one; after
+// FB_REJOIN_AFTER_FAILS, WiFi is left and joined again. On 18 Nov 398 reports failed on one session without either.
+const uint8_t       FB_RESET_AFTER_FAILS     = 3;
+const uint8_t       FB_REJOIN_AFTER_FAILS    = 10;
+// Firebase request budgets (18 Nov 2026 f). On 18 Nov 18:32 (18e, -87 dBm) Firebase STORED a report while ESP1 gave up
+// waiting for the 204 (http=-11): 6 s was too short for the reply on this link. Connect stays 6 s.
+const uint16_t      FB_CONNECT_TIMEOUT_MS    = 6000;
+const uint16_t      FB_REPLY_TIMEOUT_MS      = 12000;
+enum LinkMode : uint8_t { LINK_IDLE = 0, LINK_BUSY = 2 };   // 1 was WATCHED (30 s while a page was open), 18 Nov e-f
+volatile bool       linkBusyFlag = false;               // core 1 (telemetryCollect) -> core 0
+volatile uint32_t   fbLinkResets = 0, fbWifiRejoins = 0;   // recovery counters since this start (diagnostics)
+volatile uint32_t   fbTextFixes = 0;                    // reports whose text needed cleaning before the PUT (18 Nov 2026 g)
+// Firebase's own words when it refuses a report (18 Nov 2026 g): core 0 -> core 1 (logEvent is core-1 only), as
+// FBASE,REPLY|... and FBASE,TEXT|... lines. On 18 Nov evening every report that reached Firebase got HTTP 400, and the
+// reason was thrown away with the body.
+char                fbReplyLog[176] = "";
+volatile bool       fbReplyLogPending = false;
 const unsigned long FB_PUSH_MIN_GAP_MS        = 5000;   // floor between error-triggered out-of-band pushes
 const unsigned long FB_PUSH_FRESH_WAIT_MS     = 2500;   // longest a push waits for a snapshot taken after its event
 // Command poll cadence. The TLS connection is REUSED between polls (fbClient/fbHttp below),
 // so this is one small GET on an open socket -- not a handshake every 3 s.
 const unsigned long FIREBASE_COMMAND_POLL_MS  = 3000;
-// Live viewing (2026-11-17, user: "a very realtime website, and a refresh button"). While a dashboard page is open and on
-// screen it touches irrigation/viewer/at every ~15 s; its Refresh button touches irrigation/viewer/refreshAt. ESP1 polls
-// that node with the commands and, while someone is watching, uploads the snapshot every FIREBASE_UPLOAD_LIVE_ACTIVE_MS
-// during a run / FIREBASE_UPLOAD_LIVE_IDLE_MS otherwise, instead of every 20 / 60 s. Nobody watching: nothing extra
-// goes up. A Refresh is answered at once (at most every FB_REFRESH_MIN_GAP_MS). Core 0 (netTask) only.
-const unsigned long FIREBASE_UPLOAD_LIVE_ACTIVE_MS = 2000;
-const unsigned long FIREBASE_UPLOAD_LIVE_IDLE_MS   = 4000;
-const unsigned long FB_VIEWER_HOLD_MS              = 45000;   // one touch keeps the fast pace this long
-const unsigned long FB_REFRESH_MIN_GAP_MS          = 1500;
-unsigned long fbViewerUntilMs = 0;
+// Refresh (2026-11-17; LINK PACE since 18 Nov 2026 e). The website's Refresh button, and the page opening or coming back
+// to the front, touch irrigation/viewer/refreshAt. ESP1 polls that node every FB_VIEWER_POLL_MS and answers with a
+// report at once (at most every FB_REFRESH_GAP_IDLE_MS / _BUSY_MS). irrigation/viewer/at (a page being open, 17 Nov to
+// 18 Nov f) is no longer used: since 18 Nov g the pace does not change with viewers. Core 0 (netTask) only.
+const unsigned long FB_LOG_STEP_MIN_MS             = 500;     // the SD log upload: one piece a pass at most
+// A live report that fails is tried again after FB_UPLOAD_RETRY_MS, up to FB_UPLOAD_RETRIES times in a row (18 Nov 2026 c),
+// instead of at the next tick: the website calls ESP1 lost at 90 s. Not while BUSY (18 Nov 2026 e): the next tick will do.
+const unsigned long FB_UPLOAD_RETRY_MS             = 3000;
+const uint8_t       FB_UPLOAD_RETRIES              = 3;
+// FBASE,OK/FAIL lines at most this often (18 Nov 2026 c). Nothing is lost -- every line carries the running totals
+// n= (attempts) and fail= (failures).
+const unsigned long FB_LOG_TRANSITION_MIN_MS       = 10000;
 bool          fbRefreshPending = false;
-static bool fbViewerWatching() { return fbViewerUntilMs != 0 && (long)(fbViewerUntilMs - millis()) > 0; }
+static LinkMode linkModeNow() { return linkBusyFlag ? LINK_BUSY : LINK_IDLE; }
+static unsigned long linkPaceMs(LinkMode m) { return m == LINK_BUSY ? FB_PACE_BUSY_MS : FB_PACE_IDLE_MS; }
+static const char *linkModeName(LinkMode m) { return m == LINK_BUSY ? "busy" : "idle"; }
 /* ---- Operator FORCE run limits -------------------------------------------- *
  * A FORCE_RUN is a full irrigation/fertigation with operator-supplied volume and doses -- far more
  * consequential than the bounded 5 s pump test the other remote commands allow. These are the caps
@@ -979,9 +1073,25 @@ const float FORCE_MAX_DOSE_ML  = 500.0f;  // per nutrient, per request          
 // command id to report completion against ("" = started from SMS/LCD).
 uint8_t forceMask = 0;
 char    forceCmdId[48] = "";
-// Skip an upload below this much free heap: an mbedTLS session needs ~40-50 KB and a
-// failed alloc mid-handshake is far worse than a skipped dashboard tick.
-const uint32_t FIREBASE_MIN_HEAP = 60000;
+/* ---- MEMORY for the network (18 Nov 2026 h) -------------------------------------------------------------------------
+ * ESP.getFreeHeap() / ESP.getMaxAllocHeap() count MALLOC_CAP_INTERNAL, which on the ESP32 includes ~40 KB of spare IRAM
+ * that only 32-bit loads can use: never a String, a JSON text or an mbedTLS buffer. That is why the "largest block" read
+ * 40,948 all day on 18 Nov (it is that IRAM), and why "68 KB free" was really ~27 KB of usable memory. The 60 / 32 KB
+ * floors of 17-18 Nov were measured against that number and protected nothing. From 18 Nov h every decision uses
+ * byte-addressable memory (MALLOC_CAP_8BIT): heap8Free() and heap8Block().
+ *   FB_TLS_MIN_BLOCK / _FREE  a NEW TLS session needs one block for mbedTLS's 16 KB input buffer and ~24 KB in all.
+ *                             Below that the handshake can only fail (http=-1) after churning the heap, so it is not
+ *                             tried (fbBegin) and the next pass tries again.
+ *   FB_REPORT_MIN_BLOCK       the report's JSON text (~5.1 KB) in one block.
+ * 18 Nov h also stopped HTTPClient copying every body: PUT(String) / POST(String) / PATCH(String) take the String BY
+ * VALUE, a second 5-7 KB block. When that copy failed the request went out with NO body and Firebase answered HTTP 400
+ * "No data supplied." -- logged by 18 Nov g (FBASE,REPLY), the cause of every 400 that evening. */
+const uint32_t FB_TLS_MIN_BLOCK    = 17000;
+const uint32_t FB_TLS_MIN_FREE     = 24000;
+const uint32_t FB_REPORT_MIN_BLOCK = 6144;
+static inline uint32_t heap8Free()  { return heap_caps_get_free_size(MALLOC_CAP_8BIT); }
+static inline uint32_t heap8Block() { return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT); }
+volatile uint32_t fbTlsSkips = 0;                  // new TLS sessions not tried for want of memory (diagnostics)
 // URL is NVS-backed (SoftAP admin form / FBASE SMS) -- never hardcoded in tracked source,
 // same rule as the Supabase creds. Empty URL or firebaseEnabled=false disables the feature.
 String   fbUrl = "";                               // e.g. "https://<ref>-default-rtdb.<region>.firebasedatabase.app"
@@ -989,9 +1099,15 @@ bool     firebaseEnabled = true;                   // master switch (NVS "fben")
 volatile bool fbPersistPending = false;            // core0 admin form -> core1: persist fbUrl/firebaseEnabled
 volatile bool fbLastOk = false;                    // last PUT result (diagnostics page)
 volatile unsigned long fbLastUploadMs = 0;         // cadence gate + "last seen" age
-volatile uint32_t fbLastHeap = 0;                  // free heap observed at the last attempt
+volatile uint32_t fbLastHeap = 0;                  // byte-addressable heap free at the last attempt (18 Nov h: was INTERNAL)
+volatile uint32_t fbLastBlock = 0;                 // ...and its largest block (18 Nov 2026 h)
 volatile int  fbLastHttp = 0;                      // last HTTP status (0 = never attempted / skipped)
 volatile uint32_t fbAttempts = 0, fbFailures = 0;  // lifetime counters (logged on transition)
+// 18 Nov 2026 (c): counts FINISHED firebaseUploadLive() calls, so firebaseLogTick() (core 1) reads fbLastOk/fbLastHttp only
+// once they describe the call that just ended. It used fbLastUploadMs, which is stamped when a call STARTS, so each
+// FBASE line described the attempt before, and the "FAIL|http=0" just after every restart was a request still on the wire.
+volatile uint32_t fbUploadDone = 0;
+const char * volatile fbLastSkip = "";             // why the last call sent nothing ("" = it sent); string literals only
 
 /* ---- Firebase Auth (device account) --------------------------------------- *
  * Provision once with email+password -> signInWithPassword returns an ID token AND a
@@ -1019,6 +1135,7 @@ char     fbPollErrLog[96] = "";
 volatile bool fbPollErrLogPending = false;
 bool     fbPinCa = true;                           // validate the server cert against FB_ROOT_CA (NVS "fbpin")
 unsigned long fbTokenExpiryMs = 0;                 // millis() deadline for the current ID token
+unsigned long fbTokenUsableMs = 0;                 // when that token really stops working (18 Nov 2026 c, fbEnsureToken)
 volatile bool fbAuthOk = false;                    // last token operation succeeded (diagnostics)
 volatile int  fbAuthHttp = 0;                      // last auth HTTP status
 volatile bool fbSignInPending = false;             // portal/SMS -> netTask: force a password sign-in now
@@ -1027,6 +1144,10 @@ volatile bool fbTlsResetPending = false;           // SMS (core 1) -> netTask: r
 // Auth backoff: a wrong password must NOT be retried every poll (that is credential
 // hammering and Google will rate-limit the account). Same ladder shape as uploadTick().
 const unsigned long FB_AUTH_BACKOFF[4] = { 30000UL, 120000UL, 480000UL, 1800000UL };
+// 18 Nov 2026 (c): a renewal that never reached Google (no WiFi, DNS or TLS: HTTP code <= 0) is the network, not the
+// credentials, so it is tried again this soon and does not climb that ladder. It used to: on 17 Nov a short drop during
+// a renewal (09:43-09:47, 14:53-14:59) meant 30 s, then 2 min, then 8 min with no reports at all.
+const unsigned long FB_AUTH_NET_RETRY_MS = 10000;
 uint8_t  fbAuthFails = 0;
 unsigned long fbAuthNextTryMs = 0;
 
@@ -1052,10 +1173,21 @@ struct FirebaseCommand       { char id[48]; char type[32]; char pump[16];
                                int16_t wins[MAX_RUNS_PER_DAY][2];
                                float tgt[4];         // N, P, K, pH  (-1 = absent)
                                char  preset[16];     // SET_COLUMN: crop preset name ("" = absent)
+                               // SET_COLUMN Operation and day plan (2026-11-18, run_plan.h). operation: -1 absent,
+                               // 0 AUTOMATIC, 1 MANUAL, 2 not recognised. planState: 0 absent, 1 copied whole into
+                               // plan[], 2 not a string or longer than RUN_PLAN_DAYS. planFrom: yyyymmdd of plan[0]
+                               // (-1 absent = ESP1's today).
+                               int8_t operation, planState;
+                               char  plan[RUN_PLAN_DAYS + 2];
+                               long  planFrom;
+                               // SET_COLUMN own Soil start / Too wet % (2026-11-18): COL_PCT_ABSENT, -1 = back to
+                               // the default, 0..100 = its own; COL_PCT_BAD = not a whole number. Range-checked on core 1.
+                               int   soilStart, soilWet;
                                // SET_CLOCK, all required together (not optional-absent like above).
                                int16_t clkY; int8_t clkMo, clkD, clkH, clkMi;
-                               // SET_THRESH, all required together.
-                               int   thStart; float thGap;
+                               // SET_THRESH: start + gap required together; Too wet and the reservoir pause
+                               // (2026-11-18) optional, -1 = absent (an older page sends only the first two).
+                               int   thStart; float thGap; int thWet, thRes;
                                // SET_AC_VOLT, both required (-1 = absent or not a whole number).
                                int   acVMin, acVMax;
                                // SET_AC_AMP, both required, whole tenths of an amp (-1 = absent or not whole).
@@ -1065,6 +1197,7 @@ struct FirebaseCommand       { char id[48]; char type[32]; char pump[16];
 // catch a mistyped volume. 0 is still allowed for a deliberate fire-now.
 const uint16_t FORCE_DEFAULT_DELAY_S = 30;
 const uint16_t FORCE_MAX_DELAY_S     = 300;
+const int COL_PCT_ABSENT = -1000, COL_PCT_BAD = -1001;   // FirebaseCommand.soilStart / soilWet sentinels
 struct FirebaseCommandStatus { char id[48]; char status[16]; char detail[48]; };
 QueueHandle_t fbCommandQueue = NULL;                // core0 -> core1: requests awaiting validation
 QueueHandle_t fbStatusQueue  = NULL;                // core1 -> core0: results to PATCH back
@@ -1337,6 +1470,7 @@ struct TelemetrySnapshot {
   char     runStage[18];
   uint8_t  runOrd, runTotal, runPhaseId;
   int      runCol;
+  uint8_t  runMask;            // every column the run waters (a FORCE run may water several): published as "A+B"
   float    runStageL, runStageTgt, runWaterGot, runWaterTgt;
   float    runDoseTgt[3], runDoseGot[3];
   // Diagnostics mirrored for the dashboard's diagnostics panel. All core-1 owned, so none of it may
@@ -1378,6 +1512,11 @@ struct TelemetrySnapshot {
   float    dayWaterL[NUM_COLUMNS], dayNutMl[NUM_COLUMNS];
   uint8_t  dayWaterings[NUM_COLUMNS], dayFeedings[NUM_COLUMNS];
   long     exNextMin[3];
+  // Operation + day plan per column (2026-11-18): the default, today's, and the plan text from today. planYmd is the
+  // date of plan[c][0]; -1 while ESP1's date isn't known, and then no plan is published.
+  uint8_t  opManual[NUM_COLUMNS], opManualToday[NUM_COLUMNS];
+  char     plan[NUM_COLUMNS][RUN_PLAN_DAYS + 1];
+  long     planYmd;
   bool     wmHeld;         // dashboard manual-mode hold
   long     wmLeftS;
   char     wmState[10], wmWhy[40];
@@ -1576,6 +1715,11 @@ bool     bswBootStruck = false;    // this boot already counted ESP1's own switc
 // A run was lost in a way that can leave ESP2's saved tank volume too low, so the next fill could overfill.
 // No run starts until the operator has looked at the tank and confirmed. Kept in NVS across reboots.
 volatile bool tankCheckNeeded = false;
+// For the website (18 Nov 2026): why the tank check was raised ("" = carried over a restart), this boot's reset
+// reason, and how many times ESP1 has started today (NVS "bootDay"/"bootN", counted once the date is known).
+char tankCheckWhy[40] = "";
+const char *bootReasonStr = "OTHER";
+uint16_t bootsToday = 0;
 static inline bool battQuietActive() {
   unsigned long u = battQuietUntilMs;
   return u != 0 && (long)(millis() - u) < 0;
@@ -2083,6 +2227,7 @@ RunPhase runPhase = RUN_NONE;
 struct RunUi {
   bool     fert;
   int      col;
+  uint8_t  mask;                    // every column this run waters (bit 0 = A): a FORCE run may water several at once
   uint8_t  ord, total;              // stage ordinal / total, as reported by ESP2
   char     stage[18];               // stage name (LCD-friendly, from ESP2)
   float    doseTgt[3], doseGot[3];  // per-nutrient mL planned / measured
@@ -2296,7 +2441,7 @@ void esp2SetPower(bool on, bool force = false);
 void esp2PowerTick();
 void dispatchPendingRun();
 void dispatchPendingExercise();
-void runUiBegin(int c, bool fert, float forceL = -1.0f, const float *forceDose = nullptr);
+void runUiBegin(int c, bool fert, float forceL = -1.0f, const float *forceDose = nullptr, uint8_t mask = 0);
 void runUiFinish(bool ok);
 void runUiTick();
 void runUiAdvance();
@@ -2547,7 +2692,8 @@ void setup() {
                     : rr == ESP_RST_PANIC ? "PANIC" : rr == ESP_RST_INT_WDT ? "INT_WDT" : rr == ESP_RST_TASK_WDT ? "TASK_WDT"
                     : rr == ESP_RST_WDT ? "WDT" : rr == ESP_RST_BROWNOUT ? "BROWNOUT" : rr == ESP_RST_DEEPSLEEP ? "DEEPSLEEP"
                     : "OTHER";
-    logEvent("SYS", "BOOT", String("reason=") + why + "|rr=" + (int)rr); }
+    logEvent("SYS", "BOOT", String("reason=") + why + "|rr=" + (int)rr);
+    bootReasonStr = why; }                                // a string literal: safe to keep the pointer
 
   // ---- WiFi/ThingSpeak uplink task on core 0 (Part A) ----
   // Started after NVS load so creds are ready. Runs network I/O off the core-1 loop.
@@ -2560,7 +2706,10 @@ void setup() {
   if (!fbCommandQueue || !fbStatusQueue) Serial.println(F("[FIREBASE] command queues unavailable"));
   // 28 KB: WebServer/scan/SD stream (portal) + mbedTLS handshake frames. Two TLS consumers now share
   // this task (Supabase daily CSV, Firebase every ~60 s) -- they serialize, but the deepest frame wins.
-  xTaskCreatePinnedToCore(netTask, "netTask", 28672, NULL, 1, &netTaskHandle, 0);
+  // 24 KB (28 KB until 18 Nov 2026 h). Its deepest use, through TLS handshakes and the portal, was ~11.5 KB on 18 Nov
+  // (FBASE netstk= never under 17,128 free of 28,672), and a task stack comes out of the same byte-addressable heap the
+  // network was starving for (see MEMORY for the network).
+  xTaskCreatePinnedToCore(netTask, "netTask", 24576, NULL, 1, &netTaskHandle, 0);
 
   bswBoot();                                // battery-switch latch + was THIS boot caused by a switch?
   wdtSetup();                               // arm task watchdog (core-1 loop only)
@@ -2938,10 +3087,23 @@ void loadConfig() {
       if (!windowsValid(win, n)) colRuns[c] = 1;
     }
     COLUMN_ENABLED[c] = prefs.getBool((String(key) + "en").c_str(), COLUMN_ENABLED[c]);
+    // Operation + day plan (2026-11-18). Absent on older NVS: Automatic, no plan -- exactly the old behaviour.
+    colOpManual[c] = prefs.getUChar((String(key) + "op").c_str(), 0) ? 1 : 0;
+    planClear(colPlan[c]);
+    {
+      String pk = String(key) + "pl";
+      RunPlan stored;
+      if (prefs.isKey(pk.c_str()) && prefs.getBytes(pk.c_str(), &stored, sizeof(stored)) == sizeof(stored)) colPlan[c] = stored;
+    }
+    // Own Soil start / Too wet (18 Nov 2026). Absent on older NVS: -1, the defaults -- exactly the old behaviour.
+    colSoilStart[c] = (int8_t)clampi(prefs.getChar((String(key) + "ss").c_str(), -1), -1, 100);
+    colSoilWet[c]   = (int8_t)clampi(prefs.getChar((String(key) + "sw").c_str(), -1), -1, 100);
   }
   // global thresholds (settable on-device, sec.10.10.1)
   soilStartPct = prefs.getInt("sstart", soilStartPct);
   fertGap      = prefs.getFloat("fgap", fertGap);
+  soilWetPct   = clampi(prefs.getInt("swet", soilWetPct), 0, 100);                               // 18 Nov 2026
+  resPausePct  = clampi(prefs.getInt("rpause", resPausePct), (int)RES_LOW_PCT, RES_PAUSE_MAX_PCT); // never under the filter
   { // AC supply window (PZEM): a missing or unusable pair keeps the compiled defaults.
     int lo = prefs.getInt("acvlo", AC_V_DEFAULT_LOW), hi = prefs.getInt("acvhi", AC_V_DEFAULT_HIGH);
     if (acVoltWindowOk(lo, hi)) { acVMin = lo; acVMax = hi; }
@@ -3256,6 +3418,37 @@ void saveColEnable(int c) {
   snprintf(key, sizeof(key), "c%d", c);
   prefs.putBool((String(key) + "en").c_str(), COLUMN_ENABLED[c]);
 }
+// Operation + day plan (2026-11-18, run_plan.h).
+void saveColumnPlan(int c) {
+  char key[8];
+  snprintf(key, sizeof(key), "c%d", c);
+  prefs.putUChar((String(key) + "op").c_str(), colOpManual[c]);
+  prefs.putBytes((String(key) + "pl").c_str(), &colPlan[c], sizeof(colPlan[c]));
+}
+// A column's own Soil start / Too wet (18 Nov 2026), -1 = the default.
+void saveColumnThresh(int c) {
+  char key[8];
+  snprintf(key, sizeof(key), "c%d", c);
+  prefs.putChar((String(key) + "ss").c_str(), colSoilStart[c]);
+  prefs.putChar((String(key) + "sw").c_str(), colSoilWet[c]);
+  // The same warning saveThresholds() gives for the default: under the NPK floor, this column never gets nutrients.
+  if (colSoilStart[c] >= 0 && colSoilStart[c] <= NPK_MIN_MOIST_PCT) {
+    logEvent("ESP1", "FAULT", String("WARN|THRESH_NO_FERT|col=") + COL_TAG[c] + "|start=" + colSoilStart[c]
+                              + "|npkMin=" + NPK_MIN_MOIST_PCT);
+    smsAlert(smsFaultText('W', "THRESH_NO_FERT", "Column " + String(COL_TAG[c]) + " start is " + String(colSoilStart[c]) +
+                                                 "%, the NPK sensor needs over " + String(NPK_MIN_MOIST_PCT) + "%"));
+  }
+}
+// Today's day number by ESP1's own clock, or -1 while the date isn't known (RTC not set yet / dead).
+static long planToday() {
+  return currentDayStamp > 0 ? planDayFromYmd(currentDayStamp) : -1;
+}
+// Whether column c is in Manual today: its plan's mark for today, else its default. With no date known, the
+// default alone -- a dead clock already stops every scheduled run (controlTick returns on !rtcOk).
+static bool colManualToday(int c) {
+  long today = planToday();
+  return today < 0 ? colOpManual[c] != 0 : planManualOn(colPlan[c], colOpManual[c] != 0, today);
+}
 
 /* Bounds for an operator-supplied nutrient target. The SMS "SET,COL_A,N,150,..." path historically
  * assigned whatever float arrived -- a typo'd negative or a stray extra digit went straight into
@@ -3295,6 +3488,8 @@ void saveExercise() {
 void saveThresholds() {
   prefs.putInt("sstart", soilStartPct);
   prefs.putFloat("fgap", fertGap);
+  prefs.putInt("swet", soilWetPct);       // 18 Nov 2026: the default Too wet line
+  prefs.putInt("rpause", resPausePct);    // 18 Nov 2026: the reservoir pause
   // Warn about a combination that silently disables fertigation. Irrigation only starts below
   // soilStartPct, so if that sits at or under the NPK trust floor the probe will always be too dry
   // to read when the decision is made, and every run downgrades to irrigation-only forever. Not
@@ -3560,7 +3755,7 @@ bool classifyAndApply(const String &payload, const String &raw) {
     sensor.rawResCm = rInv ? -1 : rd; sensor.rawMixCm = mInv ? -1 : md;   // Sensor Diag: raw cm + L/min
     sensor.rawFlow = tok[3].toFloat(); sensor.msTank = millis();
     // A1: clear the reservoir-low latch once the level recovers (with hysteresis).
-    if (!rInv && sensor.resLevel >= RES_LOW_PCT + 5.0f) resLowLatched = false;
+    if (!rInv && sensor.resLevel >= resPauseLevel() + 5.0f) resLowLatched = false;
     sensor.lastNanoMs = millis();
     // While an AC pump runs, or ESP2 holds a feed lease, relay every reading to ESP2 at once (web v.4: it meters
     // the water with it). A reading not usable for control -- lost echo, pings too scattered (splash, ripple,
@@ -4738,7 +4933,7 @@ void forceTick() {
   else if (esp2Held)                                            bad = "HELD";
   // (No TANK_CHECK here since 2026-11-17: a forced run is never refused for it -- see sendForceWorkOrder.)
   else if (secBattBlocksAc())                                   bad = secBlockTag();   // which reason (2026-11-17)
-  else if (reservoirLow(sensor.msTank != 0, sensor.resLevel, RES_LOW_PCT)) bad = "RES_LOW";
+  else if (reservoirLow(sensor.msTank != 0, sensor.resLevel, resPauseLevel())) bad = "RES_LOW";
   if (bad) { forceAbort(bad); return; }
 
   const ForceSeq &q = fcSeq[fcSlot];
@@ -4845,7 +5040,7 @@ void sendForceWorkOrder(uint8_t mask, float liters, const float doseMl[3], const
   strlcpy(forceCmdId, fbCmdId ? fbCmdId : "", sizeof(forceCmdId));
 
   setState(ACTIVE_STATE);
-  runUiBegin(primary, fert, liters, doseMl);         // force targets, NOT the scheduled budget
+  runUiBegin(primary, fert, liters, doseMl, mask);   // force targets, NOT the scheduled budget; every column it waters
   esp2WarmupMs = millis();
   // The FORCE gate requires the system to be idle, and idle means ESP2 is POWERED OFF
   // (OFF-during-idle, sec.18.8) -- so this else branch is the normal case, not the exception.
@@ -4887,9 +5082,25 @@ void runNoteErr(const String &e) {
 // forceL >= 0 / forceDose != nullptr override the schedule for an operator FORCE run: the receipt,
 // the LCD progress bars and the published run node must show what was actually ordered, not the
 // scheduled budget the run is deliberately bypassing.
-void runUiBegin(int c, bool fert, float forceL, const float *forceDose) {
+// The columns this run waters: "A", or "A+B" for a FORCE run that waters several at once (2026-11-18: the screens and
+// the receipts named only the first). sep "+" on the LCD; "" in the log, "COL_AB" as the ACT rows already write it.
+static String runCols(const char *sep) {
+  uint8_t m = run.mask ? run.mask : (uint8_t)(1 << run.col);
+  String s;
+  for (int b = 0; b < NUM_COLUMNS; b++) if (m & (1 << b)) { if (s.length()) s += sep; s += COL_TAG[b]; }
+  return s;
+}
+static bool runMulti() { return __builtin_popcount(run.mask) > 1; }
+// Water out to the column(s) so far: the finished Release stages plus the one still moving water. ESP2 adds a Release
+// stage's litres to its total only when the stage ends, so the irrigation bar used to sit at zero all run (2026-11-18);
+// the dashboard already counts it the same way.
+static bool runReleasing() { return !strcmp(run.stage, "Release") || !strcmp(run.stage, "Flush Release"); }
+static float runWaterNow() { return run.waterGot + (runReleasing() ? run.stageL : 0.0f); }
+
+void runUiBegin(int c, bool fert, float forceL, const float *forceDose, uint8_t mask) {
   memset(&run, 0, sizeof(run));
   run.fert = fert; run.col = c; run.ok = true;
+  run.mask = mask ? mask : (uint8_t)(1 << c);
   run.total = fert ? ((FLUSH_PCT > 0) ? 7 : 5) : 2;
   run.ord = 0;
   strncpy(run.stage, "Starting", sizeof(run.stage) - 1);
@@ -4915,8 +5126,8 @@ void runUiBegin(int c, bool fert, float forceL, const float *forceDose) {
   runPhase = RUN_PRE; runPhaseMs = millis(); runLocked = true;
   wakeBacklight();
 
-  String d = String("PRE|COL_") + COL_TAG[c] + "|" + (fert ? "FERTIGATION" : "IRRIGATION")
-           + "|PLANT=" + runPlant(c)
+  String d = String("PRE|COL_") + runCols("") + "|" + (fert ? "FERTIGATION" : "IRRIGATION")
+           + "|PLANT=" + (runMulti() ? "-" : runPlant(c))
            + "|WATER=" + String(run.waterTgt, 1) + "|FLUSH=" + String((int)FLUSH_PCT)
            + "|STEPS=" + String(run.total);
   if (fert) {
@@ -4939,7 +5150,7 @@ void runUiFinish(bool ok) {
   if (!ok) run.ok = false;
   for (int i = 0; i < 3; i++) run.npkAfter[i] = sensor.npk[run.col][4 + i];
 
-  String d = String("POST|COL_") + COL_TAG[run.col] + "|" + (run.fert ? "FERTIGATION" : "IRRIGATION")
+  String d = String("POST|COL_") + runCols("") + "|" + (run.fert ? "FERTIGATION" : "IRRIGATION")
            + "|" + (run.ok ? "OK" : "WITH_ERRORS")
            + "|WATER=" + String(run.waterGot, 2) + "of" + String(run.waterTgt, 1)
            + "|SECS=" + String((millis() - run.startMs) / 1000);
@@ -4965,13 +5176,13 @@ void runUiTick() {
   }
 }
 
-// 8-cell progress bar, e.g. "[####----]". frac is clamped 0..1.
-static String runBar(float frac) {
+// Progress bar of `cells` cells (8 by default), e.g. "[####----]". frac is clamped 0..1.
+static String runBar(float frac, int cells = 8) {
   if (!(frac > 0)) frac = 0;
   if (frac > 1) frac = 1;
-  int on = (int)(frac * 8 + 0.5f);
+  int on = (int)(frac * cells + 0.5f);
   String s = "[";
-  for (int i = 0; i < 8; i++) s += (i < on) ? '#' : '-';
+  for (int i = 0; i < cells; i++) s += (i < on) ? '#' : '-';
   return s + "]";
 }
 
@@ -4982,7 +5193,9 @@ void lcdRenderRun() {
   int  c = run.col;
 
   if (runPhase == RUN_PRE) {
-    snprintf(l, 21, "RECEIPT  %c  %s", COL_TAG[c], runPlant(c));                       lcdRow(0, l);
+    if (runMulti()) snprintf(l, 21, "RECEIPT  %s", runCols("+").c_str());               // A+B: one batch, both columns
+    else            snprintf(l, 21, "RECEIPT  %c  %s", COL_TAG[c], runPlant(c));
+    lcdRow(0, l);
     snprintf(l, 21, "%s %.1fL +%d%%", run.fert ? "FERTIGATE" : "IRRIGATE", run.waterTgt, (int)FLUSH_PCT); lcdRow(1, l);
     if (run.fert) {
       snprintf(l, 21, "Tgt N%d P%d K%d", (int)col[c].targetN, (int)col[c].targetP, (int)col[c].targetK); lcdRow(2, l);
@@ -4995,25 +5208,38 @@ void lcdRenderRun() {
   }
 
   if (runPhase == RUN_LIVE) {
-    snprintf(l, 21, "%s %c %s", run.fert ? "FERTIGATE" : "IRRIGATE", COL_TAG[c], runPlant(c)); lcdRow(0, l);
+    const char *op = run.fert ? "FERTIGATE" : "IRRIGATE";
+    if (runMulti()) snprintf(l, 21, "%s %s", op, runCols("+").c_str());
+    else            snprintf(l, 21, "%s %c %s", op, COL_TAG[c], runPlant(c));
+    lcdRow(0, l);
     snprintf(l, 21, "%d/%d %s", run.ord, run.total, run.stage);                          lcdRow(1, l);
     if (run.fert) {
       snprintf(l, 21, "Tgt N%d P%d K%d", (int)col[c].targetN, (int)col[c].targetP, (int)col[c].targetK); lcdRow(2, l);
-      // Detail row: during dosing show the nutrient mL, otherwise the water moved so far.
+      // Detail row: during dosing show the nutrient mL, otherwise the water out so far (with the live Release).
       float frac = (run.stageTgt > 0) ? (run.stageL / run.stageTgt) : 0;
       if (run.ord == 2) snprintf(l, 21, "Nut %s %s", String(run.doseGot[0] + run.doseGot[1] + run.doseGot[2], 0).c_str(), runBar(frac).c_str());
-      else              snprintf(l, 21, "%.1fL %s", run.waterGot, runBar(frac).c_str());
+      else              snprintf(l, 21, "%.1fL %s", runWaterNow(), runBar(frac).c_str());
       lcdRow(3, l);
     } else {
       snprintf(l, 21, "Target %.1f L", run.waterTgt);                                    lcdRow(2, l);
-      float frac = (run.waterTgt > 0) ? (run.waterGot / run.waterTgt) : 0;
-      snprintf(l, 21, "%.1fL %s", run.waterGot, runBar(frac).c_str());                    lcdRow(3, l);
+      if (run.ord == 1 && run.stageTgt > 0) {
+        // Transfer Water: the fill into the mixing tank, over all its runs and settles (ESP2 reports the whole fill).
+        snprintf(l, 21, "Fill %.1fL %s", run.stageL, runBar(run.stageL / run.stageTgt, 7).c_str());
+      } else {
+        // Release: the water out to the column(s), counting the stage still under way (2026-11-18: the bar sat at 0).
+        float got = runWaterNow();
+        float frac = (run.waterTgt > 0) ? (got / run.waterTgt) : 0;
+        snprintf(l, 21, "%.1fL %s", got, runBar(frac).c_str());
+      }
+      lcdRow(3, l);
     }
     return;
   }
 
   if (runPhase == RUN_POST) {
-    snprintf(l, 21, "RESULT %c %s %s", COL_TAG[c], runPlant(c), run.ok ? "OK" : "!!");    lcdRow(0, l);
+    if (runMulti()) snprintf(l, 21, "RESULT %s %s", runCols("+").c_str(), run.ok ? "OK" : "!!");
+    else            snprintf(l, 21, "RESULT %c %s %s", COL_TAG[c], runPlant(c), run.ok ? "OK" : "!!");
+    lcdRow(0, l);
     snprintf(l, 21, "Water %.1fL of %.1fL", run.waterGot, run.waterTgt);                  lcdRow(1, l);
     if (run.fert) {
       // Measured NPK delta next to the expected increase from the mL actually pumped.
@@ -6936,6 +7162,13 @@ void controlTick() {
     int c = order[oi];
     bool finishDosed = dosedNow & (1 << c);
     if (!COLUMN_ENABLED[c]) continue;                              // config, not a fault -> no CTRL log spam
+    // Manual (2026-11-18): the operator waters this column by hand today (forced runs), so no scheduled run --
+    // nor the finishing of a dosed batch, the same as a snoozed column. Its readings carry on as usual.
+    if (colManualToday(c)) {
+      long today = planToday();
+      ctrlNote(c, (today >= 0 && planMarkFor(colPlan[c], today) == PLAN_MANUAL) ? "MANUAL|plan" : "MANUAL|default");
+      continue;
+    }
     // Operator (or the auto-cancel breaker) suppressed this column for a while. Logged like every
     // other skip reason so the CSV shows why a due column was passed over.
     if (colSnoozeUntil[c] && (long)(millis() - colSnoozeUntil[c]) < 0) {
@@ -6968,14 +7201,14 @@ void controlTick() {
     }
     if (tankCheckNeeded) { ctrlNote(c, "TANK_CHECK"); continue; }  // the operator must confirm the tank first
     if (!finishDosed && sensor.soil[c] < 0) { ctrlNote(c, "SOIL_INVALID"); continue; }   // invalid soil (faulted elsewhere)
-    if (!finishDosed && sensor.soil[c] >= soilStartPct) {          // not dry enough
-      ctrlNote(c, "NOT_DRY|soil=" + String(sensor.soil[c]) + ">=" + String(soilStartPct));
+    if (!finishDosed && sensor.soil[c] >= colStartPct(c)) {        // not dry enough (its own line, 18 Nov 2026)
+      ctrlNote(c, "NOT_DRY|soil=" + String(sensor.soil[c]) + ">=" + String(colStartPct(c)));
       continue;
     }
-    if (reservoirLow(sensor.msTank != 0, sensor.resLevel, RES_LOW_PCT)) {   // reservoir guard (sec.14.4.1)
+    if (reservoirLow(sensor.msTank != 0, sensor.resLevel, resPauseLevel())) {   // reservoir guard (sec.14.4.1)
       // A1: latch so the fault/SMS fires ONCE per low episode (cleared on recovery in powerTick-
       // style check below), not every loop while a column sits due over a low reservoir.
-      ctrlNote(c, "RES_LOW|res=" + String((int)sensor.resLevel));
+      ctrlNote(c, "RES_LOW|res=" + String((int)sensor.resLevel) + "<" + String((int)resPauseLevel()));
       if (!resLowLatched) { resLowLatched = true; raiseFault('M', "RES_LOW", "RESERVOIR"); }
       continue;
     }
@@ -7603,12 +7836,14 @@ void tankCheckSet(const char *why) {
     tankCheckNeeded = true;
     prefs.putBool("tankchk", true);
   }
+  strlcpy(tankCheckWhy, why ? why : "", sizeof(tankCheckWhy));   // published for the website (18 Nov 2026)
   raiseFault('M', "TANK_CHECK", why);
 }
 
 void tankCheckClear(const char *by) {
   if (!tankCheckNeeded) return;
   tankCheckNeeded = false;
+  tankCheckWhy[0] = '\0';
   prefs.putBool("tankchk", false);
   logEvent("ESP1", "STATE", String("TANK_CHECK|CONFIRMED|by=") + by);
 }
@@ -7898,6 +8133,11 @@ void scheduleTick() {
     if (firstAfterBoot) {
       nanoDailyResetDone = (prefs.getLong("nrsDay", -1) == ds);
       reportSentToday    = (prefs.getLong("rptDay", -1) == ds);
+      // Starts today, for the website (18 Nov 2026: 40 boots on 17 Nov, most of them power loss). One NVS write a boot.
+      bootsToday = (prefs.getLong("bootDay", -1) == ds) ? (uint16_t)(prefs.getUShort("bootN", 0) + 1) : 1;
+      prefs.putLong("bootDay", ds); prefs.putUShort("bootN", bootsToday);
+    } else {
+      bootsToday = 0;                            // a new day began while running: no start today yet
     }
   }
   uint16_t mod = now.hour() * 60 + now.minute();
@@ -8011,8 +8251,12 @@ void uploadTick() {
   unsigned long wait = (attempts > 0) ? BACKOFF[attempts < 4 ? attempts - 1 : 3] : 5000UL;
   if (millis() - lastAttemptMs < wait) return;                   // backoff / gentle SD-scan throttle
 
+  // Firebase: only a day someone ASKED for (the website's "Upload from the rig", SMS, the portal). The automatic catch-up of
+  // every completed day (17 Nov 2026) is off since 18 Nov 2026 g: up to 14 days at ~1.2 MB each in 6 KB pieces never
+  // finished on this link (logs/index on 18 Nov: nothing completed) and took the one TLS session down with every failed
+  // piece. The SD card keeps every day; Supabase (only while Firebase is off) keeps its old catch-up.
   long target = (manualUploadStamp != 0) ? manualUploadStamp
-              : toFb ? uploadNextCatchupDay(fbLogLast, logKeepFrom) : uploadNextCatchupDay(supaLast, 0);
+              : toFb ? 0 : uploadNextCatchupDay(supaLast, 0);
   if (target == 0) return;
   uploadReqPartial = (target == currentDayStamp);                // today's file: sent as far as it is written
   uploadReqStamp = target;                                       // hand to netTask
@@ -8154,10 +8398,30 @@ void deviceHealthTick() {
 /* =============================================================================
  *  WiFi + THINGSPEAK TELEMETRY  (Part A: core-0 task, non-blocking uplink)
  * ========================================================================== */
+// Core 1: BUSY for the link (LINK PACE, 18 Nov 2026 e) -- the rig is working, or about to. A watering window counts
+// while it is open and not yet served, and from LINK_PRE_RUN_MIN before it opens: a run can start at any minute of it.
+// Same column filters as controlTick(): enabled, not Manual today, not snoozed, not done for the day.
+static bool linkBusyNow() {
+  if (sysState == ACTIVE_STATE || wo.active || pendingRun.active || pendingExercise.active || fcPhase == FP_WAIT) return true;
+  if (tankDosedMask && !isNight()) return true;                  // a dosed batch goes out at the next chance
+  if (!rtcOk || actuationsDisabled) return false;
+  uint16_t mod = minuteOfDay();
+  for (int c = 0; c < NUM_COLUMNS; c++) {
+    if (!COLUMN_ENABLED[c] || colManualToday(c) || dayDoneToday(c)) continue;
+    if (colSnoozeUntil[c] && (long)(millis() - colSnoozeUntil[c]) < 0) continue;
+    for (int w = 0; w < windowCount(c); w++) {
+      if (windowDoneToday(c, w)) continue;
+      if (windowOpenOrSoon(mod, windowStart(c, w), windowEnd(c, w), LINK_PRE_RUN_MIN)) return true;   // pure_math.h
+    }
+  }
+  return false;
+}
+
 // Core 1: snapshot the latest readings into the shared struct (POD -> spinlock). Throttled.
 void telemetryCollect() {
   if (millis() - lastTelemCollectMs < 1000) return;
   lastTelemCollectMs = millis();
+  linkBusyFlag = linkBusyNow();                                  // read by netTask (core 0), LINK PACE
   String deviceTime = tsString();                  // before the lock: an I2C read cannot run with interrupts off
   portENTER_CRITICAL(&telemMux);
   strlcpy(telem.deviceTime, deviceTime.c_str(), sizeof(telem.deviceTime));
@@ -8220,6 +8484,16 @@ void telemetryCollect() {
     telem.dayWaterL[c] = waterUsedToday[c];   telem.dayNutMl[c] = nutrientUsedToday[c];
     telem.dayWaterings[c] = wateringsToday[c]; telem.dayFeedings[c] = feedingsToday[c];
   }
+  {                                             // Operation + day plan (2026-11-18)
+    long today = planToday();
+    telem.planYmd = today >= 0 ? currentDayStamp : -1;
+    for (int c = 0; c < NUM_COLUMNS; c++) {
+      telem.opManual[c]      = colOpManual[c];
+      telem.opManualToday[c] = colManualToday(c) ? 1 : 0;
+      if (today >= 0) planText(colPlan[c], today, telem.plan[c]);
+      else            telem.plan[c][0] = '\0';
+    }
+  }
   for (int k = 0; k < 3; k++) {                // exerciseTick()'s own test: due once idle this long
     unsigned long since = millis() - lastPumpUseMs[k];
     telem.exNextMin[k] = since >= PUMP_EXERCISE_INTERVAL_MS ? 0 : (long)((PUMP_EXERCISE_INTERVAL_MS - since) / 60000UL);
@@ -8269,6 +8543,7 @@ void telemetryCollect() {
   telem.runActive  = (runPhase != RUN_NONE);
   telem.runFert    = run.fert;
   telem.runCol     = run.col;
+  telem.runMask    = run.mask;
   telem.runOrd     = run.ord;      telem.runTotal   = run.total;
   telem.runPhaseId = (uint8_t)runPhase;
   telem.runStageL  = run.stageL;   telem.runStageTgt = run.stageTgt;
@@ -8290,15 +8565,16 @@ void telemetryCollect() {
   portEXIT_CRITICAL(&telemMux);
 }
 
-// Core 0: one ThingSpeak update GET. Returns true on HTTP 200.
-static bool tsGet(const String &url) {
+// Core 0: one ThingSpeak update GET. Returns the HTTP status; negative = no connection or no answer (HTTPClient's own
+// codes), 0 = the URL would not parse. TS_TIMEOUT_MS each way (18 Nov 2026 c: 6 s before).
+static int tsGet(const String &url) {
   HTTPClient http;
-  http.setConnectTimeout(6000);
-  http.setTimeout(6000);
-  if (!http.begin(url)) return false;
+  http.setConnectTimeout(TS_TIMEOUT_MS);
+  http.setTimeout(TS_TIMEOUT_MS);
+  if (!http.begin(url)) return 0;
   int code = http.GET();
   http.end();
-  return code == 200;
+  return code;
 }
 
 // Core 0: push channel 1 (per-column moisture+NPK) and channel 2 (system) from the snapshot.
@@ -8309,7 +8585,9 @@ static void tsUpload() {
 
   String k1, k2, k3;
   xSemaphoreTake(netMux, portMAX_DELAY); k1 = tsKey1; k2 = tsKey2; k3 = tsKey3; xSemaphoreGive(netMux);
-  bool ok = false;
+  // down (18 Nov 2026 c): ThingSpeak did not answer at all, so the channels after it are skipped this round instead of
+  // each waiting out its own timeouts -- up to 36 s with netTask blocked and no live report going up.
+  bool ok = false, down = false;
 
   if (k1.length()) {                                  // Channel 1: columns (moisture + NPK)
     String url = "http://" + String(TS_HOST) + "/update?api_key=" + k1;
@@ -8323,9 +8601,11 @@ static void tsUpload() {
         url += "&field" + String(fld++) + "=" + String(t.npkK[c], 1);
       } else fld += 3;
     }
-    ok = tsGet(url) || ok;
+    int code = tsGet(url);
+    ok = (code == 200) || ok;
+    down = code < 0;
   }
-  if (k2.length()) {                                  // Channel 2: system
+  if (k2.length() && !down) {                         // Channel 2: system
     String url = "http://" + String(TS_HOST) + "/update?api_key=" + k2;
     // Audit fix (2026-09-09): this upload previously wrote every field unconditionally, unlike the
     // Firebase live snapshot which gates each on its own validity flag (envValid/tankValid/
@@ -8339,9 +8619,11 @@ static void tsUpload() {
     if (t.tankValid)  { url += "&field4=" + String(t.resLevel, 1); url += "&field5=" + String(t.mixLevel, 1); url += "&field8=" + String(t.flow, 1); }
     if (t.battVCalValid) url += "&field6=" + String(t.battV, 2);
     if (t.battVCalValid && t.battIOk_) url += "&field7=" + String(t.battP, 1);   // power needs both V and I valid
-    ok = tsGet(url) || ok;
+    int code = tsGet(url);
+    ok = (code == 200) || ok;
+    down = code < 0;
   }
-  if (k3.length()) {                                  // Channel 3: pH + solar + battery current (EC dropped)
+  if (k3.length() && !down) {                         // Channel 3: pH + solar + battery current (EC dropped)
     String url = "http://" + String(TS_HOST) + "/update?api_key=" + k3;
     int fld = 1;
     // 2026-11-15 (user): soil EC is no longer sent to ThingSpeak -- its fields carry SOLAR instead. Each
@@ -8362,7 +8644,7 @@ static void tsUpload() {
       url += "&field" + String(TS3_SOLAR_V_FIELD)  + "=" + String(t.solarV_, 2);
       url += "&field" + String(TS3_SOLAR_W_FIELD)  + "=" + String(t.solarP_, 1);
     }
-    ok = tsGet(url) || ok;
+    ok = (tsGet(url) == 200) || ok;
   }
   lastTsOk = ok; lastTsUploadMs = millis();
 }
@@ -8393,32 +8675,55 @@ static void fbApplyTls() {
   fbHttp.setReuse(true);                            // <-- the whole point: keep the socket alive
   fbTlsReady = true;
 }
+// The host the open TLS session belongs to ("" = none). HTTPClient switches hosts by closing the session, so a request to
+// another host (the token renewal at securetoken.googleapis.com) means a new handshake for the next RTDB request too.
+static String fbSessionHost;
+static String fbHostOf(const String &url) {
+  int a = url.indexOf("://"); a = (a < 0) ? 0 : a + 3;
+  int b = url.indexOf('/', a);
+  return url.substring(a, b < 0 ? url.length() : b);
+}
+// True when a request to url needs a NEW TLS session: none is open, or the open one is to another host.
+static bool fbNeedsHandshake(const String &url) { return !fbClient.connected() || fbHostOf(url) != fbSessionHost; }
+
 // Force the next request to re-apply the trust policy (and drop any open socket), so toggling
 // pinning takes effect immediately instead of at the next reboot.
 static void fbResetTls() {
   fbHttp.end();
   fbClient.stop();
   fbTlsReady = false;
+  fbSessionHost = "";
 }
 
 // Every Firebase HTTP call goes through here so the handshake counter and timeouts stay honest.
 static bool fbBegin(const String &url) {
   fbApplyTls();
-  if (!fbClient.connected()) fbHandshakes++;        // a fresh TCP+TLS session is about to happen
-  fbHttp.setConnectTimeout(6000);
-  fbHttp.setTimeout(6000);
+  if (fbNeedsHandshake(url)) {                      // a fresh TCP+TLS session is about to happen
+    // Not without the memory it needs (18 Nov 2026 h): it would fail with http=-1 anyway, after fragmenting the heap.
+    if (heap8Block() < FB_TLS_MIN_BLOCK || heap8Free() < FB_TLS_MIN_FREE) { fbTlsSkips++; return false; }
+    fbHandshakes++;
+  }
+  fbSessionHost = fbHostOf(url);
+  fbHttp.setConnectTimeout(FB_CONNECT_TIMEOUT_MS);
+  fbHttp.setTimeout(FB_REPLY_TIMEOUT_MS);              // 6 s before 18 Nov 2026 f (LINK PACE table)
   return fbHttp.begin(fbClient, url);
 }
 
 // Single seam for the RTDB path + auth. Every request carries the device account's ID token;
 // lock the RTDB rules to that UID or the token buys you nothing.
-static String fbBuildUrl(const String &base, const char *path) {
+static String fbBuildUrl(const String &base, const char *path, const char *suffix = nullptr) {
   // netMux: fbIdToken is also written from core-1's FBASE,SIGNOUT SMS handler -- the same
   // cross-core String race already guarded at the FBASE,STATUS handler and fbEnsureToken(), just
   // not previously extended to this read site (audit fix, 2026-09-08).
   String tok;
   xSemaphoreTake(netMux, portMAX_DELAY); tok = fbIdToken; xSemaphoreGive(netMux);
-  return base + path + "?auth=" + tok;
+  // One allocation (18 Nov 2026 c): with the ~1 KB token, `base + path + "?auth=" + tok` regrew the String several
+  // times per request, five or six requests a second at the live pace -- churn that fragments the heap.
+  String url;
+  url.reserve(base.length() + strlen(path) + 6 + tok.length() + (suffix ? strlen(suffix) : 0));
+  url = base; url += path; url += "?auth="; url += tok;
+  if (suffix) url += suffix;                       // "&print=silent" etc., inside the same block (18 Nov 2026 h)
+  return url;
 }
 
 /* ---- Token lifecycle -------------------------------------------------------
@@ -8495,6 +8800,9 @@ static bool fbStoreToken(const String &idToken, const String &refresh, unsigned 
   xSemaphoreGive(netMux);
   // Renew 5 min early so a slow link never uses an expired token mid-request.
   fbTokenExpiryMs = millis() + ((expSec > 300 ? expSec - 300 : 60) * 1000UL);
+  // ...but it keeps working until 1 min before it really expires, so a renewal that fails in those 5 minutes no longer
+  // stops the reports (18 Nov 2026 c, fbEnsureToken).
+  fbTokenUsableMs = nzMs(millis() + ((expSec > 120 ? expSec - 60 : expSec / 2) * 1000UL));
   fbAuthFails = 0; fbAuthNextTryMs = 0; fbAuthOk = true;
   return true;
 }
@@ -8506,7 +8814,7 @@ static bool fbRefreshToken(const String &apiKey, const String &refresh) {
     fbAuthHttp = -1; fbNoteAuthError(-1, ""); return false;
   }
   fbHttp.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  int code = fbHttp.POST(body);
+  int code = fbHttp.POST((uint8_t *)body.c_str(), body.length());     // by pointer (18 Nov 2026 h)
   // ALWAYS drain the body: it carries the reason on failure, and an unread body would
   // leave the kept-alive socket dirty for the next request.
   String resp = fbHttp.getString();
@@ -8538,7 +8846,7 @@ static bool fbPasswordSignIn(const String &apiKey, const String &email, const St
     fbAuthHttp = -1; fbNoteAuthError(-1, ""); return false;
   }
   fbHttp.addHeader("Content-Type", "application/json");
-  int code = fbHttp.POST(body);
+  int code = fbHttp.POST((uint8_t *)body.c_str(), body.length());     // by pointer (18 Nov 2026 h)
   String resp = fbHttp.getString();                       // always drain -- see fbRefreshToken
   fbHttp.end();
   fbAuthHttp = code;
@@ -8560,7 +8868,10 @@ static bool fbEnsureToken() {
   // netMux: fbIdToken is also cleared from core-1's FBASE,SIGNOUT SMS handler (audit fix, 2026-09-08).
   String curTok; xSemaphoreTake(netMux, portMAX_DELAY); curTok = fbIdToken; xSemaphoreGive(netMux);
   if (curTok.length() && (long)(millis() - fbTokenExpiryMs) < 0) return true;   // still valid
-  if (fbAuthNextTryMs && (long)(millis() - fbAuthNextTryMs) < 0) return false;     // backing off
+  // Due for renewal, but still accepted by Firebase until fbTokenUsableMs (18 Nov 2026 c). While that holds, a renewal
+  // that fails or waits out its backoff does not stop the live report and the command polls: they keep the old token.
+  bool usable = curTok.length() && fbTokenUsableMs && (long)(millis() - fbTokenUsableMs) < 0;
+  if (fbAuthNextTryMs && (long)(millis() - fbAuthNextTryMs) < 0) return usable;    // backing off
 
   String apiKey, email, pass, refresh;
   bool force;
@@ -8574,13 +8885,18 @@ static bool fbEnsureToken() {
     return false;
   }
 
-  bool ok = false, tried = false;
+  // refused (18 Nov 2026 c): Google answered and said no (any HTTP status, or a 200 that would not parse). Only that is a
+  // credential problem; a request that never got an answer (fbAuthHttp <= 0) is the network.
+  bool ok = false, tried = false, refused = false;
   // Prefer the refresh token; only fall back to the password when provisioning or when the
   // refresh token has been revoked/expired (a forced sign-in from the portal also lands here).
-  if (!force && refresh.length()) { tried = true; ok = fbRefreshToken(apiKey, refresh); }
-  if (!ok && email.length() && pass.length()) {
+  if (!force && refresh.length()) { tried = true; ok = fbRefreshToken(apiKey, refresh); refused = !ok && fbAuthHttp > 0; }
+  // The password only when Google REFUSED the refresh token (or there is none, or a forced sign-in): a refresh that never
+  // reached Google would fail the same way with the password, one more handshake for nothing (18 Nov 2026 c).
+  if (!ok && email.length() && pass.length() && (force || !refresh.length() || refused)) {
     tried = true;
     ok = fbPasswordSignIn(apiKey, email, pass);
+    if (!ok && fbAuthHttp > 0) refused = true;
     if (ok) fbCredsPersistPending = true;                                          // persist the new refresh token
   }
   if (!ok) {
@@ -8589,18 +8905,38 @@ static bool fbEnsureToken() {
     // token, so there is no credential to exchange. Previously this fell straight into the
     // backoff and reported nothing at all.
     if (!tried) fbNoteAuthLocal("have API key but no password and no refresh token");
-    xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); // don't reuse a dead token
-    // Escalate: 30 s -> 2 m -> 8 m -> 30 m. Retrying a wrong password every poll is
-    // credential hammering and Google will rate-limit or lock the account.
-    fbAuthNextTryMs = millis() + FB_AUTH_BACKOFF[fbAuthFails < 4 ? fbAuthFails : 3];
-    if (fbAuthFails < 4) fbAuthFails++;
+    if (!usable) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); } // don't reuse a dead token
+    if (tried && !refused) {
+      // No request got an answer from Google: the network, not the credentials. Soon again, no escalation (18 Nov 2026 c).
+      fbAuthNextTryMs = nzMs(millis() + FB_AUTH_NET_RETRY_MS);
+    } else {
+      // Escalate: 30 s -> 2 m -> 8 m -> 30 m. Retrying a wrong password every poll is
+      // credential hammering and Google will rate-limit or lock the account.
+      fbAuthNextTryMs = millis() + FB_AUTH_BACKOFF[fbAuthFails < 4 ? fbAuthFails : 3];
+      if (fbAuthFails < 4) fbAuthFails++;
+    }
+    return usable;
   }
   return ok;
 }
 
+// Text for an SD log line (18 Nov 2026 g): printable ASCII only, line breaks and tabs as single spaces. Core 0.
+static void fbCopyPrintable(char *dst, size_t cap, const String &src) {
+  size_t j = 0;
+  for (size_t i = 0; i < src.length() && j + 1 < cap; i++) {
+    char c = src[i];
+    if (c == 0x0A || c == 0x0D || c == 0x09) c = ' ';   // line feed, carriage return, tab
+    if ((uint8_t)c < 0x20 || (uint8_t)c > 0x7E) c = '?';
+    if (c == ' ' && (j == 0 || dst[j - 1] == ' ')) continue;   // no leading or repeated spaces
+    dst[j++] = c;
+  }
+  dst[j] = 0;
+}
+
 // Core 0: publish the latest verified snapshot. Reads ONLY from the telem snapshot (never core-1's
 // `sensor`/`wo`/`sysState`) so the dashboard can't show a torn mix of old and new readings.
-static bool firebaseUploadLive() {
+// Called only through firebaseUploadLive() below, which counts it as finished (fbUploadDone).
+static bool firebaseUploadLiveOnce() {
   // Stamp the attempt FIRST, unconditionally: every early return below still consumes this tick.
   // Stamping only on success would leave the netTask cadence gate permanently open and retry the
   // whole path every 500 ms loop iteration (worst at boot, before the first telemetryCollect()).
@@ -8624,19 +8960,28 @@ static bool firebaseUploadLive() {
   signedIn = fbIdToken.length() > 0;
   authErr  = fbAuthErr;
   xSemaphoreGive(netMux);
-  if (!enabled || base.length() < 8) { fbLastOk = false; return false; }
+  if (!enabled || base.length() < 8) { fbLastOk = false; fbLastSkip = "off"; return false; }
 
   TelemetrySnapshot t;
   portENTER_CRITICAL(&telemMux); t = telem; portEXIT_CRITICAL(&telemMux);
-  if (!t.valid || WiFi.status() != WL_CONNECTED) { fbLastOk = false; return false; }
+  if (!t.valid || WiFi.status() != WL_CONNECTED) { fbLastOk = false; fbLastSkip = t.valid ? "wifi" : "no-snapshot"; return false; }
 
   // An mbedTLS session needs ~40-50 KB. Skipping a dashboard tick is much cheaper than a failed
   // alloc mid-handshake, and fbLastHeap makes the long-run fragmentation trend visible on PAGE_GSM.
-  uint32_t heap = ESP.getFreeHeap();
-  fbLastHeap = heap;
-  if (heap < FIREBASE_MIN_HEAP) { fbLastOk = false; return false; }
+  // 18 Nov 2026 (c): that floor only before a NEW session; an open one needs room for this report alone. connected()
+  // first: it frees a session the server has closed, so the heap read after it is the one a handshake would get.
+  // 18 Nov 2026 (h): byte-addressable memory (see MEMORY for the network). With a session open to the database only the
+  // report's text has to fit; without one the handshake must fit as well, next to that text -- otherwise the report waits
+  // and the next command poll (no body) opens the session for it.
+  bool tls = fbNeedsHandshake(base);
+  uint32_t free8 = heap8Free(), block8 = heap8Block();
+  fbLastHeap = free8; fbLastBlock = block8;
+  bool roomy = tls ? (block8 >= FB_TLS_MIN_BLOCK + FB_REPORT_MIN_BLOCK && free8 >= FB_TLS_MIN_FREE + FB_REPORT_MIN_BLOCK)
+                   : (block8 >= FB_REPORT_MIN_BLOCK);
+  if (!roomy) { fbLastOk = false; fbLastSkip = "memory"; return false; }
 
-  if (!fbEnsureToken()) { fbLastOk = false; return false; }   // no token -> no request (respects backoff)
+  if (!fbEnsureToken()) { fbLastOk = false; fbLastSkip = "login"; return false; }   // no token -> no request (respects backoff)
+  fbLastSkip = "";
 
   // 10240 B: zones + run node + the diagnostics tree + fault/forceArmed + the raw sensor block
   // (1536 -> 2048 for powerSource/battery/chemistry/actuators, -> 6144 for diagnostics, -> 10240 for
@@ -8649,7 +8994,8 @@ static bool firebaseUploadLive() {
   // fail first, mid-TLS, in a way that looks like a network fault rather than a stack overflow.
   // In .bss it costs the same RAM without competing for stack, and re-entrancy is not a concern:
   // this function is only ever called from netTask.
-  static StaticJsonDocument<16384> doc;          // margin for the event ring, which is fitted to
+  // 12 KB (16 KB until 18 Nov 2026 h: the 4 KB goes back to the heap). A full report with all 12 events uses ~9 KB.
+  static StaticJsonDocument<12288> doc;          // margin for the event ring, which is fitted to
   doc.clear();                                   // whatever is left (see recentEvents below)
   JsonObject meta = doc.createNestedObject("meta");
   meta.createNestedObject("updatedAt")[".sv"] = "timestamp";   // server clock; millis() is not wall time
@@ -8667,14 +9013,26 @@ static bool firebaseUploadLive() {
   // t.state, not sysState: this runs on core 0 and the snapshot is the only sanctioned view of
   // core-1 state. The enum read happened to be atomic, but mixing the two invites the next field
   // added here to be one that is not.
-  bool watched = fbViewerWatching();                 // the dashboard's live pace (2026-11-17)
-  meta["refreshMs"] = watched ? ((t.state == ACTIVE_STATE) ? FIREBASE_UPLOAD_LIVE_ACTIVE_MS : FIREBASE_UPLOAD_LIVE_IDLE_MS)
-                              : ((t.state == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS);
-  meta["live"] = watched;
+  // LINK PACE (18 Nov 2026 e): the pace of the mode ESP1 is in, and the mode itself ("idle" / "watched" / "busy").
+  // The website derives its "late" / "lost" thresholds from refreshMs, so a pace change here needs no website change.
+  // meta.live (the 1 s realtime flag of 17-18 Nov) is no longer sent.
+  LinkMode lm = linkModeNow();
+  meta["refreshMs"] = linkPaceMs(lm);
+  meta["linkMode"]  = linkModeName(lm);
 
   JsonObject system = doc.createNestedObject("system");
   system["state"] = stateLabel(t.state, t.actDisabled);
-  system["firmware"] = "web v.4 (2026-11-17)";           // the dashboard names the firmware it is talking to
+  system["firmware"] = "web v.4 (2026-11-18h)";          // the dashboard names the firmware it is talking to
+  // 18 Nov 2026 (website parity): this boot's reset reason, starts today, seconds since this start, and the two
+  // watering thresholds, which the website could only ask for before.
+  system["bootReason"]   = bootReasonStr;
+  system["bootsToday"]   = bootsToday;
+  system["uptimeS"]      = (uint32_t)(millis() / 1000UL);
+  system["soilStartPct"] = soilStartPct;
+  system["fertGap"]      = fertGap;
+  // 18 Nov 2026: the default Too wet line and the reservoir pause (each column's own lines are under its zone).
+  system["soilWetPct"]   = soilWetPct;
+  system["resPausePct"]  = (int)resPauseLevel();
   system["masterWorkOrderActive"] = t.woActive;
   // The dashboard has a Power Source tile; without this key it reads "--". The rig runs from the
   // battery bank, with the inverter raised only for AC pumps during a run.
@@ -8789,6 +9147,16 @@ static bool firebaseUploadLive() {
   dfb["attempts"]       = fbAttempts;
   dfb["lastUploadOk"]   = fbLastOk;
   dfb["lastHttp"]       = fbLastHttp;
+  // Link health (18 Nov 2026 c), for the website's Diagnostics: failed reports and new TLS sessions since this start (a
+  // steady link keeps both low), and the free heap and largest free block just before this report.
+  dfb["failures"]       = fbFailures;
+  dfb["handshakes"]     = fbHandshakes;
+  dfb["freeHeap"]       = fbLastHeap;              // byte-addressable (18 Nov 2026 h; INTERNAL before, ~40 KB too high)
+  dfb["maxAllocHeap"]   = fbLastBlock;             // its largest block (18 Nov h; was the IRAM block, always 40,948)
+  dfb["tlsSkips"]       = fbTlsSkips;              // new sessions not tried for want of memory (18 Nov 2026 h)
+  dfb["linkResets"]     = fbLinkResets;            // fresh TLS sessions forced after failed reports (18 Nov 2026 e)
+  dfb["wifiRejoins"]    = fbWifiRejoins;           // WiFi left and joined again after more of them
+  dfb["textFixes"]      = fbTextFixes;             // reports whose text was cleaned before sending (18 Nov 2026 g)
   dfb["tlsValidationEnabled"] = fbPinCa;
   if (authErr.length()) dfb["lastAuthError"] = authErr;   // Google's reason string, never a secret
 
@@ -8816,6 +9184,36 @@ static bool firebaseUploadLive() {
   if (t.lastFaultAt[0]) dsy["lastFaultTime"] = t.lastFaultAt;
   // Lock Screen status (Part 2, item M). The website shows it, and since 2026-11-05 can set it with LCD_LOCK.
   dsy["lcdLocked"] = lcdLocked;
+
+  // Tank check (18 Nov 2026): scheduled runs wait while it is needed; the website shows it and can confirm it
+  // (TANK_CHECK_OK), as SMS TANKCHECK,OK and the LCD row do. Read across cores like lcdLocked: a bool and a short
+  // string that change about twice a day.
+  JsonObject dtk = dg.createNestedObject("tankCheck");
+  dtk["needed"] = (bool)tankCheckNeeded;
+  if (tankCheckNeeded) dtk["why"] = tankCheckWhy[0] ? tankCheckWhy : "CARRIED_OVER_RESTART";
+
+  // Calibration, read-only for the website (18 Nov 2026): what the LCD's Calibration menu has set. Only real numbers
+  // go in: a NaN would serialize as bare NaN and Firebase would refuse the whole report.
+  JsonObject dca = dg.createNestedObject("calibration");
+  auto putNum = [&](JsonObject o, const char *k, float v) { if (!isnan(v) && !isinf(v)) o[k] = v; };
+  JsonObject dcr = dca.createNestedObject("rates");                  // 0 = not measured: the default lines
+  putNum(dcr, "transferLpm", calRateXfer);  putNum(dcr, "boosterLpm", calRateBoost);
+  putNum(dcr, "transferStartL", calXferStartL); putNum(dcr, "boosterStartL", calBoostStartL);
+  JsonArray dcn = dcr.createNestedArray("nutMlpm");                 // Nut A/B/C pump mL/min (the dose ceilings)
+  for (int i = 0; i < 3; i++) dcn.add(PUMP_FLOWRATE_MLPM[i]);
+  JsonArray dcs = dcr.createNestedArray("nutMeasured");
+  for (int i = 0; i < 3; i++) dcs.add(pumpRateSet[i]);
+  JsonObject dck = dca.createNestedObject("flowK");                  // flow meters, pulses per litre
+  putNum(dck, "nutA", calKNut[0]); putNum(dck, "nutB", calKNut[1]); putNum(dck, "nutC", calKNut[2]);
+  putNum(dck, "nutD", calKNutD);   putNum(dck, "phUp", calKPhUp);   putNum(dck, "phDn", calKPhDn);
+  putNum(dck, "reservoirScale", calFlowResScale);
+  JsonObject dct = dca.createNestedObject("tanks");                  // ultrasonic: sensor to water at empty / full
+  putNum(dct, "resEmptyCm", calResEmptyCm); putNum(dct, "resFullCm", calResFullCm);
+  putNum(dct, "mixEmptyCm", calMixEmptyCm); putNum(dct, "mixFullCm", calMixFullCm);
+  JsonObject dcp = dca.createNestedObject("probes");
+  putNum(dcp, "phM", calPhM); putNum(dcp, "phB", calPhB); putNum(dcp, "ecM", calEcM); putNum(dcp, "ecB", calEcB);
+  putNum(dcp, "acs712Zero", calAcs712Zero);
+  putNum(dcp, "tempOff", calTempOff); putNum(dcp, "humOff", calHumOff); putNum(dcp, "luxOff", calLuxOff);
 
   JsonObject de2 = dg.createNestedObject("esp2");
   de2["available"]         = t.esp2Avail;
@@ -8951,7 +9349,13 @@ static bool firebaseUploadLive() {
   if (t.runActive) {
     rn["operation"] = t.runFert ? "fertigation" : "irrigation";
     rn["phase"]     = RUN_PHASE_NAME[t.runPhaseId < 5 ? t.runPhaseId : 0];
-    rn["zone"]      = String(COL_TAG[t.runCol >= 0 && t.runCol < NUM_COLUMNS ? t.runCol : 0]);
+    {  // "A", or "A+B" for a FORCE run that waters several columns at once (2026-11-18; the page only displays it)
+      int c0 = (t.runCol >= 0 && t.runCol < NUM_COLUMNS) ? t.runCol : 0;
+      uint8_t m = t.runMask ? t.runMask : (uint8_t)(1 << c0);
+      String z;
+      for (int b = 0; b < NUM_COLUMNS; b++) if (m & (1 << b)) { if (z.length()) z += '+'; z += COL_TAG[b]; }
+      rn["zone"] = z;
+    }
     rn["stage"]     = t.runStage;
     rn["stageOrdinal"] = t.runOrd;
     rn["stageTotal"]   = t.runTotal;
@@ -8999,6 +9403,21 @@ static bool firebaseUploadLive() {
     zt["ml"]        = roundf(t.dayNutMl[c] * 10.0f) / 10.0f;
     z["targetN"]   = col[c].targetN; z["targetP"] = col[c].targetP;
     z["targetK"]   = col[c].targetK; z["targetPH"] = col[c].targetPH;
+    // Operation + day plan (2026-11-18, run_plan.h): the column's default, what applies today, and the plan from
+    // today (one character a day: '-' default, 'M' Manual, 'A' Automatic). A char* (not const), so it is copied.
+    z["operation"]      = t.opManual[c]      ? "MANUAL" : "AUTOMATIC";
+    z["operationToday"] = t.opManualToday[c] ? "MANUAL" : "AUTOMATIC";
+    if (t.planYmd > 0) { z["plan"] = (char *)t.plan[c]; z["planFrom"] = t.planYmd; }
+    // Why a due column may be passed over (18 Nov 2026): resting after repeated faults (minutes left), or the whole
+    // day closed by a STOP reply or a lost fault. Absent / false = neither.
+    if (colSnoozeUntil[c] && (long)(millis() - colSnoozeUntil[c]) < 0) z["restMin"] = (uint32_t)((colSnoozeUntil[c] - millis()) / 60000UL + 1);
+    if (dayDoneToday(c)) z["skippedToday"] = true;
+    // The column's watering lines as they apply (18 Nov 2026): Soil start (waters below it) and Too wet (a warning
+    // above it). *Own = its own value, not the default.
+    z["soilStartPct"] = colStartPct(c);
+    z["soilWetPct"]   = colWetPct(c);
+    if (colSoilStart[c] >= 0) z["soilStartOwn"] = true;
+    if (colSoilWet[c]   >= 0) z["soilWetOwn"]   = true;
     if (!COLUMN_ENABLED[c]) continue;                   // no sensor data for a disabled column
     if (t.soil[c] >= 0) z["moisture"] = t.soil[c];
     if (t.npkValid[c]) {
@@ -9054,24 +9473,75 @@ static bool firebaseUploadLive() {
   fbAttempts++;
   lastDocUsed = doc.memoryUsage();
   if (doc.overflowed()) { fbLastOk = false; fbLastHttp = -100; fbFailures++; return false; }  // never PUT truncated JSON
+  // One block for the whole text (18 Nov 2026 c): serializing into an empty String grew it a few bytes at a time --
+  // hundreds of reallocations per report, every second at the live pace, the churn that fragments a heap.
+  // -101 = no free block that size (counted as a failed report, like -100 above).
+  // 18 Nov 2026 (h): the text needs ONE byte-addressable block of its length; checked before asking, with 1 KB to spare
+  // for the request around it. Not enough: this report waits (skip "memory", not a failure) and the next tick tries.
+  size_t need = measureJson(doc) + 1;
+  if (heap8Block() < need + 1024) { fbAttempts--; fbLastOk = false; fbLastSkip = "memory"; return false; }
   String payload;
+  if (!payload.reserve(need)) { fbLastOk = false; fbLastHttp = -101; fbFailures++; return false; }
   serializeJson(doc, payload);
+
+  // Text safety (18 Nov 2026 g). This report is printable ASCII by construction -- every literal in it is -- so a byte
+  // under 0x20 or over 0x7E can only be line noise that reached a text field (the Nano, ESP2 and modem links all carry
+  // GARBAGE on this rig). Raw, such a byte makes the JSON invalid and Firebase refuses the WHOLE report with HTTP 400,
+  // every minute, for as long as the text stays. Cleaned to '?', the report goes through; the first one is logged (with
+  // the JSON just before it, which names the field) at most every 10 minutes.
+  {
+    int firstBad = -1; uint16_t nBad = 0;
+    for (size_t i = 0; i < payload.length(); i++) {
+      uint8_t c = (uint8_t)payload[i];
+      if (c < 0x20 || c > 0x7E) { if (firstBad < 0) firstBad = (int)i; payload.setCharAt(i, '?'); nBad++; }
+    }
+    if (nBad) {
+      fbTextFixes++;
+      static unsigned long lastTextLogMs = 0;
+      if (!fbReplyLogPending && (!lastTextLogMs || millis() - lastTextLogMs > 600000UL)) {
+        lastTextLogMs = nzMs(millis());
+        char near[72];
+        fbCopyPrintable(near, sizeof(near), payload.substring(firstBad > 64 ? firstBad - 64 : 0, firstBad + 1));
+        snprintf(fbReplyLog, sizeof(fbReplyLog), "TEXT|fixed=%u|near=%s", (unsigned)nBad, near);
+        fbReplyLogPending = true;
+      }
+    }
+  }
 
   // print=silent (2026-11-09): without it RTDB answers a PUT by echoing the whole ~6-10 KB snapshot
   // back, and that body was never read. WiFiClientSecure::flush() is a no-op in core 2.0.17, so
   // fbHttp.end() left it sitting on the kept-alive socket, where the NEXT request (a command poll)
   // could read it as its own status line. With print=silent a success is a bodiless 204 (still
   // inside the 2xx test below), and the drain covers the small error body of a rejection.
-  if (!fbBegin(fbBuildUrl(base, "/irrigation/live.json") + "&print=silent")) { fbLastOk = false; fbLastHttp = 0; fbFailures++; return false; }
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/live.json", "&print=silent"))) { fbLastOk = false; fbLastHttp = 0; fbFailures++; return false; }
   fbHttp.addHeader("Content-Type", "application/json");
-  int code = fbHttp.PUT(payload);
-  if (code > 0) fbHttp.getString();                        // drain: never leave a body on the reused socket
+  int code = fbHttp.PUT((uint8_t *)payload.c_str(), payload.length());   // by pointer: PUT(String) copied it (18 Nov h)
+  String reply = (code > 0) ? fbHttp.getString() : String();   // drain: never leave a body on the reused socket
   fbHttp.end();                                            // setReuse(true): keeps the socket, frees the request
   fbLastHttp = code;
   fbLastOk = (code >= 200 && code < 300);
   if (!fbLastOk) fbFailures++;
+  // Firebase refused it (an HTTP status, not a network error): keep its reason for the SD log (18 Nov 2026 g). Once per
+  // status, and again at most every 10 minutes while it lasts.
+  if (code > 0 && !fbLastOk) {
+    static int lastReplyCode = 0;
+    static unsigned long lastReplyLogMs = 0;
+    if (!fbReplyLogPending && (code != lastReplyCode || millis() - lastReplyLogMs > 600000UL)) {
+      lastReplyCode = code; lastReplyLogMs = millis();
+      char why[112];
+      fbCopyPrintable(why, sizeof(why), reply);
+      snprintf(fbReplyLog, sizeof(fbReplyLog), "REPLY|http=%d|len=%u|%s", code, (unsigned)payload.length(), why);
+      fbReplyLogPending = true;
+    }
+  }
   if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; }  // token rejected -> force a renew next tick
   return fbLastOk;
+}
+// Every call counts once it has FINISHED (18 Nov 2026 c), so firebaseLogTick() never reads a result still on the wire.
+static bool firebaseUploadLive() {
+  bool ok = firebaseUploadLiveOnce();
+  fbUploadDone++;
+  return ok;
 }
 
 /* =============================================================================
@@ -9079,9 +9549,9 @@ static bool firebaseUploadLive() {
  * ========================================================================== */
 static bool fbOk(int code) { return code >= 200 && code < 300; }
 static int fbLogRequest(const String &base, const String &path, const char *method, const String &body) {
-  if (!fbBegin(fbBuildUrl(base, path.c_str()) + "&print=silent")) return 0;
+  if (!fbBegin(fbBuildUrl(base, path.c_str(), "&print=silent"))) return 0;
   int code;
-  if (!strcmp(method, "PUT")) { fbHttp.addHeader("Content-Type", "application/json"); code = fbHttp.PUT(body); }
+  if (!strcmp(method, "PUT")) { fbHttp.addHeader("Content-Type", "application/json"); code = fbHttp.PUT((uint8_t *)body.c_str(), body.length()); }
   else code = fbHttp.sendRequest(method);
   if (code > 0) fbHttp.getString();                        // drain: never leave a body on the reused socket
   fbHttp.end();
@@ -9116,8 +9586,8 @@ static void fbLogJobFinish(bool ok, int code) {
     const char *ph = fbLogJob.phase == 0 ? "start" : fbLogJob.phase == 1 ? "piece" : "done";
     if (fbLogJob.phase == 1) snprintf(fbLogFailStep, sizeof(fbLogFailStep), "piece%u", (unsigned)fbLogJob.n);
     else strlcpy(fbLogFailStep, ph, sizeof(fbLogFailStep));
-    fbLogFailHeap = ESP.getFreeHeap();
-    fbLogFailBlock = ESP.getMaxAllocHeap();
+    fbLogFailHeap = heap8Free();                   // byte-addressable (18 Nov 2026 h)
+    fbLogFailBlock = heap8Block();
   }
   fbLogJob.active = false;
   uploadHttp = code;
@@ -9135,7 +9605,7 @@ static void fbLogJobBegin(long stamp, const char *path, bool partial) {
 static void fbLogRetention(const String &base) {
   long keepFrom = logKeepFrom;
   if (keepFrom <= 0) return;
-  if (!fbBegin(fbBuildUrl(base, "/logs/index.json") + "&shallow=true")) return;
+  if (!fbBegin(fbBuildUrl(base, "/logs/index.json", "&shallow=true"))) return;
   int code = fbHttp.GET();
   String resp = (code > 0) ? fbHttp.getString() : "";
   fbHttp.end();
@@ -9167,10 +9637,13 @@ static void fbLogJobStep() {
   String base; bool en;
   xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; en = firebaseEnabled; xSemaphoreGive(netMux);
   if (!en || base.length() < 8) { fbLogJobFinish(false, 0); return; }
+  // LINK PACE (18 Nov 2026 e): while BUSY the upload waits where it is, and its time limit waits with it.
+  if (linkBusyFlag) { fbLogJob.startMs = millis(); return; }
   if (millis() - fbLogJob.startMs > FB_LOG_JOB_MAX_MS) { fbLogJobFinish(false, -5); return; }
   if (WiFi.status() != WL_CONNECTED || !fbEnsureToken()) return;        // wait (bounded by FB_LOG_JOB_MAX_MS)
   if (!fbLastOk) return;          // the live report goes first: start or go on only while Firebase answers (2026-11-17)
-  if (ESP.getFreeHeap() < FIREBASE_MIN_HEAP) return;
+  // The 60 KB floor only before a new session, as for the live report (18 Nov 2026 c); a piece's own block is checked below.
+  if (heap8Block() < FB_REPORT_MIN_BLOCK) return;  // byte-addressable (18 Nov 2026 h); a new session is gated in fbBegin()
   String idx = String("/logs/index/") + fbLogJob.day + ".json";
   if (fbLogJob.phase == 0) {
     if (!sdTake(2000)) return;
@@ -9198,7 +9671,7 @@ static void fbLogJobStep() {
     if (want > LOG_CHUNK_BYTES) want = LOG_CHUNK_BYTES;
     // The piece's JSON text is the only big allocation, and it is freed when this pass ends. It needs one block of
     // about want x 1.15; without that, wait for the next pass instead of fragmenting the heap further.
-    if (ESP.getMaxAllocHeap() < want + want / 4 + 1024) return;
+    if (heap8Block() < want + want / 4 + 1024) return;   // byte-addressable (18 Nov 2026 h)
     String body;
     if (!body.reserve(want + want / 8 + 16)) return;
     body += '"';
@@ -9241,7 +9714,7 @@ static void firebasePollLogRequest() {
   static unsigned long lastPollMs = 0;
   static int64_t lastAt = -1;
   static bool primed = false;
-  if (millis() - lastPollMs < 10000UL) return;
+  if (millis() - lastPollMs < FB_LOGREQ_POLL_MS) return;     // every 30 s (10 s on 17-18 Nov f; LINK PACE table)
   lastPollMs = millis();
   String base; bool enabled;
   xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
@@ -9328,14 +9801,14 @@ static void firebasePollManual() {
   if (seq != webManualSeq) { webManualSeq = seq; webManualPing = true; }
 }
 
-// irrigation/viewer = {at, refreshAt} (server timestamps, written by the dashboard; see FB_VIEWER_HOLD_MS). Only a CHANGE
-// counts -- ESP1's clock is not Firebase's, so the values are never compared with a time. Core 0 only: it sets two
-// plain variables that the same netTask loop reads.
+// irrigation/viewer/refreshAt (a server timestamp, written by the dashboard's Refresh button and when a page opens). Only
+// a CHANGE counts -- ESP1's clock is not Firebase's, so the value is never compared with a time. viewer/at is ignored since
+// 18 Nov 2026 g (it set the "watched" pace). Core 0 only: it sets a plain flag that the same netTask loop reads.
 static void firebasePollViewer() {
   static unsigned long lastPollMs = 0;
-  static int64_t lastAt = -1, lastRefresh = -1;
+  static int64_t lastRefresh = -1;
   static bool primed = false;
-  if (millis() - lastPollMs < FIREBASE_COMMAND_POLL_MS) return;
+  if (millis() - lastPollMs < FB_VIEWER_POLL_MS) return;
   lastPollMs = millis();
   String base; bool enabled;
   xSemaphoreTake(netMux, portMAX_DELAY); base = fbUrl; enabled = firebaseEnabled; xSemaphoreGive(netMux);
@@ -9350,12 +9823,9 @@ static void firebasePollViewer() {
   if (code != 200 || resp.length() == 0 || resp == "null") return;
   StaticJsonDocument<192> doc;
   if (deserializeJson(doc, resp)) return;
-  int64_t at = doc["at"] | (int64_t)-1, rf = doc["refreshAt"] | (int64_t)-1;   // int64: a JS timestamp (see PollManual)
-  if (primed) {
-    if (at > 0 && at != lastAt) fbViewerUntilMs = nzMs((millis() + FB_VIEWER_HOLD_MS));
-    if (rf > 0 && rf != lastRefresh) { fbRefreshPending = true; fbViewerUntilMs = nzMs((millis() + FB_VIEWER_HOLD_MS)); }
-  }
-  primed = true; lastAt = at; lastRefresh = rf;
+  int64_t rf = doc["refreshAt"] | (int64_t)-1;              // int64: a JS timestamp (see PollManual)
+  if (primed && rf > 0 && rf != lastRefresh) fbRefreshPending = true;
+  primed = true; lastRefresh = rf;
 }
 
 /* Web hold-to-run (2026-09-10, Website Manual/Test tab, mousedown/mouseup) -- irrigation/testHold =
@@ -9424,7 +9894,7 @@ static void firebasePollCommands() {
   // window has to outlast a burst of clicks. Anything that scrolls out of it is never seen and stays
   // "queued" forever -- the same invisible-loss failure this whole change exists to remove, just at a
   // higher threshold. 10 nodes is ~550 B filtered, comfortably inside the 2048 B document.
-  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json") + "&orderBy=%22%24key%22&limitToLast=10")) return;
+  if (!fbBegin(fbBuildUrl(base, "/irrigation/commands.json", "&orderBy=%22%24key%22&limitToLast=10"))) return;
   int code = fbHttp.GET();
   String resp = (code > 0) ? fbHttp.getString() : "";      // read error bodies too: an unread one poisons the reused socket
   if (code != 200) resp = "";
@@ -9461,8 +9931,11 @@ static void firebasePollCommands() {
   pf["windows"] = true;                            // SET_COLUMN: [[start,end], ...] own watering times (2026-11-05)
   pf["targetN"] = true; pf["targetP"] = true; pf["targetK"] = true; pf["targetPH"] = true;
   pf["preset"] = true;                             // SET_COLUMN: crop preset name
+  pf["operation"] = true; pf["plan"] = true; pf["planFrom"] = true;   // SET_COLUMN: Operation + day plan (2026-11-18)
+  pf["soilStart"] = true; pf["soilWet"] = true;    // SET_COLUMN: own Soil start / Too wet (2026-11-18)
   pf["clkY"] = true; pf["clkMo"] = true; pf["clkD"] = true; pf["clkH"] = true; pf["clkMi"] = true;
   pf["thStart"] = true; pf["thGap"] = true;
+  pf["thWet"] = true; pf["thRes"] = true;          // SET_THRESH: Too wet + the reservoir pause (2026-11-18)
   pf["vMin"] = true; pf["vMax"] = true;            // SET_AC_VOLT: the AC supply window (2026-11-14)
   pf["aMin10"] = true; pf["aMax10"] = true;        // SET_AC_AMP: the AC pump current limits (2026-11-16)
 
@@ -9568,6 +10041,29 @@ static void firebasePollCommands() {
     c.tgt[2]    = req["payload"]["targetK"]  | -1.0f;
     c.tgt[3]    = req["payload"]["targetPH"] | -1.0f;
     strlcpy(c.preset, req["payload"]["preset"] | "", sizeof(c.preset));
+    // SET_COLUMN Operation + day plan (2026-11-18). Checked on core 1 like every other SET_COLUMN field; here only
+    // copied, with "absent", "not recognised" and "too long" kept apart so core 1 can refuse instead of guessing.
+    {
+      JsonVariant jo = req["payload"]["operation"];
+      if (jo.isNull()) c.operation = -1;
+      else {
+        const char *o = jo.is<const char *>() ? jo.as<const char *>() : "";
+        c.operation = !strcmp(o, "AUTOMATIC") ? 0 : !strcmp(o, "MANUAL") ? 1 : 2;
+      }
+      JsonVariant jp = req["payload"]["plan"];
+      c.planState = 0;
+      if (!jp.isNull()) {
+        const char *p = jp.is<const char *>() ? jp.as<const char *>() : nullptr;
+        c.planState = (p && strlcpy(c.plan, p, sizeof(c.plan)) <= (size_t)RUN_PLAN_DAYS) ? 1 : 2;
+      }
+      c.planFrom = req["payload"]["planFrom"] | -1L;
+    }
+    // SET_COLUMN own Soil start / Too wet (2026-11-18): absent, a whole number (range-checked on core 1), or refused.
+    {
+      JsonVariant js = req["payload"]["soilStart"], jw2 = req["payload"]["soilWet"];
+      c.soilStart = js.isNull()  ? COL_PCT_ABSENT : js.is<int>()  ? constrain(js.as<int>(),  -999, 999) : COL_PCT_BAD;
+      c.soilWet   = jw2.isNull() ? COL_PCT_ABSENT : jw2.is<int>() ? constrain(jw2.as<int>(), -999, 999) : COL_PCT_BAD;
+    }
     // SET_CLOCK: all required together; -1/0 sentinels simply fail the range check if omitted.
     c.clkY  = req["payload"]["clkY"]  | -1;
     c.clkMo = req["payload"]["clkMo"] | -1;
@@ -9577,6 +10073,8 @@ static void firebasePollCommands() {
     // SET_THRESH: all required together.
     c.thStart = req["payload"]["thStart"] | -1;
     c.thGap   = req["payload"]["thGap"]   | -1.0f;
+    c.thWet   = req["payload"]["thWet"]   | -1;      // optional (2026-11-18); a decimal reads as absent
+    c.thRes   = req["payload"]["thRes"]   | -1;
     // SET_AC_VOLT: both required, whole volts (a decimal reads as absent and is refused).
     c.acVMin  = req["payload"]["vMin"] | -1;
     c.acVMax  = req["payload"]["vMax"] | -1;
@@ -9616,9 +10114,9 @@ static void firebaseFlushStatus() {
     String json; serializeJson(body, json);
     String path = String("/irrigation/commands/") + u.id + ".json";
     // print=silent + drain: same reason as the live PUT -- an unread echo poisons the kept-alive socket.
-    if (!fbBegin(fbBuildUrl(base, path.c_str()) + "&print=silent")) return;
+    if (!fbBegin(fbBuildUrl(base, path.c_str(), "&print=silent"))) return;
     fbHttp.addHeader("Content-Type", "application/json");
-    int code = fbHttp.PATCH(json);
+    int code = fbHttp.PATCH((uint8_t *)json.c_str(), json.length());     // by pointer (18 Nov 2026 h)
     if (code > 0) fbHttp.getString();
     fbHttp.end();
     if (code == 401) { xSemaphoreTake(netMux, portMAX_DELAY); fbIdToken = ""; xSemaphoreGive(netMux); fbTokenExpiryMs = 0; return; }
@@ -9688,7 +10186,7 @@ void firebaseCommandTick() {
         firebaseQueueStatus(c.id, "rejected", why);
         logEvent("FIREBASE", "REJECT", String("FORCE|NOT_IDLE|") + why); continue;
       }
-      if (reservoirLow(sensor.msTank != 0, sensor.resLevel, RES_LOW_PCT)) {
+      if (reservoirLow(sensor.msTank != 0, sensor.resLevel, resPauseLevel())) {
         firebaseQueueStatus(c.id, "rejected", "reservoir too low");
         logEvent("FIREBASE", "REJECT", "FORCE|RES_LOW"); continue;
       }
@@ -9872,6 +10370,8 @@ void firebaseCommandTick() {
       // one bad field must reject cleanly, not leave earlier fields applied-live-but-unsaved
       // (review-fix: SET_COLUMN used to mutate col[]/COLUMN_ENABLED[]/schedule in place field-by-field,
       // so a late failure stranded the earlier fields live in RAM with none of it persisted to NVS).
+      uint8_t  newOp    = colOpManual[ci];       bool setOp    = false;
+      RunPlan  newPlan  = colPlan[ci];           bool setPlan  = false;  int planMarked = 0;
       uint8_t  newMode  = col[ci].mode;          bool setMode  = false;
       bool     newEn    = COLUMN_ENABLED[ci];    bool setEn    = false;
       uint8_t  newSched = colSchedMode[ci];      bool setSched = false;
@@ -9880,6 +10380,8 @@ void firebaseCommandTick() {
       static const char *TGT_KEY[4] = { "N", "P", "K", "PH" };
       float newTgt[4] = { col[ci].targetN, col[ci].targetP, col[ci].targetK, col[ci].targetPH };
       bool  setTgt[4] = { false, false, false, false };
+      int8_t   newSs    = colSoilStart[ci];      bool setSs    = false;   // own Soil start / Too wet (2026-11-18)
+      int8_t   newSw    = colSoilWet[ci];        bool setSw    = false;
 
       if (c.colMode[0]) {
         if      (!strcmp(c.colMode, "AUTO"))            { newMode = MODE_AUTO;            setMode = true; }
@@ -9887,6 +10389,25 @@ void firebaseCommandTick() {
         else { firebaseQueueStatus(c.id, "rejected", "mode must be AUTO or IRRIGATION_ONLY"); continue; }
       }
       if (c.enabled >= 0) { newEn = (c.enabled == 1); setEn = true; }
+      // Operation + day plan (2026-11-18, run_plan.h). The plan replaces the column's whole plan; "" clears it.
+      if (c.operation >= 0) {
+        if (c.operation > 1) { firebaseQueueStatus(c.id, "rejected", "operation must be AUTOMATIC or MANUAL"); continue; }
+        newOp = (uint8_t)c.operation; setOp = true;
+      }
+      if (c.planState) {
+        if (c.planState != 1 || !planTextValid(c.plan)) {
+          firebaseQueueStatus(c.id, "rejected", "plan: up to 62 days of - M A"); continue;
+        }
+        long today = planToday();
+        if (!rtcOk || today < 0) { firebaseQueueStatus(c.id, "rejected", "set ESP1's clock before a day plan"); continue; }
+        long from = (c.planFrom == -1) ? today : planDayFromYmd(c.planFrom);
+        if (from < 0) { firebaseQueueStatus(c.id, "rejected", "planFrom must be a date, yyyymmdd"); continue; }
+        // More than a day off ESP1's own date is not a clock difference but a wrong clock on one side.
+        if (from < today - 1 || from > today + 1) {
+          firebaseQueueStatus(c.id, "rejected", "plan date is not ESP1's date: check clock"); continue;
+        }
+        planMarked = planReplace(newPlan, today, from, c.plan); setPlan = true;
+      }
       if (c.schedMode >= 0) {
         if (c.schedMode > 1) { firebaseQueueStatus(c.id, "rejected", "schedMode must be 0 (auto) or 1 (manual)"); continue; }
         newSched = (uint8_t)c.schedMode; setSched = true;
@@ -9961,14 +10482,32 @@ void firebaseCommandTick() {
         newTgt[t] = c.tgt[t]; setTgt[t] = true;
       }
       if (tgtBad) continue;
-      if (!(setMode || setEn || setSched || setWin || setWins || setTgt[0] || setTgt[1] || setTgt[2] || setTgt[3])) {
+      // Own Soil start / Too wet (2026-11-18), -1 = back to the default. The pair that will then apply must keep
+      // Too wet at least THRESH_MIN_GAP_PCT over Soil start, or the column could be "dry enough" and "too wet" at once.
+      if (c.soilStart != COL_PCT_ABSENT) {
+        if (c.soilStart < -1 || c.soilStart > 100) { firebaseQueueStatus(c.id, "rejected", "soilStart must be -1 or 0-100"); continue; }
+        newSs = (int8_t)c.soilStart; setSs = true;
+      }
+      if (c.soilWet != COL_PCT_ABSENT) {
+        if (c.soilWet < -1 || c.soilWet > 100) { firebaseQueueStatus(c.id, "rejected", "soilWet must be -1 or 0-100"); continue; }
+        newSw = (int8_t)c.soilWet; setSw = true;
+      }
+      if ((setSs || setSw) && !wetAboveStart(effPct(newSs, soilStartPct), effPct(newSw, soilWetPct))) {
+        firebaseQueueStatus(c.id, "rejected", "too wet must be 5 % over soil start"); continue;
+      }
+      if (!(setOp || setPlan || setSs || setSw || setMode || setEn || setSched || setWin || setWins || setTgt[0] || setTgt[1] || setTgt[2] || setTgt[3])) {
         firebaseQueueStatus(c.id, "rejected", "no recognised field to change"); continue;
       }
 
       // ---- Pass 2: every field validated -- apply and persist together.
       String changed;
       if (presetApplied.length()) changed += "preset=" + presetApplied + " ";
-      bool touchedCol = false, touchedSched = false, touchedEn = false;
+      bool touchedCol = false, touchedSched = false, touchedEn = false, touchedPlan = false, touchedTh = false;
+      // First in the reply, which holds only 47 characters: these are what the website checks for.
+      if (setOp)    { colOpManual[ci] = newOp; changed += newOp ? "ops=MANUAL " : "ops=AUTO "; touchedPlan = true; }
+      if (setPlan)  { colPlan[ci] = newPlan; changed += "plan=" + String(planMarked) + "d "; touchedPlan = true; }
+      if (setSs)    { colSoilStart[ci] = newSs; changed += "start="; changed += (newSs < 0 ? String("def") : String(newSs)); changed += " "; touchedTh = true; }
+      if (setSw)    { colSoilWet[ci] = newSw;   changed += "wet=";   changed += (newSw < 0 ? String("def") : String(newSw)); changed += " "; touchedTh = true; }
       if (setMode)  { col[ci].mode = newMode; changed += (newMode == MODE_AUTO) ? "mode=AUTO " : "mode=IRRIGATION_ONLY "; touchedCol = true; }
       if (setEn)    { COLUMN_ENABLED[ci] = newEn; changed += String("enabled=") + (newEn ? "1 " : "0 "); touchedEn = true; }
       if (setSched) { colSchedMode[ci] = newSched; changed += String("sched=") + (newSched ? "MANUAL " : "AUTO "); touchedSched = true; }
@@ -9989,6 +10528,8 @@ void firebaseCommandTick() {
       if (touchedCol)   saveColumn(ci);                   // only write the NVS blocks we touched
       if (touchedSched) saveSchedule(ci);
       if (touchedEn)    saveColEnable(ci);
+      if (touchedPlan)  saveColumnPlan(ci);
+      if (touchedTh)    saveColumnThresh(ci);
       changed.trim();
       logEvent("FIREBASE", "CFG", String("COL_") + COL_TAG[ci] + "|" + changed);
       firebaseQueueStatus(c.id, "completed", (String("COL_") + COL_TAG[ci] + ": " + changed).c_str());
@@ -10027,11 +10568,22 @@ void firebaseCommandTick() {
       if (c.thStart < 0 || c.thGap < 0.0f) { firebaseQueueStatus(c.id, "rejected", "missing threshold fields"); continue; }
       int s  = clampi(c.thStart, 0, 100);
       float g = (c.thGap > 500.0f) ? 500.0f : c.thGap;
-      soilStartPct = s; fertGap = g;
+      // Too wet + the reservoir pause (2026-11-18): optional, so an older page still sets the first two alone. Checked
+      // before anything changes: a refused field leaves all four as they were.
+      int w = soilWetPct, r = resPausePct;
+      if (c.thWet >= 0) {
+        if (!wetAboveStart(s, c.thWet)) { firebaseQueueStatus(c.id, "rejected", "too wet must be 5 % over soil start, max 100"); continue; }
+        w = c.thWet;
+      }
+      if (c.thRes >= 0) {
+        if (!resPauseOk(c.thRes, (int)RES_LOW_PCT)) { firebaseQueueStatus(c.id, "rejected", "reservoir pause must be 18-50 %"); continue; }
+        r = c.thRes;
+      }
+      soilStartPct = s; fertGap = g; soilWetPct = w; resPausePct = r;
       saveThresholds();
-      logEvent("FIREBASE", "CFG", String("THRESH|start=") + s + "|gap=" + String(g, 1));
+      logEvent("FIREBASE", "CFG", String("THRESH|start=") + s + "|gap=" + String(g, 1) + "|wet=" + w + "|res=" + r);
       firebaseQueueStatus(c.id, "completed",
-        (String("thresholds: start=") + s + " gap=" + String(g, 1)).c_str());
+        (String("thresholds: start=") + s + " gap=" + String(g, 1) + " wet=" + w + " res=" + r).c_str());
       continue;
     }
 
@@ -10090,6 +10642,17 @@ void firebaseCommandTick() {
       bool was = bswLatched;
       bswClear("WEB");
       firebaseQueueStatus(c.id, "completed", was ? "battery-switch fault cleared" : "no battery-switch fault was latched");
+      continue;
+    }
+
+    // ---- TANK_CHECK_OK (18 Nov 2026): the website's "I've checked the tank". Same rule and effect as SMS
+    // TANKCHECK,OK: only while idle, and it doesn't change ESP2's saved volume. Control accounts (RTDB rules).
+    if (!strcmp(c.type, "TANK_CHECK_OK")) {
+      if (sysState != IDLE_STATE) { firebaseQueueStatus(c.id, "rejected", "wait until the rig is idle"); continue; }
+      bool was = tankCheckNeeded;
+      tankCheckClear("WEB");
+      fbRequestPush();                                   // the banner goes as soon as the next report lands
+      firebaseQueueStatus(c.id, "completed", was ? "tank check confirmed: runs can start" : "no tank check was needed");
       continue;
     }
 
@@ -10218,14 +10781,22 @@ void firebaseLogTick() {
     fbAuthErrLogPending = false;
     logEvent("ESP1", "FBASE", String("AUTH|") + fbAuthErrLog);
   }
+  if (fbReplyLogPending) {                          // Firebase refused a report / its text was cleaned (18 Nov 2026 g)
+    logEvent("ESP1", "FBASE", fbReplyLog);           // copied before the flag clears: core 0 writes only while it is clear
+    fbReplyLogPending = false;
+  }
   if (fbPollErrLogPending) {                        // command-poll diagnostics, deferred from core 0
     fbPollErrLogPending = false;
     logEvent("FIREBASE", "POLL", fbPollErrLog);
   }
   static int  lastState = -1;                       // -1 unknown, 0 fail, 1 ok
-  static unsigned long lastSeenUploadMs = 0;
-  if (fbLastUploadMs == lastSeenUploadMs) return;   // no new attempt since the last check
-  lastSeenUploadMs = fbLastUploadMs;
+  static unsigned long lastLineMs = 0;              // 0 = none yet
+  // fbUploadDone, not fbLastUploadMs (18 Nov 2026 c): the latter is stamped when a call STARTS, so this used to read the
+  // previous call's result while the new request was still on the wire.
+  static uint32_t lastSeenDone = 0;
+  uint32_t done = fbUploadDone;
+  if (done == lastSeenDone) return;                 // no call has finished since the last check
+  lastSeenDone = done;
   // netMux: the core-0 admin form may be rewriting these while this core-1 tick reads them.
   // Unconfigured/disabled is not a failure -- don't log a FAIL line for a feature that is simply off.
   bool configured;
@@ -10237,14 +10808,21 @@ void firebaseLogTick() {
   if (!configured) { lastState = -1; return; }      // re-arm so the first real result still logs
   int now = fbLastOk ? 1 : 0;
   if (now == lastState) return;
+  // At most one line per FB_LOG_TRANSITION_MIN_MS (18 Nov 2026 c). lastState is left as it was, so a change that lasts
+  // is still written once the gap is over, and n= / fail= below count everything in between.
+  if (lastLineMs && millis() - lastLineMs < FB_LOG_TRANSITION_MIN_MS) return;
+  lastLineMs = nzMs(millis());
   lastState = now;
   uint32_t stackFree = netTaskHandle ? uxTaskGetStackHighWaterMark(netTaskHandle) : 0;
   // auth= and url= make an n=0 row self-explanatory: with no attempt counted, the cause is
-  // always upstream of the request, and it is one of these two.
+  // always upstream of the request, and it is one of these two. skip= (18 Nov 2026 c) says which,
+  // when nothing was sent: off, wifi, no-snapshot, memory or login.
+  const char *skip = fbLastSkip;
   logEvent("ESP1", "FBASE", String(now ? "OK" : "FAIL") + "|http=" + String(fbLastHttp) +
+                            (skip[0] ? String("|skip=") + skip : String("")) +
                             "|auth=" + String(fbAuthOk ? "ok" : "no") +
                             "|url=" + String(urlLabel) +
-                            "|heap=" + String(fbLastHeap) + "|netstk=" + String(stackFree) +
+                            "|heap=" + String(fbLastHeap) + "|blk=" + String(fbLastBlock) + "|netstk=" + String(stackFree) +
                             "|n=" + String(fbAttempts) + "|fail=" + String(fbFailures));
 }
 
@@ -10313,7 +10891,7 @@ bool supaUploadFile(const char *path, const char *objName) {
   // Close Firebase's kept-alive TLS session first, so only one is ever open (~40-50 KB each); its next
   // request simply re-handshakes. Then the same heap floor Firebase uses: a skipped upload just retries.
   fbResetTls();
-  if (ESP.getFreeHeap() < FIREBASE_MIN_HEAP) { uploadHttp = -3; return false; }
+  if (heap8Free() < FB_TLS_MIN_FREE || heap8Block() < FB_TLS_MIN_BLOCK) { uploadHttp = -3; return false; }   // 18 Nov h
 
   if (!sdTake(4000)) { uploadHttp = -1; return false; }            // SD busy (portal/summary) -> retry later
   File f = SD.open(path, FILE_READ);
@@ -10862,6 +11440,11 @@ static void portalHandleThresh() {                            // POST /thresh
                  String(portalServer.arg("gap").toInt()), "Thresholds saved (reload to confirm).");
 }
 static void portalStart() {
+  // Drop the Firebase TLS session first (18 Nov 2026 g): its ~40 KB of mbedTLS buffers stayed allocated through the whole
+  // portal session, next to the AP, the DNS and web servers and the WiFi scan -- on a heap at ~68 KB free with a 40 KB
+  // largest block. On 18 Nov evening the portal was opened ~40 times and ESP1 rebooted with PANIC / TASK_WDT 7 times,
+  // each within two minutes of opening (or cancelling) it. Nothing uses the session while the portal is up.
+  fbResetTls();
   WiFi.mode(WIFI_AP_STA);                                     // AP_STA so scanNetworks() works while AP is up
   WiFi.softAP(AP_SSID, AP_PASS);
   vTaskDelay(pdMS_TO_TICKS(100));
@@ -10900,6 +11483,9 @@ static void portalStart() {
   portalSaved = false; portalStartMs = millis(); portalActive = true;
   Serial.printf("[PORTAL] up: AP=%s IP=%s\n", AP_SSID, portalApIp);
 }
+// WiFi power save: the core's default (modem sleep) again since 18 Nov 2026 g. 18 Nov f kept the radio awake
+// (WiFi.setSleep(false), ~80-100 mA more) without a measurable gain; the SD card shows 1-8 % failed reports a day on
+// 10-17 Nov with the default at -84..-89 dBm. Back to what was proven.
 static void portalStop() {
   portalServer.stop();
   portalDns.stop();
@@ -10966,13 +11552,11 @@ void netTask(void *pv) {
     wifiRssiVal = WiFi.RSSI();
     if (fbTlsResetPending) { fbTlsResetPending = false; fbResetTls(); }
 
-    // t.state, not raw sysState: this runs on core 0 and the telemMux-guarded snapshot is the only
-    // sanctioned view of core-1 state here -- same principle firebaseUploadLive() already documents
-    // for itself (this cadence check just hadn't been updated to match when that was written).
-    SystemState netState;
-    { TelemetrySnapshot t; portENTER_CRITICAL(&telemMux); t = telem; portEXIT_CRITICAL(&telemMux); netState = t.state; }
-    unsigned long interval = (netState == ACTIVE_STATE) ? TS_UPLOAD_ACTIVE_MS : TS_UPLOAD_IDLE_MS;
-    if (millis() - lastUpload >= interval) { lastUpload = millis(); tsUpload(); }
+    // ThingSpeak: one pace in every mode (18 Nov 2026 e; it was every 20 s during a run).
+    if (millis() - lastUpload >= TS_UPLOAD_IDLE_MS) { lastUpload = millis(); tsUpload(); }
+    // The link mode for this pass (LINK PACE). linkBusyFlag is a plain bool written by core 1 once a second.
+    const LinkMode lmode = linkModeNow();
+    const bool     lbusy = lmode == LINK_BUSY;
 
     // Firebase live snapshot for the web dashboard. Same core-0 cadence discipline as tsUpload above:
     // it may block on the network, but never touches the core-1 control loop. Additive -- ThingSpeak
@@ -10989,9 +11573,7 @@ void netTask(void *pv) {
       if (fbOn) fbEnsureToken();
     }
 
-    unsigned long fbInterval = fbViewerWatching()
-        ? ((netState == ACTIVE_STATE) ? FIREBASE_UPLOAD_LIVE_ACTIVE_MS : FIREBASE_UPLOAD_LIVE_IDLE_MS)   // someone is watching
-        : ((netState == ACTIVE_STATE) ? FIREBASE_UPLOAD_ACTIVE_MS : FIREBASE_UPLOAD_IDLE_MS);
+    unsigned long fbInterval = linkPaceMs(lmode);          // LINK PACE: 60 s idle, 30 s watched, 60 s busy
     // An error should not sit unseen for up to a minute, so core 1 can force a push out of band.
     // Rate-limited: a burst of rejections must not turn into a burst of TLS uploads on a battery.
     // It waits for a snapshot taken after the request (fbPushSeq), at most FB_PUSH_FRESH_WAIT_MS, so
@@ -11013,9 +11595,42 @@ void netTask(void *pv) {
         pushWaitMs = 0;
       }
     }
-    // The dashboard's Refresh button: a fresh report now (the snapshot core 1 refreshes every second).
-    if (fbRefreshPending && millis() - fbLastUploadMs >= FB_REFRESH_MIN_GAP_MS) { fbRefreshPending = false; urgent = true; }
-    if (urgent || millis() - fbLastUploadMs >= fbInterval) firebaseUploadLive();
+    // The dashboard's Refresh button: a fresh report now (the snapshot core 1 refreshes every second). While BUSY at
+    // most every FB_REFRESH_GAP_BUSY_MS; a request inside the gap stays pending and is answered when the gap is over.
+    if (fbRefreshPending && millis() - fbLastUploadMs >= (lbusy ? FB_REFRESH_GAP_BUSY_MS : FB_REFRESH_GAP_IDLE_MS)) {
+      fbRefreshPending = false; urgent = true;
+    }
+    // A report that FAILED goes again after FB_UPLOAD_RETRY_MS, up to FB_UPLOAD_RETRIES times in a row (18 Nov 2026 c),
+    // instead of at the next tick; not while BUSY (18 Nov 2026 e). A call that sent nothing (no WiFi, no token, low
+    // memory) is not retried early: its own cause has to clear first, and the regular tick tries again.
+    static uint8_t       upRetries = 0;
+    static unsigned long upRetryAt = 0;                    // 0 = none due
+    static uint8_t       netFails  = 0;                    // reports failed in a row with a network error (recovery)
+    bool retryDue = upRetryAt && (long)(millis() - upRetryAt) >= 0;
+    if (urgent || retryDue || millis() - fbLastUploadMs >= fbInterval) {
+      uint32_t triedBefore = fbAttempts;
+      bool sent = firebaseUploadLive();
+      bool tried = fbAttempts != triedBefore;
+      upRetryAt = 0;
+      if (sent) upRetries = 0;
+      else if (tried && !lbusy && upRetries < FB_UPLOAD_RETRIES) { upRetries++; upRetryAt = nzMs(millis() + FB_UPLOAD_RETRY_MS); }
+      // Recovery (18 Nov 2026 e). A network error is -1..-99 (HTTPClient; -100/-101 are this side's own: an
+      // over-full document or no free block). Drop the session every FB_RESET_AFTER_FAILS of them, so the next request
+      // opens a fresh one, and leave WiFi after FB_REJOIN_AFTER_FAILS: the top of this loop joins it again.
+      int code = fbLastHttp;
+      if (sent) netFails = 0;
+      else if (tried && code < 0 && code > -100) {
+        netFails++;
+        if (netFails >= FB_REJOIN_AFTER_FAILS) {
+          netFails = 0; fbWifiRejoins++;
+          fbResetTls();
+          WiFi.disconnect();
+          vTaskDelay(pdMS_TO_TICKS(500));
+          continue;                                        // the top of the loop reconnects
+        }
+        if (netFails % FB_RESET_AFTER_FAILS == 0) { fbLinkResets++; fbResetTls(); }
+      }
+    }
     // Remote-command transport, both directions. Cheap: they ride the SAME keep-alive TLS
     // socket as the upload above, so a 3 s poll costs one small GET, not a handshake.
     firebaseFlushStatus();                                 // results first: report before fetching more
@@ -11042,9 +11657,12 @@ void netTask(void *pv) {
         uploadReqStamp = 0; uploadBusy = false;
       }
     }
-    if (fbLogJob.active) fbLogJobStep();
+    {   // one log piece per FB_LOG_STEP_MIN_MS at most, as when every pass ended with a 500 ms wait
+      static unsigned long lastLogStepMs = 0;
+      if (fbLogJob.active && millis() - lastLogStepMs >= FB_LOG_STEP_MIN_MS) { lastLogStepMs = millis(); fbLogJobStep(); }
+    }
     firebasePollLogRequest();                              // the website's "Upload from the rig" (every 10 s)
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(500));                        // one pass every 500 ms in every mode (100 ms while watched, 18 Nov b-d)
   }
 }
 
@@ -12781,7 +13399,10 @@ void commitEditor() {
       saveExercise();
       break;
     case SET_THRESH:
-      soilStartPct = editTmp[0]; fertGap = editTmp[1]; saveThresholds();
+      soilStartPct = editTmp[0]; fertGap = editTmp[1];
+      soilWetPct  = wetEffPct(editTmp[2], editTmp[0]);                              // 18 Nov 2026
+      resPausePct = clampi(editTmp[3], (int)RES_LOW_PCT, RES_PAUSE_MAX_PCT);
+      saveThresholds();
       logEvent("ESP1", "STATE", "THRESH_SET");
       break;
     case SET_ACVOLT:
@@ -12856,14 +13477,18 @@ void restoreDefaults() {
     static const uint16_t EXTRA_DEF[MAX_RUNS_PER_DAY - 1][2] = { { 12*60, 13*60 }, { 16*60, 17*60 }, { 18*60, 19*60 } };
     colRuns[c] = 1;
     for (int x = 0; x < MAX_RUNS_PER_DAY - 1; x++) { COL_EXTRA_START[c][x] = EXTRA_DEF[x][0]; COL_EXTRA_END[c][x] = EXTRA_DEF[x][1]; }
-    saveColumn(c); saveSchedule(c);
+    colOpManual[c] = 0; planClear(colPlan[c]);   // Automatic, no day plan (2026-11-18)
+    colSoilStart[c] = colSoilWet[c] = -1;        // the default Soil start / Too wet again (2026-11-18)
+    saveColumn(c); saveSchedule(c); saveColumnPlan(c); saveColumnThresh(c);
   }
   // Audit fix (2026-09-10): restoreDefaults() is documented as "reset to compiled defaults" -- this
   // was hardcoding 20.0f while the actual compiled global default (line 134, FERTIGATE_TRIGGER_GAP)
   // is 30.0f. soilStartPct here already matches its own compiled default; fertGap was the one silent
   // outlier, making Restore Defaults leave a materially more aggressive fertigation trigger than the
   // function's own contract promises.
-  soilStartPct = 35; fertGap = 30.0f; saveThresholds();
+  soilStartPct = 35; fertGap = 30.0f;
+  soilWetPct = SOIL_WET_DEFAULT_PCT; resPausePct = (int)RES_LOW_PCT;   // 18 Nov 2026: 90 % and 18 %
+  saveThresholds();
   setAcVoltWindow(AC_V_DEFAULT_LOW, AC_V_DEFAULT_HIGH, "ESP1");   // AC supply window back to 215-240 V
   setAcAmpWindow(AC_A_DEFAULT_MIN, AC_A_DEFAULT_MAX, "ESP1");     // AC current limits back to 0.5 / 3.0 A
   logEvent("ESP1", "RESET", "CONFIG|DEFAULTS|kept cal+cols+wifi");
@@ -12886,7 +13511,8 @@ void enterEditor(int item) {
       editTmp[2] = (int)col[0].targetN; editTmp[3] = (int)col[0].targetP;
       editTmp[4] = (int)col[0].targetK; editTmp[5] = (int)(col[0].targetPH * 10);
       break;
-    case SET_THRESH:   editTmp[0] = soilStartPct; editTmp[1] = (int)fertGap; break;
+    case SET_THRESH:   editTmp[0] = soilStartPct; editTmp[1] = (int)fertGap;
+                       editTmp[2] = soilWetPct; editTmp[3] = (int)resPauseLevel(); break;   // + Too wet, pause (18 Nov)
     case SET_ACVOLT:   editTmp[0] = acVMin; editTmp[1] = acVMax; break;
     case SET_ACAMP:    editTmp[0] = acAMax10; editTmp[1] = acAMin10; break;   // overcurrent first
     case SET_EXERCISE: editTmp[0] = exerciseEnabled ? 1 : 0; editTmp[1] = exerciseRunS; break;
@@ -13167,11 +13793,15 @@ void settingsButton(int i) {
           }
           break;
       case SET_THRESH:
+        // 18 Nov 2026: + Too wet (kept THRESH_MIN_GAP_PCT over soil start) and the reservoir pause (18-50 %).
         if (delta) {
           if (editField == 0) editTmp[0] = clampi(editTmp[0] + delta, 0, 100);
           else if (editField == 1) editTmp[1] = clampi(editTmp[1] + delta, 0, 500);
+          else if (editField == 2) editTmp[2] = clampi(editTmp[2] + delta, editTmp[0] + THRESH_MIN_GAP_PCT, 100);
+          else if (editField == 3) editTmp[3] = clampi(editTmp[3] + delta, (int)RES_LOW_PCT, RES_PAUSE_MAX_PCT);
         } else if (i == 2) {
-          if (++editField > 1) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
+          if (editField == 1) editTmp[2] = wetEffPct(editTmp[2], editTmp[0]);   // a raised start pushes Too wet up
+          if (++editField > 3) { commitEditor(); editDirty = false; uiMode = UI_MENU; editItem = -1; }
         }
         break;
       case SET_ACVOLT:
@@ -13640,8 +14270,8 @@ void lcdTick() {
       break;
     case PAGE_COLUMNS:
       for (int c = 0; c < 3; c++) {
-        snprintf(l, 21, "%c:%s %s", COL_TAG[c],
-                 COLUMN_ENABLED[c] ? (col[c].mode == MODE_AUTO ? "AUTO" : "IRR ") : "OFF ",
+        snprintf(l, 21, "%c:%s %s", COL_TAG[c],      // MAN = Manual today: no scheduled run (2026-11-18)
+                 COLUMN_ENABLED[c] ? (colManualToday(c) ? "MAN " : col[c].mode == MODE_AUTO ? "AUTO" : "IRR ") : "OFF ",
                  strlen(col[c].name) ? col[c].name : "-");
         lcdRow(c, l);
       }
@@ -13925,8 +14555,9 @@ void lcdRenderSettings() {
       snprintf(l, 21, "%cSoil start<%3d%%    ", editField==0?'>':' ', editTmp[0]); lcd.print(l);
       lcd.setCursor(0, 1);
       snprintf(l, 21, "%cFert gap %3d mg/kg  ", editField==1?'>':' ', editTmp[1]); lcd.print(l);
-      lcd.setCursor(0, 2);
-      lcd.print(F("                    "));
+      lcd.setCursor(0, 2);                                  // 18 Nov 2026: Too wet over / reservoir pause under
+      snprintf(l, 21, "%cWet>%3d%% %cRes<%2d%%  ", editField==2?'>':' ', editTmp[2], editField==3?'>':' ', editTmp[3]);
+      lcd.print(l);
       break;
 
     case SET_ACVOLT: {

@@ -85,11 +85,15 @@
          INFO,PUMP_RATE,<pump>|seen=..|cal=..|unit=<L/min|mL/min>|moved=..|s=.. (end of each stage: the rate the
                  levels / dose meter really saw, beside the measured one); DEGRADED,PUMP_WEAK|<pump>|levels=..|by_rate=..
                  (the levels saw under half of what the measured rate should have moved: alert only, the run goes on);
-         INFO,FILL_RUN|need=..|run_s=..|q=..|start_l=..|base=..[|topup=n] (a transfer run, timed from the inverter
-                 switch-on, 2026-11-17); INFO,FILL_CHECK|goal=..|measured=..|missing=..|settle_s=..|<OK|TOPUP> (after
-                 the ~1 min settle); DEGRADED,FILL_SHORT|goal=..|measured=..|topups=n (still more than 3 L short after the
+         INFO,FILL_RUN|need=..|run_s=..|q=..|start_l=..|base=..[|cut=..][|topup=n] (a transfer run, timed from the
+                 inverter switch-on, 2026-11-17; q = the rate it is timed with, cut = the live level that ends it early,
+                 2026-11-18 two-step fill); INFO,FILL_CUT|level=..|cut=..|t=..|run_s=..|by_time=.. (it ended there: the
+                 pump was faster than q); INFO,FILL_CHECK|goal=..|measured=..|missing=..|settle_s=..|<OK|TOPUP>[|seen=..]
+                 (after the ~1 min settle; seen = the rate the runs really gave, which times the top-up);
+                 DEGRADED,FILL_SHORT|goal=..|measured=..|topups=n (still more than 3 L short after the
                  top-ups: the run goes on); DEGRADED,FILL_NOT_STEADY|level=..|band=.. (measured anyway);
-                 DEGRADED,FILL_SETTLE_BLIND|goal=..|by_time=.. (no level after the settle: the run time's figure, EST);
+                 DEGRADED,FILL_SETTLE_BLIND|goal=..|by_time=..[|rest=..] (no level after the settle: the run time's
+                 figure, EST; rest = a two-step fill's remainder, run next on the saved rate);
          INFO,HELD,<work order>,<code>,<loc> (every 30 s while a fault is held: the hold reply again, in case it was
                  lost on the wire -- ESP1 acts on it only for its own acknowledged, not-yet-held work order);
          INFO,FILL_REPLAN|done=..|left=.. / INFO,DRAIN_REPLAN|done=..|left=.. (back on after a SERVO_MISMATCH re-seat:
@@ -489,6 +493,8 @@ const unsigned long TIMED_STAGE_CAP_MS = 120000; // hard cap on any single timed
  *      FILL_STEADY_WIN_MS.
  *   4. Measure. More than FILL_TOPUP_MIN_L short of the plan: run again for what is missing (at most FILL_TOPUP_MAX
  *      times), settle and measure again. FILL_TOPUP_MIN_L or less short: carry on with the run.
+ *   (2026-11-18: the first run aims for FILL_FIRST_FRAC of the need, any run may end early on the live level, and a
+ *    top-up is timed with the rate the runs really gave -- see TWO-STEP FILL below.)
  * Every run is still watched on the mixing tank's own rise: the overflow stop, no level change, stall, the empty-
  * reservoir window, the pump verdict and blind. A run that ended on the overflow limit or an empty reservoir is
  * measured but never topped up.                                                                                    */
@@ -502,8 +508,33 @@ const unsigned long FILL_SETTLE_MS     = 60000;  // user: ~1 minute             
 const unsigned long FILL_STEADY_WIN_MS = 10000;  // the reading holds this long ...
 const float         FILL_STEADY_L      = 0.3f;   // ... within this (the level noise)                          [MEASURE]
 const unsigned long FILL_SETTLE_MAX_MS = 150000; // never steady by then: measured anyway (DEGRADED,FILL_NOT_STEADY)
-const float         FILL_TOPUP_MIN_L   = 3.0f;   // user: 3 L short or less -> no top-up                        [CONFIRM]
-const uint8_t       FILL_TOPUP_MAX     = 2;      // top-up runs per fill
+// 3.0 -> 0.8 L (2026-11-18, user approved the two-step fill below): any real shortfall is topped up. Not lower: the
+// shortest run (XFER_MIN_RUN_S) gives ~1.6-2.3 L, so a top-up for less would land further off than it started.
+const float         FILL_TOPUP_MIN_L   = 0.8f;   //                                                             [MEASURE]
+const uint8_t       FILL_TOPUP_MAX     = 2;      // top-up runs per fill (the two-step fill's second run is the first)
+const float         FILL_SHORT_ALERT_L = 3.0f;   // still this short with the top-ups used up -> DEGRADED,FILL_SHORT
+/* TWO-STEP FILL (2026-11-18 user request: a 10 L forced run gave 14.9 L). The transfer pump's rate is not the same from
+ * run to run -- 18 Nov: ~10.8 L/min at 15:33, ~17.8 L/min at 17:34, same inverter power both times -- so one run timed
+ * with the saved rate can land far off, and an overfill can never be taken back. So:
+ *   1. The first run aims for FILL_FIRST_FRAC of the litres needed (all of them when the rest would be under
+ *      FILL_TOPUP_MIN_L), and ends early once the mixing tank's live level has risen FILL_FIRST_CUT_FRAC of them
+ *      (a pump much faster than its saved rate).
+ *   2. Settle and measure (as before). The rate that run really gave is worked out from the measurement
+ *      (level_meter.h fillSeenLpm; runs of FILL_LEARN_MIN_S or more).
+ *   3. The top-up is timed with that rate, for whatever is still missing, and ends early once the live level is
+ *      within FILL_CUT_LAG_L of the goal. Settle and measure again; one more top-up if still short.
+ * Every early end is a normal end (INFO,FILL_CUT) -- never a fault. It needs FILL_CUT_SAMPLES readings in a row at
+ * the cut level and a believable pace (levelPaceOk), so one noisy echo cannot end a run. A level-blind recovery
+ * (resumeTimed) keeps the single run: it could not measure the first.                                              */
+const float         FILL_FIRST_FRAC     = 0.70f;
+const float         FILL_FIRST_CUT_FRAC = 0.75f; // 0.80 left ~0.8 L for the top-up on a fast pump: at its threshold
+                                                 // (simulated 18 Nov, 8-22 L/min: 0.75 kept every fill within ~1 L)
+const float         FILL_CUT_LAG_L      = 0.8f;  // 17:34 run: settled 0.65 L above the level at pump-off, + the
+                                                 // FILL_CUT_SAMPLES readings                                    [MEASURE]
+const uint8_t       FILL_CUT_SAMPLES    = 3;     // ~1 s at the Nano's FAST rate
+const float         FILL_LEARN_MIN_S    = 10.0f; // a run this long (from the switch-on) gives a usable rate
+const float         FILL_LEARN_LO       = 0.4f;  // a seen rate outside 0.4-2.5x the saved one is not used
+const float         FILL_LEARN_HI       = 2.5f;
 // DELIVERY (2026-11-17 user rule): the booster empties the tank to under MIX_LOW_STOP_PCT and runs MIX_LOW_STOP_MS more.
 // Its rate is no measure of the litres (the drip pipe slows it, by an amount not measured yet); it only sizes how long
 // a delivery may take to show progress: the no-flow and stall windows and the stage cap allow a tank that drains
@@ -852,6 +883,13 @@ float sgXferGoalL = 0.0f;                // the mixing-tank level the run aims f
 unsigned long sgRelayOnMs = 0;           // the inverter switch-on this run is timed from (0 = not on yet)
 unsigned long sgXferRunMs = 0;           // its run time from that switch-on
 bool  sgXferStopped = false;             // the water stopped (no level change / stall / empty): credit the levels
+// Two-step fill (2026-11-18, see FILL_FIRST_FRAC): the rate this run is timed with and the live level that ends it early.
+float sgXferLpm = 0.0f;                  // L/min this run is timed with (0 = the saved rate, xferLpm())
+float sgXferCutL = -1.0f;                // live mixing-tank level that ends the run early (<0 = none)
+bool  sgXferCut = false;                 // the run ended there: credited with the level's rise, not the clock's
+uint8_t  sgCutHits = 0;                  // readings in a row at the cut level
+uint32_t sgCutSeenN = 0;                 // the last level sample judged (lfMix.count)
+bool  sgXferReplanned = false;           // a selector re-seat replanned this run (FILL_REPLAN): its rate says nothing
 unsigned long sgFloorSinceMs = 0;        // delivery: the level reached the booster's floor (its MIX_LOW_STOP_MS count)
 bool  sgFillBlind = false;               // this fill lost its level and runs on its (capped) run time
 String lastStageDiag = "";               // "moved=..|level=..|base=.." of the last level stage (fault text)
@@ -2499,12 +2537,16 @@ void goStep(SeqStep s) {
  * ~1 Hz while a work order runs so ESP1 can draw a moving bar. Cheap: no extra hardware reads.       */
 const unsigned long PROG_MS = 1000;
 unsigned long lastProgMs = 0;
+static bool fillProgress(float &L, float &T);   // with fillStep: a fill's progress across its runs and settles
 void progTick() {
   if (!wo.active) { lastProgMs = 0; return; }
   if (millis() - lastProgMs < PROG_MS) return;
   lastProgMs = millis();
-  float L = (sgPump >= 0 && sgPumpOn) ? stageMovedL() : 0.0f;
-  reply("PROG," + String(L, 3) + "," + String(sgTarget, 3) + "," + String(woWaterL, 2));
+  float L = (sgPump >= 0 && sgPumpOn) ? stageMovedL() : 0.0f, T = sgTarget;
+  // A fill is one or more runs with settles between them (two-step fill, 2026-11-18): report the whole fill, so the bar
+  // does not drop back to zero for the settle or start again for the top-up.
+  fillProgress(L, T);
+  reply("PROG," + String(L, 3) + "," + String(T, 3) + "," + String(woWaterL, 2));
 }
 
 /* ---- Level feed lease (web v.4) ------------------------------------------- *
@@ -2596,13 +2638,16 @@ static float rateMovedL(unsigned long now) {
   return sgRateBaseL + sgRateLpm * (float)(now - sgRateT0) / 60000.0f;
 }
 /* ---- Transfer by run time (2026-11-17 user rule, see XFER_START_L) ---- */
+// The rate this run is timed with: the one the fill's first run really gave (two-step fill, 2026-11-18), else the
+// saved one.
+static float xferQLpm() { return sgXferLpm > 0.0f ? sgXferLpm : xferLpm(); }
 static unsigned long xferRunMsFor(float needL) {
-  return (unsigned long)(xferRunS(needL, xferLpm() / 60.0f, xferStartL, XFER_MIN_RUN_S) * 1000.0f);
+  return (unsigned long)(xferRunS(needL, xferQLpm() / 60.0f, xferStartL, XFER_MIN_RUN_S) * 1000.0f);
 }
 // Litres this fill has given by now: what was in before a re-seat, plus the line since this run's switch-on.
 static float xferTimerL(unsigned long now) {
   if (sgRelayOnMs == 0) return sgXferDoneL;
-  return sgXferDoneL + xferLitresAt((float)(now - sgRelayOnMs) / 1000.0f, xferLpm() / 60.0f, xferStartL, XFER_MIN_RUN_S);
+  return sgXferDoneL + xferLitresAt((float)(now - sgRelayOnMs) / 1000.0f, xferQLpm() / 60.0f, xferStartL, XFER_MIN_RUN_S);
 }
 static bool xferDue(unsigned long now) { return sgRelayOnMs != 0 && now - sgRelayOnMs >= sgXferRunMs; }
 // Weak transfer pump: RATE_CHECK_MS after the switch-on, once the line says RATE_CHECK_MIN_L should be in, the mixing
@@ -2709,6 +2754,7 @@ void stageBegin(int pumpBit, bool isAC, int flowPin, float k, float targetL) {
   sgLevelsL = 0.0f; sgRateChecked = false; sgLastMovedMs = 0;
   sgPaceWarned = false; sgNoiseWarned = false;
   sgXferTimed = false; sgXferStopped = false; sgRelayOnMs = 0; sgXferRunMs = 0; sgXferDoneL = 0.0f;
+  sgXferLpm = 0.0f; sgXferCutL = -1.0f; sgXferCut = false; sgCutHits = 0; sgCutSeenN = 0; sgXferReplanned = false;
   sgFloorSinceMs = 0;
   sgFillBlind = false;
   sgMeterRaw = 0; sgMeterGood = 0; sgMeterDropped = 0; sgMeterWinMs = millis();
@@ -2747,9 +2793,12 @@ float endMeteredStage() {
       // A FILL (2026-11-17 user rule): the transfer pump's run time is the measure -- the settle that follows re-measures
       // the tank on its ultrasonic. A run whose water stopped (no level change, a stall, an empty reservoir) is credited
       // with the mixing tank's own rise instead: the clock's litres never came.
-      if (sgXferStopped) { if (fresh) { sgLastMovedL = lfMix.med - sgMixBaseL; sgLastMovedMs = nowMs; } }
+      // A run ended early at its cut level (two-step fill, 2026-11-18) is credited with that rise too: the pump ran
+      // faster than the clock assumes, so the clock's figure would be short.
+      bool byLevel = sgXferStopped || sgXferCut;
+      if (byLevel) { if (fresh) { sgLastMovedL = lfMix.med - sgMixBaseL; sgLastMovedMs = nowMs; } }
       else if (sgPumpOn) { sgLastMovedL = xferTimerL(nowMs); sgLastMovedMs = nowMs; }
-      if (sgTimed || (sgXferStopped && !fresh)) woEstimated = true;
+      if (sgTimed || (byLevel && !fresh)) woEstimated = true;
       if (sgPumpOn) fillEstimate(&resDown, &mixUp, &inL);       // the two tanks, for the log only
       liters = sgLastMovedL > 0.0f ? sgLastMovedL : 0.0f;
       if (!sgTimed) rateReport(nowMs);
@@ -2768,12 +2817,12 @@ float endMeteredStage() {
     lastStageDiag = String("moved=") + String(liters, 2) + "|level=" + (fresh ? String(cur, 2) : String("blind")) +
                     "|base=" + String(sgMixBaseL, 2) + "|bad_lines=" + String(lvBad) + "|lost_lines=" + String(lvGap);
     if (fill && sgXferTimed) {
-      lastStageDiag += String("|by_time=") + (sgXferStopped ? String("stopped") : String(liters, 2));
+      lastStageDiag += String("|by_time=") + (sgXferStopped ? String("stopped") : sgXferCut ? String("cut") : String(liters, 2));
       if (mixUp != -1.0f) lastStageDiag += "|mix=+" + String(mixUp, 2);
       if (resDown != -1.0f) lastStageDiag += "|res=-" + String(resDown, 2);
     }
     if (sgTankSign < 0) woWaterL += liters;      // mix -> column
-    if (fill && sgXferTimed && !sgXferStopped && sgBaseMeasured) {
+    if (fill && sgXferTimed && !sgXferStopped && !sgXferCut && sgBaseMeasured) {
       // The run time's figure: the settled level it started from plus what the line gives. The mixing tank still has the
       // inflow's waves on it; the settle that follows (fillStep) replaces this with a measured level.
       mixTankL = sgMixBaseL;
@@ -2902,7 +2951,7 @@ int stagePoll() {
         float room = mixCapL - level;
         if (left > room) left = room;
         if (left < 0.0f) left = 0.0f;
-        sgXferDoneL = done; sgXferNeedL = left;
+        sgXferDoneL = done; sgXferNeedL = left; sgXferReplanned = true;
         sgRelayOnMs = (apRelayOnMs && now - apRelayOnMs < 60000UL) ? apRelayOnMs : now;
         sgXferRunMs = (left >= TANK_EPS_L) ? xferRunMsFor(left) : 0;   // nothing left: it stops at once
         lsBegin(ls, +1, done, now);                      // moving or not: judged afresh, for the right pump
@@ -3023,6 +3072,22 @@ int stagePoll() {
     sgLastMovedL = byTime; sgLastMovedMs = now;
     xferWeakCheck(levelsL, byTime, now);
     if (xferDue(now)) return 1;                                // rule 2: the run time is reached
+    // Two-step fill (2026-11-18): the live level reached this run's cut level before its run time -- the pump is faster
+    // than the rate it was timed with. A normal end: the settle measures it and a top-up makes up the rest. Judged
+    // once per new accepted sample, FILL_CUT_SAMPLES in a row, at a believable pace.
+    if (sgXferCutL > 0.0f && lfMix.count != sgCutSeenN) {
+      sgCutSeenN = lfMix.count;
+      sgCutHits = (cur >= sgXferCutL) ? (uint8_t)(sgCutHits < 255 ? sgCutHits + 1 : 255) : 0;
+      if (sgCutHits >= FILL_CUT_SAMPLES &&
+          levelPaceOk(levelsL, now, xferQLpm() > xferLpm() ? xferQLpm() : xferLpm(), "FILL")) {
+        sgXferCut = true;
+        sgLastMovedL = levelsL; sgLastMovedMs = now;
+        reply("INFO,FILL_CUT|level=" + String(cur, 2) + "|cut=" + String(sgXferCutL, 2) + "|t=" +
+              String((now - sgRelayOnMs) / 1000.0f, 1) + "|run_s=" + String(sgXferRunMs / 1000.0f, 1) +
+              "|by_time=" + String(byTime, 2));
+        return 1;
+      }
+    }
   } else {
     // DELIVERY: the mixing tank's own fall is the measure. Rule 2 (2026-11-17 user rule): under MIX_LOW_STOP_PCT the
     // booster runs MIX_LOW_STOP_MS more (the low stop above); a tank its booster cannot get that low ends the same way,
@@ -3264,36 +3329,61 @@ static String colMaskName(uint8_t mask) {
   return s;
 }
 
-/* ---- FILL / FLUSH_FILL (2026-11-17 user rule): run time, settle, measure, top up ------------------------------ *
- * One transfer run is timed from the inverter switch-on for the litres it should give (xferRunMsFor). Then the
- * inverter is off and the water settles for FILL_SETTLE_MS while the mixing tank is watched; once the reading has held
- * within FILL_STEADY_L for FILL_STEADY_WIN_MS it is the measurement. More than FILL_TOPUP_MIN_L short of the plan: another
- * run for what is missing (at most FILL_TOPUP_MAX), settled and measured again; otherwise the run carries on.
+/* ---- FILL / FLUSH_FILL (2026-11-17 user rule; two steps since 2026-11-18): run time, settle, measure, top up ----- *
+ * A transfer run is timed from the inverter switch-on for the litres it should give (xferRunMsFor). Then the inverter
+ * is off and the water settles for FILL_SETTLE_MS while the mixing tank is watched; once the reading has held within
+ * FILL_STEADY_L for FILL_STEADY_WIN_MS it is the measurement. The first run aims short of the goal and every run may
+ * end early at its cut level (TWO-STEP FILL, at FILL_FIRST_FRAC). More than FILL_TOPUP_MIN_L short after a settle:
+ * another run for what is missing, timed with the rate the runs really gave (at most FILL_TOPUP_MAX), settled and
+ * measured again; otherwise the run carries on.
  * Returns 1 when the fill is done (the caller moves on), 0 while it runs / settles / waits / holds.                */
 enum FillPhase : uint8_t { FP_RUN = 0, FP_SETTLE = 1 };
 FillPhase     fpPhase = FP_RUN;
 float         fpGoalL = 0.0f;          // the mixing-tank level this fill aims for (settled base + batch, capped)
+float         fpBase0L = 0.0f;         // the settled level the fill started from (zero on the progress bar)
 uint8_t       fpTopups = 0;            // top-up runs so far
 unsigned long fpStopMs = 0;            // the last run stopped (the settle clock)
 bool          fpNoTopup = false;       // that run ended on the overflow limit or an empty reservoir
+bool          fpSplit = false;         // the first run aimed short of the goal (two-step fill)
+float         fpRunBaseL = 0.0f;       // the last run: the level it started from,
+float         fpRunS = 0.0f;           //   how long it ran from the inverter switch-on (s),
+bool          fpRunClean = false;      //   and whether its rise can tell the pump's rate (no re-seat, blind or timed part)
+float         fpSeenLpm = 0.0f;        // the rate this fill's runs really gave (0 = not known: the saved rate)
 SteadyWatch   fpSteady = { 0, 0.0f, 0.0f, false };
 
-static void fillRunBegin(float needL, float baseL, bool measured) {
+// One transfer run: needL from baseL, timed with qLpm (0 = the saved rate), ended early once the live level reaches
+// cutL (<0 = only at its run time).
+static void fillRunBegin(float needL, float baseL, bool measured, float qLpm, float cutL) {
   resValveSet(true);
   levelStageBegin(PUMP_TRANSFER, +1, needL, baseL, measured);
   sgXferTimed = true;
+  sgXferLpm  = (qLpm > 0.0f) ? qLpm : 0.0f;
+  sgXferCutL = resumeTimed ? -1.0f : cutL;       // a level-blind recovery has no level to end on
   sgXferNeedL = needL; sgXferDoneL = 0.0f; sgXferGoalL = baseL + needL;
   sgXferRunMs = xferRunMsFor(needL);
-  sgCapMs = stageCapMs(needL, xferLpm(), STAGE_MAX_MS, STAGE_CAP_MARGIN);
+  // The cap stays well past the run time whichever rate times it: sized on the slower of the two.
+  sgCapMs = stageCapMs(needL, xferQLpm() < xferLpm() ? xferQLpm() : xferLpm(), STAGE_MAX_MS, STAGE_CAP_MARGIN);
   if (resumeTimed) sgTimed = true;       // level metering lost: no level rules, the run time alone (no margin: it fills)
   fpPhase = FP_RUN;
+  fpRunBaseL = baseL; fpRunS = 0.0f; fpRunClean = false;
   reply("INFO,FILL_RUN|need=" + String(needL, 2) + "|run_s=" + String(sgXferRunMs / 1000.0f, 1) + "|q=" +
-        String(xferLpm(), 2) + "|start_l=" + String(xferStartL, 2) + "|base=" + String(baseL, 2) +
+        String(xferQLpm(), 2) + "|start_l=" + String(xferStartL, 2) + "|base=" + String(baseL, 2) +
+        (sgXferCutL > 0.0f ? "|cut=" + String(sgXferCutL, 2) : String("")) +
         (fpTopups ? "|topup=" + String(fpTopups) : String("")));
 }
 static void fillSettleBegin(bool noTopup) {
   fpPhase = FP_SETTLE; fpStopMs = millis(); fpNoTopup = noTopup;
   swReset(fpSteady);
+}
+// A fill's progress across all its runs and settles (the PROG line, ESP1's progress bar): litres in since the fill
+// began, out of the fill's whole plan. false = no fill under way (the caller keeps the stage's own figures).
+static bool fillProgress(float &L, float &T) {
+  if ((step != SEQ_FILL && step != SEQ_FLUSH_FILL) || !stepInit) return false;
+  float sofar = (fpPhase == FP_RUN && sgPump >= 0 && sgPumpOn) ? (sgMixBaseL - fpBase0L) + stageMovedL()
+                                                               : mixTankL - fpBase0L;
+  L = sofar > 0.0f ? sofar : 0.0f;
+  T = fpGoalL - fpBase0L;
+  return true;
 }
 static int fillStep(int c, bool flush) {
   if (!stepInit) {
@@ -3312,8 +3402,16 @@ static int fillStep(int c, bool flush) {
     if (remaining > headroom) remaining = headroom;
     if (remaining < TANK_EPS_L) return 1;          // already enough in the tank -> skip the fill
     fpGoalL = mixTankL + remaining;
-    fpTopups = 0;
-    fillRunBegin(remaining, base, measured);
+    fpBase0L = mixTankL;
+    fpTopups = 0; fpSeenLpm = 0.0f;
+    // Two-step fill (2026-11-18): the first run aims short and ends early on a fast pump; the measured top-up finishes
+    // it. A fill too small to split, or a level-blind recovery (it could not measure the first run), is one run that
+    // still ends early if the live level gets near the goal first.
+    float first = resumeTimed ? remaining : fillFirstL(remaining, FILL_FIRST_FRAC, FILL_TOPUP_MIN_L);
+    fpSplit = (first < remaining);
+    float cut = fpSplit ? base + remaining * FILL_FIRST_CUT_FRAC
+                        : fillCutLevel(fpGoalL, FILL_CUT_LAG_L, base, LVL_MOVED_MIN_L);
+    fillRunBegin(first, base, measured, 0.0f, cut);
     stepInit = true;
     return 0;
   }
@@ -3321,7 +3419,12 @@ static int fillStep(int c, bool flush) {
     int r = stagePoll();
     if (r == 0) return 0;
     resValveSet(false);
-    if (r == 1)       { endMeteredStage(); fillSettleBegin(false); }   // run time reached: settle, then measure
+    if (r == 1) {                                                      // run time (or cut level) reached: settle, measure
+      // The run's own record, for the rate it really gave (worked out once the settle has measured it).
+      fpRunS = sgRelayOnMs ? (float)(millis() - sgRelayOnMs) / 1000.0f : 0.0f;
+      fpRunClean = !sgTimed && !sgFillBlind && !sgXferReplanned && sgBaseMeasured;
+      endMeteredStage(); fillSettleBegin(false);
+    }
     else if (r == -3) { fillStoppedHigh(); fillSettleBegin(true); }    // at the overflow limit: measure, never top up
     else if (r == -5) { fillStoppedDry();  fillSettleBegin(true); }    // the reservoir is empty: the same
     else if (r == -1) levelFlowFail("TRANSFER");
@@ -3336,9 +3439,19 @@ static int fillStep(int c, bool flush) {
   if (!steady) {
     if (now - fpStopMs < FILL_SETTLE_MAX_MS) return 0;
     if (!fresh) {
-      // No level to check the fill with: carry on with the run time's figure, marked EST.
+      // No level to check the fill with: carry on with the run time's figure, marked EST. A two-step fill's first run
+      // stopped short on purpose, so the rest is run first on the saved rate, as the single run would have (the
+      // blind-fill cap still keeps it off the overflow limit).
       woEstimated = true;
-      reply("DEGRADED,FILL_SETTLE_BLIND|goal=" + String(fpGoalL, 2) + "|by_time=" + String(mixTankL, 2));
+      float rest = fpGoalL - mixTankL;
+      bool runRest = fpSplit && !fpNoTopup && rest >= TANK_EPS_L && fpTopups < FILL_TOPUP_MAX;
+      reply("DEGRADED,FILL_SETTLE_BLIND|goal=" + String(fpGoalL, 2) + "|by_time=" + String(mixTankL, 2) +
+            (runRest ? "|rest=" + String(rest, 2) : String("")));
+      if (runRest) {
+        fpSplit = false; fpTopups++;
+        fillRunBegin(rest, mixTankL, false, 0.0f, -1.0f);
+        return 0;
+      }
       return 1;
     }
     reply("DEGRADED,FILL_NOT_STEADY|level=" + String(lfMix.med, 2) + "|band=" + String(fpSteady.hi - fpSteady.lo, 2));
@@ -3348,20 +3461,27 @@ static int fillStep(int c, bool flush) {
   mixTankL = meas;                                   // the measured truth replaces the run time's figure
   if (mixTankL > MIXING_TANK_MAX_L) mixTankL = MIXING_TANK_MAX_L;
   tankSave();
+  // The rate the run really gave (two-step fill): it times the top-up. A short or unclean run keeps the last one known.
+  if (fpRunClean) {
+    float q = fillSeenLpm(meas - fpRunBaseL, fpRunS, xferStartL, FILL_LEARN_MIN_S, xferLpm(), FILL_LEARN_LO, FILL_LEARN_HI);
+    if (q > 0.0f) fpSeenLpm = q;
+  }
   bool topup = !fpNoTopup && fillNeedsTopup(fpGoalL, meas, FILL_TOPUP_MIN_L, fpTopups, FILL_TOPUP_MAX);
   reply("INFO,FILL_CHECK|goal=" + String(fpGoalL, 2) + "|measured=" + String(meas, 2) + "|missing=" +
-        String(missing, 2) + "|settle_s=" + String((now - fpStopMs) / 1000) + "|" + (topup ? "TOPUP" : "OK"));
+        String(missing, 2) + "|settle_s=" + String((now - fpStopMs) / 1000) + "|" + (topup ? "TOPUP" : "OK") +
+        (fpSeenLpm > 0.0f ? "|seen=" + String(fpSeenLpm, 2) : String("")));
   if (topup) {
     float need = missing;
     float headroom = mixCapL - meas;
     if (need > headroom) need = headroom;
     if (need >= TANK_EPS_L) {
       fpTopups++;
-      fillRunBegin(need, meas, true);              // a new run for what is missing (timed from its own switch-on)
+      // A new run for what is missing, timed from its own switch-on with the rate seen, ended early near the goal.
+      fillRunBegin(need, meas, true, fpSeenLpm, fillCutLevel(meas + need, FILL_CUT_LAG_L, meas, LVL_MOVED_MIN_L));
       return 0;
     }
   }
-  if (!fpNoTopup && missing > FILL_TOPUP_MIN_L)       // still short with the top-ups used up: alert, carry on
+  if (!fpNoTopup && missing > FILL_SHORT_ALERT_L)     // still short with the top-ups used up: alert, carry on
     reply("DEGRADED,FILL_SHORT|goal=" + String(fpGoalL, 2) + "|measured=" + String(meas, 2) + "|topups=" +
           String(fpTopups));
   return 1;

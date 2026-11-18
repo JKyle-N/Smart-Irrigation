@@ -293,6 +293,38 @@ void test_topup_rule(void) {
   TEST_ASSERT_TRUE(fillNeedsTopup(10.0f, 6.9f, 3.0f, 0, 2));    // more than 3 L short: run again
   TEST_ASSERT_FALSE(fillNeedsTopup(10.0f, 2.0f, 3.0f, 2, 2));   // top-ups used up
   TEST_ASSERT_FALSE(fillNeedsTopup(10.0f, 11.0f, 3.0f, 0, 2));  // over: never
+  TEST_ASSERT_TRUE(fillNeedsTopup(10.57f, 9.6f, 0.8f, 1, 2));   // two-step fill (18 Nov): 0.97 L short, one left
+  TEST_ASSERT_FALSE(fillNeedsTopup(10.57f, 9.9f, 0.8f, 1, 2));  // 0.67 L short: the shortest run would overshoot
+}
+
+// Two-step fill (18 Nov): a 10 L forced run gave 14.9 L -- the pump ran ~17.8 L/min against the saved 11.74.
+void test_two_step_first_run_share(void) {
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 7.0f, fillFirstL(10.0f, 0.70f, 0.8f));    // 70 % first, 3 L left for the top-up
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 2.8f, fillFirstL(4.0f, 0.70f, 0.8f));     // 1.2 L left: still worth a top-up
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 2.0f, fillFirstL(2.0f, 0.70f, 0.8f));     // 0.6 L left would be too small: one run
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 5.0f, fillFirstL(5.0f, 1.0f, 0.8f));      // frac 1 = the old single run
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, fillFirstL(0.0f, 0.70f, 0.8f));
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, fillFirstL(-1.0f, 0.70f, 0.8f));
+}
+void test_two_step_seen_rate(void) {
+  // 17:34 on 18 Nov: 14.90 L in 48.7 s from the switch-on -> (14.90 - 0.47) / 48.7 * 60 = 17.78 L/min.
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 17.78f, fillSeenLpm(14.90f, 48.7f, 0.47f, 10.0f, 11.74f, 0.4f, 2.5f));
+  // A run that matches the saved line gives the saved rate back.
+  float v = 0.47f + 11.74f / 60.0f * 33.4f;
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 11.74f, fillSeenLpm(v, 33.4f, 0.47f, 10.0f, 11.74f, 0.4f, 2.5f));
+  TEST_ASSERT_EQUAL_FLOAT(-1.0f, fillSeenLpm(2.0f, 6.0f, 0.47f, 10.0f, 11.74f, 0.4f, 2.5f));    // too short to judge
+  TEST_ASSERT_EQUAL_FLOAT(-1.0f, fillSeenLpm(0.5f, 30.0f, 0.47f, 10.0f, 11.74f, 0.4f, 2.5f));   // ~0 L/min: not a pump run
+  TEST_ASSERT_EQUAL_FLOAT(-1.0f, fillSeenLpm(40.0f, 30.0f, 0.47f, 10.0f, 11.74f, 0.4f, 2.5f));  // 79 L/min: not believable
+  TEST_ASSERT_EQUAL_FLOAT(-1.0f, fillSeenLpm(5.0f, 30.0f, 0.47f, 10.0f, 0.0f, 0.4f, 2.5f));     // no saved rate
+  TEST_ASSERT_EQUAL_FLOAT(-1.0f, fillSeenLpm(NAN, 30.0f, 0.47f, 10.0f, 11.74f, 0.4f, 2.5f));
+  // The top-up timed with the seen rate gives what is missing on that rate's line.
+  float q = fillSeenLpm(14.90f, 48.7f, 0.47f, 10.0f, 11.74f, 0.4f, 2.5f) / 60.0f;
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 3.0f, xferLitresAt(xferRunS(3.0f, q, 0.47f, 6.0f), q, 0.47f, 6.0f));
+}
+void test_two_step_cut_level(void) {
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 9.77f, fillCutLevel(10.57f, 0.8f, 7.57f, 0.4f));   // the goal less the lag
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 9.92f, fillCutLevel(10.57f, 0.8f, 9.52f, 0.4f));   // never within 0.4 L of the base
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.40f, fillCutLevel(1.20f, 0.8f, 1.00f, 0.4f));    // a tiny top-up: base + 0.4
 }
 
 int main(int, char **) {
@@ -334,5 +366,8 @@ int main(int, char **) {
   RUN_TEST(test_xfer_litres_ramp_then_line);
   RUN_TEST(test_settle_watch);
   RUN_TEST(test_topup_rule);
+  RUN_TEST(test_two_step_first_run_share);
+  RUN_TEST(test_two_step_seen_rate);
+  RUN_TEST(test_two_step_cut_level);
   return UNITY_END();
 }

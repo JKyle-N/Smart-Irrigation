@@ -158,8 +158,26 @@ void test_mixer_with_points_still_passes_through_them(void) {
   TEST_ASSERT_FLOAT_WITHIN(0.001f, 13.0f, tvLitersAtH(c, 15.0f));
 }
 
+// The tape-measured tank (2026-11-18): 34.60 cm across at the floor, +0.1219 cm per cm, sensor head 47.5 cm above the
+// floor. ESP1 puts the 42.9 / 24.0 cm marks on it (4.6 and 23.5 cm of water): 35.16 / 37.46 cm across there, and
+// the mixer's 11.4 cm stands 6.8 cm above the 0 % mark. These are the litres the guides' tables quote.
+static float tapeD(float hFromFloor) { return 34.60f + 0.1219f * hFromFloor; }
+void test_measured_tank_shape(void) {
+  TankVolCal mix = { 42.9f, 24.0f, tapeD(4.6f), tapeD(23.5f), 0, {0}, {0}, 6.0f, 11.4f - 4.6f };
+  TankVolCal res = { 42.9f, 24.0f, tapeD(4.6f), tapeD(23.5f), 0, {0}, {0} };
+  TEST_ASSERT_FLOAT_WITHIN(0.02f, 0.89f, tvLitersAtPct(mix, 5.0f));     // the delivery low stop
+  TEST_ASSERT_FLOAT_WITHIN(0.02f, 9.29f, tvLitersAtPct(mix, 50.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.02f, 17.32f, tvLitersAtPct(mix, 90.0f));   // MIXCAP
+  TEST_ASSERT_FLOAT_WITHIN(0.02f, 19.39f, tvLitersAtPct(mix, 100.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.02f, 19.58f, tvLitersAtPct(res, 100.0f));
+  // The whole body, floor to the 35.8 cm line (47.5 -> 11.7 cm from the sensor), no mixer: 38.08 L.
+  TankVolCal body = { 47.5f, 11.7f, tapeD(0.0f), tapeD(35.8f), 0, {0}, {0} };
+  TEST_ASSERT_FLOAT_WITHIN(0.03f, 38.08f, tvLitersAtPct(body, 100.0f));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
+  RUN_TEST(test_measured_tank_shape);
   RUN_TEST(test_cone_empty_is_zero);
   RUN_TEST(test_cone_full_matches_frustum_formula);
   RUN_TEST(test_cone_is_wider_at_the_top);

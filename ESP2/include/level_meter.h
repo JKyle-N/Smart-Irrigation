@@ -325,6 +325,34 @@ static inline bool fillNeedsTopup(float goalL, float measuredL, float minShortL,
   return isfinite(goalL) && isfinite(measuredL) && (goalL - measuredL) > minShortL && done < maxN;
 }
 
+/* ---- Two-step fill (2026-11-18 user request) -------------------------------------------------------------------
+ * The transfer pump's rate is not the same from run to run (18 Nov: ~10.8 L/min at 15:33, ~17.8 L/min at 17:34 with
+ * the same inverter power), so one timed run can land far off. The first run aims short of the goal; the settle
+ * measures it; the top-up is timed with the rate that run really gave.                                              */
+/* The litres the first run aims for: frac of the need -- or all of it when the rest would be too small for a top-up
+ * to be worth a run (minTopupL). */
+static inline float fillFirstL(float needL, float frac, float minTopupL) {
+  if (!(needL > 0.0f) || !isfinite(needL)) return 0.0f;
+  if (!(frac > 0.0f) || frac >= 1.0f) return needL;
+  return (needL * (1.0f - frac) >= minTopupL) ? needL * frac : needL;
+}
+/* The rate (L/min) a finished run really gave, on the same line as the run time (V = startL + q * t, t from the
+ * switch-on). -1 when the run is shorter than minS (the level noise would swamp it) or the figure is outside
+ * lo..hi times the saved rate (a run that was not a clean pump run). */
+static inline float fillSeenLpm(float risenL, float runS, float startL, float minS, float calLpm, float lo, float hi) {
+  if (!isfinite(risenL) || !isfinite(runS) || !(runS >= minS) || !(runS > 0.0f) || !(calLpm > 0.0f)) return -1.0f;
+  float q = (risenL - startL) / runS * 60.0f;
+  if (!(q >= lo * calLpm) || !(q <= hi * calLpm)) return -1.0f;
+  return q;
+}
+/* The live mixing-tank level that ends a run early (a pump faster than its rate): the goal less what is still on its
+ * way when the pump stops (lagL), but never closer to the run's own base than minRiseL (a real rise, not noise). */
+static inline float fillCutLevel(float goalL, float lagL, float baseL, float minRiseL) {
+  float c = goalL - lagL;
+  float lo = baseL + minRiseL;
+  return (c > lo) ? c : lo;
+}
+
 /* ---- Plausibility (2026-11-17, from the web v.3 log of 17 Nov 08:01) --------------------------------------
  * A stage cannot have moved water faster than its pump can: paceOk() is false when movedL litres in elMs would
  * need more than x times the pump's rate (L/min), beyond slackL of level noise. A level that says "done" too early

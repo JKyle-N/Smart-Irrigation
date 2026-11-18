@@ -14,7 +14,7 @@ const float WATER_BUDGET_L[3] = { 5.0f, 5.0f, 5.0f };
 
 // Mixing-tank safety ceiling, litres. An outer sanity bound on any volume that crosses the wire; the
 // real planning ceiling is the tank calibration's litres at MIX_HIGH_PCT (ESP1 sends it as MIXCAP --
-// ~16.2 L with the default 31 / 39.4 cm frustum and the 2026-11-15 geometry).          [MEASURE]
+// ~17.3 L with the tape-measured tank shape of 2026-11-18 and the 2026-11-15 marks).    [MEASURE]
 const float MIXING_TANK_MAX_L = 50.0f;
 
 // Mixing-tank overflow stop, % of the empty..full span: ESP2 stops a fill at it (LEVEL_HIGH), and ESP1
