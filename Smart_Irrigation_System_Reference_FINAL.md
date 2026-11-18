@@ -34,8 +34,12 @@
 >   calibration (read-only) and column rest/skip published (§19.4.9.29).
 > - **Tank shape:** taped by the user: 34.60 cm across at the floor, +0.1219 cm per cm, sensor 47.5 cm above the floor.
 >   The 0 % / 100 % marks stay; the litres change (MIXCAP 15.90 → 17.32 L) (§19.4.9.31).
-> - **SD card logs** reach the website through Firebase for a day someone asks for, since the Supabase project
->   expired (§19.4.9.23, §19.4.9.34).
+> - **SD card logs** reach the website through Firebase for a day someone asks for. **Supabase is not used:** Firebase
+>   replaced it for the logs when the Supabase project expired (§19.4.9.23, §29.9).
+> - **Website:** the page (the UI) is hosted on GitHub Pages and all its data goes through Firebase. The rig and the
+>   page never talk directly (§29.13).
+> - **ThingSpeak is not used:** it is left off so that ESP32 #1's memory and network task serve Firebase alone, for
+>   a faster, more reliable link (§29.4).
 >
 > - **As-built lists (17 Nov):** calibration defaults incl. the pump readings §5.3.2–5.3.3, Nano packets §9.7.1,
 >   ESP32 #1 ↔ #2 messages §9.7.4, SMS commands §12.2.5, crop presets §12.2.2, LCD menus §18.10.7.5, fault codes
@@ -105,7 +109,7 @@ the website.
 | Board | Does | Never |
 | --- | --- | --- |
 | **Arduino Nano** (sensor hub) | Reads the soil probes, the NPK probe (RS485), DHT22, BH1750, the reservoir inflow meter and both tank ultrasonics (raw cm); turns the pump-selector servo; sends checksummed packets to ESP32 #1 | decides anything or switches a load |
-| **ESP32 #1** (master) | Turns readings into %, litres and decisions; runs the schedule; LCD and buttons, SD log, clock, SMS (A7670C), the website (Firebase) and ThingSpeak; watches the second battery; switches ESP32 #2's power | drives a pump or valve |
+| **ESP32 #1** (master) | Turns readings into %, litres and decisions; runs the schedule; LCD and buttons, SD log, clock, SMS (A7670C) and the website (through Firebase; ThingSpeak not used); watches the second battery; switches ESP32 #2's power | drives a pump or valve |
 | **ESP32 #2** (actuators) | Runs one whole work order (fill, dose, mix, deliver, flush) through the PCF8575 relay bank; measures each stage on the tank levels; counts the dosing meters; reads EC/pH, the mixer current and the inverter output (PZEM-004T); stops on its own on a fault | chooses when to run |
 
 **When a column is watered (ESP32 #1)**
@@ -151,9 +155,9 @@ measure. The sensors can't see closer than about 20 cm, so a reading near 20 cm 
   everything off.
 
 **How the operator reaches it.** At the rig, the LCD and buttons: status pages, forced runs, settings, calibration
-and testing. By SMS: alerts, STATUS and commands (§12). On the website: a report once a minute plus Refresh, remote
-commands, and the SD logs on request (§29.11). The SD card keeps every event, one CSV per day, and ThingSpeak draws
-the graphs.
+and testing. By SMS: alerts, STATUS and commands (§12). On the website (a GitHub Pages page fed by Firebase, §29.13): a
+report once a minute plus Refresh, remote commands, and the SD logs on request. The SD card keeps every event, one
+CSV per day; graphs for the thesis come from those logs, since ThingSpeak is not used (§29.4).
 
 **Design rules**
 - **One job per board:** ESP32 #1 decides, ESP32 #2 acts and protects, the Nano reads (§5.4).
@@ -2474,8 +2478,8 @@ finish.
 | `WIFIPORTAL`, `WIFIPORTAL,STOP` | The setup access point (closes after 10 min unused) |
 | `TSKEY,<1-3>,<key>` | A ThingSpeak channel write key |
 | `FBASE,<url>`, `FBASE,ON` / `OFF`, `FBASE,CLEAR`, `FBASE,STATUS`, `FBASE,SIGNOUT`, `FBASE,TLS,ON` / `OFF`, `FBASE,APIKEY,<key>`, `FBASE,AUTH,<email>,<password>` | Website (Firebase) sync: address, on/off, why it is not connecting, sign out, the certificate check (OFF = test only), the web API key, the device account. No secret is ever echoed or logged |
-| `UPLOAD`, `UPLOAD,YYYYMMDD` | Send yesterday's / that day's SD log. Through Firebase when website sync is on, today included as far as it is written (17 Nov); through Supabase only while Firebase is off, completed days only |
-| `SUPA,<url>,<service key>`, `SUPA,CLEAR` | Supabase log upload (the project expired 17 Nov; kept for a new one) |
+| `UPLOAD`, `UPLOAD,YYYYMMDD` | Send yesterday's / that day's SD log to the website through Firebase, today included as far as it is written (17 Nov). Supabase is not used (§29.9) |
+| `SUPA,<url>,<service key>`, `SUPA,CLEAR` | Supabase log upload: **not used**, the project expired 17 Nov and Firebase replaced it. Leave unset (`SUPA,CLEAR` removes old credentials) |
 | `BATTSW`, `BATTSW,CLEAR` | Battery-switch status / clear a latched switch fault |
 | `SIMTEST` | The SIM check (also sent by itself every Sunday) |
 | `USSD,<code>`, `USSD,CLEAR`, `USSD` | The carrier's balance code / clear it / show it |
@@ -4019,7 +4023,7 @@ Recommended: 3–4 points per tank (near empty, ~⅓, ~⅔, near full), measured
 
 #### 19.4.9.5. Where the litres show
 
-LCD Sensor Diag page 2 (`R 31.2  12.4L s0.3`: cm, litres, spread; `!` = not usable for control), the SD/Supabase `TANK` log rows (`|L=res/mix|s=…`), and Firebase `sensors.reservoirLiters` / `sensors.mixingLiters`.
+LCD Sensor Diag page 2 (`R 31.2  12.4L s0.3`: cm, litres, spread; `!` = not usable for control), the SD `TANK` log rows (on the website through Firebase) (`|L=res/mix|s=…`), and Firebase `sensors.reservoirLiters` / `sensors.mixingLiters`.
 
 #### 19.4.9.6. Values to confirm at commissioning
 
@@ -4241,7 +4245,9 @@ ESP2 sends `INFO,INV_ON,<pump>` the moment it switches the inverter relay on. Un
 - **What goes up:** each day's CSV goes to the Realtime Database that serves the website, as text pieces `logs/files/<yyyymmdd>/<nnnn>` of 6 KB (`LOG_CHUNK_BYTES`; 12 KB until the evening of 17 Nov), plus `logs/index/<yyyymmdd>` = `{state: uploading/done/missing/failed, size, chunks, partial, at}`.
 - **How it is sent:** non-ASCII and control bytes (line noise) become `?`; everything else is unchanged. ESP1 sends one piece per network-task pass, so commands and the live report keep flowing. A 1 MB day is 171 pieces, about 2–3 minutes.
 - **Which days:** since 18 Nov 2026 (g), only a day someone asks for. Finished days no longer go up by themselves (oldest first after `fbLogLast`, NVS `fblogl`): at about 1.2 MB a day that catch-up never finished on this link (§19.4.9.34). The website's **Upload from the rig** (`irrigation/logRequest = {day, at}`, polled every 30 s; 10 s until 18 Nov g) asks for any day on the card, today included as far as it is written (`partial`). Firebase keeps `LOG_KEEP_DAYS` (14). Older days are deleted there and stay on the SD card only.
-- **Supabase** remains the target only while Firebase is off.
+- **Supabase is not used.** Firebase is its replacement for the logs. The old Supabase path is still in the firmware,
+  but it would only run with Firebase switched off and Supabase credentials stored. Firebase is on, so it never runs
+  (§29.9).
 - **Who can see them:** operators and the privileged tier can read the logs (they hold SMS texts and phone numbers). Only ESP1's device account writes them. On the website: Diagnostics → SD card logs (list, Download, Upload from the rig).
 - **Manual/Test → SD card log (CSV)** (user, 17 Nov: logs at any time of the morning). **Update today's log** asks for today's log so far, through the same `irrigation/logRequest`. It works only while ESP1 is reporting, idle (`IDLE_STATE` or `SAFE_MODE`), with no run, pump test, pump or mixer on; otherwise the button is off and says why. **Download today's log** works once it is sent. The badge follows `logs/index/<today>`: NOT SENT → ASKED → SENDING → SENT (SO FAR), or FAILED / NOT ON CARD.
 - **Heap (fixed the evening of 17 Nov).** The first version kept the 12 KB piece in a `static` buffer, which took 12.4 KB of heap for good (static RAM 94,432 B, against 82,040 B before). During runs ESP1 then had 55–60 KB free, under `FIREBASE_MIN_HEAP` (60 KB), and skipped every Firebase request. After the 17:58 flash no restart reached `FBASE,OK`, and every log upload failed (`UPLOAD,FAIL|20261103.CSV|http=-1`). Now each piece is read in 512-byte blocks (`LOG_READ_BLOCK`) straight into its JSON text, which is freed after the request; static RAM is 82,184 B again.
@@ -5302,7 +5308,7 @@ Note: daily files keep individual files manageable and align with the daily-summ
 * Debugging (primary purpose — full event visibility)
 * Daily summary generation (via GSM, Section 12.1.3)
 * Performance analysis
-* Thesis data collection. Sensor data can be graphed two ways now: (a) automatically via the WiFi → ThingSpeak telemetry uplink (live per-field charts, Section 29.4), and (b) from the SD CSV logs / SMS digests for offline or paper graphing.
+* Thesis data collection. Sensor data is graphed from the SD CSV logs (downloadable from the website, §29.13) and the SMS digests. The ThingSpeak uplink (Section 29.4) is not used, to keep ESP32 #1's memory for the website link.
 
 ---
 
@@ -5371,6 +5377,19 @@ ESP32 #2. The Nano is unchanged except where stated.
   the software reset and self-limits even when the RTC itself is dead.
 
 ## 29.4. WiFi → ThingSpeak telemetry (live graphs)
+
+> **Not used by the system (user decision, 18 Nov 2026).**
+> - **Why:** ESP32 #1 runs all its network work on one core-0 task (`netTask`) with one heap. Every ThingSpeak upload
+>   is another HTTP request on that same task, using memory the website link needs. After the 18 Nov memory fix ESP1
+>   had about 34 KB of usable heap, and a new Firebase TLS connection needs 24 KB free with a 17 KB block (§19.4.9.34).
+>   Leaving ThingSpeak off gives that task and that memory to Firebase alone, for a faster and more reliable link
+>   with the website. ThingSpeak was also not needed: the website shows the live state, and the SD logs hold every
+>   reading for graphs.
+> - **How it stays off:** `tsUpload()` sends a channel only when its write key is stored (`tsKey1`–`tsKey3`, set by
+>   SMS `TSKEY` or the setup portal). With no keys, nothing goes to ThingSpeak. So **do not set `TSKEY` keys.** The
+>   LCD network page shows `TS:--` while nothing is sent. The code stays in the firmware, dormant.
+>
+> The rest of this section describes the feature as built, for the record.
 
 * ESP32 #1 connects to a nearby WiFi network and uploads telemetry to **ThingSpeak**,
   which renders a live graph per field — viewable from anywhere over the internet. This
@@ -5521,10 +5540,18 @@ Extends the manual TEST mode (Section 18.10.8).
   ESP32 #1↔#2 link: if relays click here but Testing still fails, the fault is the link, not the
   hardware.
 
-## 29.9. Remote log retrieval — Supabase Storage upload
+## 29.9. Remote log retrieval — Supabase Storage upload (not used; replaced by Firebase)
 
-> **Replaced on 17 Nov 2026:** the Supabase project expired. Logs now go to Firebase and are downloaded on the
-> website (§19.4.9.23). Supabase is used only while Firebase is switched off.
+> **Not used by the system. Firebase replaced it on 17 Nov 2026,** when the Supabase project expired.
+> - **Where the logs go now:** the SD card keeps every day. A day someone asks for (the website's "Upload from the
+>   rig", or SMS `UPLOAD`) goes up to the same Firebase project that serves the website, and is downloaded there
+>   (§19.4.9.23, §29.13).
+> - **One cloud service:** ESP32 #1 talks to Firebase alone, with no second TLS service or credentials, which keeps its
+>   memory and network task for the website link (as with ThingSpeak, §29.4).
+> - **The old path is dormant:** the firmware would fall back to Supabase only with Firebase switched off *and*
+>   Supabase credentials stored. Keep website sync on and leave `SUPA` unset; `SUPA,CLEAR` removes old credentials.
+>
+> The rest of this section describes the old feature, for the record.
 
 The site is ~50 km away with **outbound-only** internet (no port forwarding), so logs are pushed to
 the cloud rather than pulled. ESP32 #1 uploads each completed daily CSV to a **private Supabase
@@ -5636,3 +5663,53 @@ unchanged since 17 Nov.
 | Website link: busy / idle, a report a minute plus Refresh, the memory fix for HTTP 400 | ESP1, website | §19.4.9.34 |
 | A reservoir reading near 20 cm (about 120 %) explained: the sensor's dead zone; no change | — | §19.4.9.8 |
 | Noise measures (second battery, inverter placement, servo pump switch); main-battery and solar sensors not fitted | hardware | §20.5 |
+| ThingSpeak not used: ESP32 #1's memory and network task kept for the website link | ESP1 (no keys set) | §29.4 |
+| Supabase not used: the SD logs go to the website through Firebase only | ESP1, website | §29.9, §19.4.9.23 |
+
+## 29.13. How the website is connected: GitHub for the page, Firebase for the data
+
+The website has two parts, and the rig talks to neither of them directly except Firebase:
+
+```
+  Browser ──loads the page──▶ GitHub Pages (Jmhatake123/Website, the UI files)
+     │
+     └──reads / writes data──▶ Firebase (project smart-irrigation-web2)
+                                 ├─ Authentication: who may sign in
+                                 └─ Realtime Database ◀──HTTPS── ESP32 #1 (Wi-Fi)
+```
+
+**GitHub: the user interface (UI).**
+- **What it holds:** the page itself is three static files with no build step: `index.html`, `script.js` and
+  `style.css`. They live in the GitHub repository **Jmhatake123/Website**, branch `main`. The local copy is
+  `web v.4 pure ultrasonic\Website`.
+- **How it is published:** GitHub Pages serves the files at **https://jmhatake123.github.io/Website/**. A push to `main`
+  publishes the new version by itself (workflow `.github/workflows/static.yml`), usually within a minute or two.
+- **No rig data on GitHub:** it only hands the page to the browser.
+- **The firmware repository is a separate copy:** JKyle-N/Smart-Irrigation keeps a copy of the site under `Website/`
+  for the record. It is not the one that is served.
+
+**Firebase: the data, the accounts and the rules.**
+- **The project:** the page loads `firebase-config.js`, the project's public web settings for **smart-irrigation-web2**.
+  These are public by design. What protects the data is sign-in plus the database rules (`firebase-rules.json`).
+- **Authentication:** decides who may sign in. Account levels (pending, approved, restricted, operator) decide what
+  each person may see and press. The rules enforce this on Firebase's side, not only in the page.
+- **Realtime Database:** the meeting point between the rig and the website.
+  - **ESP32 #1 writes** the live snapshot (`irrigation/live`) once a minute, and one more when someone presses
+    Refresh. It also writes the SD logs when a day is asked for (`logs/…`).
+  - **The website writes** commands (`irrigation/commands`), Refresh requests (`irrigation/viewer/refreshAt`) and log
+    requests (`irrigation/logRequest`).
+  - **ESP32 #1 reads** them: commands every 3 s, Refresh every 6 s, log requests every 30 s. It checks every command
+    against its own rules before acting, and writes back accepted / completed / rejected (§29.11).
+- **ESP32 #1's own account:** it signs in with a device account. Only a refresh token is kept in its NVS; no password
+  stays on the rig. Every request goes over HTTPS with a short-lived ID token.
+- **Deleting a user:** one small Vercel function (`delete-user-api`) does the one thing a browser cannot do in
+  Firebase. Its admin credentials live in Vercel's settings, never in the repositories.
+
+**What this design gives:**
+- **The rig never accepts a connection from the internet.** It only reaches out to Firebase, so the page cannot
+  command hardware directly. A lost Wi-Fi link only makes the website stale; the rig keeps running, and SMS and the
+  LCD stay the dependable stop paths.
+- **One network service on ESP32 #1:** Firebase alone (ThingSpeak is off, §29.4), at one report a minute, so the link
+  stays light on a weak Wi-Fi signal (§19.4.9.34).
+- **The page and the firmware change separately:** a website update is a push to GitHub. It needs no reflash, because
+  the page reads the pace and mode from the snapshot (`meta.refreshMs` / `meta.linkMode`).
